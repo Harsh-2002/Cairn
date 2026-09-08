@@ -47,13 +47,25 @@ through a pidfd, allowing the wrapper to finish the trace before bounded group t
 Process samples identify executables; timestamped phase records allow load/idle alignment.
 
 Three equal-duration load/idle cycles reuse one backend. The seeded byte generator is identical
-in both drivers. The metadata driver submits actual `PutObjectVersion` mutations through the
-canonical FULL-durability Writer, reads through the WAL pool and lists the worker's bounded
-16-key overwrite ring. It uses eight read connections, 8 MiB per connection and no mmap. This
-first workload is an attribution fixture, not the complete Phase 5 metadata evaluation.
-Blob transactions stage, fully read/verify and delete an actual raw object. S3 transactions issue
+in both drivers. The metadata driver initializes one storage generation, reserves each exact
+object plan through the canonical FULL-durability Writer, then submits its original
+`PutObjectVersion` through `PublishStorageWrite`. It reads through the WAL pool and lists the
+worker's bounded 16-key overwrite ring. The `admit_publish` time includes both Writer submissions;
+publication creates durable cleanup debt for unused aliases and superseded paths, retained until
+owned teardown because this metadata-only fixture creates no physical files. It uses eight read
+connections, 8 MiB per connection and no mmap. This workload is an attribution fixture, not the
+complete Phase 5 metadata evaluation.
+Blob transactions use explicitly synthetic fixture creation permits, then stage, fully read/verify
+and reclaim an actual raw object using an explicit synthetic cleanup receipt and matching lease;
+cleanup synchronizes absence and prunes empty parents. They have no metadata Writer or journal.
+S3 transactions issue
 signed PUT/GET/DELETE on one persistent connection per worker, without retries. Successful
 transactions/second refers to these three-operation units, not individual S3 requests/second.
+Every direct-layer cycle records `publication_variant`: `writer_admission_exact_publication_v2`
+for metadata and `blob_only_fixture_permit_exact_cleanup_no_metadata_v3` for blobs. The metadata unit now has two
+physical Writer commit points. Keep these results separate from historical bare-PUT trials; their
+rate difference cannot establish journal-adoption cost or benefit. A valid comparison requires
+matched workload/publication semantics and the predeclared paired experiment gates.
 Operation sequences rotate across all configured buckets even when there are fewer workers than
 buckets; per-bucket success counts are recorded and incomplete coverage cannot pass.
 The blob driver's stage time includes encoding/filesystem/durability waits and is not isolated
@@ -141,7 +153,16 @@ campaign's fanout allowance. Build with `cargo build --locked --release --manife
 conformance/storage_lab/Cargo.toml --bin cairn-fanout-lab` from the repository root. The complete
 command, fixed matrix and predeclared gates are in `../../docs/storage-fanout-2026-09.md`.
 Single-case or single-pair runs cannot qualify for adoption. Raw-file publication measures
-namespace durability; GET/delete/reconciliation use LocalBlobStore. This is not S3 throughput.
+namespace durability; GET/delete/reconciliation use LocalBlobStore. Its current publication
+variant is `raw_namespace_descriptor_coalescer_exact_cleanup_fixture_v3`: the actual production directory
+coalescer retains directory descriptors and explicit fixture I/O leases, with no metadata admission
+or storage journal. Deletes use exact synthetic cleanup receipts and matching leases, including
+durable absence and empty-parent pruning. This differs from the earlier v2 raw-delete workload.
+This is not S3 throughput or journal-adoption evidence. The current coordinator
+has no external fsync measurement hook, so actual coalesced syscall counts/times are explicitly
+null with an unavailable reason; directory-sync requests and directory-creation timing remain
+separate measurements. Historical pathname-coalescer results retain their original provenance and
+cannot be pooled with this variant as one unchanged trial.
 `LAB_TEST_FANOUT_DRIVER` supplies the debug binary to tiny deterministic Python fixtures;
 `cargo test` also checks cancellation/failure cleanup and directory synchronization.
 

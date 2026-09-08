@@ -3,7 +3,8 @@
 
 Stdlib-only; writes use public HTTP APIs, metadata inspection is read-only. --crash-multipart
 requires a failpoints binary and additionally kills a Complete paused after durable assembly.
-Every populated durable table is compared by complete rows, preserving additive schema fields.
+Snapshot images preserve every complete durable row. Restore changes are checked against exact
+recovery transitions, with fresh ownership, preserved live files and independently verified quotas.
 """
 import argparse
 import base64
@@ -40,8 +41,130 @@ def rows(database, table):
         return [dict(row) for row in conn.execute(f'SELECT * FROM "{table}"')]
 
 
-def same_rows(left, right, table):
-    assert sorted(map(repr, rows(left, table))) == sorted(map(repr, rows(right, table))), table
+def database_rows(database, tables=None):
+    """Capture all tables in one read transaction, including empty tables and additive columns."""
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        inventory = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        if tables is None:
+            tables = inventory
+        else:
+            assert set(tables) <= set(inventory), "required recovery table missing"
+        return {table: [dict(row) for row in conn.execute(
+            'SELECT * FROM "' + table.replace('"', '""') + '"')] for table in tables}
+
+
+def same_database_rows(left, right):
+    before, after = database_rows(left), database_rows(right)
+    assert before.keys() == after.keys(), "snapshot table inventory changed"
+    for table in before:
+        assert sorted(map(repr, before[table])) == sorted(map(repr, after[table])), table
+
+
+def fresh_storage_generation(before, after):
+    assert len(before) == len(after) == 1, "storage recovery singleton missing or duplicated"
+    old, new = before[0], after[0]
+    generation = new["generation"]
+    assert (isinstance(generation, str) and len(generation) == 32
+            and all(char in "0123456789abcdef" for char in generation)), "invalid fresh generation"
+    assert generation != old["generation"], "recovery reused the old serving generation"
+    assert new == dict(old, generation=generation), "recovery changed coverage or other singleton fields"
+    assert new["coverage_state"] == "incomplete", "this phase must retain full-scan recovery"
+
+
+def multipart_accounting(state):
+    """Recompute v26 roll-ups from authoritative sessions/parts, reservations and charged debt."""
+    sessions = {row["id"]: row for row in state["multipart_uploads"]}
+    bucket, principal = {}, {}
+
+    def charge(bucket_name, principal_id, active=0, size=0):
+        for totals, key in ((bucket, bucket_name), (principal, principal_id)):
+            count, amount = totals.get(key, (0, 0))
+            totals[key] = count + active, amount + size
+
+    def session_charge(upload, **amount):
+        session = sessions[upload]
+        charge(session["bucket_name"], session["initiated_by"] or session["owner_id"], **amount)
+
+    for session in sessions.values():
+        session_charge(session["id"], active=1)
+    for part in state["multipart_parts"]:
+        session_charge(part["upload_id"], size=part["size"])
+    for reservation in state["multipart_part_reservations"]:
+        session_charge(reservation["upload_id"], size=reservation["reserved_bytes"])
+    for debt in state["multipart_staging_cleanups"]:
+        charge(debt["bucket_name"], debt["principal_id"], size=debt["bytes"])
+    for table, key, totals in (("multipart_bucket_stats", "bucket_name", bucket),
+                               ("multipart_principal_stats", "principal_id", principal)):
+        actual = {row[key]: (row["active_uploads"], row["staged_bytes"]) for row in state[table]}
+        assert totals.keys() <= actual.keys(), f"missing quota roll-up: {table}"
+        assert all(value == totals.get(identity, (0, 0)) for identity, value in actual.items()), table
+
+
+def recovered_database_rows(before, after):
+    """Require exact full-row fidelity except for individually proven offline recovery effects."""
+    assert before.keys() == after.keys(), "restored table inventory changed"
+    assert "storage_recovery_state" in before, "storage protocol 2 binary required"
+    multipart_accounting(before)
+    multipart_accounting(after)
+    fresh_storage_generation(before["storage_recovery_state"], after["storage_recovery_state"])
+    emptied = {"storage_write_intents", "storage_intent_paths", "storage_cleanups",
+               "multipart_part_reservations", "multipart_staging_cleanups"}
+    for table in emptied:
+        assert not after[table], f"unresolved restored ownership/debt: {table}"
+    sessions = {row["id"]: row for row in before["multipart_uploads"]}
+    released_bucket, released_principal = {}, {}
+    for row in before["multipart_part_reservations"]:
+        session = sessions[row["upload_id"]]
+        for totals, key in ((released_bucket, session["bucket_name"]),
+                            (released_principal, session["initiated_by"] or session["owner_id"])):
+            totals[key] = totals.get(key, 0) + row["reserved_bytes"]
+    for row in before["multipart_staging_cleanups"]:
+        for totals, key in ((released_bucket, row["bucket_name"]),
+                            (released_principal, row["principal_id"])):
+            totals[key] = totals.get(key, 0) + row["bytes"]
+    for table, original in before.items():
+        expected = [dict(row) for row in original]
+        if table in emptied:
+            expected = []
+        elif table == "storage_recovery_state":
+            expected[0]["generation"] = after[table][0]["generation"]
+        elif table == "multipart_uploads":
+            for row in expected:
+                if row["status"] == "completing":
+                    row.update(status="active", completion_claim_token=None)
+        elif table in ("multipart_bucket_stats", "multipart_principal_stats"):
+            key, totals = (("bucket_name", released_bucket) if table == "multipart_bucket_stats"
+                           else ("principal_id", released_principal))
+            for row in expected:
+                row["staged_bytes"] -= totals.get(row[key], 0)
+        assert sorted(map(repr, expected)) == sorted(map(repr, after[table])), table
+
+
+def recovered_artifacts_absent(root, state):
+    live = {row["storage_path"] for table in ("object_versions", "multipart_parts")
+            for row in state[table] if row.get("storage_path")}
+    for table in ("storage_intent_paths", "storage_cleanups"):
+        for row in state[table]:
+            if row["storage_path"] not in live:
+                assert not os.path.lexists(root / row["storage_path"]), "retired physical artifact remains"
+
+
+def same_live_files(snapshot_blobs, restored, state):
+    def digest(path):
+        assert path.is_file() and not path.is_symlink(), "authoritative file missing or replaced by symlink"
+        result = hashlib.sha256()
+        with path.open("rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                result.update(block)
+        return result.digest()
+    for table in ("object_versions", "multipart_parts"):
+        for row in state[table]:
+            path = row.get("storage_path")
+            if path:
+                assert digest(snapshot_blobs / path) == digest(restored / path), "live file changed during restore"
 
 
 def wait_for(probe, label, timeout=20):
@@ -121,6 +244,7 @@ def main():
             # Recovery verification does not deliver outbound writes before claims are inspected.
             if data == restored:
                 settings["CAIRN_REPLICATION_INTERVAL_SECS"] = "3600"
+                settings["CAIRN_MULTIPART_SWEEP_INTERVAL_SECS"] = "1"
                 settings.pop("CAIRN_REPLICATION_ENDPOINT")
                 settings.pop("CAIRN_REPLICATION_ACCESS_KEY")
                 settings.pop("CAIRN_REPLICATION_SECRET")
@@ -225,9 +349,8 @@ def main():
             manifest = json.loads((snapshot / "manifest.json").read_text())
             assert manifest["complete"] is True
             source_db = snapshot / "metadata.sqlite3"
-            for table in durable_tables(source_db):
-                same_rows(database, source_db, table)
-            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox"):
+            same_database_rows(database, source_db)
+            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox", "storage_write_intents", "storage_intent_paths", "storage_cleanups"):
                 assert rows(source_db, table), f"vacuous coverage: {table}"
             assert all(row["lock_mode"] == "COMPLIANCE" and row["legal_hold"] == 1
                        and row["retain_until"] > int(time.time() * 1000)
@@ -261,11 +384,16 @@ def main():
             cli(refused_target, "restore", str(broken_snapshot), succeeds=False)
             assert not (refused_target / "cairn.db").exists()
             cli(restored, "restore", str(snapshot))
-            for table in durable_tables(source_db):
-                same_rows(source_db, restored / "cairn.db", table)
+            snapshot_state = database_rows(source_db)
+            restored_state = database_rows(restored / "cairn.db")
+            recovered_database_rows(snapshot_state, restored_state)
+            same_live_files(snapshot / "blobs", restored, snapshot_state)
+            recovered_artifacts_absent(restored, snapshot_state)
             # An assembled file without committed metadata is not authoritative snapshot data.
             assert len(list((restored / "recovery").iterdir())) == 2
             start(restored)
+            fresh_storage_generation(restored_state["storage_recovery_state"],
+                                     rows(restored / "cairn.db", "storage_recovery_state"))
             request("GET", "/recovery/history", expected=404)
             for version, body in versions:
                 suffix = urllib.parse.urlencode({"versionId": version})
@@ -307,7 +435,11 @@ def main():
                 request("DELETE", "/recovery/replica?" + urllib.parse.urlencode({"versionId": replica_version}), expected=403)
                 assert not any(row["key"] == "replica" for row in rows(restored_db, "replication_outbox"))
                 print("PASS: persisted replica multipart identity and loop prevention survive restore", flush=True)
+            wait_for(lambda: not rows(restored_db, "storage_cleanups")
+                     and not rows(restored_db, "multipart_staging_cleanups"),
+                     "durable exact cleanup of completed parts")
             stop()
+            multipart_accounting(database_rows(restored_db))
             assert not rows(restored_db, "multipart_parts")
             assert not rows(restored_db, "multipart_part_reservations")
             assert not list((restored / ".staging" / "multipart" / upload_id).glob("*"))

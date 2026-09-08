@@ -39,6 +39,18 @@ use zeroize::Zeroizing;
 /// fsync dir) is its invariant.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
+    /// Select every possible physical name without performing I/O. The returned plan is consumed
+    /// only after the canonical Writer acknowledges its exact durable admission.
+    fn plan_write(
+        &self,
+        bucket: BucketName,
+        generation: crate::storage::StorageToken,
+        target: crate::storage::StorageWriteTarget,
+    ) -> Result<crate::storage::PlannedStorageWrite, BlobError> {
+        crate::storage::PlannedStorageWrite::new(bucket, generation, target)
+            .map_err(|error| BlobError::Io(error.to_string()))
+    }
+
     /// Report this backend's read allocation/frame bounds from authoritative object metadata,
     /// without opening the body or resolving a key. Callers reserve this allowance before
     /// `open_raw_guarded`; the backend must keep it valid through probe, queued work and streaming.
@@ -55,7 +67,7 @@ pub trait BlobStore: Send + Sync {
     /// blob is durable. Writes no metadata; does not verify client checksums.
     async fn stage(
         &self,
-        bucket: &BucketName,
+        permit: crate::storage::StorageCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError>;
@@ -127,8 +139,22 @@ pub trait BlobStore: Send + Sync {
     /// `open_raw` cannot serve that — a DEK-less open of an encrypted blob fails closed by design.
     async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError>;
 
-    /// Idempotently delete a committed blob (absence is success).
-    async fn delete(&self, path: &StoragePath) -> Result<(), BlobError>;
+    /// Confirm the admitted names have no remaining kernel writer. The caller first drains its
+    /// cancelled I/O watch, or holds exclusive restart ownership after the previous process exited.
+    /// A missing name alone is insufficient unless no old namespace operation can still create it.
+    async fn confirm_storage_quiescence(
+        &self,
+        plan: &crate::storage::StorageWritePlan,
+        lease: crate::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError>;
+
+    /// Reclaim one Writer-claimed immutable path and synchronize its absence, including the
+    /// surviving ancestor after parent removal. Errors preserve debt and multipart quota.
+    async fn cleanup_storage(
+        &self,
+        cleanup: &crate::storage::StorageCleanup,
+        lease: crate::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError>;
 
     /// Stage one multipart part durably, reporting its plaintext size, MD5, and any supplementary
     /// `checksums` computed over the plaintext (empty when `checksums` is empty). The caller
@@ -140,45 +166,30 @@ pub trait BlobStore: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn stage_part(
         &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
+        permit: crate::storage::StorageCreationPermit,
         body: crate::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
         encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError>;
 
-    /// Idempotently delete one deterministically-named multipart part attempt.
-    ///
-    /// The caller reserves `attempt_id` before staging. This exact deletion seam lets cleanup retry
-    /// converge even if [`BlobStore::stage_part`] created the artifact but failed before returning
-    /// its [`StagedPart`].
-    async fn delete_part_attempt(
-        &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
-    ) -> Result<(), BlobError>;
-
     /// Assemble ordered parts into one durably-committed blob, applying compression during
     /// the assembly pass.
     async fn assemble(
         &self,
-        bucket: &BucketName,
+        permit: crate::storage::StorageCreationPermit,
         parts: &[PartRef],
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError>;
 
-    /// Idempotently delete all of a session's staged parts.
-    async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError>;
-
-    /// Reconcile on-disk blobs against the metadata, reclaiming orphans. Bounded in memory:
-    /// it streams the filesystem and consults the batched membership `oracle`.
+    /// Reconcile under exclusive maintenance ownership, retaining `lease` through actual I/O.
+    /// Streams the filesystem in bounded pages. The oracle protects authoritative references,
+    /// unfinished intents and exact cleanup debt; scans never bypass journal retirement.
     async fn reconcile(
         &self,
         oracle: &dyn ReconcileOracle,
         opts: ReconcileOpts,
+        lease: crate::storage::io::StorageIoLease,
     ) -> Result<ReconcileReport, BlobError>;
 }
 

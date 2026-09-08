@@ -855,6 +855,29 @@ ALTER TABLE multipart_staging_cleanups ADD COLUMN storage_protocol INTEGER NOT N
 UPDATE storage_protocol SET minimum_reader=2, minimum_writer=2;
 "#,
     },
+    Migration {
+        version: 37,
+        name: "storage_multipart_alias_ownership",
+        sql: r#"
+-- An unfinished spool alias follows its part's sole v26 charge even after publication.
+ALTER TABLE storage_cleanups ADD COLUMN quota_owner_path TEXT;
+CREATE INDEX idx_storage_cleanup_quota_owner ON storage_cleanups (quota_owner_path)
+    WHERE quota_owner_path IS NOT NULL;
+CREATE INDEX idx_multipart_cleanups_path ON multipart_staging_cleanups (storage_path)
+    WHERE storage_path IS NOT NULL;
+-- Exact multipart ownership must be seekable without scanning unrelated object intents.
+ALTER TABLE storage_write_intents ADD COLUMN upload_id TEXT;
+ALTER TABLE storage_write_intents ADD COLUMN reservation_id TEXT;
+UPDATE storage_write_intents SET
+    upload_id=COALESCE(json_extract(plan, '$.target.Part.upload_id'),
+                       json_extract(plan, '$.target.Completion.upload_id')),
+    reservation_id=json_extract(plan, '$.target.Part.reservation_id');
+CREATE INDEX idx_storage_intents_upload ON storage_write_intents (upload_id, attempt_id)
+    WHERE upload_id IS NOT NULL;
+CREATE INDEX idx_storage_intents_reservation ON storage_write_intents (reservation_id, attempt_id)
+    WHERE reservation_id IS NOT NULL;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -1088,7 +1111,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 36);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 37);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
@@ -1283,59 +1306,48 @@ mod tests {
         assert_eq!(matches.first().unwrap().get_i64(0), 0);
     }
 
-    async fn assert_v27_discards_only_legacy_orphan_lock_rows(driver: &dyn AsyncSqlDriver) {
+    /// Materialize the real historical schema so later migrations can extend every table.
+    async fn migrate_fixture_through(driver: &dyn AsyncSqlDriver, version: i64) {
         driver
             .execute_batch(
-                "PRAGMA foreign_keys=ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE object_versions (
-                     id TEXT PRIMARY KEY,
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL DEFAULT 1,
-                     is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                     etag TEXT NOT NULL DEFAULT '',
-                     size_logical INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
-                     storage_class TEXT NOT NULL DEFAULT 'Standard',
-                     owner_id TEXT NOT NULL DEFAULT '',
-                     UNIQUE (bucket_name, key, version_id)
-                 );
-                 INSERT INTO object_versions (id, bucket_name, key, version_id)
-                     VALUES ('row-live','b','live','v');
-                 CREATE INDEX idx_ov_latest_cover ON object_versions
-                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
-                      updated_at, storage_class, owner_id)
-                     WHERE is_latest = 1;
-                 CREATE TABLE object_locks (
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     lock_mode TEXT,
-                     retain_until INTEGER,
-                     legal_hold INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (bucket_name, key, version_id)
-                 );
-                 INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
-                 INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );
-                 INSERT INTO multipart_uploads VALUES ('legacy-upload','active');",
+                "PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
             )
             .await
             .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            driver.execute_batch(migration.sql).await.unwrap();
+            driver
+                .execute(
+                    "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                    vec![
+                        Value::Int(migration.version),
+                        Value::Text(migration.name.to_owned()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn assert_v27_discards_only_legacy_orphan_lock_rows(driver: &dyn AsyncSqlDriver) {
+        migrate_fixture_through(driver, 26).await;
+        driver.execute_batch(
+            "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region)
+                 VALUES ('b','owner',0,'enabled','BucketOwnerEnforced','us-east-1');
+             INSERT INTO object_versions
+                 (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+                  etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,created_at,updated_at)
+                 VALUES ('row-live','b','live','v',1,0,0,0,'','text/plain','{}','STANDARD','owner','[]','[]',0,0);
+             INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
+             INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
+             INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('legacy-upload','b','assembled','text/plain','active','owner','[]',0,0);",
+        ).await.unwrap();
 
         run_migrations(driver).await.unwrap();
         let locks = driver
@@ -1360,43 +1372,7 @@ mod tests {
     }
 
     async fn assert_v28_adds_row_identity_to_current_listing_cover(driver: &dyn AsyncSqlDriver) {
-        driver
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE object_versions (
-                     id TEXT PRIMARY KEY,
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL,
-                     is_delete_marker INTEGER NOT NULL,
-                     etag TEXT NOT NULL,
-                     size_logical INTEGER NOT NULL,
-                     updated_at INTEGER NOT NULL,
-                     storage_class TEXT NOT NULL,
-                     owner_id TEXT NOT NULL
-                 );
-                 CREATE INDEX idx_ov_latest_cover ON object_versions
-                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
-                      updated_at, storage_class, owner_id)
-                     WHERE is_latest = 1;
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );",
-            )
-            .await
-            .unwrap();
-
+        migrate_fixture_through(driver, 27).await;
         run_migrations(driver).await.unwrap();
         let columns = driver
             .query(
@@ -1426,29 +1402,13 @@ mod tests {
     }
 
     async fn assert_v29_resets_unowned_legacy_completion_claims(driver: &dyn AsyncSqlDriver) {
-        driver
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
-                 CREATE TABLE object_versions (id TEXT PRIMARY KEY, bucket_name TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL DEFAULT 1, is_delete_marker INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );
-                 INSERT INTO multipart_uploads VALUES ('active-upload','active');
-                 INSERT INTO multipart_uploads VALUES ('orphaned-completer','completing');",
-            )
-            .await
-            .unwrap();
+        migrate_fixture_through(driver, 28).await;
+        driver.execute_batch(
+            "INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('active-upload','b','assembled','text/plain','active','owner','[]',0,0),
+                        ('orphaned-completer','b','assembled','text/plain','completing','owner','[]',0,0);",
+        ).await.unwrap();
 
         run_migrations(driver).await.unwrap();
         let rows = driver

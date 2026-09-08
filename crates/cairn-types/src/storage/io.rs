@@ -4,13 +4,13 @@ use super::StorageToken;
 use crate::BlobError;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
 struct State {
     cancelled: bool,
     active: usize,
-    waiter: Option<Waker>,
+    waiters: Vec<(Weak<()>, Waker)>,
 }
 
 struct Shared {
@@ -29,6 +29,7 @@ impl Shared {
 }
 
 /// Request/recovery observer. Cancellation closes lease admission atomically with its count.
+#[derive(Clone)]
 pub struct StorageIoWatch(Arc<Shared>);
 
 impl std::fmt::Debug for StorageIoWatch {
@@ -51,7 +52,7 @@ impl StorageIoWatch {
             state: Mutex::new(State {
                 cancelled: false,
                 active: 1,
-                waiter: None,
+                waiters: Vec::new(),
             }),
             _lifetime: lifetime,
         });
@@ -67,7 +68,11 @@ impl StorageIoWatch {
     /// Dropping this future leaves ownership outstanding; it never manufactures a proof.
     pub async fn quiescent(&mut self) -> StorageQuiescence {
         self.cancel();
-        Quiescent(&self.0).await
+        Quiescent {
+            shared: &self.0,
+            identity: Arc::new(()),
+        }
+        .await
     }
 }
 
@@ -110,17 +115,19 @@ impl StorageIoLease {
 
 impl Drop for StorageIoLease {
     fn drop(&mut self) {
-        let wake = {
+        let waiters = {
             let mut state = self.0.state();
             state.active -= 1;
             if state.active == 0 {
-                state.waiter.take()
+                std::mem::take(&mut state.waiters)
             } else {
-                None
+                Vec::new()
             }
         };
-        if let Some(waker) = wake {
-            waker.wake();
+        for (identity, waker) in waiters {
+            if identity.upgrade().is_some() {
+                waker.wake();
+            }
         }
     }
 }
@@ -144,24 +151,54 @@ impl StorageQuiescence {
     }
 }
 
-struct Quiescent<'a>(&'a Arc<Shared>);
+struct Quiescent<'a> {
+    shared: &'a Arc<Shared>,
+    identity: Arc<()>,
+}
 
 impl Future for Quiescent<'_> {
     type Output = StorageQuiescence;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.0.state();
+        let mut state = self.shared.state();
         if state.active == 0 {
             Poll::Ready(StorageQuiescence {
-                attempt: self.0.attempt.clone(),
-                generation: self.0.generation.clone(),
+                attempt: self.shared.attempt.clone(),
+                generation: self.shared.generation.clone(),
             })
         } else {
-            state.waiter = Some(cx.waker().clone());
+            let identity = Arc::downgrade(&self.identity);
+            state.waiters.retain(|(slot, _)| slot.strong_count() != 0);
+            if let Some((_, waker)) = state
+                .waiters
+                .iter_mut()
+                .find(|(slot, _)| Weak::ptr_eq(slot, &identity))
+            {
+                waker.clone_from(cx.waker());
+            } else {
+                state.waiters.push((identity, cx.waker().clone()));
+            }
             Poll::Pending
         }
     }
 }
+
+impl Drop for Quiescent<'_> {
+    fn drop(&mut self) {
+        let identity = Arc::downgrade(&self.identity);
+        self.shared
+            .state()
+            .waiters
+            .retain(|(slot, _)| !Weak::ptr_eq(slot, &identity));
+    }
+}
+
+impl PartialEq for StorageIoWatch {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for StorageIoWatch {}
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +240,25 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(detached);
         assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn cloned_observers_wait_independently_and_cancelled_waiters_are_removed() {
+        let (mut first, lease) = StorageIoWatch::new(
+            StorageToken::generate(),
+            StorageToken::generate(),
+            Arc::new(()),
+        );
+        let mut second = first.clone();
+        for _ in 0..64 {
+            assert!(first.quiescent().now_or_never().is_none());
+            assert!(first.0.state().waiters.is_empty());
+        }
+        let mut a = Box::pin(first.quiescent());
+        let mut b = Box::pin(second.quiescent());
+        assert!(a.as_mut().now_or_never().is_none());
+        assert!(b.as_mut().now_or_never().is_none());
+        drop(lease);
+        assert!(a.now_or_never().is_some());
+        assert!(b.now_or_never().is_some());
     }
 }

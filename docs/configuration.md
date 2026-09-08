@@ -17,6 +17,16 @@ TLS removes only that acknowledgement requirement and does not make either liste
 itself. These are installer controls that render the environment or Compose port mapping, not
 additional server-configuration flags.
 
+Storage lifecycle protocol 2 has no environment toggle: durable admission and exact cleanup
+accounting apply to every physical write. Full startup reconciliation remains mandatory. Storage
+requires Linux 5.6+ `openat2`; the configured root may be a mount, but descendant mounts and
+symlinks are refused (Section 8). Request timeouts do not bound backend I/O lifetime or authorize
+forgiving multipart quota. The existing sweeper checks exact storage cleanup every second while
+idle and continues promptly after a full successful batch. Each batch claims at most 1,000 paths,
+processes at most eight concurrently and has a 30-second deadline. Failed or cancelled work retains
+its durable claim/debt for retry after the claim expires or during exclusive restart. The configured
+multipart sweep interval controls stale-session and expired-credential scans independently.
+
 ### 28.2 Settings
 
 | Setting | Variable | Default | Meaning |

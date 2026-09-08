@@ -85,11 +85,13 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
   layout and parses each synchronous CLI's stdout counts. Also runs stdlib `recovery_state.py`:
   encrypted history/delete markers, ACL/tags/retention/legal hold, active encrypted multipart parts,
-  real interrupted replication claims, complete-row snapshot comparisons, fail-closed missing-part /
+  real interrupted replication claims, exact source-to-snapshot table/row fidelity, explicit
+  fresh-generation restore transitions and independent quota/live-file/retired-alias checks,
+  fail-closed missing-part /
   wrong-key / live-lock / shard checks, and retryable multipart completion after restore. The
   failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
 - `recovery_remote.py` — real Cairn destination and bounded HTTP fault proxy: lose a successful
-  initiation/part/abort response, SIGKILL source, compare every durable table across snapshot/restore,
+  initiation/part/abort response, SIGKILL source, compare every snapshot table exactly and validate only specified recovery transitions on restore,
   verify unknown upload-ID incidents versus known-ID cleanup and exact native version redelivery.
   `--cleanup-lease` includes abandoned abort ownership. Requires the v33 streaming sender and runs
   in the backup/restore CI gate; no failpoints build or MinIO download is needed.
@@ -350,3 +352,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `bench-compare` jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
+
+Protocol-2 crash recovery can reclaim through exact journals before the full scan. Crash harnesses
+must verify retired alias absence and empty recovered intent/debt rather than require the scan's
+orphan counter to include journal work. Terminal multipart HTTP success precedes deferred cleanup;
+the focused stress harness uses a one-second sweep and bounded disk/debt/quota polling.

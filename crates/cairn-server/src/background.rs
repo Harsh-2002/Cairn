@@ -27,6 +27,7 @@ const MAX_DRAIN_PASSES: u32 = 50;
 const MULTIPART_SWEEP_PAGE: u32 = 1_000;
 const MULTIPART_SWEEP_MAX_ITEMS: usize = 10_000;
 const MULTIPART_SWEEP_MAX_DURATION: Duration = Duration::from_secs(30);
+const STORAGE_CLEANUP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 struct ManagedTask {
     name: String,
@@ -270,10 +271,13 @@ impl StoppedBackgroundTasks {
         request_tail_grace: Duration,
         final_flush_grace: Duration,
     ) -> BackgroundShutdownReport {
-        let tail_report = self
+        let mut tail_report = self
             .request_tail_tasks
             .join_or_abort(request_tail_grace)
             .await;
+        if !self.stack.multipart_claim_recovery.is_complete() {
+            tail_report.failed += 1;
+        }
         if tail_report.is_complete() {
             tracing::info!(
                 completed = tail_report.completed,
@@ -327,11 +331,6 @@ pub(crate) fn spawn(
     let sweep_interval = Duration::from_secs(cfg.multipart_sweep_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
     let multipart_lifetime_secs = cfg.multipart_upload_lifetime_secs as i64;
-    #[allow(clippy::cast_possible_wrap)]
-    let multipart_reservation_lifetime_secs = cfg
-        .request_timeout_secs
-        .saturating_add(60)
-        .min(i64::MAX as u64) as i64;
     let lifecycle_interval = Duration::from_secs(cfg.lifecycle_interval_secs);
     let checkpoint_interval = Duration::from_secs(cfg.wal_checkpoint_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
@@ -343,8 +342,9 @@ pub(crate) fn spawn(
     // Unlike periodic workers, storage-commit recovery remains alive through the HTTP drain:
     // cancelling CompleteMultipart, PUT, or Copy at the request-timeout or shutdown deadline drops
     // its protocol guard and synchronously queues exact recovery at that moment. After both accept
-    // loops have joined/cancelled every connection, `server::serve` sends the FIFO drain sentinel;
-    // this retained worker is then joined before the final metrics/counter/WAL tail.
+    // loops and ordinary workers (including direct S3 import producers) have joined/cancelled,
+    // `server::serve` sends the FIFO drain sentinel. This retained worker is then joined before
+    // the final metrics/counter/WAL tail.
     tasks.spawn_request_tail(
         "storage commit cancellation recovery",
         stack
@@ -358,7 +358,6 @@ pub(crate) fn spawn(
             stack.clone(),
             sweep_interval,
             multipart_lifetime_secs,
-            multipart_reservation_lifetime_secs,
             shutdown.clone(),
         ),
     );
@@ -1641,58 +1640,100 @@ async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>)
     }
 }
 
-/// Periodically abort multipart sessions idle beyond their lifetime and reclaim their parts.
+/// Exact cleanup shares this existing task with the configured stale-session/credential sweep.
+/// Full successful cleanup pages continue promptly; every page yields and checks both deadlines.
 async fn sweeper_loop(
     stack: Arc<AppStack>,
     interval: Duration,
     lifetime_secs: i64,
-    reservation_lifetime_secs: i64,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let clock = SystemClock::new();
-    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
-        let result = tokio::time::timeout(
-            MULTIPART_SWEEP_MAX_DURATION,
-            sweep_multipart_once(
-                &stack,
-                clock.now(),
-                lifetime_secs,
-                reservation_lifetime_secs,
-                &shutdown,
-            ),
+    let mut next_sessions = tokio::time::Instant::now() + interval;
+    let mut next_cleanup = tokio::time::Instant::now() + STORAGE_CLEANUP_IDLE_INTERVAL;
+    loop {
+        let wake = next_sessions.min(next_cleanup);
+        if !wait_for_interval_or_shutdown(
+            wake.saturating_duration_since(tokio::time::Instant::now()),
+            &mut shutdown,
         )
-        .await;
-        match result {
-            Ok(report) if report.reclaimed > 0 || report.aborted > 0 => tracing::info!(
-                reclaimed = report.reclaimed,
-                aborted = report.aborted,
-                attempted = report.attempted,
-                "multipart sweeper reclaimed stale staging"
-            ),
-            Ok(_) => {}
-            Err(_) => tracing::warn!(
-                max_seconds = MULTIPART_SWEEP_MAX_DURATION.as_secs(),
-                "multipart sweep reached its fixed time budget"
-            ),
+        .await
+        {
+            return;
         }
-        // Reclaim expired STS-style session credentials on the same cadence (ARCH 14): an expired
-        // credential is already denied at auth time, but pruning its row keeps the table bounded.
+        if tokio::time::Instant::now() >= next_sessions {
+            let pass_shutdown = shutdown.clone();
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                result = tokio::time::timeout(MULTIPART_SWEEP_MAX_DURATION, async {
+                    // Run this constant-shape deletion before the paged session walk, so a
+                    // session backlog exhausting the pass budget cannot starve credentials.
+                    let _ = stack.meta.submit(Mutation::DeleteExpiredSessionCredentials {
+                        before: clock.now(),
+                    }).await;
+                    sweep_multipart_once(&stack, clock.now(), lifetime_secs, &pass_shutdown).await
+                }) => result,
+            };
+            match result {
+                Ok(report) if report.aborted > 0 => tracing::info!(
+                    aborted = report.aborted,
+                    attempted = report.attempted,
+                    "multipart sweeper aborted stale sessions"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    max_seconds = MULTIPART_SWEEP_MAX_DURATION.as_secs(),
+                    "multipart sweep reached its fixed time budget"
+                ),
+            }
+            next_sessions = tokio::time::Instant::now() + interval;
+        }
         if *shutdown.borrow() {
             return;
         }
-        let _ = stack
-            .meta
-            .submit(Mutation::DeleteExpiredSessionCredentials {
-                before: clock.now(),
-            })
-            .await;
+        if tokio::time::Instant::now() >= next_cleanup {
+            // Dropping this future on timeout/shutdown cannot release an executing blob job's
+            // lease. Unacknowledged claims and quota remain durable for retry or startup recovery.
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                result = tokio::time::timeout(
+                    MULTIPART_SWEEP_MAX_DURATION,
+                    crate::multipart_claim_recovery::drain_storage_cleanup(
+                        &*stack.meta, &*stack.blob, &stack.storage_generation,
+                        stack.storage_lifetime.clone(), MULTIPART_SWEEP_PAGE,
+                    ),
+                ) => result,
+            };
+            let full_success = match result {
+                Ok(Ok(batch)) => {
+                    batch.claimed == MULTIPART_SWEEP_PAGE as usize && batch.retired == batch.claimed
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "storage cleanup batch failed");
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!("storage cleanup batch reached its fixed time budget");
+                    false
+                }
+            };
+            next_cleanup = tokio::time::Instant::now()
+                + if full_success {
+                    Duration::ZERO
+                } else {
+                    STORAGE_CLEANUP_IDLE_INTERVAL
+                };
+        }
+        // A sustained backlog must not monopolize this task or hide a due session/credential pass.
+        tokio::task::yield_now().await;
     }
 }
 
 #[derive(Default)]
 struct MultipartSweepReport {
     attempted: usize,
-    reclaimed: usize,
     aborted: usize,
 }
 
@@ -1700,152 +1741,9 @@ async fn sweep_multipart_once(
     stack: &AppStack,
     now: cairn_types::Timestamp,
     lifetime_secs: i64,
-    reservation_lifetime_secs: i64,
     shutdown: &watch::Receiver<bool>,
 ) -> MultipartSweepReport {
     let mut report = MultipartSweepReport::default();
-
-    // Cleanup debt comes first. Exact superseded-part paths are ordered before whole-session
-    // directories by the metadata store, so cheap unlinks cannot be starved by a large directory.
-    let mut seen_cleanups = std::collections::HashSet::new();
-    loop {
-        if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
-            return report;
-        }
-        let cleanups = match stack
-            .meta
-            .list_multipart_cleanups(MULTIPART_SWEEP_PAGE)
-            .await
-        {
-            Ok(cleanups) => cleanups,
-            Err(error) => {
-                tracing::warn!(%error, "multipart sweeper could not list cleanup debt");
-                break;
-            }
-        };
-        let page_full = cleanups.len() == MULTIPART_SWEEP_PAGE as usize;
-        let mut discovered = 0usize;
-        for cleanup in cleanups {
-            if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
-                return report;
-            }
-            if !seen_cleanups.insert(cleanup.id.clone()) {
-                continue;
-            }
-            discovered += 1;
-            report.attempted += 1;
-            let deletion = match &cleanup.storage_path {
-                Some(path) => stack.blob.delete(path).await,
-                None => stack.blob.delete_session(&cleanup.upload_id).await,
-            };
-            if let Err(error) = deletion {
-                tracing::warn!(
-                    cleanup_id = cleanup.id,
-                    upload_id = %cleanup.upload_id,
-                    %error,
-                    "multipart cleanup debt unlink failed"
-                );
-                continue;
-            }
-            let release = match cleanup.storage_path {
-                Some(_) => Mutation::ReleaseMultipartCleanup {
-                    cleanup_id: cleanup.id.clone(),
-                },
-                None => Mutation::ReleaseMultipartUploadCleanups {
-                    upload_id: cleanup.upload_id.clone(),
-                },
-            };
-            match stack.meta.submit(release).await {
-                Ok(MutationOutcome::Ack) => report.reclaimed += 1,
-                Ok(outcome) => tracing::warn!(
-                    ?outcome,
-                    cleanup_id = cleanup.id,
-                    "multipart cleanup release returned an unexpected outcome"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    cleanup_id = cleanup.id,
-                    "multipart cleanup accounting release failed"
-                ),
-            }
-        }
-        if !page_full || discovered == 0 {
-            break;
-        }
-    }
-
-    // A reservation can outlive a cancelled/timed-out request before RecordPart commits. Its
-    // deterministic attempt name lets the sweep prove the artifact absent before releasing bytes.
-    let reservation_cutoff = now.plus_secs(-reservation_lifetime_secs);
-    let mut seen_reservations = std::collections::HashSet::new();
-    loop {
-        if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
-            return report;
-        }
-        let reservations = match stack
-            .meta
-            .enumerate_stale_multipart_reservations(reservation_cutoff, MULTIPART_SWEEP_PAGE)
-            .await
-        {
-            Ok(reservations) => reservations,
-            Err(error) => {
-                tracing::warn!(%error, "multipart sweeper could not list stale reservations");
-                break;
-            }
-        };
-        let page_full = reservations.len() == MULTIPART_SWEEP_PAGE as usize;
-        let mut discovered = 0usize;
-        for reservation in reservations {
-            if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
-                return report;
-            }
-            if !seen_reservations.insert(reservation.attempt_id.clone()) {
-                continue;
-            }
-            discovered += 1;
-            report.attempted += 1;
-            if let Err(error) = stack
-                .blob
-                .delete_part_attempt(
-                    &reservation.upload_id,
-                    reservation.part_number,
-                    &reservation.attempt_id,
-                )
-                .await
-            {
-                tracing::warn!(
-                    attempt_id = reservation.attempt_id,
-                    upload_id = %reservation.upload_id,
-                    %error,
-                    "multipart reservation artifact cleanup failed"
-                );
-                continue;
-            }
-            match stack
-                .meta
-                .submit(Mutation::ReleaseMultipartReservation {
-                    upload_id: reservation.upload_id.clone(),
-                    attempt_id: reservation.attempt_id.clone(),
-                })
-                .await
-            {
-                Ok(MutationOutcome::Ack) => report.reclaimed += 1,
-                Ok(outcome) => tracing::warn!(
-                    ?outcome,
-                    attempt_id = reservation.attempt_id,
-                    "multipart reservation release returned an unexpected outcome"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    attempt_id = reservation.attempt_id,
-                    "multipart reservation accounting release failed"
-                ),
-            }
-        }
-        if !page_full || discovered == 0 {
-            break;
-        }
-    }
 
     let session_cutoff = now.plus_secs(-lifetime_secs);
     let mut seen_sessions = std::collections::HashSet::new();
@@ -1881,36 +1779,9 @@ async fn sweep_multipart_once(
                 .await
             {
                 Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
-                    if let Err(error) = stack.blob.delete_session(&session.upload_id).await {
-                        tracing::warn!(
-                            upload_id = %session.upload_id,
-                            %error,
-                            "multipart sweeper failed to reclaim an aborted session"
-                        );
-                        continue;
-                    }
-                    match stack
-                        .meta
-                        .submit(Mutation::ReleaseMultipartUploadCleanups {
-                            upload_id: session.upload_id.clone(),
-                        })
-                        .await
-                    {
-                        Ok(MutationOutcome::Ack) => {
-                            report.reclaimed += 1;
-                            report.aborted += 1;
-                        }
-                        Ok(outcome) => tracing::warn!(
-                            upload_id = %session.upload_id,
-                            ?outcome,
-                            "multipart session cleanup release returned an unexpected outcome"
-                        ),
-                        Err(error) => tracing::warn!(
-                            upload_id = %session.upload_id,
-                            %error,
-                            "multipart session cleanup accounting release failed"
-                        ),
-                    }
+                    // Terminal removal records exact debt; an active admitted writer keeps
+                    // that debt unclaimable until the retained recovery worker proves quiescence.
+                    report.aborted += 1;
                 }
                 Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {}
                 Ok(outcome) => tracing::warn!(
@@ -2586,6 +2457,306 @@ mod tests {
         assert!(!wait_for_interval_or_shutdown(Duration::from_secs(3_600), &mut shutdown_rx).await);
     }
 
+    mod storage_sweep {
+        use super::*;
+        use cairn_types::meta::{InitialObjectState, Precondition};
+        use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
+        use cairn_types::storage::{
+            PlannedStorageWrite, StorageAdmission, StorageMutation, StorageToken,
+            StorageWriteTarget,
+        };
+        use cairn_types::{Timestamp, UserId};
+
+        async fn fixture() -> (tempfile::TempDir, Config, Arc<AppStack>) {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = Config {
+                data_dir: dir.path().join("data"),
+                db_path: dir.path().join("data/cairn.db"),
+                master_key: Some("41".repeat(32).into()),
+                ..Config::default()
+            };
+            let node =
+                Arc::new(crate::node_lock::NodeLock::acquire(&cfg.data_dir, &cfg.db_path).unwrap());
+            let stack = Arc::new(crate::stack::build(&cfg, node).await.unwrap());
+            stack
+                .meta
+                .submit(Mutation::CreateBucket(Box::new(cairn_types::Bucket {
+                    name: BucketName::parse("sweep").unwrap(),
+                    owner_id: UserId("owner".into()),
+                    created_at: Timestamp(1),
+                    versioning: cairn_types::VersioningState::Unversioned,
+                    ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+                    region: "us-east-1".into(),
+                    compression: None,
+                })))
+                .await
+                .unwrap();
+            (dir, cfg, stack)
+        }
+
+        fn cleanup_counts(cfg: &Config) -> (u64, u64) {
+            let db = rusqlite::Connection::open_with_flags(
+                &cfg.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            db.query_row(
+                "SELECT COUNT(*),COUNT(claim_token) FROM storage_cleanups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        async fn admit(
+            stack: &AppStack,
+            key: &str,
+        ) -> (
+            PlannedStorageWrite,
+            StorageAdmission,
+            StorageIoWatch,
+            StorageIoLease,
+        ) {
+            let planned = stack
+                .blob
+                .plan_write(
+                    BucketName::parse("sweep").unwrap(),
+                    stack.storage_generation.clone(),
+                    StorageWriteTarget::Object {
+                        key: ObjectKey::parse(key).unwrap(),
+                        version_id: VersionId::null(),
+                        row_id: StorageToken::generate().as_str().to_owned(),
+                    },
+                )
+                .unwrap();
+            let plan = planned.plan();
+            let MutationOutcome::StorageAdmission(receipt @ StorageAdmission::Granted(_)) = stack
+                .meta
+                .submit(Mutation::Storage {
+                    bucket: plan.bucket.clone(),
+                    operation: StorageMutation::Reserve {
+                        plan: Box::new(plan.clone()),
+                        now: Timestamp(1),
+                    },
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("fixture admission failed");
+            };
+            let (watch, lease) = StorageIoWatch::new(
+                plan.attempt.clone(),
+                plan.generation.clone(),
+                stack.storage_lifetime.clone(),
+            );
+            (planned, receipt, watch, lease)
+        }
+
+        async fn abandon_before_creation(stack: &AppStack, key: &str) {
+            let (planned, _receipt, mut watch, lease) = admit(stack, key).await;
+            drop(lease);
+            assert_eq!(
+                stack
+                    .meta
+                    .submit(Mutation::Storage {
+                        bucket: planned.plan().bucket.clone(),
+                        operation: StorageMutation::Resolve {
+                            quiescence: watch.quiescent().await
+                        },
+                    })
+                    .await
+                    .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            );
+        }
+
+        async fn publish_and_delete(
+            stack: &AppStack,
+            root: &std::path::Path,
+        ) -> std::path::PathBuf {
+            let (planned, receipt, _watch, lease) = admit(stack, "deleted").await;
+            let plan = planned.plan().clone();
+            let staged = stack
+                .blob
+                .stage(
+                    planned.admit(receipt, lease).unwrap(),
+                    Box::pin(futures_util::stream::once(async {
+                        Ok(bytes::Bytes::from_static(b"durable"))
+                    })),
+                    cairn_types::StageOptions::default(),
+                )
+                .await
+                .unwrap();
+            let StorageWriteTarget::Object {
+                key,
+                version_id,
+                row_id,
+            } = &plan.target
+            else {
+                unreachable!()
+            };
+            let row = cairn_types::ObjectVersionRow {
+                id: row_id.clone(),
+                bucket: plan.bucket.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                is_latest: true,
+                is_delete_marker: false,
+                size_logical: staged.size_logical,
+                size_physical: staged.size_physical,
+                etag: staged.etag,
+                content_type: "application/octet-stream".into(),
+                content_encoding: None,
+                cache_control: None,
+                content_disposition: None,
+                content_language: None,
+                expires: None,
+                storage_path: Some(staged.storage_path.clone()),
+                compression: staged.compression,
+                storage_class: cairn_types::StorageClass::Standard,
+                cold_locator: None,
+                owner_id: UserId("owner".into()),
+                user_metadata: Vec::new(),
+                acl: None,
+                checksums: Vec::new(),
+                sse_descriptor: None,
+                replication_status: None,
+                internal_sha256: Some(staged.internal_sha256),
+                replicated_at: None,
+                created_at: Timestamp(1),
+                updated_at: Timestamp(1),
+            };
+            assert!(matches!(
+                stack
+                    .meta
+                    .submit(Mutation::PublishStorageWrite {
+                        plan: Box::new(plan.clone()),
+                        operation: Box::new(Mutation::PutObjectVersion {
+                            row: Box::new(row),
+                            precondition: Precondition::default(),
+                            initial_state: InitialObjectState::default(),
+                            replication: Vec::new(),
+                        }),
+                    })
+                    .await
+                    .unwrap(),
+                MutationOutcome::Put { .. }
+            ));
+            assert!(matches!(
+                stack
+                    .meta
+                    .submit(Mutation::DeleteVersion {
+                        bucket: plan.bucket,
+                        key: key.clone(),
+                        version_id: version_id.clone(),
+                        expected_row_id: Some(row_id.clone()),
+                        expected_updated_at: None,
+                        require_sole_key_version: false,
+                        now: Timestamp(2),
+                        bypass: cairn_types::GovernanceBypass::Denied,
+                    })
+                    .await
+                    .unwrap(),
+                MutationOutcome::Deleted { .. }
+            ));
+            let path = root.join(staged.storage_path.as_str());
+            assert!(
+                path.exists(),
+                "metadata deletion must leave physical debt for the sweeper"
+            );
+            path
+        }
+
+        async fn wait_empty(cfg: &Config) {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while cleanup_counts(cfg).0 != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("cleanup backlog must not wait for the hourly session interval");
+        }
+
+        #[tokio::test]
+        async fn default_hourly_session_interval_cleans_real_deleted_blob_and_multiple_pages() {
+            let (_dir, cfg, stack) = fixture().await;
+            assert_eq!(cfg.multipart_sweep_interval_secs, 3_600);
+            let path = publish_and_delete(&stack, &cfg.data_dir).await;
+            // Each admitted, abandoned-before-create attempt contributes three exact aliases.
+            // The setup is operation-capped and creates no payload files for the backlog.
+            for index in 0..(MULTIPART_SWEEP_PAGE / 3 + 2) {
+                abandon_before_creation(&stack, &format!("pending-{index}")).await;
+            }
+            assert!(cleanup_counts(&cfg).0 > u64::from(MULTIPART_SWEEP_PAGE));
+            let (stop, rx) = watch::channel(false);
+            let worker = tokio::spawn(sweeper_loop(
+                stack,
+                Duration::from_secs(cfg.multipart_sweep_interval_secs),
+                86_400,
+                rx,
+            ));
+            wait_empty(&cfg).await;
+            assert!(!path.exists());
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cleanup_counts(&cfg), (0, 0));
+        }
+
+        #[tokio::test]
+        async fn locked_cleanup_keeps_debt_until_physical_exclusion_is_available() {
+            let (_dir, cfg, stack) = fixture().await;
+            let path = publish_and_delete(&stack, &cfg.data_dir).await;
+            let file = cairn_blob::open_readonly_nofollow(&path).unwrap();
+            cairn_blob::try_lock_exclusive(&file).unwrap();
+            let batch = crate::multipart_claim_recovery::drain_storage_cleanup(
+                &*stack.meta,
+                &*stack.blob,
+                &stack.storage_generation,
+                stack.storage_lifetime.clone(),
+                MULTIPART_SWEEP_PAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!((batch.claimed, batch.retired), (3, 2));
+            assert_eq!(cleanup_counts(&cfg), (1, 1));
+            assert!(path.exists());
+            drop(file);
+            // An exclusive new generation invalidates the failed claim without forgiving debt.
+            let generation = crate::stack::begin_storage_generation(&*stack.meta)
+                .await
+                .unwrap();
+            assert_eq!(cleanup_counts(&cfg), (1, 0));
+            let batch = crate::multipart_claim_recovery::drain_storage_cleanup(
+                &*stack.meta,
+                &*stack.blob,
+                &generation,
+                stack.storage_lifetime.clone(),
+                MULTIPART_SWEEP_PAGE,
+            )
+            .await
+            .unwrap();
+            assert_eq!((batch.claimed, batch.retired), (1, 1));
+            assert_eq!(cleanup_counts(&cfg), (0, 0));
+            assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn already_visible_stop_prevents_cleanup_claims() {
+            let (_dir, cfg, stack) = fixture().await;
+            let path = publish_and_delete(&stack, &cfg.data_dir).await;
+            let before = cleanup_counts(&cfg);
+            assert_eq!(before, (3, 0));
+            let (stop, rx) = watch::channel(false);
+            stop.send(true).unwrap();
+            sweeper_loop(stack, Duration::from_secs(3_600), 86_400, rx).await;
+            assert_eq!(cleanup_counts(&cfg), before);
+            assert!(path.exists());
+        }
+    }
+
     #[test]
     fn finalization_report_cannot_claim_success_after_any_incomplete_tail() {
         assert!(FinalizeReport::default().is_complete());
@@ -2961,6 +3132,7 @@ mod tests {
         use cairn_types::blob::StageOptions;
         use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
         use cairn_types::object::{ETag, ObjectVersionRow, StorageClass};
+        use cairn_types::testing::FixtureBlobStore;
         use cairn_types::traits::{BlobStore, Crypto};
         use cairn_types::{CompressionDescriptor, Timestamp, UserId};
 
@@ -3037,7 +3209,7 @@ mod tests {
                     Ok::<_, cairn_types::error::BodyError>(bytes)
                 }));
             let staged = blobs
-                .stage(
+                .stage_fixture(
                     &bucket,
                     stream,
                     StageOptions {
@@ -3076,7 +3248,10 @@ mod tests {
         #[tokio::test]
         async fn an_encrypted_version_is_verified() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let dek = [7u8; 32];
             let row = staged_row(
@@ -3098,7 +3273,10 @@ mod tests {
         #[tokio::test]
         async fn a_corrupted_encrypted_blob_is_reported_corrupt() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let dek = [9u8; 32];
             let row = staged_row(
@@ -3124,7 +3302,10 @@ mod tests {
         #[tokio::test]
         async fn a_compressed_version_is_verified_and_its_rot_reported() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let body = "compress me ".repeat(4096);
             let row = staged_row(
@@ -3157,7 +3338,10 @@ mod tests {
         #[tokio::test]
         async fn an_unknown_key_id_is_skipped_not_corrupt() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let sealing = crypto_with_key_id(1, 0xa1);
             let dek = [3u8; 32];
             let row = staged_row(
@@ -3181,7 +3365,10 @@ mod tests {
         #[tokio::test]
         async fn a_malformed_descriptor_is_corruption() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let dek = [4u8; 32];
             let mut row = staged_row(&blobs, b"body", Some(dek.into()), None, None).await;
@@ -3196,7 +3383,10 @@ mod tests {
         #[tokio::test]
         async fn a_plaintext_version_is_verified_and_its_rot_reported() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"plain bytes on disk", None, None, None).await;
             assert_eq!(
@@ -3221,7 +3411,10 @@ mod tests {
         #[tokio::test]
         async fn a_composite_etag_is_skipped_with_a_reason() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
             row.etag = ETag::from_md5_hex(format!("{}-2", "0".repeat(32)));
@@ -3247,7 +3440,12 @@ mod tests {
             for mode in 0..3 {
                 for algorithm in algorithms {
                     let dir = tempfile::tempdir().unwrap();
-                    let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+                    let blobs = LocalBlobStore::open(
+                        dir.path(),
+                        cairn_types::testing::fixture_storage_io(),
+                    )
+                    .await
+                    .unwrap();
                     let crypto = crypto_with_key_id(1, 0xa1);
                     let body = b"multipart full content ".repeat(4096);
                     let dek = (mode == 2).then_some([3u8; 32]);
@@ -3285,7 +3483,10 @@ mod tests {
         #[tokio::test]
         async fn internal_multipart_digest_detects_plaintext_rot_and_bad_metadata() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"multipart plaintext", None, None, None).await;
             row.etag = ETag::multipart("0".repeat(32), 2);
@@ -3307,7 +3508,10 @@ mod tests {
         async fn composite_checksums_are_not_full_object_baselines() {
             use cairn_types::{ChecksumAlgorithm, ChecksumValue};
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
             row.internal_sha256 = None;
@@ -3330,7 +3534,10 @@ mod tests {
         #[tokio::test]
         async fn scrub_pacing_is_cancellable_and_unthrottled_by_default() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let row = staged_row(&blobs, &[42; 100], None, None, None).await;
             // One byte/s cannot verify 100 bytes within 20 ms. Dropping the pending future
@@ -3357,7 +3564,10 @@ mod tests {
             use cairn_types::{BlobCipher, ByteRange};
             use futures_util::StreamExt;
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let row = staged_row(&blobs, &vec![42; 32 * 1024 * 1024], None, None, None).await;
             for rate in [None, Some(0), Some(16 * 1024 * 1024)] {
@@ -3412,7 +3622,10 @@ mod tests {
         #[tokio::test]
         async fn a_row_without_a_blob_is_skipped_with_a_reason() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"body", None, None, None).await;
             row.storage_path = None;
@@ -3428,7 +3641,10 @@ mod tests {
         #[tokio::test]
         async fn a_blob_missing_from_disk_is_reported_corrupt() {
             let dir = tempfile::tempdir().unwrap();
-            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let row = staged_row(&blobs, b"body that then vanishes", None, None, None).await;
             let p = dir.path().join(row.storage_path.as_ref().unwrap().as_str());

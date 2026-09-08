@@ -12,6 +12,7 @@
 //! fill), the property fails with a shrunk counterexample.
 
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::testing::FixtureMetadataStore;
 use cairn_types::traits::MetadataStore;
 use cairn_types::*;
 use proptest::collection::{btree_set, vec};
@@ -197,9 +198,11 @@ proptest! {
             .unwrap();
         rt.block_on(async {
             let store = cairn_meta::open_in_memory().unwrap();
+            let fixture = store.begin_fixture().await.unwrap();
             let bucket = BucketName::parse("bkt").unwrap();
+            store.submit(Mutation::CreateBucket(Box::new(Bucket { name: bucket.clone(), owner_id: UserId("owner".into()), created_at: Timestamp(1), versioning: VersioningState::Enabled, ownership_mode: OwnershipMode::BucketOwnerEnforced, region: "us-east-1".into(), compression: None }))).await.unwrap();
             for k in &keys {
-                store.submit(put(row(&bucket, k))).await.unwrap();
+                store.submit_fixture(&fixture, put(row(&bucket, k))).await.unwrap();
             }
 
             let want = oracle_entries(&keys, &prefix, delimiter.as_deref());

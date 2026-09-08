@@ -36,42 +36,35 @@ Clock/Crypto>`) — never a concrete engine.
   must never overwrite the object body — `unhandled_{object,bucket}_subresource` gates this and
   returns `NotImplemented`. Add new `?subresource` arms *above* those guards (the `?encryption`
   Get/Put/Delete arms sit above the bucket guard, exactly like `cors`).
-- **Durability ordering is the contract** (ARCH 8/21.1): stage (fsync file+dir) → verify
-  Content-MD5 / signed SHA-256 / client checksums → `meta.submit(Mutation::…)` (the single
-  linearization point) → reclaim the superseded blob best-effort. Don't reorder.
-- **Every artifact returned by `blob.stage` or `blob.stage_part` needs explicit ownership until its
-  metadata commit.** PUT/Copy arm `ObjectWriteGuard` immediately after staging and carry the exact
-  bucket/key/version/immutable-row-id/path through every later await. Cancellation or an ambiguous
-  writer acknowledgement synchronously queues `ResolveObjectWrite` on the retained server worker;
-  only its exact `referenced: false` outcome permits deletion, while a match or metadata error
-  preserves the path. Disarm before the first post-commit await. Definite pre-submit validation
-  failures attempt direct deletion while the guard remains armed across that await. Multipart part
-  parts arm an exact attempt/path guard immediately after staging in both UploadPart and
-  UploadPartCopy. Cancellation or ambiguous `RecordPart` acknowledgement queues
-  `ResolveMultipartPartWrite`; a match or metadata error preserves the artifact, and only an exact
-  miss deletes the attempt and releases its reservation. The attempt-derived path is the ABA token
-  across same-number retries.
+- **Durability ordering is the contract** (ARCH 8/21.1): obtain a bounded recovery slot,
+  plan every fresh filename and arm `StorageWriteGuard`, await durable Writer admission, then
+  stage → fsync file → rename → fsync directories → verify hashes → publish metadata. Admission
+  publishes no object. Only its typed receipt becomes a move-only creation permit.
+- `storage_write.rs` owns the runtime-neutral `StorageWriteRuntime` and guard. PUT/Copy, parts,
+  and Complete capture exact target/generation/path ownership before their first admission await.
+  `PublishStorageWrite` validates the admitted plan and atomically installs authoritative metadata,
+  retires intent and enqueues superseded/temporary/spool cleanup. Disarm only on acknowledged
+  publication. Cancellation, validation failures and ambiguous acknowledgements enqueue the same
+  recovery record; do not delete directly. Recovery waits for actual backend I/O quiescence,
+  resolves through the Writer, then uses exact cleanup claims. Import and replica ingest share
+  these ordinary service paths. Absence of an injected storage runtime refuses writes.
 - **The Writer is the final Object Lock authority.** PUT/Copy pass validated tags + explicit lock
   intent in the object commit mutation; capture their creation timestamp after staging so upload
   duration cannot shorten a bucket default, and let the Writer resolve/revalidate lock state in the
   same savepoint as the version and outbox. Copy never carries source retention/legal hold.
   Multipart pins tags/explicit intent at initiate but resolves a default at Complete; every
-  post-claim lock failure deletes the assembled blob and releases the claim. Permanent deletes and
+  post-claim lock failure queues exact recovery of the assembly and claim. Permanent deletes and
   sentinel replacements pass `GovernanceBypass::{Denied,Authorized}` and consume it only inside the
   Writer—no protocol pre-read decides protection. A present malformed/disabled lock configuration
   fails closed; only the specialized `PUT ?object-lock` mutation may repair it.
-- Abort and Complete have exactly one metadata-writer-owned terminal winner. Complete claims
-  `active -> completing`; Abort removes only `active` and deletes session bytes only on its typed
-  `Aborted` outcome; final completion rechecks ownership in its object-upsert savepoint. Every
-  genuine post-claim failure conditionally releases `completing -> active` so retryability does not
-  weaken the terminal race. Complete mints a fresh `MultipartClaimToken` and arms its request-local
-  drop guard immediately before awaiting the token-bearing Claim mutation; cancellation can
-  therefore recover even when the writer committed but its acknowledgement was lost. An
-  acknowledged miss disarms the guard. Every release and final completion matches the persisted
-  token, so delayed or duplicate recovery cannot affect a newer owner. Terminal completion disarms
-  before any best-effort cleanup await. Once assembly returns, the guard carries that durable path
-  as well; the server may delete it only after `Released` proves no completion row references it,
-  while `NotOwner` must preserve it unless a typed non-commit result supplied stronger proof.
+- Abort and Complete have one Writer-owned terminal winner. Complete's admission atomically
+  claims `active -> completing` under its fresh token and records the assembled-object plan;
+  final publication rechecks that token and the exact intent. Abort removes only `active` and
+  records exact part/reservation cleanup debt in its savepoint; an admitted unfinished part stays
+  protected until its backend quiesces. Failed Complete recovery conditionally restores `active`
+  under its own token and enqueues its unreferenced paths, preserving retryability. A stale
+  recovery cannot release a newer completer or delete its bytes. No terminal handler recursively
+  deletes a session directory or releases quota before durable physical cleanup.
 - **Crypto fails closed** across every SSE seam. `open_sse_cipher`/`open_part_cipher` return an error
   on a bad/missing key, tampered envelope, unknown format marker, or blob/metadata version mismatch
   — never plaintext. New object descriptors stamp CRNB v3; new multipart part envelopes use the
@@ -116,12 +109,9 @@ Clock/Crypto>`) — never a concrete engine.
 ## Contract / how it fits
 - Depends on `cairn-auth`/`cairn-authz` (policy), `cairn-xml` (codec), `cairn-replication`/
   `cairn-lifecycle` (filters). Holds no SQL and no filesystem syscalls — those are `cairn-meta`/
-  `cairn-blob`. Stays runtime-agnostic: the replication-drain wake, multipart-completion,
-  multipart-part, and ordinary object-write recovery enqueues are injected synchronous callbacks;
-  bounded recovery admission is an injected runtime-neutral async callback. The hooks
-  (`with_replication_wake`, `with_multipart_claim_recovery`,
-  `with_multipart_part_write_recovery`, `with_object_write_recovery`, and
-  `with_storage_recovery_admission`) never expose Tokio handles or detached tasks.
+  `cairn-blob`. Stays runtime-agnostic: `with_storage_write_runtime` injects the committed
+  generation, node lifetime, bounded async admission and synchronous recovery enqueue. The
+  replication wake remains an injected callback. No hook exposes Tokio handles or detached tasks.
 - All writes go through `meta.submit(Mutation::…)`; never open an ad-hoc write path. A new mutation
   obeys the 4(+1)-site rule (see the root `../../CLAUDE.md`).
 

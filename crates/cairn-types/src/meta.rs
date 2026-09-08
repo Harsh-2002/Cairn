@@ -90,9 +90,22 @@ pub enum Mutation {
         bucket: BucketName,
         operation: crate::storage::StorageMutation,
     },
-    /// Resolve a bounded page of prior-generation intents during exclusive startup. Full scans
-    /// still follow; this mutation alone cannot establish legacy coverage or readiness.
-    RecoverStorageIntents {
+    /// Joint multipart quota reservation or completion claim and physical admission.
+    /// Only `ReserveMultipartPart` and `ClaimMultipart` are accepted as the inner operation.
+    AdmitStorageWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        operation: Box<Mutation>,
+        now: Timestamp,
+    },
+    /// Publish the exact admitted object/part and consume its intent in the same savepoint.
+    /// Only `PutObjectVersion`, `RecordPart` and `CompleteMultipart` are accepted inside.
+    PublishStorageWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        operation: Box<Mutation>,
+    },
+    /// Read a bounded page of prior-generation intents through the Writer. This does not resolve
+    /// ownership: exclusive restart must probe each plan's actual backend quiescence first.
+    ListStorageIntents {
         generation: crate::storage::StorageToken,
         limit: u32,
     },
@@ -803,10 +816,17 @@ pub enum Mutation {
 pub enum MutationOutcome {
     /// A committed pre-stage admission. The acknowledgement itself is move-only.
     StorageAdmission(crate::storage::StorageAdmission),
+    /// Joint completion claim and move-only storage admission.
+    StorageMultipartClaim {
+        admission: crate::storage::StorageAdmission,
+        claim: ClaimOutcome,
+    },
+    /// Publication lost its exact intent, generation or cancellation fence.
+    StoragePublicationNotApplied,
     /// Exact physical-ownership mutation applied or lost its owner/generation.
     StorageUpdated { applied: bool },
-    /// Prior-generation intents resolved by a bounded startup page.
-    StorageRecovered(u32),
+    /// A bounded page of prior-generation plans requiring actual backend quiescence checks.
+    StorageIntentBatch(Vec<crate::storage::StorageWritePlan>),
     /// Independently claimed physical debt, with retained routing and exact lease ownership.
     StorageCleanupBatch(Vec<crate::storage::StorageCleanup>),
     /// Whether a replication update still owned its exact attempt.

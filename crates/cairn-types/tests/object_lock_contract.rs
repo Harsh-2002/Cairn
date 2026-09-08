@@ -1,6 +1,6 @@
 //! Writer-authoritative Object Lock contract for the canonical in-memory metadata backend.
 
-use cairn_types::testing::InMemoryMetadataStore;
+use cairn_types::testing::{FixtureMetadataStore, InMemoryMetadataStore, PublicationFixture};
 use cairn_types::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,7 +40,7 @@ fn bucket(name: &str, versioning: VersioningState) -> Bucket {
 
 fn row(bucket: &BucketName, key: &str, version: &str, created_at: Timestamp) -> ObjectVersionRow {
     ObjectVersionRow {
-        id: format!("row-{version}"),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         bucket: bucket.clone(),
         key: ObjectKey::parse(key).unwrap(),
         version_id: VersionId::from_string(version.to_owned()),
@@ -55,10 +55,7 @@ fn row(bucket: &BucketName, key: &str, version: &str, created_at: Timestamp) -> 
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(StoragePath::from_string(format!(
-            "{}/blob-{version}",
-            bucket.as_str()
-        ))),
+        storage_path: Some(StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -87,16 +84,20 @@ async fn create_lock_bucket(store: &InMemoryMetadataStore, name: &str) -> Bucket
 
 async fn put(
     store: &InMemoryMetadataStore,
+    fixture: &PublicationFixture,
     row: ObjectVersionRow,
     initial_state: InitialObjectState,
 ) -> Result<MutationOutcome, MetaError> {
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state,
-            replication: Vec::new(),
-        })
+        .submit_fixture(
+            fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state,
+                replication: Vec::new(),
+            },
+        )
         .await
 }
 
@@ -221,6 +222,7 @@ async fn object_lock_bucket_creation_and_configuration_are_writer_atomic_and_imm
 #[tokio::test]
 async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
     let store = InMemoryMetadataStore::new();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(&store, "protected").await;
     let key = ObjectKey::parse("key").unwrap();
     let version = VersionId::from_string("null".to_owned());
@@ -230,6 +232,7 @@ async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
     };
     put(
         &store,
+        &fixture,
         row(&bucket, key.as_str(), version.as_str(), Timestamp(100)),
         InitialObjectState {
             tags: vec![("class".to_owned(), "records".to_owned())],
@@ -262,6 +265,7 @@ async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
     assert!(matches!(
         put(
             &store,
+            &fixture,
             row(&bucket, key.as_str(), version.as_str(), Timestamp(200)),
             InitialObjectState::default(),
         )
@@ -314,12 +318,14 @@ async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
 #[tokio::test]
 async fn object_commit_exactly_replaces_side_rows_and_markers_never_gain_state() {
     let store = InMemoryMetadataStore::new();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(&store, "exact-side-state").await;
     let key = ObjectKey::parse("key").unwrap();
     let version = VersionId::from_string("null".to_owned());
 
     put(
         &store,
+        &fixture,
         row(&bucket, key.as_str(), version.as_str(), Timestamp(10)),
         InitialObjectState {
             tags: vec![("old".to_owned(), "tag".to_owned())],
@@ -330,6 +336,7 @@ async fn object_commit_exactly_replaces_side_rows_and_markers_never_gain_state()
     .unwrap();
     put(
         &store,
+        &fixture,
         row(&bucket, key.as_str(), version.as_str(), Timestamp(20)),
         InitialObjectState::default(),
     )
@@ -361,6 +368,7 @@ async fn object_commit_exactly_replaces_side_rows_and_markers_never_gain_state()
     marker.size_physical = 0;
     put(
         &store,
+        &fixture,
         marker,
         InitialObjectState {
             tags: vec![("must".to_owned(), "drop".to_owned())],
@@ -395,26 +403,30 @@ async fn object_commit_exactly_replaces_side_rows_and_markers_never_gain_state()
 #[tokio::test]
 async fn late_outbox_conflict_rolls_back_version_tags_and_lock_together() {
     let store = InMemoryMetadataStore::new();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(&store, "late-conflict").await;
     let seed_key = ObjectKey::parse("seed").unwrap();
     let seed_version = VersionId::from_string("seed-v1".to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(
-                &bucket,
-                seed_key.as_str(),
-                seed_version.as_str(),
-                Timestamp(10),
-            )),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox(
-                &bucket,
-                &seed_key,
-                &seed_version,
-                "duplicate-outbox",
-            )],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(
+                    &bucket,
+                    seed_key.as_str(),
+                    seed_version.as_str(),
+                    Timestamp(10),
+                )),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox(
+                    &bucket,
+                    &seed_key,
+                    &seed_version,
+                    "duplicate-outbox",
+                )],
+            },
+        )
         .await
         .unwrap();
 
@@ -422,31 +434,34 @@ async fn late_outbox_conflict_rolls_back_version_tags_and_lock_together() {
     let failed_version = VersionId::from_string("failed-v1".to_owned());
     assert!(matches!(
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(row(
-                    &bucket,
-                    failed_key.as_str(),
-                    failed_version.as_str(),
-                    Timestamp(20),
-                )),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState {
-                    tags: vec![("must".to_owned(), "rollback".to_owned())],
-                    lock_intent: ExplicitObjectLockIntent {
-                        retention: Some(ObjectRetention {
-                            mode: ObjectLockMode::Compliance,
-                            retain_until: Timestamp(1_000),
-                        }),
-                        legal_hold: Some(true),
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row(
+                        &bucket,
+                        failed_key.as_str(),
+                        failed_version.as_str(),
+                        Timestamp(20),
+                    )),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: vec![("must".to_owned(), "rollback".to_owned())],
+                        lock_intent: ExplicitObjectLockIntent {
+                            retention: Some(ObjectRetention {
+                                mode: ObjectLockMode::Compliance,
+                                retain_until: Timestamp(1_000),
+                            }),
+                            legal_hold: Some(true),
+                        },
                     },
-                },
-                replication: vec![outbox(
-                    &bucket,
-                    &failed_key,
-                    &failed_version,
-                    "duplicate-outbox",
-                )],
-            })
+                    replication: vec![outbox(
+                        &bucket,
+                        &failed_key,
+                        &failed_version,
+                        "duplicate-outbox",
+                    )],
+                }
+            )
             .await,
         Err(MetaError::Conflict)
     ));
@@ -476,11 +491,13 @@ async fn late_outbox_conflict_rolls_back_version_tags_and_lock_together() {
 #[tokio::test]
 async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() {
     let store = InMemoryMetadataStore::new();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(&store, "governed").await;
     let key = ObjectKey::parse("key").unwrap();
     let version = VersionId::from_string("v1".to_owned());
     put(
         &store,
+        &fixture,
         row(&bucket, key.as_str(), version.as_str(), Timestamp(10)),
         InitialObjectState {
             tags: Vec::new(),
@@ -584,6 +601,7 @@ async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() 
     let corrupt_version = VersionId::from_string("corrupt".to_owned());
     put(
         &store,
+        &fixture,
         row(
             &bucket,
             key.as_str(),
@@ -619,6 +637,7 @@ async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() 
 #[tokio::test]
 async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
     let store = Arc::new(InMemoryMetadataStore::new());
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(store.as_ref(), "lock-races").await;
 
     // An expired retention may be extended concurrently with a permanent delete. If the extension
@@ -628,6 +647,7 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
     let version = VersionId::from_string("race-v1".to_owned());
     put(
         store.as_ref(),
+        &fixture,
         row(&bucket, key.as_str(), version.as_str(), Timestamp(10)),
         InitialObjectState {
             tags: Vec::new(),
@@ -728,6 +748,7 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
     let hold_version = VersionId::from_string("race-v2".to_owned());
     put(
         store.as_ref(),
+        &fixture,
         row(
             &bucket,
             hold_key.as_str(),
@@ -816,6 +837,7 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
     let update_version = VersionId::from_string("race-v3".to_owned());
     put(
         store.as_ref(),
+        &fixture,
         row(
             &bucket,
             update_key.as_str(),
@@ -906,6 +928,7 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
 #[tokio::test]
 async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_completion() {
     let store = InMemoryMetadataStore::new();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = create_lock_bucket(&store, "multipart-lock").await;
     store.install_raw_object_lock_configuration(
         &bucket,
@@ -914,6 +937,7 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
     assert!(matches!(
         put(
             &store,
+            &fixture,
             row(&bucket, "unknown-field", "v0", Timestamp(10)),
             InitialObjectState::default(),
         )
@@ -924,6 +948,7 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
     assert!(matches!(
         put(
             &store,
+            &fixture,
             row(&bucket, "blocked", "v0", Timestamp(10)),
             InitialObjectState::default(),
         )
@@ -942,7 +967,7 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         })
         .await
         .unwrap();
-    let upload = UploadId::from_string("mp-default".to_owned());
+    let upload = UploadId::generate();
     store
         .submit(Mutation::CreateMultipart {
             session: Box::new(session(
@@ -973,25 +998,44 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         .await
         .unwrap();
     let claim_token = MultipartClaimToken::generate();
+    let completed = row(&bucket, "assembled", "v-complete", Timestamp(1_000));
+    let completion_plan = fixture
+        .completion_plan(&completed, &upload, &claim_token)
+        .unwrap();
     assert!(matches!(
         store
-            .submit(Mutation::ClaimMultipart {
-                upload_id: upload.clone(),
-                claim_token: claim_token.clone(),
-            })
+            .submit(
+                PublicationFixture::admission(
+                    completion_plan.clone(),
+                    Mutation::ClaimMultipart {
+                        upload_id: upload.clone(),
+                        claim_token: claim_token.clone(),
+                    },
+                    Timestamp(1)
+                )
+                .unwrap()
+            )
             .await
             .unwrap(),
-        MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+        MutationOutcome::StorageMultipartClaim {
+            claim: ClaimOutcome::Claimed(_),
+            ..
+        }
     ));
-    let completed = row(&bucket, "assembled", "v-complete", Timestamp(1_000));
     store
-        .submit(Mutation::CompleteMultipart {
-            upload_id: upload,
-            claim_token,
-            row: Box::new(completed.clone()),
-            precondition: Precondition::default(),
-            replication: Vec::new(),
-        })
+        .submit(
+            PublicationFixture::publication(
+                completion_plan.clone(),
+                Mutation::CompleteMultipart {
+                    upload_id: upload,
+                    claim_token,
+                    row: Box::new(completed.clone()),
+                    precondition: Precondition::default(),
+                    replication: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1015,7 +1059,7 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         }
     );
 
-    let expiring = UploadId::from_string("mp-explicit".to_owned());
+    let expiring = UploadId::generate();
     store
         .submit(Mutation::CreateMultipart {
             session: Box::new(session(
@@ -1037,22 +1081,39 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         .await
         .unwrap();
     let expiring_claim_token = MultipartClaimToken::generate();
+    let expired = row(&bucket, "expires", "v-expired", Timestamp(60));
+    let expired_plan = fixture
+        .completion_plan(&expired, &expiring, &expiring_claim_token)
+        .unwrap();
     store
-        .submit(Mutation::ClaimMultipart {
-            upload_id: expiring.clone(),
-            claim_token: expiring_claim_token.clone(),
-        })
+        .submit(
+            PublicationFixture::admission(
+                expired_plan.clone(),
+                Mutation::ClaimMultipart {
+                    upload_id: expiring.clone(),
+                    claim_token: expiring_claim_token.clone(),
+                },
+                Timestamp(1),
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     assert!(matches!(
         store
-            .submit(Mutation::CompleteMultipart {
-                upload_id: expiring.clone(),
-                claim_token: expiring_claim_token,
-                row: Box::new(row(&bucket, "expires", "v-expired", Timestamp(60))),
-                precondition: Precondition::default(),
-                replication: Vec::new(),
-            })
+            .submit(
+                PublicationFixture::publication(
+                    expired_plan.clone(),
+                    Mutation::CompleteMultipart {
+                        upload_id: expiring.clone(),
+                        claim_token: expiring_claim_token,
+                        row: Box::new(expired),
+                        precondition: Precondition::default(),
+                        replication: Vec::new(),
+                    }
+                )
+                .unwrap()
+            )
             .await,
         Err(MetaError::InvalidObjectLockState)
     ));

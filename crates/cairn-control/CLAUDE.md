@@ -45,7 +45,9 @@ in-memory doubles).
   version id in every reported prefix-delete error. If a force-delete removes unlocked versions
   before returning `409`, record `DeleteBucketContents` so the partial destructive write remains
   auditable. Object-Lock bucket creation is one
-  `CreateObjectLockBucket` mutation, never create-then-configure.
+  `CreateObjectLockBucket` mutation, never create-then-configure. Every authoritative removal
+  records exact storage cleanup debt in the same savepoint. Handlers report metadata outcomes;
+  they do not perform raw blob deletion or recursively delete session directories.
 - **Self-lockout / break-glass guards** (in `delete_user`/`patch_user`): can't delete the identity
   you're signed in as; the root admin (`with_root_access_key`, re-seeded every startup) is undeletable;
   never remove the last active administrator. Preserve all three when touching user mutations.

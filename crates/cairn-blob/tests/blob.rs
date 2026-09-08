@@ -6,6 +6,7 @@ use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::testing::SetReconcileOracle;
+use cairn_types::testing::{FixtureBlobStore, fixture_storage_cleanup};
 use cairn_types::*;
 
 fn body(data: Vec<u8>) -> BodyStream {
@@ -38,7 +39,9 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
     use futures_util::StreamExt;
     for encrypted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
         let bucket = BucketName::parse("prepared-reader").unwrap();
         let key = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
         let cipher = if encrypted {
@@ -52,7 +55,7 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
         };
         let original = vec![b'a'; 8193];
         let staged = store
-            .stage(&bucket, body(original.clone()), options.clone())
+            .stage_fixture(&bucket, body(original.clone()), options.clone())
             .await
             .unwrap();
         let mut handle = store
@@ -70,7 +73,7 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
         // encrypted write. An old reopen would read the replacement or fail authentication.
         let replacement_key = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
         let replacement = store
-            .stage(
+            .stage_fixture(
                 &bucket,
                 body(vec![b'b'; original.len()]),
                 StageOptions {
@@ -99,7 +102,7 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
 async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path())
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_small_read_max(2 * 1024 * 1024);
@@ -110,7 +113,7 @@ async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
     assert!(bound.buffer_bytes >= len);
     assert!(bound.max_frame_bytes >= len);
     let staged = store
-        .stage(
+        .stage_fixture(
             &BucketName::parse("read-bound").unwrap(),
             body(vec![7; len as usize]),
             StageOptions::default(),
@@ -136,12 +139,15 @@ async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
 async fn encoded_preflight_rejects_before_staging_or_polling_body() {
     use aes_gcm::KeyInit;
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
-    // Removing this owned empty staging tree also makes running the regression against the old
-    // implementation safe: file creation fails before any huge preallocation could be attempted.
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    // Replace the empty staging tree with a regular file, so physical creation must fail before
+    // any huge preallocation even when directory preparation would recreate a missing tree.
     tokio::fs::remove_dir_all(dir.path().join(".staging"))
         .await
         .unwrap();
+    std::fs::write(dir.path().join(".staging"), b"blocked directory").unwrap();
     let bucket = BucketName::parse("preflight").unwrap();
     let max_blocks = (64_u64 * 1024 * 1024) / 9;
     for (encrypted, content_type, block_size) in [
@@ -161,12 +167,12 @@ async fn encoded_preflight_rejects_before_staging_or_polling_body() {
             panic!("preflight must not poll the body")
         }));
         assert!(matches!(
-            store.stage(&bucket, unread_body, options).await,
+            store.stage_fixture(&bucket, unread_body, options).await,
             Err(BlobError::SizeExceeded)
         ));
     }
     // A precompressed plaintext object uses raw storage, so the CRNB limit must not reject it.
-    // The deliberately absent staging tree stops it before preallocation or body polling.
+    // The blocked staging directory stops it before preallocation or body polling.
     let raw_options = StageOptions {
         compression: Some(CompressionPolicy::default()),
         content_type: "application/zip".into(),
@@ -175,7 +181,9 @@ async fn encoded_preflight_rejects_before_staging_or_polling_body() {
         ..StageOptions::default()
     };
     assert!(matches!(
-        store.stage(&bucket, body(Vec::new()), raw_options).await,
+        store
+            .stage_fixture(&bucket, body(Vec::new()), raw_options)
+            .await,
         Err(BlobError::Io(_))
     ));
     assert!(!dir.path().join(bucket.as_str()).exists());
@@ -184,11 +192,13 @@ async fn encoded_preflight_rejects_before_staging_or_polling_body() {
 #[tokio::test]
 async fn assembly_format_limit_and_overflow_leave_parts_retryable() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("bounded-assembly").unwrap();
     let upload = UploadId::generate();
     let part = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "format-limit",
@@ -222,13 +232,18 @@ async fn assembly_format_limit_and_overflow_leave_parts_retryable() {
     };
     for parts in [vec![over_format], vec![overflow, actual.clone()]] {
         assert!(matches!(
-            store.assemble(&bucket, &parts, options.clone()).await,
+            store
+                .assemble_fixture(&bucket, &parts, options.clone())
+                .await,
             Err(BlobError::SizeExceeded)
         ));
         assert!(store.probe(&part.storage_path).await.is_ok());
         assert!(!dir.path().join(bucket.as_str()).exists());
     }
-    let completed = store.assemble(&bucket, &[actual], options).await.unwrap();
+    let completed = store
+        .assemble_fixture(&bucket, &[actual], options)
+        .await
+        .unwrap();
     assert_eq!(
         read_all(
             &store,
@@ -286,10 +301,12 @@ async fn read_all(
 #[tokio::test]
 async fn uncompressed_roundtrip_and_etag() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let staged = store
-        .stage(&b, body(b"hello world".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"hello world".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     assert_eq!(staged.etag.as_str(), "5eb63bbbe01eeed093cb22bb8f5acdc3"); // md5("hello world")
@@ -331,7 +348,7 @@ async fn uncompressed_roundtrip_and_etag() {
     // reads back byte-exact.
     let big = vec![7u8; 300 * 1024];
     let staged_big = store
-        .stage(
+        .stage_fixture(
             &b,
             body(big.clone()),
             opts(None, "application/octet-stream"),
@@ -372,12 +389,14 @@ async fn uncompressed_roundtrip_and_etag() {
 #[tokio::test]
 async fn small_object_fast_path_ranged_reads_are_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     // A distinct byte pattern so a mis-sliced range would produce visibly wrong bytes.
     let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     let staged = store
-        .stage(
+        .stage_fixture(
             &b,
             body(data.clone()),
             opts(None, "application/octet-stream"),
@@ -448,14 +467,16 @@ async fn uncompressed_blob_ending_in_crnb_magic_is_not_misdetected() {
     // block-container trailer magic must NOT be misread as a compressed container — the stored
     // descriptor is authoritative, not a trailer sniff.
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     // Plant "CRNB" exactly at offset len-34, where the trailer magic would sit — the worst case.
     let mut data = vec![0u8; 64];
     let pos = data.len() - 34;
     data[pos..pos + 4].copy_from_slice(b"CRNB");
     let staged = store
-        .stage(
+        .stage_fixture(
             &b,
             body(data.clone()),
             opts(None, "application/octet-stream"),
@@ -483,7 +504,9 @@ async fn uncompressed_blob_ending_in_crnb_magic_is_not_misdetected() {
 #[tokio::test]
 async fn preallocated_write_roundtrips_and_size_is_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
 
     // A >1 MiB object so the preallocation/fadvise fast path runs (ARCH 7.5). The blob must
@@ -495,7 +518,7 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         ..StageOptions::default()
     };
     let staged = store
-        .stage(&b, chunked_body(data.clone(), 64 * 1024), opts)
+        .stage_fixture(&b, chunked_body(data.clone(), 64 * 1024), opts)
         .await
         .unwrap();
     assert_eq!(
@@ -525,7 +548,10 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         content_length: Some(8 * 1024 * 1024),
         ..StageOptions::default()
     };
-    let staged2 = store.stage(&b, body(short.clone()), opts2).await.unwrap();
+    let staged2 = store
+        .stage_fixture(&b, body(short.clone()), opts2)
+        .await
+        .unwrap();
     assert_eq!(
         staged2.size_logical,
         short.len() as u64,
@@ -547,7 +573,9 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
 #[tokio::test]
 async fn compression_is_transparent_and_etag_invariant() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let data: Vec<u8> = b"the quick brown fox "
         .iter()
@@ -561,11 +589,11 @@ async fn compression_is_transparent_and_etag_invariant() {
     };
 
     let plain = store
-        .stage(&b, body(data.clone()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(data.clone()), opts(None, "text/plain"))
         .await
         .unwrap();
     let comp = store
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 333),
             opts(Some(policy), "text/plain"),
@@ -663,7 +691,9 @@ async fn read_all_dek(
 #[tokio::test]
 async fn encrypted_roundtrip_etag_invariant_and_ranged() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let data: Vec<u8> = b"the quick brown fox "
         .iter()
@@ -679,11 +709,11 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
 
     // The same plaintext, staged plain and staged encrypted, must share the plaintext-MD5 ETag.
     let plain = store
-        .stage(&b, body(data.clone()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(data.clone()), opts(None, "text/plain"))
         .await
         .unwrap();
     let enc = store
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 333),
             opts_encrypted(Some(policy), "text/plain", dek),
@@ -761,7 +791,9 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
     const VERSION_ENCRYPTED: u8 = 3;
 
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let data: Vec<u8> = b"encrypt me at rest "
         .iter()
@@ -776,7 +808,7 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
     let dek = [0x5au8; 32];
 
     let enc = store
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 512),
             opts_encrypted(Some(policy), "text/plain", dek),
@@ -863,13 +895,15 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
 #[tokio::test]
 async fn encrypted_without_compression_and_wrong_dek_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let data: Vec<u8> = (0..20_000u32).map(|i| (i % 256) as u8).collect();
     let dek = [0x22u8; 32];
 
     let enc = store
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 4096),
             opts_encrypted(None, "application/octet-stream", dek),
@@ -937,7 +971,9 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
 #[tokio::test]
 async fn old_unencrypted_blob_reads_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let data: Vec<u8> = b"plaintext payload that compresses "
         .iter()
@@ -950,7 +986,7 @@ async fn old_unencrypted_blob_reads_unchanged() {
         block_size: 512,
     };
     let staged = store
-        .stage(&b, body(data.clone()), opts(Some(policy), "text/plain"))
+        .stage_fixture(&b, body(data.clone()), opts(Some(policy), "text/plain"))
         .await
         .unwrap();
     // Reads via `open_raw(KnownPlaintext)` (twice, once through each helper) both succeed and match.
@@ -983,7 +1019,9 @@ async fn old_unencrypted_blob_reads_unchanged() {
 #[tokio::test]
 async fn precompressed_content_type_stored_raw() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let policy = CompressionPolicy {
         algorithm: CompressionAlgorithm::Zstd,
@@ -991,7 +1029,7 @@ async fn precompressed_content_type_stored_raw() {
     };
     // Even with a compression policy, image/* is stored uncompressed.
     let staged = store
-        .stage(&b, body(vec![1u8; 5000]), opts(Some(policy), "image/jpeg"))
+        .stage_fixture(&b, body(vec![1u8; 5000]), opts(Some(policy), "image/jpeg"))
         .await
         .unwrap();
     assert!(matches!(
@@ -1003,13 +1041,18 @@ async fn precompressed_content_type_stored_raw() {
 #[tokio::test]
 async fn size_ceiling_aborts() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let mut o = opts(None, "application/octet-stream");
     o.size_ceiling = 100;
-    let err = store.stage(&b, body(vec![0u8; 500]), o).await.unwrap_err();
+    let err = store
+        .stage_fixture(&b, body(vec![0u8; 500]), o)
+        .await
+        .unwrap_err();
     assert!(matches!(err, BlobError::SizeExceeded));
-    // The aborted staging artifact is cleaned up.
+    // The admitted artifact stays owned until the retained recovery consumer cleans it.
     let staging = dir.path().join(".staging");
     let mut count = 0;
     let mut rd = tokio::fs::read_dir(&staging).await.unwrap();
@@ -1018,17 +1061,19 @@ async fn size_ceiling_aborts() {
             count += 1;
         }
     }
-    assert_eq!(count, 0, "staging temp file removed on failure");
+    assert_eq!(count, 1, "failed staging remains journal-owned");
 }
 
 #[tokio::test]
 async fn multipart_assembly_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "roundtrip-1",
@@ -1040,7 +1085,7 @@ async fn multipart_assembly_roundtrip() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "roundtrip-2",
@@ -1066,7 +1111,7 @@ async fn multipart_assembly_roundtrip() {
         },
     ];
     let assembled = store
-        .assemble(&b, &refs, opts(None, "text/plain"))
+        .assemble_fixture(&b, &refs, opts(None, "text/plain"))
         .await
         .unwrap();
     assert_eq!(assembled.size_logical, (p1.size + p2.size));
@@ -1081,19 +1126,35 @@ async fn multipart_assembly_roundtrip() {
         .await,
         b"part-one-part-two"
     );
-    store.delete_session(&upload).await.unwrap();
-    store.delete_session(&upload).await.unwrap(); // idempotent
+    for part in [&p1, &p2] {
+        let (cleanup, lease) = fixture_storage_cleanup(
+            BucketName::parse("fixture-bucket").unwrap(),
+            part.storage_path.clone(),
+        );
+        store
+            .cleanup_storage(&cleanup, lease.try_child().unwrap())
+            .await
+            .unwrap();
+        store.cleanup_storage(&cleanup, lease).await.unwrap(); // exact idempotent retry
+    }
+    assert!(
+        !dir.path()
+            .join(format!(".staging/multipart/{upload}"))
+            .exists()
+    );
 }
 
 #[tokio::test]
 async fn assemble_enforces_size_ceiling() {
     // Audit 2026-07: the multipart total must be bounded by size_ceiling, exactly as a single PUT is.
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "bounded-1",
@@ -1105,7 +1166,7 @@ async fn assemble_enforces_size_ceiling() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "bounded-2",
@@ -1137,30 +1198,38 @@ async fn assemble_enforces_size_ceiling() {
         ..StageOptions::default()
     };
     assert!(matches!(
-        store.assemble(&b, &refs, tight).await,
+        store.assemble_fixture(&b, &refs, tight).await,
         Err(BlobError::SizeExceeded)
     ));
     // A generous ceiling assembles fine.
     assert!(
         store
-            .assemble(&b, &refs, opts(None, "text/plain"))
+            .assemble_fixture(&b, &refs, opts(None, "text/plain"))
             .await
             .is_ok()
     );
-    store.delete_session(&upload).await.unwrap();
+    for part in [&p1, &p2] {
+        let (cleanup, lease) = fixture_storage_cleanup(
+            BucketName::parse("fixture-bucket").unwrap(),
+            part.storage_path.clone(),
+        );
+        store.cleanup_storage(&cleanup, lease).await.unwrap();
+    }
 }
 
 #[tokio::test]
 async fn reconcile_reclaims_orphans_only() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let keep = store
-        .stage(&b, body(b"keep".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"keep".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     let orphan = store
-        .stage(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
 
@@ -1174,7 +1243,7 @@ async fn reconcile_reclaims_orphans_only() {
     };
 
     let report = store
-        .reconcile(
+        .reconcile_fixture(
             &oracle,
             ReconcileOpts {
                 staging_safety_margin_secs: 0,
@@ -1213,10 +1282,12 @@ async fn reconcile_reclaims_orphans_only() {
 #[tokio::test]
 async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_is_path_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
-    let upload = UploadId::from_string("live-upload".to_owned());
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let upload = UploadId::generate();
     let keep = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "keep-attempt",
@@ -1228,7 +1299,7 @@ async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_i
         .await
         .unwrap();
     let orphan = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "orphan-attempt",
@@ -1248,7 +1319,7 @@ async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_i
             .collect(),
     };
     let report = store
-        .reconcile(
+        .reconcile_fixture(
             &oracle,
             ReconcileOpts {
                 staging_safety_margin_secs: 0,
@@ -1270,8 +1341,24 @@ async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_i
             .unwrap()
     );
 
+    let unrelated = store
+        .stage_part_fixture(
+            &upload,
+            1,
+            "unrelated-attempt",
+            body(b"unrelated".to_vec()),
+            ChecksumSet::none(),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+    let (cleanup, lease) = fixture_storage_cleanup(
+        BucketName::parse("fixture-bucket").unwrap(),
+        keep.storage_path.clone(),
+    );
     store
-        .delete_part_attempt(&upload, 1, "keep-attempt")
+        .cleanup_storage(&cleanup, lease.try_child().unwrap())
         .await
         .unwrap();
     assert!(
@@ -1280,10 +1367,11 @@ async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_i
             .unwrap()
     );
     // Idempotent: a retry after the file is already absent is still success.
-    store
-        .delete_part_attempt(&upload, 1, "keep-attempt")
-        .await
-        .unwrap();
+    store.cleanup_storage(&cleanup, lease).await.unwrap();
+    assert!(
+        dir.path().join(unrelated.storage_path.as_str()).exists(),
+        "exact cleanup preserves another attempt of the same part number"
+    );
 }
 
 /// A blob younger than the staging safety margin must NOT be reclaimed even when the oracle reports
@@ -1291,10 +1379,12 @@ async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_i
 #[tokio::test]
 async fn reconcile_skips_recent_orphan_within_safety_margin() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let orphan = store
-        .stage(&b, body(b"fresh".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"fresh".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     // The oracle says nothing is live, but the just-written blob is within the safety margin.
@@ -1304,7 +1394,7 @@ async fn reconcile_skips_recent_orphan_within_safety_margin() {
         live_multipart_paths: Default::default(),
     };
     let report = store
-        .reconcile(
+        .reconcile_fixture(
             &oracle,
             ReconcileOpts {
                 staging_safety_margin_secs: 3600,
@@ -1333,16 +1423,18 @@ async fn reconcile_skips_recent_orphan_within_safety_margin() {
 #[tokio::test]
 async fn reconcile_prunes_emptied_bucket_dir() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("doomed").unwrap();
     // One bucket whose only blob is an orphan, and a second bucket whose blob is live.
     store
-        .stage(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     let kb = BucketName::parse("kept").unwrap();
     let keep = store
-        .stage(&kb, body(b"keep".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&kb, body(b"keep".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
 
@@ -1355,7 +1447,7 @@ async fn reconcile_prunes_emptied_bucket_dir() {
     };
 
     let report = store
-        .reconcile(
+        .reconcile_fixture(
             &oracle,
             ReconcileOpts {
                 staging_safety_margin_secs: 0,
@@ -1384,12 +1476,14 @@ async fn reconcile_prunes_emptied_bucket_dir() {
 #[tokio::test]
 async fn reconcile_honours_parallelism_across_buckets() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     // Several buckets, each with a single orphan blob, reconciled with bounded concurrency.
     for n in 0..6 {
         let b = BucketName::parse(&format!("bucket-{n}")).unwrap();
         store
-            .stage(&b, body(vec![n as u8; 8]), opts(None, "text/plain"))
+            .stage_fixture(&b, body(vec![n as u8; 8]), opts(None, "text/plain"))
             .await
             .unwrap();
     }
@@ -1401,7 +1495,7 @@ async fn reconcile_honours_parallelism_across_buckets() {
         staging_safety_margin_secs: 0,
         ..ReconcileOpts::default()
     };
-    let report = store.reconcile(&oracle, opts).await.unwrap();
+    let report = store.reconcile_fixture(&oracle, opts).await.unwrap();
     assert_eq!(report.blobs_scanned, 6);
     assert_eq!(report.orphans_reclaimed, 6);
     assert_eq!(report.dirs_pruned, 6, "every emptied bucket dir is pruned");
@@ -1411,22 +1505,31 @@ async fn reconcile_honours_parallelism_across_buckets() {
 #[tokio::test]
 async fn single_filesystem_check_passes() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     // Data root and its in-root staging dir share a filesystem, so the startup check is Ok.
     store.check_single_filesystem().unwrap();
 }
 
 #[tokio::test]
-async fn delete_is_idempotent_and_paths_are_safe() {
+async fn exact_cleanup_is_idempotent_and_paths_are_safe() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
-    let b = BucketName::parse("bkt").unwrap();
-    let staged = store
-        .stage(&b, body(b"x".to_vec()), opts(None, "text/plain"))
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap();
-    store.delete(&staged.storage_path).await.unwrap();
-    store.delete(&staged.storage_path).await.unwrap(); // idempotent: absence is success
+    let b = BucketName::parse("bkt").unwrap();
+    let staged = store
+        .stage_fixture(&b, body(b"x".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let (cleanup, lease) = fixture_storage_cleanup(b.clone(), staged.storage_path.clone());
+    store
+        .cleanup_storage(&cleanup, lease.try_child().unwrap())
+        .await
+        .unwrap();
+    store.cleanup_storage(&cleanup, lease).await.unwrap(); // idempotent absence barrier
+    assert!(!dir.path().join(staged.storage_path.as_str()).exists());
 
     // A traversal path is rejected structurally.
     let evil = StoragePath::from_string("../../../etc/passwd".to_owned());
@@ -1451,11 +1554,13 @@ async fn delete_is_idempotent_and_paths_are_safe() {
 #[tokio::test]
 async fn stage_part_computes_requested_checksum() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let upload = UploadId::generate();
     // CRC32("abc") = 0x352441C2; base64 of the big-endian bytes is "NSRBwg==".
     let staged = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "checksum-1",
@@ -1472,7 +1577,7 @@ async fn stage_part_computes_requested_checksum() {
 
     // No algorithm requested -> no supplementary checksum computed.
     let plain = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "checksum-2",
@@ -1492,11 +1597,13 @@ async fn stage_part_computes_requested_checksum() {
 #[tokio::test]
 async fn assemble_honors_extra_checksums_whole_object() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "whole-checksum-1",
@@ -1508,7 +1615,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "whole-checksum-2",
@@ -1539,7 +1646,10 @@ async fn assemble_honors_extra_checksums_whole_object() {
         content_type: "text/plain".to_owned(),
         ..StageOptions::default()
     };
-    let assembled = store.assemble(&b, &refs, assemble_opts).await.unwrap();
+    let assembled = store
+        .assemble_fixture(&b, &refs, assemble_opts)
+        .await
+        .unwrap();
     let assembled_crc = assembled
         .checksums
         .iter()
@@ -1555,7 +1665,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
         ..StageOptions::default()
     };
     let single = store
-        .stage(&b, body(b"part-one-part-two".to_vec()), whole)
+        .stage_fixture(&b, body(b"part-one-part-two".to_vec()), whole)
         .await
         .unwrap();
     let single_crc = single
@@ -1587,11 +1697,11 @@ async fn assemble_honors_extra_checksums_whole_object() {
 async fn io_uring_staged_object_reads_back_identically() {
     let dir = tempfile::tempdir().unwrap();
     // Two stores over the same root: one forced onto the io_uring path, one onto tokio::fs.
-    let uring = LocalBlobStore::open(dir.path())
+    let uring = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_io_uring(true);
-    let epoll = LocalBlobStore::open(dir.path())
+    let epoll = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_io_uring(false);
@@ -1603,7 +1713,7 @@ async fn io_uring_staged_object_reads_back_identically() {
         .collect();
 
     let via_uring = uring
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 7000),
             opts(None, "application/octet-stream"),
@@ -1611,7 +1721,7 @@ async fn io_uring_staged_object_reads_back_identically() {
         .await
         .unwrap();
     let via_epoll = epoll
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 7000),
             opts(None, "application/octet-stream"),
@@ -1674,7 +1784,7 @@ async fn io_uring_staged_object_reads_back_identically() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path())
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_io_uring(true);
@@ -1693,7 +1803,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
 
     // Compressed + encrypted single-shot stage via io_uring.
     let enc = store
-        .stage(
+        .stage_fixture(
             &b,
             chunked_body(data.clone(), 1234),
             opts_encrypted(Some(policy), "text/plain", dek),
@@ -1718,7 +1828,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
     // Multipart parts staged + assembled via io_uring.
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "uring-1",
@@ -1730,7 +1840,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "uring-2",
@@ -1756,7 +1866,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         },
     ];
     let assembled = store
-        .assemble(&b, &refs, opts(None, "text/plain"))
+        .assemble_fixture(&b, &refs, opts(None, "text/plain"))
         .await
         .unwrap();
     assert_eq!(
@@ -1770,7 +1880,13 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .await,
         b"uring-part-one-uring-part-two"
     );
-    store.delete_session(&upload).await.unwrap();
+    for part in [&p1, &p2] {
+        let (cleanup, lease) = fixture_storage_cleanup(
+            BucketName::parse("fixture-bucket").unwrap(),
+            part.storage_path.clone(),
+        );
+        store.cleanup_storage(&cleanup, lease).await.unwrap();
+    }
 }
 
 /// A lightweight, opt-in throughput probe comparing the io_uring staging-write backend against the
@@ -1791,7 +1907,7 @@ async fn uring_vs_epoll_staging_throughput() {
         // Warm up so directory-creation and first-touch costs don't skew the timed loop.
         for _ in 0..4 {
             store
-                .stage(
+                .stage_fixture(
                     &b,
                     body(payload.to_vec()),
                     opts(None, "application/octet-stream"),
@@ -1802,7 +1918,7 @@ async fn uring_vs_epoll_staging_throughput() {
         let start = Instant::now();
         for _ in 0..iters {
             store
-                .stage(
+                .stage_fixture(
                     &b,
                     body(payload.to_vec()),
                     opts(None, "application/octet-stream"),
@@ -1819,12 +1935,12 @@ async fn uring_vs_epoll_staging_throughput() {
     let iters = 200u32;
 
     let dir_u = tempfile::tempdir().unwrap();
-    let uring = LocalBlobStore::open(dir_u.path())
+    let uring = LocalBlobStore::open(dir_u.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_io_uring(true);
     let dir_e = tempfile::tempdir().unwrap();
-    let epoll = LocalBlobStore::open(dir_e.path())
+    let epoll = LocalBlobStore::open(dir_e.path(), cairn_types::testing::fixture_storage_io())
         .await
         .unwrap()
         .with_io_uring(false);
@@ -1853,7 +1969,7 @@ async fn uring_vs_epoll_concurrent_staging() {
         let b = BucketName::parse("bench").unwrap();
         for _ in 0..4 {
             store
-                .stage(
+                .stage_fixture(
                     &b,
                     body(payload.to_vec()),
                     opts(None, "application/octet-stream"),
@@ -1868,7 +1984,7 @@ async fn uring_vs_epoll_concurrent_staging() {
             set.spawn(async move {
                 let b = BucketName::parse("bench").unwrap();
                 for _ in 0..per {
-                    s.stage(&b, body(p.to_vec()), opts(None, "application/octet-stream"))
+                    s.stage_fixture(&b, body(p.to_vec()), opts(None, "application/octet-stream"))
                         .await
                         .unwrap();
                 }
@@ -1885,14 +2001,14 @@ async fn uring_vs_epoll_concurrent_staging() {
 
     let du = tempfile::tempdir().unwrap();
     let uring = Arc::new(
-        LocalBlobStore::open(du.path())
+        LocalBlobStore::open(du.path(), cairn_types::testing::fixture_storage_io())
             .await
             .unwrap()
             .with_io_uring(true),
     );
     let de = tempfile::tempdir().unwrap();
     let epoll = Arc::new(
-        LocalBlobStore::open(de.path())
+        LocalBlobStore::open(de.path(), cairn_types::testing::fixture_storage_io())
             .await
             .unwrap()
             .with_io_uring(false),
@@ -2001,12 +2117,14 @@ async fn legacy_v2_open_raw_rejects_flag_and_logical_length_forgery() {
     use futures_util::StreamExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("bkt").unwrap();
     let dek = [0x62u8; 32];
     let plaintext = vec![b'A'; 1024];
     let staged = store
-        .stage(
+        .stage_fixture(
             &bucket,
             body(plaintext.clone()),
             opts_encrypted(
@@ -2066,13 +2184,15 @@ async fn legacy_v2_open_raw_rejects_flag_and_logical_length_forgery() {
 #[tokio::test]
 async fn legacy_v2_multipart_rejects_part_size_mismatch_instead_of_truncating() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let dek = [0x73u8; 32];
     let plaintext = vec![b'P'; 4096];
     let staged = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "legacy-v2-size",
@@ -2095,7 +2215,7 @@ async fn legacy_v2_multipart_rejects_part_size_mismatch_instead_of_truncating() 
         cipher: BlobCipher::LegacyV2(dek.into()),
     };
     let assembled = store
-        .assemble(
+        .assemble_fixture(
             &bucket,
             std::slice::from_ref(&valid_ref),
             opts(None, "application/octet-stream"),
@@ -2119,7 +2239,7 @@ async fn legacy_v2_multipart_rejects_part_size_mismatch_instead_of_truncating() 
         ..valid_ref
     };
     let result = store
-        .assemble(
+        .assemble_fixture(
             &bucket,
             &[mismatched_ref],
             opts(None, "application/octet-stream"),
@@ -2134,9 +2254,10 @@ async fn legacy_v2_multipart_rejects_part_size_mismatch_instead_of_truncating() 
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
-    assert!(
-        leaked.is_empty(),
-        "failed legacy-v2 assembly left an orphan staging file"
+    assert_eq!(
+        leaked.len(),
+        1,
+        "failed legacy-v2 assembly retains its admitted artifact"
     );
 }
 
@@ -2150,13 +2271,15 @@ async fn first_part_failpoint_leaves_a_session_directory_but_no_part_file() {
     fail::cfg("blob_after_multipart_session_dir", "panic").unwrap();
 
     let root = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(root.path()).await.unwrap();
+    let store = LocalBlobStore::open(root.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let upload = UploadId::generate();
     let task_store = store.clone();
     let task_upload = upload.clone();
     let task = tokio::spawn(async move {
         task_store
-            .stage_part(
+            .stage_part_fixture(
                 &task_upload,
                 1,
                 "failpoint-1",
@@ -2187,7 +2310,9 @@ async fn first_part_failpoint_leaves_a_session_directory_but_no_part_file() {
 #[tokio::test]
 async fn stage_part_encrypted_roundtrips_via_assemble() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let dek1 = [7u8; 32];
@@ -2195,7 +2320,7 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
     let plain1 = vec![b'A'; 6 * 1024 * 1024];
     let plain2 = b"tail-bytes".to_vec();
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "encrypted-roundtrip-1",
@@ -2207,7 +2332,7 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "encrypted-roundtrip-2",
@@ -2220,7 +2345,7 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
         .unwrap();
     let refs = vec![part_ref(1, &p1, Some(dek1)), part_ref(2, &p2, Some(dek2))];
     let assembled = store
-        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .assemble_fixture(&b, &refs, opts(None, "application/octet-stream"))
         .await
         .unwrap();
     let mut expected = plain1.clone();
@@ -2240,7 +2365,7 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
     // ETag/MD5 basis stays the PLAINTEXT digest (unchanged by per-part encryption): it matches the
     // same concatenated bytes staged as a single plaintext object.
     let single = store
-        .stage(
+        .stage_fixture(
             &b,
             body(expected.clone()),
             opts(None, "application/octet-stream"),
@@ -2255,12 +2380,14 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
 #[tokio::test]
 async fn staged_part_file_is_ciphertext() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let upload = UploadId::generate();
     let dek = [3u8; 32];
     let plain = vec![b'Z'; 4096];
     let p = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "wrong-key-1",
@@ -2301,11 +2428,13 @@ async fn staged_part_file_is_ciphertext() {
 #[tokio::test]
 async fn two_identical_parts_differ_in_block0_ciphertext() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let upload = UploadId::generate();
     let plain = vec![b'Q'; 4096];
     let a = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "missing-dek-1",
@@ -2317,7 +2446,7 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .await
         .unwrap();
     let bpart = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "plain-part-2",
@@ -2338,7 +2467,7 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
 
     // Re-upload variant: the same part number staged twice under fresh keys must also differ.
     let first = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             3,
             "encrypted-part-3",
@@ -2350,7 +2479,7 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .await
         .unwrap();
     let second = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             3,
             "replacement-part-3",
@@ -2375,12 +2504,14 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
 #[tokio::test]
 async fn assemble_wrong_part_dek_is_corruption() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let plain = vec![b'W'; 6 * 1024 * 1024];
     let p = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "tamper-1",
@@ -2394,22 +2525,23 @@ async fn assemble_wrong_part_dek_is_corruption() {
     // Assemble with a DIFFERENT key than the part was staged under.
     let refs = vec![part_ref(1, &p, Some([2u8; 32]))];
     let err = store
-        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .assemble_fixture(&b, &refs, opts(None, "application/octet-stream"))
         .await;
     assert!(
         matches!(err, Err(BlobError::Corruption(_))),
         "wrong part DEK must be Corruption"
     );
-    // No orphan staging tmp remains.
+    // The failed assembled output remains covered by its admitted intent.
     let staging = dir.path().join(".staging");
     let leaked: Vec<_> = std::fs::read_dir(&staging)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
-    assert!(
-        leaked.is_empty(),
-        "failed assembly left an orphan staging tmp"
+    assert_eq!(
+        leaked.len(),
+        1,
+        "failed assembly retains its admitted artifact"
     );
 }
 
@@ -2419,13 +2551,15 @@ async fn assemble_wrong_part_dek_is_corruption() {
 #[tokio::test]
 async fn preallocation_holds_for_encrypted_parts() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let plain1 = vec![b'M'; 6 * 1024 * 1024];
     let plain2 = vec![b'N'; 5 * 1024 * 1024];
     let p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             1,
             "mixed-1",
@@ -2437,7 +2571,7 @@ async fn preallocation_holds_for_encrypted_parts() {
         .await
         .unwrap();
     let p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &upload,
             2,
             "mixed-2",
@@ -2455,7 +2589,7 @@ async fn preallocation_holds_for_encrypted_parts() {
         part_ref(2, &p2, Some([2u8; 32])),
     ];
     let assembled = store
-        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .assemble_fixture(&b, &refs, opts(None, "application/octet-stream"))
         .await
         .unwrap();
     let mut expected = plain1.clone();
@@ -2483,7 +2617,9 @@ async fn preallocation_holds_for_encrypted_parts() {
 #[tokio::test]
 async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let dek1 = [0x41u8; 32];
     let dek2 = [0x42u8; 32];
@@ -2494,7 +2630,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
     let enc_upload = UploadId::generate();
     let plain_upload = UploadId::generate();
     let enc_p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &enc_upload,
             1,
             "parity-encrypted-1",
@@ -2506,7 +2642,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .await
         .unwrap();
     let plain_p1 = store
-        .stage_part(
+        .stage_part_fixture(
             &plain_upload,
             1,
             "parity-plain-1",
@@ -2537,7 +2673,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
 
     // --- whole-object: assemble over encrypted parts == assemble over plaintext parts (CRC64NVME) ---
     let enc_p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &enc_upload,
             2,
             "parity-encrypted-2",
@@ -2549,7 +2685,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .await
         .unwrap();
     let plain_p2 = store
-        .stage_part(
+        .stage_part_fixture(
             &plain_upload,
             2,
             "parity-plain-2",
@@ -2567,7 +2703,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         ..StageOptions::default()
     };
     let enc_asm = store
-        .assemble(
+        .assemble_fixture(
             &b,
             &[
                 part_ref(1, &enc_p1, Some(dek1)),
@@ -2578,7 +2714,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .await
         .unwrap();
     let plain_asm = store
-        .assemble(
+        .assemble_fixture(
             &b,
             &[part_ref(1, &plain_p1, None), part_ref(2, &plain_p2, None)],
             asm_opts,
@@ -2620,7 +2756,9 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
     // length and the ciphertext streams out as if it were the body. Compression is off by default,
     // so this was the DEFAULT configuration. The trailer cross-check now refuses.
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let dek = [42u8; 32];
     let plaintext = b"the quick brown fox jumps over the lazy dog".to_vec();
@@ -2628,7 +2766,7 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
     // Compression explicitly OFF: the descriptor is `Uncompressed` even though the file on disk is
     // an encrypted CRNB container.
     let staged = store
-        .stage(
+        .stage_fixture(
             &b,
             body(plaintext.clone()),
             opts_encrypted(None, "application/octet-stream", dek),
@@ -2682,12 +2820,14 @@ async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
     // The container is selected by the stored compression descriptor and its reader fails fast
     // because an encrypted version has no DEK.
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let dek = [42u8; 32];
     let data = vec![b'a'; 64 * 1024];
     let staged = store
-        .stage(
+        .stage_fixture(
             &b,
             body(data),
             opts_encrypted(
@@ -2723,12 +2863,14 @@ async fn plaintext_object_containing_a_complete_encrypted_blob_round_trips() {
     // operator backs up CAIRN_DATA_DIR into a bucket. Framing comes from authoritative metadata,
     // not body sniffing, so this plaintext object remains byte-for-byte readable.
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
 
     // Produce a real encrypted blob file, then read its raw bytes off disk.
     let victim = store
-        .stage(
+        .stage_fixture(
             &b,
             body(b"the original secret".to_vec()),
             opts_encrypted(None, "application/octet-stream", [7u8; 32]),
@@ -2743,7 +2885,7 @@ async fn plaintext_object_containing_a_complete_encrypted_blob_round_trips() {
 
     // PUT those bytes as an ordinary, UNENCRYPTED object — the backup workflow.
     let backup = store
-        .stage(
+        .stage_fixture(
             &b,
             body(raw.clone()),
             opts(None, "application/octet-stream"),
@@ -2787,12 +2929,14 @@ async fn plaintext_object_containing_a_complete_encrypted_blob_round_trips() {
 #[tokio::test]
 async fn probe_reports_presence_on_the_real_store_without_a_dek() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let b = BucketName::parse("bkt").unwrap();
 
     // A plaintext, uncompressed blob: present, physical length == plaintext length.
     let plain = store
-        .stage(&b, body(b"twelve bytes".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&b, body(b"twelve bytes".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     let p = store.probe(&plain.storage_path).await.unwrap();
@@ -2802,7 +2946,7 @@ async fn probe_reports_presence_on_the_real_store_without_a_dek() {
     // reports it PRESENT without any DEK — presence is not decryptability.
     let dek = [42u8; 32];
     let enc = store
-        .stage(
+        .stage_fixture(
             &b,
             body(b"top secret payload".to_vec()),
             opts_encrypted(None, "application/octet-stream", dek),
@@ -2843,7 +2987,9 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
     use aes_gcm::aead::{KeyInit, OsRng};
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("mixed-parts").unwrap();
     let upload = UploadId::generate();
     let part_key: [u8; 32] = aes_gcm::Aes256Gcm::generate_key(&mut OsRng).into();
@@ -2856,7 +3002,7 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
         let dek = (i == 1).then_some(part_key);
         let number = u16::try_from(i + 1).unwrap();
         let part = store
-            .stage_part(
+            .stage_part_fixture(
                 &upload,
                 number,
                 &format!("mixed-{i}"),
@@ -2880,11 +3026,11 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
         options.extra_checksums = ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]);
         options.encryption = encrypted.then_some(object_key.into());
         let assembled = store
-            .assemble(&bucket, &refs, options.clone())
+            .assemble_fixture(&bucket, &refs, options.clone())
             .await
             .unwrap();
         let single = store
-            .stage(&bucket, body(expected.clone()), options)
+            .stage_fixture(&bucket, body(expected.clone()), options)
             .await
             .unwrap();
         assert_eq!(assembled.size_logical, expected.len() as u64);
@@ -2940,19 +3086,24 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
 }
 
 #[tokio::test]
-async fn missing_part_records_assembly_failure_without_durability_or_leaked_tmp() {
+async fn missing_part_records_assembly_failure_and_retains_admitted_tmp() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("missing-part").unwrap();
     let refs = [PartRef {
         part_number: 1,
-        storage_path: StoragePath::from_string(".staging/multipart/missing/part".to_owned()),
+        storage_path: StoragePath::from_string(format!(
+            ".staging/multipart/{}/00001-attempt",
+            UploadId::generate()
+        )),
         size: 7,
         cipher: BlobCipher::KnownPlaintext,
     }];
     assert!(matches!(
         store
-            .assemble(&bucket, &refs, opts(None, "text/plain"))
+            .assemble_fixture(&bucket, &refs, opts(None, "text/plain"))
             .await,
         Err(BlobError::NotFound)
     ));
@@ -2968,15 +3119,23 @@ async fn missing_part_records_assembly_failure_without_durability_or_leaked_tmp(
             cairn_blob::MultipartStage::Assembly
         ]
     );
-    assert!(!dir.path().join(bucket.as_str()).exists());
-    assert!(
+    assert_eq!(
+        std::fs::read_dir(dir.path().join(bucket.as_str()))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
         std::fs::read_dir(dir.path().join(".staging"))
             .unwrap()
-            .all(|entry| !entry
+            .filter(|entry| entry
+                .as_ref()
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
                 .ends_with(".tmp"))
+            .count(),
+        1
     );
 }
 
@@ -2984,14 +3143,16 @@ async fn missing_part_records_assembly_failure_without_durability_or_leaked_tmp(
 #[tokio::test]
 async fn reconcile_preserves_flat_and_nested_reads_and_prunes_empty_leaves() {
     let root = tempfile::tempdir().unwrap();
-    let store = LocalBlobStore::open(root.path()).await.unwrap();
+    let store = LocalBlobStore::open(root.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
     let bucket = BucketName::parse("mixed-layout").unwrap();
     let flat = store
-        .stage(&bucket, body(b"flat".to_vec()), opts(None, "text/plain"))
+        .stage_fixture(&bucket, body(b"flat".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
     let mut nested = store
-        .stage(
+        .stage_fixture(
             &bucket,
             body(vec![b'n'; 8192]),
             opts(Some(CompressionPolicy::default()), "text/plain"),
@@ -3034,7 +3195,7 @@ async fn reconcile_preserves_flat_and_nested_reads_and_prunes_empty_leaves() {
         live_multipart_paths: Default::default(),
     };
     let report = store
-        .reconcile(
+        .reconcile_fixture(
             &oracle,
             ReconcileOpts {
                 batch_size: 1,
@@ -3072,7 +3233,7 @@ async fn reconcile_preserves_flat_and_nested_reads_and_prunes_empty_leaves() {
         vec![b'n'; 8192]
     );
     let fresh = store
-        .stage(
+        .stage_fixture(
             &bucket,
             body(b"still flat".to_vec()),
             opts(None, "text/plain"),

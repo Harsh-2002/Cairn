@@ -919,6 +919,29 @@ ALTER TABLE multipart_staging_cleanups ADD COLUMN storage_protocol INTEGER NOT N
 UPDATE storage_protocol SET minimum_reader=2, minimum_writer=2;
 "#,
     },
+    Migration {
+        version: 37,
+        name: "storage_multipart_alias_ownership",
+        sql: r#"
+-- An unfinished spool alias follows its part's sole v26 charge even after publication.
+ALTER TABLE storage_cleanups ADD COLUMN quota_owner_path TEXT;
+CREATE INDEX idx_storage_cleanup_quota_owner ON storage_cleanups (quota_owner_path)
+    WHERE quota_owner_path IS NOT NULL;
+CREATE INDEX idx_multipart_cleanups_path ON multipart_staging_cleanups (storage_path)
+    WHERE storage_path IS NOT NULL;
+-- Exact multipart ownership must be seekable without scanning unrelated object intents.
+ALTER TABLE storage_write_intents ADD COLUMN upload_id TEXT;
+ALTER TABLE storage_write_intents ADD COLUMN reservation_id TEXT;
+UPDATE storage_write_intents SET
+    upload_id=COALESCE(json_extract(plan, '$.target.Part.upload_id'),
+                       json_extract(plan, '$.target.Completion.upload_id')),
+    reservation_id=json_extract(plan, '$.target.Part.reservation_id');
+CREATE INDEX idx_storage_intents_upload ON storage_write_intents (upload_id, attempt_id)
+    WHERE upload_id IS NOT NULL;
+CREATE INDEX idx_storage_intents_reservation ON storage_write_intents (reservation_id, attempt_id)
+    WHERE reservation_id IS NOT NULL;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1933,60 +1956,44 @@ mod tests {
         assert_eq!(locks, 0, "version deletion must cascade its lock side row");
     }
 
+    /// Materialize the real historical schema so later migrations can extend every table.
+    fn migrate_fixture_through(conn: &Connection, version: i64) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn migration_v27_discards_only_legacy_orphan_lock_rows() {
         let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 26);
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE schema_migrations (
-                 version INTEGER PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 applied_at INTEGER NOT NULL
-             );
-             INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
-             CREATE TABLE object_versions (
-                 id TEXT PRIMARY KEY,
-                 bucket_name TEXT NOT NULL,
-                 key TEXT NOT NULL,
-                 version_id TEXT NOT NULL,
-                 is_latest INTEGER NOT NULL DEFAULT 1,
-                 is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                 etag TEXT NOT NULL DEFAULT '',
-                 size_logical INTEGER NOT NULL DEFAULT 0,
-                 updated_at INTEGER NOT NULL DEFAULT 0,
-                 storage_class TEXT NOT NULL DEFAULT 'Standard',
-                 owner_id TEXT NOT NULL DEFAULT '',
-                 UNIQUE (bucket_name, key, version_id)
-             );
-             INSERT INTO object_versions (id, bucket_name, key, version_id)
-                 VALUES ('row-live','b','live','v');
-             CREATE INDEX idx_ov_latest_cover ON object_versions
-                 (bucket_name, key, version_id, is_delete_marker, etag, size_logical, updated_at,
-                  storage_class, owner_id)
-                 WHERE is_latest = 1;
-             CREATE TABLE object_locks (
-                 bucket_name TEXT NOT NULL,
-                 key TEXT NOT NULL,
-                 version_id TEXT NOT NULL,
-                 lock_mode TEXT,
-                 retain_until INTEGER,
-                 legal_hold INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (bucket_name, key, version_id)
-             );
+            "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region)
+                 VALUES ('b','owner',0,'enabled','BucketOwnerEnforced','us-east-1');
+             INSERT INTO object_versions
+                 (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+                  etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,created_at,updated_at)
+                 VALUES ('row-live','b','live','v',1,0,0,0,'','text/plain','{}','STANDARD','owner','[]','[]',0,0);
              INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
              INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
-             CREATE TABLE multipart_uploads (
-                 id TEXT PRIMARY KEY,
-                 status TEXT NOT NULL
-             );
-             INSERT INTO multipart_uploads VALUES ('legacy-upload','active');",
-        )
-        .unwrap();
+             INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('legacy-upload','b','assembled','text/plain','active','owner','[]',0,0);",
+        ).unwrap();
 
-        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let locks: Vec<(String, String)> = conn
             .prepare("SELECT key, lock_mode FROM object_locks ORDER BY key")
@@ -2017,41 +2024,7 @@ mod tests {
     #[test]
     fn migration_v28_adds_row_identity_to_current_listing_cover() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_migrations (
-                 version INTEGER PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 applied_at INTEGER NOT NULL
-             );
-             INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
-             CREATE TABLE object_versions (
-                 id TEXT PRIMARY KEY,
-                 bucket_name TEXT NOT NULL,
-                 key TEXT NOT NULL,
-                 version_id TEXT NOT NULL,
-                 is_latest INTEGER NOT NULL,
-                 is_delete_marker INTEGER NOT NULL,
-                 etag TEXT NOT NULL,
-                 size_logical INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 storage_class TEXT NOT NULL,
-                 owner_id TEXT NOT NULL
-             );
-             CREATE INDEX idx_ov_latest_cover ON object_versions
-                 (bucket_name, key, version_id, is_delete_marker, etag, size_logical, updated_at,
-                  storage_class, owner_id)
-                 WHERE is_latest = 1;
-             CREATE TABLE multipart_uploads (
-                 id TEXT PRIMARY KEY,
-                 status TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-
-        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
+        migrate_fixture_through(&conn, 27);
         run_migrations(&conn).unwrap();
         let columns = conn
             .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
@@ -2098,28 +2071,14 @@ mod tests {
     #[test]
     fn migration_v29_resets_unowned_legacy_completion_claims() {
         let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 28);
         conn.execute_batch(
-            "CREATE TABLE schema_migrations (
-                 version INTEGER PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 applied_at INTEGER NOT NULL
-             );
-             INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
-                 CREATE TABLE object_versions (id TEXT PRIMARY KEY, bucket_name TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL DEFAULT 1, is_delete_marker INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE multipart_uploads (
-                 id TEXT PRIMARY KEY,
-                 status TEXT NOT NULL
-             );
-             INSERT INTO multipart_uploads VALUES ('active-upload','active');
-             INSERT INTO multipart_uploads VALUES ('orphaned-completer','completing');",
-        )
-        .unwrap();
+            "INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('active-upload','b','assembled','text/plain','active','owner','[]',0,0),
+                        ('orphaned-completer','b','assembled','text/plain','completing','owner','[]',0,0);",
+        ).unwrap();
 
-        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let rows = conn
             .prepare(

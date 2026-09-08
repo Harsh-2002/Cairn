@@ -19,9 +19,14 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
     DEK-only seam let a mutable on-disk version byte select the legacy parser. Neither choice is
     representable now: plaintext, legacy v2, and authenticated v3 are distinct declarations, and
     the file must match exactly. `BlobCipher`'s `Debug` is hand-written to redact every key.
-    The *write* seam (`stage`/`stage_part`/`assemble`) still takes an optional DEK because every
-    encrypted write emits current v3; `PartRef.cipher` carries the persisted version declaration
-    when assembly reads an already-staged part.
+    The write seam (`stage`/`stage_part`/`assemble`) consumes a move-only
+    `StorageCreationPermit` from exact Writer admission and retains the actual I/O lease. It also
+    takes an optional DEK because every encrypted write emits current v3; `PartRef.cipher` carries
+    the persisted version declaration when assembly reads an already-staged part.
+- `storage.rs` — protocol-2 file-free plans, exact admission/publication validation, move-only
+  creation permits and leased cleanup claims. `storage/io.rs` owns backend-operation leases,
+  node-lock retention and unforgeable quiescence proofs. Cloned plans carry metadata only; they
+  never grant a second creation permit.
 - `error.rs` — the typed error tree: per-subsystem errors (`BlobError`, `MetaError`, `AuthError`,
   `CryptoError`, `ReplicationError`, `BodyError`, `ConfigError`) **fold into the canonical `Error`**
   via the `From` impls at the bottom. `Error` is the wire-mappable enum the single translator maps
@@ -55,7 +60,10 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - `testing/` — **canonical in-memory doubles** behind `feature = "testing"`: `InMemoryMetadataStore`,
   `InMemoryBlobStore`, `StubCrypto`, `TestClock`, `FakeReplicationSink`, `FixedAuthenticator`,
   `AllowAll`/`DenyAll`. Every other crate enables this as a dev-dependency to unit-test without
-  disk or SQLite.
+  disk or SQLite. `testing/storage.rs` preserves production journal semantics;
+  `PublicationFixture` initializes one explicit generation and admits original mutations without
+  rewriting rows/paths, implicit recovery or retries. Multipart fixtures capture their plan before
+  the original reserve/claim; physical fixtures obtain real admission before staging.
 
 ## Notes
 - **This is the (+1) site of the 4(+1)-site mutation rule.** A new `Mutation` variant (or a new
@@ -68,14 +76,17 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   double must preserve those won/lost outcomes exactly; never turn Abort back into an unconditional
   acknowledgement. Its acknowledgement-loss hooks exist for deterministic downstream cancellation
   tests and must apply the mutation before hanging/failing.
-- Ordinary object-write acknowledgement is typed too. `ResolveObjectWrite` is a writer-serialized
-  exact `(bucket,key,version,row_id,storage_path)` probe used after PUT/Copy cancellation or a lost
-  acknowledgement. The double's object-put acknowledgement hooks must apply the put before failing,
-  and resolution must not confuse a newer null-version overwrite with the original row.
-- Multipart-part acknowledgement is typed equivalently. `ResolveMultipartPartWrite` probes exact
-  `(upload_id,part_number,storage_path)` ownership after UploadPart/UploadPartCopy cancellation or
-  lost acknowledgement; the double's part hooks commit before hanging/failing, and same-number
-  retry ABA must match only the new attempt path.
+- Physical publication is typed and Writer-owned. `AdmitStorageWrite` joins multipart reserve/
+  claim with exact ownership admission; `PublishStorageWrite` preserves the original mutation and
+  requires its current, uncancelled admitted plan. Bare physical object/part/completion writes are
+  rejected. A stale or absent owner returns `StoragePublicationNotApplied`. The double must commit
+  the same reference/side-state/intent/cleanup changes atomically as both SQL backends, including
+  rollback when a late part of publication fails.
+- Acknowledgement-loss hooks must commit the admitted operation before hanging/failing.
+  `ResolveObjectWrite` and `ResolveMultipartPartWrite` retain exact FIFO row/path identity checks
+  across sentinel and same-number-part replacement. Their misses do not authorize deletion:
+  protocol-2 resolution requires actual I/O quiescence, and reclamation requires exact leased
+  cleanup followed by durable absence and matching settlement.
 - Lifecycle deletion is typed too: `DeleteMarker`/`Deleted` mean the writer changed metadata, while
   `DeleteNotApplied` means the target was absent, the immutable `expected_row_id`,
   `expected_updated_at`, or sole-marker guard lost a race, or a conditional marker no longer names
@@ -132,7 +143,9 @@ metadata. Replication uses it before admission; every double/wrapper must report
 own actual read behavior. Prepared blocking-task results must retain their lease while owning
 buffers, even if the awaiting caller has already been cancelled.
 
-`storage.rs` carries protocol-2 file-free plans, move-only creation permits/admission outcomes and
-exact cleanup claims. `storage/io.rs` retains each actual backend operation plus the node-lock
-lifetime; cancellation closes child-lease admission, while only a drained ownership set can create
-a quiescence proof. Plan DTOs are copyable metadata inputs, not permission to create another file.
+Protocol-2 storage state matches schema v36 and v37 across the double, SQLite, libSQL, Turso and
+shard routing. Cleanup survives bucket/session deletion, excludes live references and outstanding
+intents, and retains multipart quota until every linked alias is durably reclaimed. Cancellation
+closes child-lease admission; only a drained ownership set creates a quiescence proof. Coverage
+remains incomplete and startup retains full scans; neither the traits nor test helpers enable
+Phase 3D recovery.

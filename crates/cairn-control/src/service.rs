@@ -198,7 +198,6 @@ pub struct UpdateStatus {
 #[derive(Clone)]
 pub struct ControlService {
     meta: Arc<dyn MetadataStore>,
-    blob: Arc<dyn BlobStore>,
     crypto: Arc<dyn Crypto>,
     clock: Arc<dyn Clock>,
     system: Arc<SystemInfo>,
@@ -235,14 +234,13 @@ impl ControlService {
     #[must_use]
     pub fn new(
         meta: Arc<dyn MetadataStore>,
-        blob: Arc<dyn BlobStore>,
+        _blob: Arc<dyn BlobStore>,
         crypto: Arc<dyn Crypto>,
         clock: Arc<dyn Clock>,
         system: SystemInfo,
     ) -> Self {
         Self {
             meta,
-            blob,
             crypto,
             clock,
             system: Arc::new(system),
@@ -922,12 +920,9 @@ impl ControlService {
                     })
                     .await
                 {
-                    Ok(MutationOutcome::Deleted { freed, .. }) => {
+                    Ok(MutationOutcome::Deleted { .. }) => {
                         deleted_any = true;
-                        if let Some(path) = freed {
-                            // Blob reclamation is best-effort and idempotent.
-                            let _ = self.blob.delete(&path).await;
-                        }
+                        // The Writer retains exact cleanup debt until durable physical reclamation.
                     }
                     Ok(MutationOutcome::DeleteNotApplied) => {}
                     Ok(MutationOutcome::DeleteProtected) => protected = true,
@@ -1056,11 +1051,8 @@ impl ControlService {
                     })
                     .await
                 {
-                    Ok(MutationOutcome::Deleted { freed, .. }) => {
-                        if let Some(path) = freed {
-                            // Blob reclamation is best-effort and idempotent.
-                            let _ = self.blob.delete(&path).await;
-                        }
+                    Ok(MutationOutcome::Deleted { .. }) => {
+                        // The Writer retains exact cleanup debt until durable physical reclamation.
                         deleted += 1;
                     }
                     Ok(MutationOutcome::DeleteNotApplied) => {}

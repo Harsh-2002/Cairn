@@ -170,20 +170,20 @@ impl MetadataStore for ShardedMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::RecoverStorageIntents { generation, limit } => {
+            Mutation::ListStorageIntents { generation, limit } => {
                 let mut remaining = limit.clamp(1,1000);
-                let mut recovered = 0;
+                let mut batch = Vec::new();
                 for shard in &self.shards {
                     if remaining == 0 { break; }
-                    match shard.submit(Mutation::RecoverStorageIntents { generation: generation.clone(), limit: remaining }).await? {
-                        MutationOutcome::StorageRecovered(count) if count <= remaining => {
-                            recovered += count;
-                            remaining -= count;
+                    match shard.submit(Mutation::ListStorageIntents { generation: generation.clone(), limit: remaining }).await? {
+                        MutationOutcome::StorageIntentBatch(plans) if plans.len() <= remaining as usize => {
+                            remaining -= plans.len() as u32;
+                            batch.extend(plans);
                         },
                         _ => return Err(MetaError::Engine("unexpected storage recovery outcome".to_owned())),
                     }
                 }
-                Ok(MutationOutcome::StorageRecovered(recovered))
+                Ok(MutationOutcome::StorageIntentBatch(batch))
             }
             Mutation::ClaimStorageCleanup { generation, limit, now, lease_secs } => {
                 let mut remaining = limit.clamp(1,1000);
@@ -254,6 +254,8 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetObjectLegalHold { .. }
             | Mutation::EnqueueReplication(_)
             | Mutation::Storage { .. }
+            | Mutation::AdmitStorageWrite { .. }
+            | Mutation::PublishStorageWrite { .. }
             | Mutation::ReplicationUpload { .. }
             // Both of its statements are keyed on `bucket_name`, and every outbox row and version
             // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
@@ -1027,6 +1029,9 @@ impl MetadataStore for ShardedMetadataStore {
 /// Extract the target bucket name from a per-bucket mutation, for shard routing.
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
+        Mutation::AdmitStorageWrite { plan, .. } | Mutation::PublishStorageWrite { plan, .. } => {
+            plan.bucket.as_str()
+        }
         Mutation::Storage { bucket, .. } | Mutation::ReplicationUpload { bucket, .. } => {
             bucket.as_str()
         }
@@ -1088,7 +1093,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
         | Mutation::BeginStorageGeneration { .. }
-        | Mutation::RecoverStorageIntents { .. }
+        | Mutation::ListStorageIntents { .. }
         | Mutation::ClaimStorageCleanup { .. }
         | Mutation::ClaimReplicationUploadCleanup { .. }
         | Mutation::RecoverClaimedReplication
@@ -1150,8 +1155,15 @@ impl ReconcileOracle for ShardedReconcileOracle {
         // into the original order so the caller's path/answer alignment is preserved.
         let n = self.oracles.len();
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut staging = Vec::new();
         for (i, p) in candidates.iter().enumerate() {
-            buckets[self.shard_for_path(p.as_str())].push(i);
+            if p.as_str().starts_with(".staging/") {
+                // Temporary/spool aliases carry an attempt, not the bucket routing identity.
+                // Ask every physical journal; hashing ".staging" would miss another shard's I/O.
+                staging.push(i);
+            } else {
+                buckets[self.shard_for_path(p.as_str())].push(i);
+            }
         }
         let mut out = vec![false; candidates.len()];
         for (shard, idxs) in buckets.into_iter().enumerate() {
@@ -1160,8 +1172,30 @@ impl ReconcileOracle for ShardedReconcileOracle {
             }
             let subset: Vec<StoragePath> = idxs.iter().map(|&i| candidates[i].clone()).collect();
             let answers = self.oracles[shard].live_blobs(&subset).await?;
+            if answers.len() != subset.len() {
+                return Err(MetaError::Engine(
+                    "incorrect reconciliation membership count".into(),
+                ));
+            }
             for (k, &i) in idxs.iter().enumerate() {
                 out[i] = answers[k];
+            }
+        }
+        if !staging.is_empty() {
+            let subset: Vec<_> = staging
+                .iter()
+                .map(|&index| candidates[index].clone())
+                .collect();
+            for oracle in &self.oracles {
+                let answers = oracle.live_blobs(&subset).await?;
+                if answers.len() != subset.len() {
+                    return Err(MetaError::Engine(
+                        "incorrect reconciliation membership count".into(),
+                    ));
+                }
+                for (&index, answer) in staging.iter().zip(answers) {
+                    out[index] |= answer;
+                }
             }
         }
         Ok(out)

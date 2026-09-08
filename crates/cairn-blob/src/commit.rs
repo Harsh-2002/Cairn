@@ -14,128 +14,171 @@
 //! syscalls. Distinct directories within one batch are fsynced concurrently, so coalescing same-
 //! directory writes never serializes unrelated buckets.
 
-use cairn_types::error::BlobError;
+use cairn_types::{error::BlobError, storage::io::StorageIoLease};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-/// One request to make a directory's pending renames durable. The reply is a stringified result so
-/// a single fsync outcome can fan out to every coalesced waiter (`BlobError` is not `Clone`).
 struct SyncRequest {
-    dir: PathBuf,
+    dir: Arc<File>,
+    identity: (u64, u64),
     done: oneshot::Sender<Result<(), String>>,
+    lease: StorageIoLease,
 }
 
-/// A handle to the directory-fsync coalescing coordinator. Cloning the owning [`LocalBlobStore`]
-/// shares one coordinator task via the inner `Arc`.
-///
-/// [`LocalBlobStore`]: crate::LocalBlobStore
 #[derive(Debug)]
 pub(crate) struct DirSyncCoalescer {
     tx: mpsc::UnboundedSender<SyncRequest>,
 }
 
 impl DirSyncCoalescer {
-    /// Spawn the coordinator task and return a handle. The task lives until every handle is
-    /// dropped (the store and all its clones), then exits when its channel closes.
     pub(crate) fn spawn() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(run(rx));
         Self { tx }
     }
 
-    /// Make every rename into `dir` that completed before this call durable, coalescing concurrent
-    /// callers for the same directory into one fsync. Resolves only after that fsync completes, so
-    /// the caller must not have proceeded past the durability barrier before awaiting this.
-    ///
-    /// If the coordinator is gone (only at shutdown) the call falls back to a direct fsync, so
-    /// durability is preserved regardless.
-    pub(crate) async fn sync_dir(&self, dir: &Path) -> Result<(), BlobError> {
-        let (done, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(SyncRequest {
-                dir: dir.to_owned(),
-                done,
-            })
-            .is_err()
-        {
-            return crate::fsync_dir(dir).await;
+    /// Sync the exact directory used by the completed rename. Coalescing by device/inode avoids
+    /// acknowledging an old descriptor by syncing a newly recreated directory at the same name.
+    pub(crate) async fn sync_file(
+        &self,
+        dir: Arc<File>,
+        lease: &StorageIoLease,
+    ) -> Result<(), BlobError> {
+        let owned = lease.try_child()?;
+        let metadata = dir.metadata().map_err(crate::io_err)?;
+        if !metadata.is_dir() {
+            return Err(BlobError::Io(
+                "storage sync target is not a directory".into(),
+            ));
         }
-        match rx.await {
+        let (done, result) = oneshot::channel();
+        if let Err(error) = self.tx.send(SyncRequest {
+            dir: dir.clone(),
+            identity: (metadata.dev(), metadata.ino()),
+            done,
+            lease: owned,
+        }) {
+            return direct_sync(error.0.dir, error.0.lease).await;
+        }
+        match result.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(BlobError::Io(e)),
-            // Coordinator dropped the reply mid-flight (shutdown race): fall back so we never
-            // report success without a real fsync.
-            Err(_) => crate::fsync_dir(dir).await,
+            Ok(Err(error)) => Err(BlobError::Io(error)),
+            Err(_) => direct_sync(dir, lease.try_child()?).await,
         }
     }
 }
 
-/// The coordinator loop: block for the next request, drain every request already queued into one
-/// batch, then fsync each distinct directory once (distinct directories concurrently) and reply to
-/// every waiter. Requests that arrive while a batch's fsyncs are in flight form the next batch, so
-/// under load batches grow and coalescing increases — the self-tuning group-commit behavior.
-async fn run(mut rx: mpsc::UnboundedReceiver<SyncRequest>) {
-    while let Some(first) = rx.recv().await {
+async fn run(mut requests: mpsc::UnboundedReceiver<SyncRequest>) {
+    while let Some(first) = requests.recv().await {
         let mut batch = vec![first];
-        while let Ok(r) = rx.try_recv() {
-            batch.push(r);
+        while let Ok(request) = requests.try_recv() {
+            batch.push(request);
         }
-        let mut by_dir: HashMap<PathBuf, Vec<oneshot::Sender<Result<(), String>>>> = HashMap::new();
-        for r in batch {
-            by_dir.entry(r.dir).or_default().push(r.done);
+        let mut by_dir: HashMap<(u64, u64), Vec<SyncRequest>> = HashMap::new();
+        for request in batch {
+            by_dir.entry(request.identity).or_default().push(request);
         }
-        let syncs = by_dir.into_iter().map(|(dir, waiters)| async move {
-            let result = crate::fsync_dir(&dir).await.map_err(|e| e.to_string());
-            for w in waiters {
-                let _ = w.send(result.clone());
-            }
+        let syncs = by_dir.into_values().map(|waiters| async move {
+            // The closure owns every waiter and lease through actual fsync completion. Neither
+            // request cancellation nor dropping this coordinator future can release them early.
+            let _ = tokio::task::spawn_blocking(move || {
+                let result = waiters[0].dir.sync_all().map_err(|error| error.to_string());
+                for waiter in waiters {
+                    let _ = waiter.done.send(result.clone());
+                }
+            })
+            .await;
         });
         futures_util::future::join_all(syncs).await;
     }
 }
 
+async fn direct_sync(dir: Arc<File>, lease: StorageIoLease) -> Result<(), BlobError> {
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let result = dir.sync_all().map_err(crate::io_err);
+        drop(dir);
+        result
+    })
+    .await
+    .map_err(|error| BlobError::Io(error.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_file::test_lease;
+    use cairn_types::storage::{StorageToken, io::StorageIoWatch};
+    use futures_util::FutureExt;
 
     #[tokio::test]
     async fn coalesces_concurrent_same_dir_syncs() {
         let dir = tempfile::tempdir().unwrap();
+        let file = Arc::new(crate::open_readonly_nofollow(dir.path()).unwrap());
         let coalescer = DirSyncCoalescer::spawn();
-        // Many concurrent syncs of the same directory all succeed (and share fsyncs under the
-        // hood). Each call returns only after a real directory fsync.
-        let mut handles = Vec::new();
+        let mut tasks = Vec::new();
         for _ in 0..32 {
-            let path = dir.path().to_owned();
+            let file = file.clone();
             let tx = coalescer.tx.clone();
-            handles.push(tokio::spawn(async move {
-                let c = DirSyncCoalescer { tx };
-                c.sync_dir(&path).await
+            tasks.push(tokio::spawn(async move {
+                DirSyncCoalescer { tx }.sync_file(file, &test_lease()).await
             }));
         }
-        for h in handles {
-            h.await.unwrap().expect("each coalesced sync must succeed");
+        for task in tasks {
+            task.await.unwrap().unwrap();
         }
     }
 
     #[tokio::test]
-    async fn syncs_distinct_dirs() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        let coalescer = DirSyncCoalescer::spawn();
-        coalescer.sync_dir(a.path()).await.unwrap();
-        coalescer.sync_dir(b.path()).await.unwrap();
+    async fn fallback_syncs_the_same_directory_and_refuses_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Arc::new(crate::open_readonly_nofollow(dir.path()).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let coalescer = DirSyncCoalescer { tx };
+        coalescer.sync_file(file, &test_lease()).await.unwrap();
+        assert!(
+            coalescer
+                .sync_file(Arc::new(tempfile::tempfile().unwrap()), &test_lease())
+                .await
+                .is_err()
+        );
     }
 
-    #[tokio::test]
-    async fn fallback_on_missing_dir_reports_error() {
-        let coalescer = DirSyncCoalescer::spawn();
-        let missing = std::path::Path::new("/nonexistent/cairn/dir/xyz");
-        assert!(
-            coalescer.sync_dir(missing).await.is_err(),
-            "a fsync of a missing directory must surface an error to the waiter"
-        );
+    #[test]
+    fn cancellation_of_waiter_and_coordinator_retains_queued_fsync_ownership() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = Arc::new(crate::open_readonly_nofollow(dir.path()).unwrap());
+            let (started, ready) = oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let (mut watch, lease) = StorageIoWatch::new(
+                StorageToken::generate(),
+                StorageToken::generate(),
+                Arc::new(()),
+            );
+            let (tx, rx) = mpsc::unbounded_channel();
+            let coalescer = DirSyncCoalescer { tx };
+            assert!(coalescer.sync_file(file, &lease).now_or_never().is_none());
+            assert!(run(rx).now_or_never().is_none());
+            drop(lease);
+            assert!(watch.quiescent().now_or_never().is_none());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            watch.quiescent().await;
+        });
     }
 }

@@ -1,40 +1,31 @@
-//! Process-local recovery for storage commits dropped by request cancellation.
+//! One bounded, retained recovery consumer for admitted storage writes (ARCH 8).
 //!
-//! `cairn-protocol` deliberately has no Tokio dependency in its production graph. It therefore
-//! owns only a synchronous callback in its request-local drop guard; this module turns that
-//! callback into a Tokio queue consumed by one retained server worker.
+//! Request Drop only cancels child-I/O admission and queues the exact plan. The worker waits for
+//! actual userspace and kernel quiescence before resolving durable ownership through the Writer.
 
-use cairn_protocol::{
-    MultipartClaimRecovery, MultipartPartWriteRecovery, ObjectWriteRecovery,
-    StorageRecoveryAdmission, StorageRecoveryPermit,
-};
-use cairn_types::id::{StoragePath, UploadId};
+use cairn_protocol::{StorageRecoveryAdmission, StorageRecoveryPermit, StorageWriteRecovery};
 use cairn_types::meta::{ClaimReleaseOutcome, Mutation, MutationOutcome};
-use cairn_types::traits::{BlobStore, MetadataStore};
+use cairn_types::storage::io::StorageIoWatch;
+use cairn_types::storage::{StorageMutation, StorageToken, StorageWriteTarget};
+use cairn_types::traits::{BlobStore, Clock, MetadataStore};
+use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 enum Command {
-    Release(MultipartClaimRecovery),
-    ResolveObjectWrite(ObjectWriteRecovery),
-    ResolveMultipartPartWrite(MultipartPartWriteRecovery),
-    /// Sent only after every accepted HTTP request has finished or been cancelled. FIFO ordering
-    /// then makes the worker consume every preceding recovery command before it exits.
+    Resolve(Box<StorageWriteRecovery>),
     DrainAndStop,
 }
 
-/// The synchronous producer plus single-consumer receiver owned by the server stack.
-///
-/// Sending is non-blocking because it runs from `Drop`, but record cardinality is bounded by
-/// `slots`. A request acquires an owned slot before staging/claiming and transfers that lease
-/// through its guard into the queued command, so sequential waves cannot outrun the worker and
-/// grow memory without bound.
+/// Synchronous Drop remains nonblocking; a slot is held by the request, recovery record and all
+/// actual backend jobs until their last owner stops. The FIFO sentinel follows the HTTP drain.
 pub(crate) struct MultipartClaimRecoveryQueue {
     sender: UnboundedSender<Command>,
     receiver: Mutex<Option<UnboundedReceiver<Command>>>,
     stop_sent: AtomicBool,
+    failed: Arc<AtomicBool>,
     slots: Arc<Semaphore>,
 }
 
@@ -46,356 +37,210 @@ impl MultipartClaimRecoveryQueue {
             sender,
             receiver: Mutex::new(Some(receiver)),
             stop_sent: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
             slots: Arc::new(Semaphore::new(capacity)),
         }
     }
 
-    /// Build async admission to one bounded slot held through worker resolution.
     pub(crate) fn admission_callback(&self) -> StorageRecoveryAdmission {
         let slots = self.slots.clone();
+        let sender = self.sender.clone();
         Arc::new(move || {
             let slots = slots.clone();
+            let sender = sender.clone();
             Box::pin(async move {
-                slots
-                    .acquire_owned()
-                    .await
-                    .ok()
-                    .map(StorageRecoveryPermit::new)
+                if sender.is_closed() {
+                    return None;
+                }
+                let permit = slots.acquire_owned().await.ok()?;
+                if sender.is_closed() {
+                    return None;
+                }
+                Some(StorageRecoveryPermit::new(permit))
             })
         })
     }
 
-    /// Build the runtime-neutral callback injected into `S3Service`.
-    pub(crate) fn callback(&self) -> Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync> {
+    pub(crate) fn callback(&self) -> Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync> {
         let sender = self.sender.clone();
-        Arc::new(
-            move |recovery| match sender.send(Command::Release(recovery)) {
-                Ok(()) => true,
-                Err(_) => {
-                    // This can happen only after the retained worker has exited unexpectedly or
-                    // after the request-drain stop sentinel. Never panic from a request-future
-                    // Drop; `false` lets an explicit error path use its direct-writer fallback.
-                    tracing::error!(
-                        "multipart completion claim recovery queue is unavailable; startup \
-                         recovery is required"
-                    );
-                    false
-                }
-            },
-        )
+        let slots = self.slots.clone();
+        let failed = self.failed.clone();
+        Arc::new(move |record| {
+            if sender.send(Command::Resolve(Box::new(record))).is_ok() {
+                true
+            } else {
+                slots.close();
+                failed.store(true, Ordering::Release);
+                tracing::error!(
+                    "storage recovery queue is unavailable; exclusive startup recovery is required"
+                );
+                false
+            }
+        })
     }
 
-    /// Build the runtime-neutral ordinary PUT/Copy recovery callback injected into `S3Service`.
-    pub(crate) fn object_callback(&self) -> Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync> {
-        let sender = self.sender.clone();
-        Arc::new(
-            move |recovery| match sender.send(Command::ResolveObjectWrite(recovery)) {
-                Ok(()) => true,
-                Err(_) => {
-                    tracing::error!(
-                        "object-write recovery queue is unavailable; startup reconciliation is \
-                         required"
-                    );
-                    false
-                }
-            },
-        )
-    }
-
-    /// Build the runtime-neutral multipart-part recovery callback injected into `S3Service`.
-    pub(crate) fn part_callback(
-        &self,
-    ) -> Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync> {
-        let sender = self.sender.clone();
-        Arc::new(
-            move |recovery| match sender.send(Command::ResolveMultipartPartWrite(recovery)) {
-                Ok(()) => true,
-                Err(_) => {
-                    tracing::error!(
-                        "multipart-part recovery queue is unavailable; startup reconciliation is \
-                         required"
-                    );
-                    false
-                }
-            },
-        )
-    }
-
-    /// Create the one worker future. Taking the receiver twice is a server wiring bug.
     pub(crate) fn worker(
         &self,
         meta: Arc<dyn MetadataStore>,
         blob: Arc<dyn BlobStore>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let receiver = self
+        let mut receiver = self
             .receiver
             .lock()
-            .expect("multipart claim recovery receiver mutex poisoned")
+            .expect("storage recovery receiver mutex poisoned")
             .take()
-            .expect("multipart claim recovery worker may be started only once");
-        recovery_loop(meta, blob, receiver)
+            .expect("storage recovery worker may be started only once");
+        let failed = self.failed.clone();
+        async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    Command::Resolve(record) => {
+                        if let Err(error) = recover_one(&*meta, &*blob, *record).await {
+                            failed.store(true, Ordering::Release);
+                            tracing::error!(%error, "storage ownership remains unresolved; exclusive startup recovery is required");
+                        }
+                    }
+                    Command::DrainAndStop => return,
+                }
+            }
+        }
     }
 
-    /// Tell the worker that all accepted request futures have been joined or cancelled.
-    ///
-    /// Every cancellation callback has returned before this send, so FIFO queue order makes the
-    /// sentinel a consumption barrier. The retained worker is joined by the background supervisor.
     pub(crate) fn finish_requests(&self) {
         if self.stop_sent.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.slots.close();
         if self.sender.send(Command::DrainAndStop).is_err() {
-            tracing::error!("multipart completion claim recovery worker stopped before drain");
+            self.failed.store(true, Ordering::Release);
+            tracing::error!("storage recovery worker stopped before drain");
         }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
     }
 }
 
-async fn recovery_loop(
-    meta: Arc<dyn MetadataStore>,
-    blob: Arc<dyn BlobStore>,
-    mut receiver: UnboundedReceiver<Command>,
-) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            Command::Release(recovery) => {
-                recover_one(&*blob, recovery, {
-                    let meta = meta.clone();
-                    move |mutation| async move { meta.submit(mutation).await }
-                })
-                .await;
-            }
-            Command::ResolveObjectWrite(recovery) => {
-                recover_object_write(&*blob, recovery, {
-                    let meta = meta.clone();
-                    move |mutation| async move { meta.submit(mutation).await }
-                })
-                .await;
-            }
-            Command::ResolveMultipartPartWrite(recovery) => {
-                recover_multipart_part_write(&*blob, recovery, {
-                    let meta = meta.clone();
-                    move |mutation| {
-                        let meta = meta.clone();
-                        async move { meta.submit(mutation).await }
-                    }
-                })
-                .await;
-            }
-            Command::DrainAndStop => return,
-        }
-    }
-}
-
-/// Preserve a committed multipart part, or reclaim its exact attempt artifact and reservation only
-/// after the FIFO writer proves that the current part row does not reference it.
-async fn recover_multipart_part_write<F, Fut>(
+async fn recover_one(
+    meta: &dyn MetadataStore,
     blob: &dyn BlobStore,
-    recovery: MultipartPartWriteRecovery,
-    submit: F,
-) where
-    F: Fn(Mutation) -> Fut,
-    Fut: std::future::Future<Output = Result<MutationOutcome, cairn_types::error::MetaError>>,
-{
-    let upload_id = recovery.upload_id;
-    let part_number = recovery.part_number;
-    let attempt_id = recovery.attempt_id;
-    let storage_path = recovery.storage_path;
-    let _permit = recovery.permit;
-    match submit(Mutation::ResolveMultipartPartWrite {
-        upload_id: upload_id.clone(),
-        part_number,
-        storage_path: storage_path.clone(),
-    })
-    .await
+    mut record: StorageWriteRecovery,
+) -> Result<(), String> {
+    let cancellation = meta
+        .submit(Mutation::Storage {
+            bucket: record.plan.bucket.clone(),
+            operation: StorageMutation::Cancel {
+                attempt: record.plan.attempt.clone(),
+                generation: record.plan.generation.clone(),
+            },
+        })
+        .await;
+    // Even a failed metadata cancellation must wait for old actual I/O before its queue slot can
+    // disappear or shutdown can report this record drained.
+    let proof = record.io.quiescent().await;
+    let (_probe, lease) = StorageIoWatch::new(
+        record.plan.attempt.clone(),
+        record.plan.generation.clone(),
+        Arc::new(record.lifetime.clone()),
+    );
+    blob.confirm_storage_quiescence(&record.plan, lease)
+        .await
+        .map_err(|error| error.to_string())?;
+    match cancellation.map_err(|error| error.to_string())? {
+        MutationOutcome::StorageUpdated { .. } => {}
+        _ => return Err("unexpected storage cancellation outcome".into()),
+    }
+    if let StorageWriteTarget::Completion {
+        upload_id,
+        claim_token,
+        ..
+    } = &record.plan.target
     {
-        Ok(MutationOutcome::MultipartPartWriteResolved { referenced: true }) => {
-            tracing::debug!(%upload_id, part_number, %storage_path, "cancelled multipart part committed");
-        }
-        Ok(MutationOutcome::MultipartPartWriteResolved { referenced: false }) => {
-            if let Err(error) = blob
-                .delete_part_attempt(&upload_id, part_number, &attempt_id)
-                .await
-            {
-                tracing::error!(
-                    %upload_id,
-                    part_number,
-                    %storage_path,
-                    %error,
-                    "uncommitted multipart part could not be reclaimed; startup reconciliation \
-                     is required"
-                );
-                return;
-            }
-            match submit(Mutation::ReleaseMultipartReservation {
+        match meta
+            .submit(Mutation::ReleaseMultipartClaim {
                 upload_id: upload_id.clone(),
-                attempt_id,
+                claim_token: cairn_types::id::MultipartClaimToken::from_string(claim_token.clone()),
             })
             .await
-            {
-                Ok(MutationOutcome::Ack) => {}
-                Ok(outcome) => tracing::error!(
-                    %upload_id,
-                    part_number,
-                    ?outcome,
-                    "unexpected multipart reservation recovery outcome"
-                ),
-                Err(error) => tracing::error!(
-                    %upload_id,
-                    part_number,
-                    %error,
-                    "multipart reservation recovery is ambiguous; startup reconciliation is \
-                     required"
-                ),
-            }
+            .map_err(|error| error.to_string())?
+        {
+            MutationOutcome::MultipartClaimRelease(
+                ClaimReleaseOutcome::Released | ClaimReleaseOutcome::NotOwner,
+            ) => {}
+            _ => return Err("unexpected storage completion release outcome".into()),
         }
-        Ok(outcome) => tracing::error!(
-            %upload_id,
-            part_number,
-            %storage_path,
-            ?outcome,
-            "unexpected multipart-part recovery outcome; startup reconciliation is required"
-        ),
-        Err(error) => tracing::error!(
-            %upload_id,
-            part_number,
-            %storage_path,
-            %error,
-            "multipart-part recovery result is ambiguous; startup reconciliation is required"
-        ),
+    }
+    match meta
+        .submit(Mutation::Storage {
+            bucket: record.plan.bucket,
+            operation: StorageMutation::Resolve { quiescence: proof },
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        MutationOutcome::StorageUpdated { .. } => Ok(()),
+        _ => Err("unexpected storage resolution outcome".into()),
     }
 }
 
-/// Reclaim an ordinary PUT/Copy blob only after the serialized writer proves its exact intended
-/// row id and storage path are absent. A metadata error is ambiguous and deliberately preserves the
-/// file for startup reconciliation.
-async fn recover_object_write<F, Fut>(
+pub(crate) struct StorageCleanupDrain {
+    pub claimed: usize,
+    pub retired: usize,
+}
+
+/// Drain one bounded batch through exact Writer claims. Errors and stale/expired acknowledgements
+/// retain debt and quota; a physical ENOENT still passes through the blob's namespace sync barrier.
+pub(crate) async fn drain_storage_cleanup(
+    meta: &dyn MetadataStore,
     blob: &dyn BlobStore,
-    recovery: ObjectWriteRecovery,
-    submit: F,
-) where
-    F: FnOnce(Mutation) -> Fut,
-    Fut: std::future::Future<Output = Result<MutationOutcome, cairn_types::error::MetaError>>,
-{
-    let bucket = recovery.bucket;
-    let key = recovery.key;
-    let version_id = recovery.version_id;
-    let row_id = recovery.row_id;
-    let storage_path = recovery.storage_path;
-    let _permit = recovery.permit;
-    match submit(Mutation::ResolveObjectWrite {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        version_id,
-        row_id,
-        storage_path: storage_path.clone(),
-    })
-    .await
-    {
-        Ok(MutationOutcome::ObjectWriteResolved { referenced: true }) => {
-            tracing::debug!(%bucket, %key, %storage_path, "cancelled object write committed");
-        }
-        Ok(MutationOutcome::ObjectWriteResolved { referenced: false }) => {
-            if let Err(error) = blob.delete(&storage_path).await {
-                tracing::error!(
-                    %bucket,
-                    %key,
-                    %storage_path,
-                    %error,
-                    "uncommitted object-write blob could not be reclaimed; startup \
-                     reconciliation is required"
+    generation: &StorageToken,
+    node_lifetime: Arc<dyn Send + Sync>,
+    limit: u32,
+) -> Result<StorageCleanupDrain, String> {
+    let clock = cairn_crypto::SystemClock::new();
+    let MutationOutcome::StorageCleanupBatch(batch) = meta
+        .submit(Mutation::ClaimStorageCleanup {
+            generation: generation.clone(),
+            limit,
+            now: clock.now(),
+            lease_secs: 60,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("unexpected storage cleanup claim outcome".into());
+    };
+    let claimed = batch.len();
+    // Keep each physical cleanup and its Writer acknowledgement in the same bounded future.
+    // Concurrent acknowledgements can group-commit; no detached task or extra executor is needed.
+    let mut operations = futures_util::stream::iter(batch)
+        .map(|cleanup| {
+            let node_lifetime = node_lifetime.clone();
+            let clock = &clock;
+            async move {
+                let (_watch, lease) = StorageIoWatch::new(
+                    cleanup.id.clone(), cleanup.generation.clone(), node_lifetime,
                 );
+                if let Err(error) = blob.cleanup_storage(&cleanup, lease).await {
+                    tracing::warn!(%error, cleanup_id = %cleanup.id.as_str(), "storage cleanup remains pending");
+                    return Ok::<bool, String>(false);
+                }
+                match meta.submit(Mutation::Storage {
+                    bucket: cleanup.bucket.clone(),
+                    operation: StorageMutation::FinishCleanup { cleanup, now: clock.now() },
+                }).await.map_err(|error| error.to_string())? {
+                    MutationOutcome::StorageUpdated { applied } => Ok(applied),
+                    _ => Err("unexpected storage cleanup retirement outcome".into()),
+                }
             }
-        }
-        Ok(outcome) => {
-            tracing::error!(
-                %bucket,
-                %key,
-                %storage_path,
-                ?outcome,
-                "unexpected object-write recovery outcome; startup reconciliation is required"
-            );
-        }
-        Err(error) => {
-            tracing::error!(
-                %bucket,
-                %key,
-                %storage_path,
-                %error,
-                "object-write recovery result is ambiguous; startup reconciliation is required"
-            );
-        }
+        })
+        .buffer_unordered(8);
+    let mut retired = 0;
+    while let Some(result) = operations.next().await {
+        retired += usize::from(result?);
     }
-}
-
-/// Apply one conditional release, then reclaim an assembled blob only when that outcome proves the
-/// completion transaction did not consume the session.
-///
-/// A metadata error remains ambiguous, so this worker leaves final resolution to the next startup's
-/// global claim recovery and blob reconciliation. The persisted claim token makes a same-token
-/// retry ownership-safe, but one retained attempt keeps shutdown bounded.
-async fn recover_one<F, Fut>(blob: &dyn BlobStore, recovery: MultipartClaimRecovery, submit: F)
-where
-    F: FnOnce(Mutation) -> Fut,
-    Fut: std::future::Future<Output = Result<MutationOutcome, cairn_types::error::MetaError>>,
-{
-    let upload_id = recovery.upload_id;
-    let claim_token = recovery.claim_token;
-    let assembled_blob = recovery.assembled_blob;
-    let delete_blob_on_not_owner = recovery.delete_blob_on_not_owner;
-    let _permit = recovery.permit;
-    match submit(Mutation::ReleaseMultipartClaim {
-        upload_id: upload_id.clone(),
-        claim_token,
-    })
-    .await
-    {
-        Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)) => {
-            tracing::debug!(%upload_id, "cancelled multipart completion claim released");
-            delete_recovered_blob(blob, &upload_id, assembled_blob).await;
-        }
-        Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)) => {
-            // The completion transaction may have committed and consumed the session. Its object
-            // row can now reference `assembled_blob`, so preserve the path unless the request saw a
-            // typed non-commit outcome and explicitly supplied stronger cleanup proof.
-            if delete_blob_on_not_owner {
-                delete_recovered_blob(blob, &upload_id, assembled_blob).await;
-            }
-        }
-        Ok(outcome) => {
-            tracing::error!(
-                %upload_id,
-                ?outcome,
-                "unexpected multipart completion claim recovery outcome; startup recovery is \
-                 required"
-            );
-        }
-        Err(error) => {
-            tracing::error!(
-                %upload_id,
-                %error,
-                "multipart completion claim recovery result is ambiguous; startup recovery is \
-                 required"
-            );
-        }
-    }
-}
-
-async fn delete_recovered_blob(
-    blob: &dyn BlobStore,
-    upload_id: &UploadId,
-    path: Option<StoragePath>,
-) {
-    if let Some(path) = path
-        && let Err(error) = blob.delete(&path).await
-    {
-        tracing::error!(
-            %upload_id,
-            %path,
-            %error,
-            "released multipart completion left an assembled orphan; startup reconciliation is \
-             required"
-        );
-    }
+    Ok(StorageCleanupDrain { claimed, retired })
 }
 
 #[cfg(test)]
@@ -403,14 +248,26 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use cairn_meta::{ShardedMetadataStore, shard_for_bucket};
-    use cairn_types::blob::StageOptions;
-    use cairn_types::error::MetaError;
-    use cairn_types::id::{BucketName, MultipartClaimToken, ObjectKey, UploadId, UserId};
+    use cairn_types::blob::{
+        BlobCipher, BlobProbe, BlobReadHandle, ByteRange, PartRef, ReadMemoryBound, ReconcileOpts,
+        ReconcileReport, StageOptions, StagedBlob, StagedPart,
+    };
+    use cairn_types::id::{
+        BucketName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, UserId, VersionId,
+    };
     use cairn_types::meta::{
-        ClaimOutcome, MultipartLimits, MultipartSession, MultipartStatus, Mutation, PartRecord,
+        ClaimOutcome, MultipartLimits, MultipartSession, MultipartStatus, PartRecord,
+    };
+    use cairn_types::storage::io::StorageIoLease;
+    use cairn_types::storage::{
+        StorageAdmission, StorageCleanup, StorageCreationPermit, StorageWritePlan,
     };
     use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore};
-    use cairn_types::time::Timestamp;
+    use cairn_types::traits::ReconcileOracle;
+    use cairn_types::{
+        BlobError, BodyStream, ChecksumSet, CompressionDescriptor, SecretKey32, Timestamp,
+    };
+    use futures_util::FutureExt;
     use std::time::Duration;
 
     fn session(upload_id: UploadId, bucket: BucketName, key: &str) -> MultipartSession {
@@ -437,587 +294,976 @@ mod tests {
         }
     }
 
-    async fn claimed(store: &InMemoryMetadataStore, id: &str) -> (UploadId, MultipartClaimToken) {
-        let upload_id = UploadId::from_string(id.to_owned());
-        let claim_token = MultipartClaimToken::generate();
-        store
+    fn object_row(
+        plan: &cairn_types::storage::StorageWritePlan,
+        owner: UserId,
+    ) -> cairn_types::ObjectVersionRow {
+        let (key, version_id, row_id) = match &plan.target {
+            StorageWriteTarget::Object {
+                key,
+                version_id,
+                row_id,
+            }
+            | StorageWriteTarget::Completion {
+                key,
+                version_id,
+                row_id,
+                ..
+            } => (key.clone(), version_id.clone(), row_id.clone()),
+            _ => panic!("object target required"),
+        };
+        cairn_types::ObjectVersionRow {
+            id: row_id,
+            bucket: plan.bucket.clone(),
+            key,
+            version_id,
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: 10,
+            size_physical: 10,
+            etag: cairn_types::ETag::from_string("etag".into()),
+            content_type: "application/octet-stream".into(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_path: Some(plan.final_path().unwrap().clone()),
+            compression: cairn_types::CompressionDescriptor::Uncompressed,
+            storage_class: cairn_types::StorageClass::Standard,
+            cold_locator: None,
+            owner_id: owner,
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            sse_descriptor: None,
+            replication_status: None,
+            internal_sha256: Some("00".repeat(32)),
+            replicated_at: None,
+            created_at: Timestamp(0),
+            updated_at: Timestamp(0),
+        }
+    }
+
+    fn put(row: cairn_types::ObjectVersionRow) -> Mutation {
+        Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Default::default(),
+            initial_state: Default::default(),
+            replication: Vec::new(),
+        }
+    }
+
+    async fn initialize(meta: &dyn MetadataStore, bucket: &BucketName) -> StorageToken {
+        meta.submit(Mutation::CreateBucket(Box::new(cairn_types::Bucket {
+            name: bucket.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(0),
+            versioning: cairn_types::VersioningState::Unversioned,
+            ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
+        let generation = StorageToken::generate();
+        meta.submit(Mutation::BeginStorageGeneration {
+            generation: generation.clone(),
+        })
+        .await
+        .unwrap();
+        generation
+    }
+
+    async fn create_session(meta: &dyn MetadataStore, bucket: &BucketName, key: &str) -> UploadId {
+        match meta
             .submit(Mutation::CreateMultipart {
-                session: Box::new(session(
-                    upload_id.clone(),
-                    BucketName::parse("recovery-bucket").unwrap(),
-                    id,
-                )),
+                session: Box::new(session(UploadId::generate(), bucket.clone(), key)),
                 limits: MultipartLimits::default(),
             })
             .await
+            .unwrap()
+        {
+            MutationOutcome::MultipartCreated(upload_id) => upload_id,
+            outcome => panic!("expected multipart creation, got {outcome:?}"),
+        }
+    }
+
+    fn object_target(key: &str) -> StorageWriteTarget {
+        StorageWriteTarget::Object {
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: VersionId::null(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        }
+    }
+
+    fn completion_target(upload_id: &UploadId, key: &str) -> StorageWriteTarget {
+        StorageWriteTarget::Completion {
+            upload_id: upload_id.clone(),
+            claim_token: MultipartClaimToken::generate().as_str().to_owned(),
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: VersionId::null(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        }
+    }
+
+    fn part_target(upload_id: &UploadId) -> StorageWriteTarget {
+        StorageWriteTarget::Part {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            reservation_id: StorageToken::generate().as_str().to_owned(),
+        }
+    }
+
+    // Use the actual Writer receipt to construct every creation permit. No fixture admission can
+    // manufacture a path without its durable intent or the queue's bounded lifetime ownership.
+    async fn admitted(
+        queue: &MultipartClaimRecoveryQueue,
+        meta: &dyn MetadataStore,
+        blob: &dyn BlobStore,
+        bucket: &BucketName,
+        generation: &StorageToken,
+        target: StorageWriteTarget,
+    ) -> (StorageWriteRecovery, StorageCreationPermit) {
+        let lifetime = (queue.admission_callback())().await.unwrap();
+        let planned = blob
+            .plan_write(bucket.clone(), generation.clone(), target)
             .unwrap();
-        assert!(matches!(
-            store
-                .submit(Mutation::ClaimMultipart {
+        let plan = planned.plan().clone();
+        let (io, lease) = StorageIoWatch::new(
+            plan.attempt.clone(),
+            generation.clone(),
+            Arc::new(lifetime.clone()),
+        );
+        let operation = match &plan.target {
+            StorageWriteTarget::Object { .. } => Mutation::Storage {
+                bucket: bucket.clone(),
+                operation: StorageMutation::Reserve {
+                    plan: Box::new(plan.clone()),
+                    now: Timestamp(1),
+                },
+            },
+            StorageWriteTarget::Part {
+                upload_id,
+                part_number,
+                reservation_id,
+            } => Mutation::AdmitStorageWrite {
+                plan: Box::new(plan.clone()),
+                now: Timestamp(1),
+                operation: Box::new(Mutation::ReserveMultipartPart {
                     upload_id: upload_id.clone(),
-                    claim_token: claim_token.clone(),
-                })
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
-        ));
-        (upload_id, claim_token)
+                    part_number: *part_number,
+                    attempt_id: reservation_id.clone(),
+                    reserved_bytes: 4,
+                    max_parts_per_upload: 10_000,
+                    now: Timestamp(1),
+                }),
+            },
+            StorageWriteTarget::Completion {
+                upload_id,
+                claim_token,
+                ..
+            } => Mutation::AdmitStorageWrite {
+                plan: Box::new(plan.clone()),
+                now: Timestamp(1),
+                operation: Box::new(Mutation::ClaimMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: MultipartClaimToken::from_string(claim_token.clone()),
+                }),
+            },
+        };
+        let receipt = match meta.submit(operation).await.unwrap() {
+            MutationOutcome::StorageAdmission(receipt) => receipt,
+            MutationOutcome::StorageMultipartClaim {
+                admission,
+                claim: ClaimOutcome::Claimed(_),
+            } => admission,
+            outcome => panic!("expected successful storage admission, got {outcome:?}"),
+        };
+        assert!(matches!(receipt, StorageAdmission::Granted(_)));
+        let permit = planned.admit(receipt, lease).unwrap();
+        (StorageWriteRecovery { plan, io, lifetime }, permit)
+    }
+
+    fn body() -> BodyStream {
+        Box::pin(futures_util::stream::once(async {
+            Ok(Bytes::from_static(b"data"))
+        }))
+    }
+
+    fn enqueue(queue: &MultipartClaimRecoveryQueue, record: StorageWriteRecovery) {
+        record.io.cancel();
+        assert!((queue.callback())(record));
+    }
+
+    async fn stop(
+        queue: &MultipartClaimRecoveryQueue,
+        meta: Arc<dyn MetadataStore>,
+        blob: Arc<dyn BlobStore>,
+    ) {
+        queue.finish_requests();
+        queue.finish_requests();
+        tokio::time::timeout(Duration::from_secs(2), queue.worker(meta, blob))
+            .await
+            .expect("FIFO recovery drain");
+        assert!(queue.is_complete());
+    }
+
+    async fn cleanup(
+        meta: &dyn MetadataStore,
+        blob: &dyn BlobStore,
+        generation: &StorageToken,
+    ) -> StorageCleanupDrain {
+        drain_storage_cleanup(meta, blob, generation, Arc::new(()), 100)
+            .await
+            .unwrap()
+    }
+
+    async fn publish_part(
+        meta: &dyn MetadataStore,
+        record: &StorageWriteRecovery,
+        staged: &StagedPart,
+    ) {
+        let StorageWriteTarget::Part {
+            upload_id,
+            part_number,
+            reservation_id,
+        } = &record.plan.target
+        else {
+            panic!("part target")
+        };
+        meta.submit(Mutation::PublishStorageWrite {
+            plan: Box::new(record.plan.clone()),
+            operation: Box::new(Mutation::RecordPart {
+                upload_id: upload_id.clone(),
+                attempt_id: reservation_id.clone(),
+                part: PartRecord {
+                    part_number: *part_number,
+                    size: staged.size,
+                    etag: staged.md5_hex.clone(),
+                    storage_path: staged.storage_path.clone(),
+                    checksum: None,
+                    part_dek: None,
+                },
+            }),
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn stop_sentinel_drains_every_queued_claim_before_worker_exit() {
-        let concrete = Arc::new(InMemoryMetadataStore::new());
-        let (first, first_token) = claimed(&concrete, "cancelled-one").await;
-        let (second, second_token) = claimed(&concrete, "cancelled-two").await;
-        let concrete_blob = Arc::new(InMemoryBlobStore::new());
-        let staged = concrete_blob
-            .stage(
-                &BucketName::parse("recovery-bucket").unwrap(),
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"uncommitted assembly"))
-                })),
-                StageOptions::default(),
-            )
-            .await
-            .unwrap();
-        let staged_object = concrete_blob
-            .stage(
-                &BucketName::parse("object-recovery").unwrap(),
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"unsubmitted put"))
-                })),
-                StageOptions::default(),
-            )
-            .await
-            .unwrap();
+    async fn stop_sentinel_drains_every_admitted_completion_and_object_before_worker_exit() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("recovery-bucket").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
         let queue = MultipartClaimRecoveryQueue::new(3);
-        let callback = queue.callback();
-        let object_callback = queue.object_callback();
-
-        // Enqueue real work before the retained worker starts, then put the stop sentinel behind it.
-        // FIFO ordering must release both claims and reclaim the first request's assembled orphan
-        // before shutdown reports the worker joined.
-        assert!(callback(MultipartClaimRecovery {
-            upload_id: first.clone(),
-            claim_token: first_token,
-            assembled_blob: Some(staged.storage_path),
-            delete_blob_on_not_owner: false,
-            permit: None,
-        }));
-        assert!(callback(MultipartClaimRecovery {
-            upload_id: second.clone(),
-            claim_token: second_token,
-            assembled_blob: None,
-            delete_blob_on_not_owner: false,
-            permit: None,
-        }));
-        assert!(object_callback(ObjectWriteRecovery {
-            bucket: BucketName::parse("object-recovery").unwrap(),
-            key: ObjectKey::parse("object").unwrap(),
-            version_id: cairn_types::VersionId::null(),
-            row_id: "unsubmitted-row".to_owned(),
-            storage_path: staged_object.storage_path,
-            permit: None,
-        }));
-        queue.finish_requests();
-        queue.finish_requests();
-
-        let meta: Arc<dyn MetadataStore> = concrete.clone();
-        let blob: Arc<dyn BlobStore> = concrete_blob.clone();
-        tokio::time::timeout(Duration::from_secs(1), queue.worker(meta, blob))
+        let first = create_session(&*meta, &bucket, "first").await;
+        let second = create_session(&*meta, &bucket, "second").await;
+        for (upload, key) in [(&first, "first"), (&second, "second")] {
+            let (record, permit) = admitted(
+                &queue,
+                &*meta,
+                &*blob,
+                &bucket,
+                &generation,
+                completion_target(upload, key),
+            )
+            .await;
+            blob.assemble(permit, &[], StageOptions::default())
+                .await
+                .unwrap();
+            enqueue(&queue, record);
+        }
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            object_target("put"),
+        )
+        .await;
+        blob.stage(permit, body(), StageOptions::default())
             .await
-            .expect("worker must drain pending commands through the stop sentinel");
-
-        for upload_id in [first, second] {
+            .unwrap();
+        enqueue(&queue, record);
+        stop(&queue, meta.clone(), blob.clone()).await;
+        for upload in [first, second] {
             assert_eq!(
-                concrete
-                    .get_multipart(&upload_id)
-                    .await
-                    .unwrap()
-                    .expect("recovered session remains")
-                    .status,
+                meta.get_multipart(&upload).await.unwrap().unwrap().status,
                 MultipartStatus::Active
             );
         }
         assert_eq!(
-            concrete_blob.blob_count(),
-            0,
-            "a writer-confirmed release proves the assembled blob is orphaned"
+            blob.blob_count(),
+            3,
+            "resolution records debt before physical reclamation"
         );
+        let drained = cleanup(&*meta, &*blob, &generation).await;
+        assert!(drained.claimed >= 3);
+        assert_eq!(drained.claimed, drained.retired);
+        assert_eq!(blob.blob_count(), 0);
+        assert_eq!(cleanup(&*meta, &*blob, &generation).await.claimed, 0);
     }
 
     #[tokio::test]
-    async fn object_write_recovery_preserves_referenced_and_ambiguous_paths() {
-        let blob = InMemoryBlobStore::new();
-        let bucket = BucketName::parse("object-recovery").unwrap();
-        let referenced = blob
-            .stage(
+    async fn acknowledged_or_ack_lost_object_publication_preserves_referenced_path() {
+        for lose_ack in [false, true] {
+            let meta = Arc::new(InMemoryMetadataStore::new());
+            let blob = Arc::new(InMemoryBlobStore::new());
+            let bucket = BucketName::parse("committed-recovery").unwrap();
+            let generation = initialize(&*meta, &bucket).await;
+            let queue = MultipartClaimRecoveryQueue::new(1);
+            let (record, permit) = admitted(
+                &queue,
+                &*meta,
+                &*blob,
                 &bucket,
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"committed"))
-                })),
-                StageOptions::default(),
+                &generation,
+                object_target("put"),
             )
-            .await
-            .unwrap();
-        let ambiguous = blob
-            .stage(
-                &bucket,
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"unknown"))
-                })),
-                StageOptions::default(),
-            )
-            .await
-            .unwrap();
-        let recovery = |storage_path| ObjectWriteRecovery {
-            bucket: bucket.clone(),
-            key: ObjectKey::parse("object").unwrap(),
-            version_id: cairn_types::VersionId::null(),
-            row_id: "row".to_owned(),
-            storage_path,
-            permit: None,
-        };
+            .await;
+            let staged = blob
+                .stage(permit, body(), StageOptions::default())
+                .await
+                .unwrap();
+            let mut row = object_row(&record.plan, UserId("owner".into()));
+            row.size_logical = staged.size_logical;
+            row.size_physical = staged.size_physical;
+            row.etag = staged.etag;
+            row.internal_sha256 = Some(staged.internal_sha256);
+            if lose_ack {
+                meta.fail_next_object_put_ack();
+            }
+            let outcome = meta
+                .submit(Mutation::PublishStorageWrite {
+                    plan: Box::new(record.plan.clone()),
+                    operation: Box::new(put(row)),
+                })
+                .await;
+            assert_eq!(outcome.is_err(), lose_ack);
+            enqueue(&queue, record);
+            stop(&queue, meta.clone(), blob.clone()).await;
+            cleanup(&*meta, &*blob, &generation).await;
+            assert_eq!(blob.get_bytes(&staged.storage_path), Some(b"data".to_vec()));
+            assert_eq!(
+                meta.current_version(&bucket, &ObjectKey::parse("put").unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_path,
+                Some(staged.storage_path)
+            );
+        }
+    }
 
-        recover_object_write(
-            &blob,
-            recovery(referenced.storage_path.clone()),
-            |_| async { Ok(MutationOutcome::ObjectWriteResolved { referenced: true }) },
+    #[tokio::test]
+    async fn bounded_admission_and_sentinel_wait_for_actual_io_lease_drain() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("bounded-recovery").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            object_target("put"),
         )
         .await;
-        recover_object_write(&blob, recovery(ambiguous.storage_path.clone()), |_| async {
-            Err(MetaError::Engine("writer unavailable".to_owned()))
-        })
-        .await;
-
-        assert!(blob.get_bytes(&referenced.storage_path).is_some());
-        assert!(blob.get_bytes(&ambiguous.storage_path).is_some());
-    }
-
-    #[tokio::test]
-    async fn bounded_admission_is_held_until_the_worker_resolves_a_record() {
-        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (_, lease) = permit.into_parts();
+        let actual_io = lease.try_child().unwrap();
+        drop(lease);
+        enqueue(&queue, record);
         let admission = queue.admission_callback();
-        let permit = admission()
-            .await
-            .expect("first request acquires the only slot");
-        let waiting = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission().await }
-        });
-        tokio::task::yield_now().await;
+        assert!(admission().now_or_never().is_none());
+        let mut worker = Box::pin(queue.worker(meta.clone(), blob.clone()));
+        assert!(worker.as_mut().now_or_never().is_none());
         assert!(
-            !waiting.is_finished(),
-            "a sequential request cannot create another retained record while capacity is full"
+            actual_io.try_child().is_err(),
+            "request cancellation fences new child I/O"
         );
-
-        let blob = Arc::new(InMemoryBlobStore::new());
-        let staged = blob
-            .stage(
-                &BucketName::parse("bounded-recovery").unwrap(),
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"uncommitted"))
-                })),
-                StageOptions::default(),
-            )
+        assert_eq!(
+            cleanup(&*meta, &*blob, &generation).await.claimed,
+            0,
+            "unfinished I/O cannot become cleanup debt"
+        );
+        assert!(admission().now_or_never().is_none());
+        queue.finish_requests();
+        assert!(
+            admission().await.is_none(),
+            "shutdown closes request admission"
+        );
+        assert!(
+            worker.as_mut().now_or_never().is_none(),
+            "sentinel cannot pass outstanding I/O"
+        );
+        drop(actual_io);
+        tokio::time::timeout(Duration::from_secs(2), worker)
             .await
             .unwrap();
-        assert!(queue.object_callback()(ObjectWriteRecovery {
-            bucket: BucketName::parse("bounded-recovery").unwrap(),
-            key: ObjectKey::parse("object").unwrap(),
-            version_id: cairn_types::VersionId::null(),
-            row_id: "unsubmitted-row".to_owned(),
-            storage_path: staged.storage_path,
-            permit: Some(permit),
-        }));
-        queue.finish_requests();
-        let meta: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-        let blob_store: Arc<dyn BlobStore> = blob;
-        queue.worker(meta, blob_store).await;
-
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), waiting)
-                .await
-                .expect("worker completion releases the retained slot")
-                .unwrap()
-                .is_some()
-        );
+        assert!(queue.is_complete());
+        assert!(cleanup(&*meta, &*blob, &generation).await.retired > 0);
     }
 
     #[tokio::test]
-    async fn part_worker_reclaims_only_a_proven_unreferenced_attempt_and_reservation() {
-        let concrete = Arc::new(InMemoryMetadataStore::new());
-        let upload_id = UploadId::from_string("uncommitted-part".to_owned());
-        concrete
-            .submit(Mutation::CreateMultipart {
-                session: Box::new(session(
-                    upload_id.clone(),
-                    BucketName::parse("recovery-bucket").unwrap(),
-                    "object",
-                )),
-                limits: MultipartLimits::default(),
-            })
+    async fn part_resolution_retains_quota_debt_until_exact_physical_cleanup() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("part-recovery").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        meta.submit(Mutation::SetBucketQuota {
+            bucket: bucket.clone(),
+            quota_bytes: Some(4),
+        })
+        .await
+        .unwrap();
+        let upload = create_session(&*meta, &bucket, "part").await;
+        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            part_target(&upload),
+        )
+        .await;
+        blob.stage_part(permit, body(), ChecksumSet::default(), 4, None)
             .await
             .unwrap();
-        concrete
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                attempt_id: "attempt-a".to_owned(),
+        enqueue(&queue, record);
+        stop(&queue, meta.clone(), blob.clone()).await;
+        assert_eq!(blob.multipart_part_count(), 1);
+        assert!(
+            meta.enumerate_stale_multipart_reservations(Timestamp(3), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let retry = blob
+            .plan_write(bucket.clone(), generation.clone(), part_target(&upload))
+            .unwrap();
+        let StorageWriteTarget::Part {
+            part_number,
+            reservation_id,
+            ..
+        } = &retry.plan().target
+        else {
+            panic!("part target")
+        };
+        let reserve_retry = Mutation::AdmitStorageWrite {
+            plan: Box::new(retry.plan().clone()),
+            now: Timestamp(3),
+            operation: Box::new(Mutation::ReserveMultipartPart {
+                upload_id: upload.clone(),
+                part_number: *part_number,
+                attempt_id: reservation_id.clone(),
                 reserved_bytes: 4,
                 max_parts_per_upload: 10_000,
-                now: Timestamp(2),
-            })
-            .await
-            .unwrap();
-        let blob = Arc::new(InMemoryBlobStore::new());
-        let staged = blob
-            .stage_part(
-                &upload_id,
-                1,
-                "attempt-a",
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"part"))
-                })),
-                cairn_types::ChecksumSet::default(),
-                4,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(blob.multipart_part_count(), 1);
-
-        let queue = MultipartClaimRecoveryQueue::new(1);
-        let permit = (queue.admission_callback())().await.expect("recovery slot");
-        assert!(queue.part_callback()(MultipartPartWriteRecovery {
-            upload_id: upload_id.clone(),
-            part_number: 1,
-            attempt_id: "attempt-a".to_owned(),
-            storage_path: staged.storage_path,
-            permit: Some(permit),
-        }));
-        queue.finish_requests();
-        let meta: Arc<dyn MetadataStore> = concrete.clone();
-        let blob_store: Arc<dyn BlobStore> = blob.clone();
-        queue.worker(meta, blob_store).await;
-
+                now: Timestamp(3),
+            }),
+        };
+        assert!(
+            matches!(
+                meta.submit(reserve_retry.clone()).await,
+                Err(cairn_types::MetaError::QuotaExceeded)
+            ),
+            "unremoved part bytes remain charged after reservation resolution"
+        );
+        let drained = cleanup(&*meta, &*blob, &generation).await;
+        assert_eq!(drained.claimed, drained.retired);
         assert_eq!(blob.multipart_part_count(), 0);
         assert!(
-            concrete
-                .enumerate_stale_multipart_reservations(Timestamp(3), 10)
-                .await
-                .unwrap()
-                .is_empty(),
-            "referenced:false cleanup must release the exact durable reservation"
+            matches!(
+                meta.submit(reserve_retry).await.unwrap(),
+                MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+            ),
+            "physical cleanup and exact retirement release the quota charge"
         );
     }
 
     #[tokio::test]
     async fn delayed_old_part_recovery_cannot_delete_a_superseding_retry() {
-        let concrete = Arc::new(InMemoryMetadataStore::new());
-        let upload_id = UploadId::from_string("part-retry-aba".to_owned());
-        concrete
-            .submit(Mutation::CreateMultipart {
-                session: Box::new(session(
-                    upload_id.clone(),
-                    BucketName::parse("recovery-bucket").unwrap(),
-                    "object",
-                )),
-                limits: MultipartLimits::default(),
-            })
-            .await
-            .unwrap();
+        let meta = Arc::new(InMemoryMetadataStore::new());
         let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("part-retry").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let upload = create_session(&*meta, &bucket, "part").await;
+        let queue = MultipartClaimRecoveryQueue::new(2);
         let mut paths = Vec::new();
-        for (attempt, bytes, now) in [
-            ("attempt-old", Bytes::from_static(b"old!"), Timestamp(2)),
-            ("attempt-new", Bytes::from_static(b"new!"), Timestamp(3)),
-        ] {
-            concrete
-                .submit(Mutation::ReserveMultipartPart {
-                    upload_id: upload_id.clone(),
-                    part_number: 1,
-                    attempt_id: attempt.to_owned(),
-                    reserved_bytes: 4,
-                    max_parts_per_upload: 10_000,
-                    now,
-                })
-                .await
-                .unwrap();
+        for bytes in [b"old!", b"new!"] {
+            let (record, permit) = admitted(
+                &queue,
+                &*meta,
+                &*blob,
+                &bucket,
+                &generation,
+                part_target(&upload),
+            )
+            .await;
             let staged = blob
                 .stage_part(
-                    &upload_id,
-                    1,
-                    attempt,
-                    Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
-                    cairn_types::ChecksumSet::default(),
+                    permit,
+                    Box::pin(futures_util::stream::once(async move {
+                        Ok(Bytes::copy_from_slice(bytes))
+                    })),
+                    ChecksumSet::default(),
                     4,
                     None,
                 )
                 .await
                 .unwrap();
-            concrete
-                .submit(Mutation::RecordPart {
-                    upload_id: upload_id.clone(),
-                    attempt_id: attempt.to_owned(),
-                    part: PartRecord {
-                        part_number: 1,
-                        size: 4,
-                        etag: attempt.to_owned(),
-                        storage_path: staged.storage_path.clone(),
-                        checksum: None,
-                        part_dek: None,
-                    },
-                })
-                .await
-                .unwrap();
+            publish_part(&*meta, &record, &staged).await;
             paths.push(staged.storage_path);
+            enqueue(&queue, record);
         }
-        assert_eq!(blob.multipart_part_count(), 2);
-
-        let queue = MultipartClaimRecoveryQueue::new(1);
-        assert!(queue.part_callback()(MultipartPartWriteRecovery {
-            upload_id: upload_id.clone(),
-            part_number: 1,
-            attempt_id: "attempt-old".to_owned(),
-            storage_path: paths[0].clone(),
-            permit: None,
-        }));
-        queue.finish_requests();
-        let meta: Arc<dyn MetadataStore> = concrete.clone();
-        let blob_store: Arc<dyn BlobStore> = blob.clone();
-        queue.worker(meta, blob_store).await;
-
+        stop(&queue, meta.clone(), blob.clone()).await;
+        cleanup(&*meta, &*blob, &generation).await;
+        assert_eq!(blob.multipart_part_count(), 1);
         assert_eq!(
-            blob.multipart_part_count(),
-            1,
-            "delayed recovery must reclaim only the old attempt artifact"
-        );
-        assert_eq!(
-            concrete
-                .submit(Mutation::ResolveMultipartPartWrite {
-                    upload_id,
-                    part_number: 1,
-                    storage_path: paths[1].clone(),
-                })
-                .await
-                .unwrap(),
+            meta.submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: upload.clone(),
+                part_number: 1,
+                storage_path: paths[1].clone()
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartPartWriteResolved { referenced: true }
         );
+        let next_queue = MultipartClaimRecoveryQueue::new(1);
+        let (record, permit) = admitted(
+            &next_queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            completion_target(&upload, "part"),
+        )
+        .await;
+        let assembled = blob
+            .assemble(
+                permit,
+                &[PartRef {
+                    part_number: 1,
+                    storage_path: paths[1].clone(),
+                    size: 4,
+                    cipher: BlobCipher::KnownPlaintext,
+                }],
+                StageOptions::default(),
+            )
+            .await
+            .expect("new authoritative part remains physically readable");
+        assert_eq!(
+            blob.get_bytes(&assembled.storage_path),
+            Some(b"new!".to_vec())
+        );
+        recover_one(&*meta, &*blob, record).await.unwrap();
     }
 
     #[tokio::test]
-    async fn delayed_old_token_release_cannot_affect_a_new_claim_owner() {
-        let concrete = Arc::new(InMemoryMetadataStore::new());
-        let (upload_id, first_token) = claimed(&concrete, "ambiguous-release").await;
-        let blob = InMemoryBlobStore::new();
-        let stale_recovery = MultipartClaimRecovery {
-            upload_id: upload_id.clone(),
-            claim_token: first_token,
-            assembled_blob: None,
-            delete_blob_on_not_owner: false,
-            permit: None,
+    async fn completion_ack_loss_preserves_published_assembly_and_reclaims_only_parts() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("completion-ack-loss").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let upload = create_session(&*meta, &bucket, "complete").await;
+        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (part, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            part_target(&upload),
+        )
+        .await;
+        let staged_part = blob
+            .stage_part(permit, body(), ChecksumSet::default(), 4, None)
+            .await
+            .unwrap();
+        publish_part(&*meta, &part, &staged_part).await;
+        drop(part);
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            completion_target(&upload, "complete"),
+        )
+        .await;
+        let staged = blob
+            .assemble(
+                permit,
+                &[PartRef {
+                    part_number: 1,
+                    storage_path: staged_part.storage_path,
+                    size: 4,
+                    cipher: BlobCipher::KnownPlaintext,
+                }],
+                StageOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut row = object_row(&record.plan, UserId("owner".into()));
+        row.size_logical = staged.size_logical;
+        row.size_physical = staged.size_physical;
+        row.etag = staged.etag;
+        row.internal_sha256 = Some(staged.internal_sha256);
+        let StorageWriteTarget::Completion { claim_token, .. } = &record.plan.target else {
+            panic!("completion target")
         };
-
-        // Model a remote commit/ack ambiguity: the first submit really releases the old owner, but
-        // its caller receives an engine error.
-        recover_one(&blob, stale_recovery.clone(), {
-            let concrete = concrete.clone();
-            move |mutation| async move {
-                assert!(matches!(
-                    concrete.submit(mutation).await.unwrap(),
-                    MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)
-                ));
-                Err(MetaError::Engine("commit acknowledgement lost".to_owned()))
-            }
-        })
-        .await;
-
-        // A retrying client now owns `completing` under a new token. A delayed at-least-once
-        // recovery of the old token must be a harmless NotOwner, never an ABA release.
-        let second_token = MultipartClaimToken::generate();
-        assert!(matches!(
-            concrete
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: upload_id.clone(),
-                    claim_token: second_token,
-                })
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
-        ));
-        recover_one(&blob, stale_recovery, {
-            let concrete = concrete.clone();
-            move |mutation| async move { concrete.submit(mutation).await }
-        })
-        .await;
+        meta.fail_next_multipart_complete_ack();
+        assert!(
+            meta.submit(Mutation::PublishStorageWrite {
+                plan: Box::new(record.plan.clone()),
+                operation: Box::new(Mutation::CompleteMultipart {
+                    upload_id: upload.clone(),
+                    claim_token: MultipartClaimToken::from_string(claim_token.clone()),
+                    row: Box::new(row),
+                    precondition: Default::default(),
+                    replication: Vec::new(),
+                }),
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            meta.get_multipart(&upload).await.unwrap().is_none(),
+            "completion committed despite its lost acknowledgement"
+        );
+        enqueue(&queue, record);
+        stop(&queue, meta.clone(), blob.clone()).await;
+        cleanup(&*meta, &*blob, &generation).await;
+        assert_eq!(blob.multipart_part_count(), 0);
+        assert_eq!(blob.get_bytes(&staged.storage_path), Some(b"data".to_vec()));
         assert_eq!(
-            concrete
-                .get_multipart(&upload_id)
+            meta.current_version(&bucket, &ObjectKey::parse("complete").unwrap())
                 .await
                 .unwrap()
-                .expect("new claimant owns the session")
-                .status,
+                .unwrap()
+                .storage_path,
+            Some(staged.storage_path)
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_old_completion_token_cannot_release_a_new_owner() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let bucket = BucketName::parse("completion-retry").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let upload = create_session(&*meta, &bucket, "complete").await;
+        let queue = MultipartClaimRecoveryQueue::new(2);
+        let (old, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            completion_target(&upload, "complete"),
+        )
+        .await;
+        blob.assemble(permit, &[], StageOptions::default())
+            .await
+            .unwrap();
+        // Retain the old recovery record across a release/retry, modelling a lost release reply.
+        recover_one(&*meta, &*blob, old.clone()).await.unwrap();
+        let (new, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            completion_target(&upload, "complete"),
+        )
+        .await;
+        let staged = blob
+            .assemble(permit, &[], StageOptions::default())
+            .await
+            .unwrap();
+        enqueue(&queue, old);
+        stop(&queue, meta.clone(), blob.clone()).await;
+        cleanup(&*meta, &*blob, &generation).await;
+        assert_eq!(
+            meta.get_multipart(&upload).await.unwrap().unwrap().status,
             MultipartStatus::Completing
         );
-    }
-
-    #[tokio::test]
-    async fn not_owner_preserves_ambiguous_path_but_deletes_one_proven_unreferenced() {
-        let blob = Arc::new(InMemoryBlobStore::new());
-        let possibly_committed = blob
-            .stage(
-                &BucketName::parse("recovery-bucket").unwrap(),
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"possibly committed"))
-                })),
-                StageOptions::default(),
-            )
-            .await
-            .unwrap();
-        let proven_unreferenced = blob
-            .stage(
-                &BucketName::parse("recovery-bucket").unwrap(),
-                Box::pin(futures_util::stream::once(async {
-                    Ok(Bytes::from_static(b"typed non-commit"))
-                })),
-                StageOptions::default(),
-            )
-            .await
-            .unwrap();
-        let queue = MultipartClaimRecoveryQueue::new(2);
-        let callback = queue.callback();
-        assert!(callback(MultipartClaimRecovery {
-            upload_id: UploadId::from_string("already-terminal".to_owned()),
-            claim_token: MultipartClaimToken::generate(),
-            assembled_blob: Some(possibly_committed.storage_path.clone()),
-            delete_blob_on_not_owner: false,
-            permit: None,
-        }));
-        assert!(callback(MultipartClaimRecovery {
-            upload_id: UploadId::from_string("typed-not-owner".to_owned()),
-            claim_token: MultipartClaimToken::generate(),
-            assembled_blob: Some(proven_unreferenced.storage_path.clone()),
-            delete_blob_on_not_owner: true,
-            permit: None,
-        }));
-        queue.finish_requests();
-
-        let meta: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-        let blob_store: Arc<dyn BlobStore> = blob.clone();
-        queue.worker(meta, blob_store).await;
-
         assert!(
-            blob.get_bytes(&possibly_committed.storage_path).is_some(),
-            "NotOwner can mean Complete committed, so recovery must preserve its blob"
+            blob.get_bytes(&staged.storage_path).is_some(),
+            "new completer still owns its assembly"
         );
-        assert!(
-            blob.get_bytes(&proven_unreferenced.storage_path).is_none(),
-            "typed non-commit proof permits cleanup despite NotOwner"
+        recover_one(&*meta, &*blob, new).await.unwrap();
+        assert_eq!(
+            meta.get_multipart(&upload).await.unwrap().unwrap().status,
+            MultipartStatus::Active
         );
     }
 
     #[tokio::test]
-    async fn retained_worker_routes_encoded_upload_to_a_nonzero_shard() {
+    async fn retained_worker_routes_admission_release_and_cleanup_to_nonzero_shard() {
         let inner: Vec<Arc<InMemoryMetadataStore>> = (0..3)
             .map(|_| Arc::new(InMemoryMetadataStore::new()))
             .collect();
-        let routed: Vec<Arc<dyn MetadataStore>> = inner
-            .iter()
-            .cloned()
-            .map(|store| store as Arc<dyn MetadataStore>)
-            .collect();
-        let router = Arc::new(ShardedMetadataStore::new(routed));
+        let router = Arc::new(ShardedMetadataStore::new(
+            inner
+                .iter()
+                .cloned()
+                .map(|store| store as Arc<dyn MetadataStore>)
+                .collect(),
+        ));
         let bucket = BucketName::parse("charlie").unwrap();
         assert_eq!(shard_for_bucket(bucket.as_str(), 3), 1);
-        let created = router
-            .submit(Mutation::CreateMultipart {
-                session: Box::new(session(UploadId::generate(), bucket, "nonzero")),
-                limits: MultipartLimits::default(),
-            })
+        let generation = initialize(&*router, &bucket).await;
+        let upload = create_session(&*router, &bucket, "complete").await;
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let queue = MultipartClaimRecoveryQueue::new(2);
+        let (part, permit) = admitted(
+            &queue,
+            &*router,
+            &*blob,
+            &bucket,
+            &generation,
+            part_target(&upload),
+        )
+        .await;
+        let staged = blob
+            .stage_part(permit, body(), ChecksumSet::default(), 4, None)
             .await
             .unwrap();
-        let upload_id = match created {
-            MutationOutcome::MultipartCreated(upload_id) => upload_id,
-            outcome => panic!("expected MultipartCreated, got {outcome:?}"),
-        };
-        router
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                attempt_id: "routed-attempt".to_owned(),
-                reserved_bytes: 4,
-                max_parts_per_upload: 10_000,
-                now: Timestamp(2),
-            })
-            .await
-            .unwrap();
-        let routed_path = StoragePath::from_string(format!(
-            ".staging/multipart/{}/00001-routed-attempt",
-            upload_id.as_str()
-        ));
-        router
-            .submit(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: "routed-attempt".to_owned(),
-                part: PartRecord {
-                    part_number: 1,
-                    size: 4,
-                    etag: "etag".to_owned(),
-                    storage_path: routed_path.clone(),
-                    checksum: None,
-                    part_dek: None,
-                },
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            router
-                .submit(Mutation::ResolveMultipartPartWrite {
-                    upload_id: upload_id.clone(),
-                    part_number: 1,
-                    storage_path: routed_path,
-                })
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartPartWriteResolved { referenced: true },
-            "encoded upload ids must route exact part resolution to their bucket shard"
-        );
-        let claim_token = MultipartClaimToken::generate();
-        assert!(matches!(
-            router
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: upload_id.clone(),
-                    claim_token: claim_token.clone(),
-                })
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
-        ));
-
-        let queue = MultipartClaimRecoveryQueue::new(1);
-        assert!(queue.callback()(MultipartClaimRecovery {
-            upload_id: upload_id.clone(),
-            claim_token,
-            assembled_blob: None,
-            delete_blob_on_not_owner: false,
-            permit: None,
-        }));
-        queue.finish_requests();
-        let meta: Arc<dyn MetadataStore> = router.clone();
-        let blob: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-        queue.worker(meta, blob).await;
-
+        publish_part(&*router, &part, &staged).await;
+        enqueue(&queue, part);
+        let (record, permit) = admitted(
+            &queue,
+            &*router,
+            &*blob,
+            &bucket,
+            &generation,
+            completion_target(&upload, "complete"),
+        )
+        .await;
+        drop(permit);
+        enqueue(&queue, record);
+        stop(&queue, router.clone(), blob.clone()).await;
+        cleanup(&*router, &*blob, &generation).await;
         assert_eq!(
             inner[1]
-                .get_multipart(&upload_id)
+                .get_multipart(&upload)
                 .await
                 .unwrap()
-                .expect("session lives on nonzero shard")
+                .unwrap()
                 .status,
             MultipartStatus::Active
         );
-        assert!(inner[0].get_multipart(&upload_id).await.unwrap().is_none());
-        assert!(inner[2].get_multipart(&upload_id).await.unwrap().is_none());
+        assert!(inner[0].get_multipart(&upload).await.unwrap().is_none());
+        assert!(inner[2].get_multipart(&upload).await.unwrap().is_none());
+        assert_eq!(
+            blob.multipart_part_count(),
+            1,
+            "committed part on its bucket shard survives recovery"
+        );
+    }
+
+    // Recovery probes can outlive their async caller just like blocking/kernel operations. The
+    // double retains the real lease in a detached task, so queue/admission assertions exercise
+    // actual lifetime ownership, including a failed or cancelled probe future.
+    struct ControlledProbeBlob {
+        inner: InMemoryBlobStore,
+        entered: tokio::sync::Notify,
+        release: Arc<Semaphore>,
+        fail_early: bool,
+    }
+
+    impl ControlledProbeBlob {
+        fn new(fail_early: bool) -> Self {
+            Self {
+                inner: InMemoryBlobStore::new(),
+                entered: tokio::sync::Notify::new(),
+                release: Arc::new(Semaphore::new(0)),
+                fail_early,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ControlledProbeBlob {
+        fn read_memory_bound(
+            &self,
+            compression: &CompressionDescriptor,
+            encrypted: bool,
+            logical_len: u64,
+        ) -> Result<ReadMemoryBound, BlobError> {
+            self.inner
+                .read_memory_bound(compression, encrypted, logical_len)
+        }
+        async fn stage(
+            &self,
+            permit: StorageCreationPermit,
+            body: BodyStream,
+            opts: StageOptions,
+        ) -> Result<StagedBlob, BlobError> {
+            self.inner.stage(permit, body, opts).await
+        }
+        async fn open_raw(
+            &self,
+            path: &StoragePath,
+            range: Option<ByteRange>,
+            cipher: BlobCipher,
+            compression: &CompressionDescriptor,
+            expected_logical_len: u64,
+        ) -> Result<BlobReadHandle, BlobError> {
+            self.inner
+                .open_raw(path, range, cipher, compression, expected_logical_len)
+                .await
+        }
+        async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError> {
+            self.inner.probe(path).await
+        }
+        async fn confirm_storage_quiescence(
+            &self,
+            plan: &StorageWritePlan,
+            lease: StorageIoLease,
+        ) -> Result<(), BlobError> {
+            assert!(lease.owns(&plan.attempt, &plan.generation));
+            let child = lease.try_child()?;
+            let release = self.release.clone();
+            let task = tokio::spawn(async move {
+                let _actual_io = child;
+                let _permit = release.acquire().await.unwrap();
+            });
+            self.entered.notify_one();
+            if self.fail_early {
+                return Err(BlobError::Io("quiescence probe failed".into()));
+            }
+            task.await.unwrap();
+            self.inner.confirm_storage_quiescence(plan, lease).await
+        }
+        async fn cleanup_storage(
+            &self,
+            cleanup: &StorageCleanup,
+            lease: StorageIoLease,
+        ) -> Result<(), BlobError> {
+            self.inner.cleanup_storage(cleanup, lease).await
+        }
+        async fn stage_part(
+            &self,
+            permit: StorageCreationPermit,
+            body: BodyStream,
+            checksums: ChecksumSet,
+            size_ceiling: u64,
+            encryption: Option<SecretKey32>,
+        ) -> Result<StagedPart, BlobError> {
+            self.inner
+                .stage_part(permit, body, checksums, size_ceiling, encryption)
+                .await
+        }
+        async fn assemble(
+            &self,
+            permit: StorageCreationPermit,
+            parts: &[PartRef],
+            opts: StageOptions,
+        ) -> Result<StagedBlob, BlobError> {
+            self.inner.assemble(permit, parts, opts).await
+        }
+        async fn reconcile(
+            &self,
+            oracle: &dyn ReconcileOracle,
+            opts: ReconcileOpts,
+            lease: StorageIoLease,
+        ) -> Result<ReconcileReport, BlobError> {
+            self.inner.reconcile(oracle, opts, lease).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_probe_preserves_ambiguous_path_and_retains_capacity_until_actual_probe_stops() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(ControlledProbeBlob::new(true));
+        let bucket = BucketName::parse("failed-probe").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            object_target("put"),
+        )
+        .await;
+        let staged = blob
+            .stage(permit, body(), StageOptions::default())
+            .await
+            .unwrap();
+        enqueue(&queue, record);
+        let mut worker = Box::pin(queue.worker(meta.clone(), blob.clone()));
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert!(
+            !queue.is_complete(),
+            "failed quiescence must make shutdown incomplete"
+        );
+        let admission = queue.admission_callback();
+        assert!(
+            admission().now_or_never().is_none(),
+            "failed probe still has actual backend work"
+        );
+        assert_eq!(cleanup(&*meta, &*blob, &generation).await.claimed, 0);
+        assert!(blob.inner.get_bytes(&staged.storage_path).is_some());
+        blob.release.add_permits(1);
+        let permit = tokio::time::timeout(Duration::from_secs(2), admission())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        queue.finish_requests();
+        worker.await;
+        assert!(!queue.is_complete());
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_probe_keeps_capacity_charged_until_detached_work_stops() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blob = Arc::new(ControlledProbeBlob::new(false));
+        let bucket = BucketName::parse("cancelled-probe").unwrap();
+        let generation = initialize(&*meta, &bucket).await;
+        let queue = MultipartClaimRecoveryQueue::new(1);
+        let (record, permit) = admitted(
+            &queue,
+            &*meta,
+            &*blob,
+            &bucket,
+            &generation,
+            object_target("put"),
+        )
+        .await;
+        drop(permit);
+        enqueue(&queue, record);
+        let worker = tokio::spawn(queue.worker(meta.clone(), blob.clone()));
+        blob.entered.notified().await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            queue.slots.available_permits(),
+            0,
+            "worker cancellation cannot uncharge a detached probe"
+        );
+        assert_eq!(cleanup(&*meta, &*blob, &generation).await.claimed, 0);
+        blob.release.add_permits(1);
+        let slot =
+            tokio::time::timeout(Duration::from_secs(2), queue.slots.clone().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(slot);
+        assert!(
+            (queue.admission_callback())().await.is_none(),
+            "dead consumer refuses new writes"
+        );
+        queue.finish_requests();
+        assert!(!queue.is_complete());
     }
 }

@@ -1,4 +1,5 @@
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::traits::MetadataStore;
 use cairn_types::*;
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use tokio::sync::Barrier;
 
 fn object_row(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId) -> ObjectVersionRow {
     ObjectVersionRow {
-        id: format!("race-{}-{}", key.as_str(), version_id.as_str()),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: version_id.clone(),
@@ -21,11 +22,7 @@ fn object_row(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId) -> O
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(StoragePath::from_string(format!(
-            "{}/race-{}",
-            bucket.as_str(),
-            key.as_str()
-        ))),
+        storage_path: Some(StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -44,32 +41,37 @@ fn object_row(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId) -> O
 
 async fn put_with_retention(
     store: &Arc<dyn MetadataStore>,
+    fixture: &PublicationFixture,
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
     retain_until: Timestamp,
 ) {
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(object_row(bucket, key, version_id)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState {
-                tags: Vec::new(),
-                lock_intent: ExplicitObjectLockIntent {
-                    retention: Some(ObjectRetention {
-                        mode: ObjectLockMode::Compliance,
-                        retain_until,
-                    }),
-                    legal_hold: None,
+        .submit_fixture(
+            fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object_row(bucket, key, version_id)),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: Some(ObjectRetention {
+                            mode: ObjectLockMode::Compliance,
+                            retain_until,
+                        }),
+                        legal_hold: None,
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
 }
 
 pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_label: &str) {
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = BucketName::parse(bucket_label).unwrap();
     store
         .submit(Mutation::CreateObjectLockBucket(Box::new(Bucket {
@@ -88,7 +90,7 @@ pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_labe
     // missing version, or the extension wins and the delete observes the new COMPLIANCE deadline.
     let key = ObjectKey::parse("extend-vs-delete").unwrap();
     let version = VersionId::from_string("race-v1".to_owned());
-    put_with_retention(&store, &bucket, &key, &version, Timestamp(100)).await;
+    put_with_retention(&store, &fixture, &bucket, &key, &version, Timestamp(100)).await;
     let barrier = Arc::new(Barrier::new(3));
     let extension = {
         let store = Arc::clone(&store);
@@ -169,12 +171,15 @@ pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_labe
     let key = ObjectKey::parse("hold-vs-delete").unwrap();
     let version = VersionId::from_string("race-hold".to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(object_row(&bucket, &key, &version)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object_row(&bucket, &key, &version)),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     let barrier = Arc::new(Barrier::new(3));
@@ -247,7 +252,7 @@ pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_labe
     // first, the longer one advances it. No serial order may finish at the shorter deadline.
     let key = ObjectKey::parse("retention-vs-retention").unwrap();
     let version = VersionId::from_string("race-v2".to_owned());
-    put_with_retention(&store, &bucket, &key, &version, Timestamp(1_000)).await;
+    put_with_retention(&store, &fixture, &bucket, &key, &version, Timestamp(1_000)).await;
     let barrier = Arc::new(Barrier::new(3));
     let shorter = {
         let store = Arc::clone(&store);

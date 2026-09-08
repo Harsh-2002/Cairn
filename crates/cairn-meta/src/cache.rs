@@ -479,7 +479,9 @@ impl CachedMetadataStore {
             | Mutation::RenewReplicationClaim { .. }
             | Mutation::BeginStorageGeneration { .. }
             | Mutation::Storage { .. }
-            | Mutation::RecoverStorageIntents { .. }
+            | Mutation::AdmitStorageWrite { .. }
+            | Mutation::PublishStorageWrite { .. }
+            | Mutation::ListStorageIntents { .. }
             | Mutation::ClaimStorageCleanup { .. }
             | Mutation::ReplicationUpload { .. }
             | Mutation::ClaimReplicationUploadCleanup { .. }

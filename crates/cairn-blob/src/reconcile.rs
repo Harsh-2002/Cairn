@@ -2,14 +2,16 @@
 //! Directory descriptors anchor traversal and unlink; nested paths never select arbitrary trees.
 
 use crate::{io_err, merge_report};
-use cairn_types::blob::ReconcileReport;
+use cairn_types::blob::{ReconcileOpts, ReconcileReport};
 use cairn_types::error::BlobError;
 use cairn_types::id::StoragePath;
+use cairn_types::storage::io::StorageIoLease;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::ReconcileOracle;
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, statat, unlinkat};
+use futures_util::StreamExt;
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, statat, unlinkat};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 struct Directory {
@@ -33,13 +35,12 @@ impl Directory {
     }
 
     fn child(parent: &File, name: &str) -> std::io::Result<Self> {
-        let fd = openat(
+        let file = crate::namespace::open_beneath(
             parent,
             name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let file: File = fd.into();
         if fstat(&file)?.st_dev != fstat(parent)?.st_dev {
             return Err(std::io::Error::other(
                 "reconcile directory crosses filesystems",
@@ -49,6 +50,14 @@ impl Directory {
     }
 
     fn page(&mut self, limit: usize) -> std::io::Result<(Vec<Entry>, usize, u64)> {
+        self.page_with(limit, |kind| kind)
+    }
+
+    fn page_with(
+        &mut self,
+        limit: usize,
+        classify: impl Fn(FileType) -> FileType,
+    ) -> std::io::Result<(Vec<Entry>, usize, u64)> {
         let mut entries = Vec::new();
         let mut invalid = 0;
         let mut examined = 0;
@@ -67,9 +76,18 @@ impl Directory {
                 invalid += 1;
                 continue;
             };
+            let kind = classify(entry.file_type());
+            let kind = if kind == FileType::Unknown {
+                // d_type is optional. A missing classification must never hide an entire root
+                // subtree and manufacture successful reconciliation/legacy quota retirement.
+                let stat = statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                FileType::from_raw_mode(stat.st_mode)
+            } else {
+                kind
+            };
             entries.push(Entry {
                 name: name.to_owned(),
-                kind: entry.file_type(),
+                kind,
                 inode: entry.ino(),
             });
         }
@@ -78,11 +96,15 @@ impl Directory {
 }
 
 async fn blocking<T: Send + 'static>(
+    lease: &StorageIoLease,
     f: impl FnOnce() -> Result<T, BlobError> + Send + 'static,
 ) -> Result<T, BlobError> {
-    tokio::task::spawn_blocking(f)
+    let lease = lease.try_child()?;
+    // Abandoning an await retains the lease with both an executing job and its returned FDs.
+    let (result, _lease) = tokio::task::spawn_blocking(move || (f(), lease))
         .await
-        .map_err(|e| BlobError::Io(e.to_string()))?
+        .map_err(|e| BlobError::Io(e.to_string()))?;
+    result
 }
 
 fn lower_hex(name: &str, len: usize) -> bool {
@@ -92,6 +114,292 @@ fn lower_hex(name: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Exclusive full scan. Every directory iterator, namespace operation and abandoned job retains
+/// the caller's maintenance lease. Parallel bucket work remains bounded by the existing options.
+pub(super) async fn run(
+    root: &Path,
+    oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
+    lease: StorageIoLease,
+) -> Result<ReconcileReport, BlobError> {
+    let path = root.to_owned();
+    let mut root_dir = blocking(&lease, move || {
+        let file: File = open(
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io_err(error.into()))?
+        .into();
+        Directory::from_file(file).map_err(io_err)
+    })
+    .await?;
+    let mut report = ReconcileReport::default();
+    let mut inflight = futures_util::stream::FuturesUnordered::new();
+    loop {
+        let (next, entries, examined, invalid) = blocking(&lease, move || {
+            let (entries, examined, invalid) = root_dir
+                .page(opts.batch_size.max(1) as usize)
+                .map_err(io_err)?;
+            Ok((root_dir, entries, examined, invalid))
+        })
+        .await?;
+        root_dir = next;
+        report.errors += invalid;
+        if examined == 0 {
+            break;
+        }
+        for entry in entries {
+            if entry.kind == FileType::Symlink {
+                report.errors += 1;
+                continue;
+            }
+            if entry.kind != FileType::Directory {
+                continue;
+            }
+            if entry.name == ".staging" {
+                merge_report(
+                    &mut report,
+                    staging(root_dir.file.clone(), oracle, opts, now, &lease).await?,
+                );
+                continue;
+            }
+            if cairn_types::BucketName::parse(&entry.name).is_err() {
+                report.errors += 1;
+                continue;
+            }
+            inflight.push(bucket(
+                root.join(&entry.name),
+                entry.name,
+                oracle,
+                opts.batch_size.max(1),
+                opts.staging_safety_margin_secs,
+                now,
+                &lease,
+            ));
+            if inflight.len() >= opts.parallelism.max(1) {
+                if let Some(part) = inflight.next().await {
+                    merge_report(&mut report, part?);
+                }
+            }
+        }
+    }
+    while let Some(part) = inflight.next().await {
+        merge_report(&mut report, part?);
+    }
+    // A previous pass may have removed an empty child before crashing ahead of its parent sync.
+    sync_directory(root_dir.file.clone(), &lease).await?;
+    Ok(report)
+}
+
+async fn sync_directory(dir: Arc<File>, lease: &StorageIoLease) -> Result<(), BlobError> {
+    blocking(lease, move || dir.sync_all().map_err(io_err)).await
+}
+
+async fn staging(
+    root: Arc<File>,
+    oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
+    lease: &StorageIoLease,
+) -> Result<ReconcileReport, BlobError> {
+    let mut dir = blocking(lease, move || {
+        Directory::child(&root, ".staging").map_err(io_err)
+    })
+    .await?;
+    let mut report = ReconcileReport::default();
+    loop {
+        let (next, entries, examined, invalid) = blocking(lease, move || {
+            let (entries, examined, invalid) =
+                dir.page(opts.batch_size.max(1) as usize).map_err(io_err)?;
+            Ok((dir, entries, examined, invalid))
+        })
+        .await?;
+        dir = next;
+        report.errors += invalid;
+        if examined == 0 {
+            break;
+        }
+        let mut files = Vec::new();
+        for entry in entries {
+            if entry.kind == FileType::RegularFile
+                && entry
+                    .name
+                    .strip_suffix(".index.tmp")
+                    .or_else(|| entry.name.strip_suffix(".tmp"))
+                    .is_some_and(|id| lower_hex(id, 32))
+            {
+                files.push(entry);
+            } else if entry.kind == FileType::Directory && entry.name == "multipart" {
+                merge_report(
+                    &mut report,
+                    multipart(dir.file.clone(), oracle, opts, now, lease).await?,
+                );
+            } else {
+                report.errors += 1;
+            }
+        }
+        let mut part = reclaim(
+            dir.file.clone(),
+            ".staging",
+            files,
+            oracle,
+            opts.staging_safety_margin_secs,
+            now,
+            lease,
+        )
+        .await?;
+        part.staging_cleaned = part.orphans_reclaimed;
+        part.orphans_reclaimed = 0;
+        part.blobs_scanned = 0;
+        merge_report(&mut report, part);
+    }
+    sync_directory(dir.file.clone(), lease).await?;
+    Ok(report)
+}
+
+async fn multipart(
+    staging: Arc<File>,
+    oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
+    lease: &StorageIoLease,
+) -> Result<ReconcileReport, BlobError> {
+    let mut dir = blocking(lease, move || {
+        Directory::child(&staging, "multipart").map_err(io_err)
+    })
+    .await?;
+    let mut report = ReconcileReport::default();
+    loop {
+        let (next, entries, examined, invalid) = blocking(lease, move || {
+            let (entries, examined, invalid) =
+                dir.page(opts.batch_size.max(1) as usize).map_err(io_err)?;
+            Ok((dir, entries, examined, invalid))
+        })
+        .await?;
+        dir = next;
+        report.errors += invalid;
+        if examined == 0 {
+            break;
+        }
+        for entry in entries {
+            let test_path =
+                StoragePath::from_string(format!(".staging/multipart/{}/00001", entry.name));
+            let valid = cairn_types::storage::validate_storage_path(
+                &cairn_types::BucketName::parse("reconcile").expect("valid internal bucket"),
+                &test_path,
+            )
+            .is_ok();
+            if entry.kind != FileType::Directory || !valid {
+                report.errors += 1;
+                continue;
+            }
+            let parent = dir.file.clone();
+            let name = entry.name.clone();
+            let child = match blocking(lease, move || {
+                Directory::child(&parent, &name).map_err(io_err)
+            })
+            .await
+            {
+                Ok(child) => child,
+                Err(_) => {
+                    report.errors += 1;
+                    continue;
+                }
+            };
+            merge_report(
+                &mut report,
+                session(
+                    child,
+                    dir.file.clone(),
+                    &entry.name,
+                    oracle,
+                    opts,
+                    now,
+                    lease,
+                )
+                .await?,
+            );
+        }
+    }
+    sync_directory(dir.file.clone(), lease).await?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session(
+    mut dir: Directory,
+    parent: Arc<File>,
+    upload: &str,
+    oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
+    lease: &StorageIoLease,
+) -> Result<ReconcileReport, BlobError> {
+    let mut report = ReconcileReport::default();
+    let prefix = format!(".staging/multipart/{upload}");
+    let bucket = cairn_types::BucketName::parse("reconcile").expect("valid internal bucket");
+    loop {
+        let (next, entries, examined, invalid) = blocking(lease, move || {
+            let (entries, examined, invalid) =
+                dir.page(opts.batch_size.max(1) as usize).map_err(io_err)?;
+            Ok((dir, entries, examined, invalid))
+        })
+        .await?;
+        dir = next;
+        report.errors += invalid;
+        if examined == 0 {
+            break;
+        }
+        let mut files = Vec::new();
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = StoragePath::from_string(format!("{prefix}/{}", entry.name));
+            if entry.kind == FileType::RegularFile
+                && cairn_types::storage::validate_storage_path(&bucket, &path).is_ok()
+            {
+                paths.push(path);
+                files.push(entry);
+            } else {
+                report.errors += 1;
+            }
+        }
+        let live = oracle
+            .live_multipart_parts(&paths)
+            .await
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        let mut part = reclaim_unreferenced(
+            dir.file.clone(),
+            files,
+            live,
+            opts.staging_safety_margin_secs,
+            now,
+            lease,
+        )
+        .await?;
+        part.staging_cleaned = part.orphans_reclaimed;
+        part.orphans_reclaimed = 0;
+        part.blobs_scanned = 0;
+        merge_report(&mut report, part);
+    }
+    sync_directory(dir.file.clone(), lease).await?;
+    if !oracle
+        .live_session(&cairn_types::UploadId::from_string(upload.to_owned()))
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))?
+    {
+        let name = upload.to_owned();
+        report.sessions_cleaned += u64::from(
+            blocking(lease, move || {
+                prune(&parent, &name, &dir.file, File::sync_all).map_err(io_err)
+            })
+            .await?,
+        );
+    }
+    Ok(report)
+}
+
 pub(super) async fn bucket(
     path: PathBuf,
     bucket: String,
@@ -99,9 +407,10 @@ pub(super) async fn bucket(
     batch_size: u32,
     margin_secs: i64,
     now: Timestamp,
+    lease: &StorageIoLease,
 ) -> Result<ReconcileReport, BlobError> {
     let name = bucket.clone();
-    let (parent, mut dir) = blocking(move || {
+    let (parent, mut dir) = blocking(lease, move || {
         let parent: File = open(
             path.parent()
                 .ok_or_else(|| BlobError::Io("missing bucket parent".into()))?,
@@ -116,7 +425,7 @@ pub(super) async fn bucket(
     .await?;
     let mut report = ReconcileReport::default();
     loop {
-        let (next, entries, examined, invalid) = blocking(move || {
+        let (next, entries, examined, invalid) = blocking(lease, move || {
             let (entries, examined, invalid) =
                 dir.page(batch_size.max(1) as usize).map_err(io_err)?;
             Ok((dir, entries, examined, invalid))
@@ -140,12 +449,24 @@ pub(super) async fn bucket(
         }
         merge_report(
             &mut report,
-            reclaim(dir.file.clone(), &bucket, files, oracle, margin_secs, now).await?,
+            reclaim(
+                dir.file.clone(),
+                &bucket,
+                files,
+                oracle,
+                margin_secs,
+                now,
+                lease,
+            )
+            .await?,
         );
         for leaf in leaves {
             let parent = dir.file.clone();
             let name = leaf.clone();
-            let child = blocking(move || Directory::child(&parent, &name).map_err(io_err)).await;
+            let child = blocking(lease, move || {
+                Directory::child(&parent, &name).map_err(io_err)
+            })
+            .await;
             let Ok(child) = child else {
                 report.errors += 1;
                 continue;
@@ -161,14 +482,19 @@ pub(super) async fn bucket(
                     batch_size,
                     margin_secs,
                     now,
+                    lease,
                 )
                 .await?,
             );
         }
     }
+    sync_directory(dir.file.clone(), lease).await?;
     let file = dir.file.clone();
     report.dirs_pruned += u64::from(
-        blocking(move || prune(&parent, &bucket, &file, File::sync_all).map_err(io_err)).await?,
+        blocking(lease, move || {
+            prune(&parent, &bucket, &file, File::sync_all).map_err(io_err)
+        })
+        .await?,
     );
     Ok(report)
 }
@@ -183,11 +509,12 @@ async fn leaf_files(
     batch_size: u32,
     margin_secs: i64,
     now: Timestamp,
+    lease: &StorageIoLease,
 ) -> Result<ReconcileReport, BlobError> {
     let mut report = ReconcileReport::default();
     let prefix = format!("{bucket}/{leaf}");
     loop {
-        let (next, entries, examined, invalid) = blocking(move || {
+        let (next, entries, examined, invalid) = blocking(lease, move || {
             let (entries, examined, invalid) =
                 dir.page(batch_size.max(1) as usize).map_err(io_err)?;
             Ok((dir, entries, examined, invalid))
@@ -212,12 +539,25 @@ async fn leaf_files(
         }
         merge_report(
             &mut report,
-            reclaim(dir.file.clone(), &prefix, files, oracle, margin_secs, now).await?,
+            reclaim(
+                dir.file.clone(),
+                &prefix,
+                files,
+                oracle,
+                margin_secs,
+                now,
+                lease,
+            )
+            .await?,
         );
     }
+    sync_directory(dir.file.clone(), lease).await?;
     let name = leaf.to_owned();
     report.dirs_pruned += u64::from(
-        blocking(move || prune(&parent, &name, &dir.file, File::sync_all).map_err(io_err)).await?,
+        blocking(lease, move || {
+            prune(&parent, &name, &dir.file, File::sync_all).map_err(io_err)
+        })
+        .await?,
     );
     Ok(report)
 }
@@ -229,6 +569,7 @@ async fn reclaim(
     oracle: &dyn ReconcileOracle,
     margin_secs: i64,
     now: Timestamp,
+    lease: &StorageIoLease,
 ) -> Result<ReconcileReport, BlobError> {
     if entries.is_empty() {
         return Ok(ReconcileReport::default());
@@ -246,7 +587,23 @@ async fn reclaim(
             "reconcile oracle returned incorrect membership count".into(),
         ));
     }
-    blocking(move || {
+    reclaim_unreferenced(dir, entries, live, margin_secs, now, lease).await
+}
+
+async fn reclaim_unreferenced(
+    dir: Arc<File>,
+    entries: Vec<Entry>,
+    live: Vec<bool>,
+    margin_secs: i64,
+    now: Timestamp,
+    lease: &StorageIoLease,
+) -> Result<ReconcileReport, BlobError> {
+    if live.len() != entries.len() {
+        return Err(BlobError::Io(
+            "reconcile oracle returned incorrect membership count".into(),
+        ));
+    }
+    blocking(lease, move || {
         let mut report = ReconcileReport {
             blobs_scanned: entries.len() as u64,
             ..Default::default()
@@ -255,17 +612,41 @@ async fn reclaim(
             if live {
                 continue;
             }
-            let stat = match statat(&*dir, entry.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => stat,
+            let file = match crate::namespace::open_beneath(
+                &dir,
+                &entry.name,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    report.errors += 1;
+                    continue;
+                }
+            };
+            let stat = fstat(&file).map_err(|error| io_err(error.into()))?;
+            // Hold the same open-description lock as data writers. A kernel operation may retain
+            // that description after process exit; neither a timer nor namespace absence proves it done.
+            if stat.st_ino != entry.inode
+                || stat.st_nlink != 1
+                || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || crate::try_lock_exclusive(&file).is_err()
+            {
+                report.errors += 1;
+                continue;
+            }
+            let current = match statat(&*dir, entry.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(current) => current,
                 Err(rustix::io::Errno::NOENT) => continue,
                 Err(_) => {
                     report.errors += 1;
                     continue;
                 }
             };
-            // Never follow a substituted symlink or reclaim a replacement observed under an old name.
-            if stat.st_ino != entry.inode
-                || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            if current.st_ino != stat.st_ino
+                || current.st_dev != stat.st_dev
+                || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
             {
                 report.errors += 1;
                 continue;
@@ -279,9 +660,8 @@ async fn reclaim(
                 Err(_) => report.errors += 1,
             }
         }
-        if report.orphans_reclaimed > 0 {
-            dir.sync_all().map_err(io_err)?;
-        }
+        // Also persist absence left by an interrupted prior pass, including ENOENT retries.
+        dir.sync_all().map_err(io_err)?;
         Ok(report)
     })
     .await
@@ -329,6 +709,35 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn unknown_dirent_types_are_resolved_without_following_links_or_skipping_subtrees() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".staging")).unwrap();
+        std::fs::create_dir(root.path().join("bucket")).unwrap();
+        std::fs::write(root.path().join("database"), b"metadata").unwrap();
+        symlink("bucket", root.path().join("link")).unwrap();
+        let mut directory =
+            Directory::from_file(crate::open_readonly_nofollow(root.path()).unwrap()).unwrap();
+        let mut seen = std::collections::HashMap::new();
+        loop {
+            let (entries, examined, invalid) =
+                directory.page_with(2, |_| FileType::Unknown).unwrap();
+            assert!(examined <= 2);
+            assert_eq!(invalid, 0);
+            if examined == 0 {
+                break;
+            }
+            for entry in entries {
+                seen.insert(entry.name, entry.kind);
+            }
+        }
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[".staging"], FileType::Directory);
+        assert_eq!(seen["bucket"], FileType::Directory);
+        assert_eq!(seen["database"], FileType::RegularFile);
+        assert_eq!(seen["link"], FileType::Symlink);
+    }
+
     struct BoundedOracle {
         maximum: AtomicUsize,
         wrong_count: bool,
@@ -349,6 +758,26 @@ mod tests {
         ) -> Result<Vec<bool>, MetaError> {
             Ok(vec![false; paths.len()])
         }
+    }
+
+    fn lease() -> StorageIoLease {
+        let (_watch, lease) = cairn_types::storage::io::StorageIoWatch::new(
+            cairn_types::storage::StorageToken::generate(),
+            cairn_types::storage::StorageToken::generate(),
+            Arc::new(()),
+        );
+        lease
+    }
+
+    async fn bucket(
+        path: PathBuf,
+        bucket: String,
+        oracle: &dyn ReconcileOracle,
+        batch_size: u32,
+        margin_secs: i64,
+        now: Timestamp,
+    ) -> Result<ReconcileReport, BlobError> {
+        super::bucket(path, bucket, oracle, batch_size, margin_secs, now, &lease()).await
     }
 
     fn empty_oracle() -> SetReconcileOracle {
@@ -468,6 +897,7 @@ mod tests {
             &empty_oracle(),
             0,
             Timestamp::from_secs(0),
+            &lease(),
         )
         .await
         .unwrap();

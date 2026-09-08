@@ -11,18 +11,26 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   the safe rustix-backed `open_readonly_nofollow`/`open_lock_file_nofollow` and
   `try_lock_exclusive` syscall seams used by snapshot input and node-local command exclusion. The
   failpoint seams live here.
-- `reconcile.rs` — bounded POSIX flat/two-hex-leaf traversal; descriptor-relative no-follow cleanup,
+- `namespace.rs` — admitted exact names, descriptor-anchored initialization/creation/rename/input
+  opens, file-lock quiescence and durable exact cleanup; Linux `openat2` rejects descendant symlinks
+  and mounts, including same-device bind mounts.
+- `owned_file.rs` — file descriptors, buffers and storage leases retained through queued/executing
+  blocking jobs and abandoned results; async cancellation cannot release actual I/O ownership.
+- `reconcile.rs` — bounded Linux flat/two-hex-leaf traversal; descriptor-relative no-follow cleanup,
   exact membership counts, conservative unknown-layout handling and parent-fsynced pruning.
+  `DT_UNKNOWN` falls back to no-follow metadata lookup and lookup errors fail the scan.
 - `timing.rs` — bounded multipart permit/assembly/durability observations, mirrored by the server
   metrics tick; includes interrupted stages and reports sample eviction.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
-  stream → `commit` / `abort`). One enum dispatching `tokio::fs` vs. the io_uring backend.
+  stream → `commit` / `abort`). One enum dispatching retained blocking file jobs vs. the io_uring
+  backend; abort stops production and leaves admitted names for exact recovery.
 - `commit.rs` — `DirSyncCoalescer`: a single coordinator task that batches concurrent same-directory
   fsyncs into one syscall (group-commit for the directory fsync, ARCH 8.2). Shared across store clones.
 - `compress.rs` — the CRNB block format: `BlockEncoder` (write) / `CompressedReader` (ranged read),
   per-block zstd/lz4, per-block AES-256-GCM. **`pub` + `#[doc(hidden)]`** only so `fuzz/` can drive it.
-- `encode.rs` — bounded CRNB staging adapter; 64-KiB index buffer spills to immediately unlinked
-  scratch on the data filesystem, then streams into the final blob before its durability barrier.
+- `encode.rs` — bounded CRNB staging adapter; 64-KiB index buffer spills to the admitted index alias,
+  unlinks its newly created inode, and streams through a leased file owner into the final blob.
+  The alias still requires exact cleanup/namespace synchronization before its debt can retire.
 - `hash.rs` — `Hashers`: the always-on MD5 (→ ETag) and internal SHA-256 plus requested supplementary checksums, over
   plaintext, in one streaming pass.
 - `raw_io.rs` — safe `fallocate`/`fadvise` placement hints (ARCH 7.5) via `rustix` (keeps `forbid(unsafe_code)`).
@@ -32,15 +40,32 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - **The durability ordering IS the contract** (`docs/storage-durability.md` 8, ARCH 8.2) — do not
   reorder: stream → `sync_data` (fdatasync, *not* `sync_all`) the staged file → rename into the bucket
   dir → fsync that dir (via the coalescer) → only then is the blob durable. `stage` returns *before*
-  any metadata row references it; a crash here leaves an orphan that reconcile reclaims — that is by design.
-- **Cancellation before `StagedBlob` return reclaims synchronously.** Single-part staging and
-  multipart assembly keep a POSIX unlink-on-drop guard over both their unique `.staging` name and
-  final bucket name through every await, including the post-rename directory fsync. The Tokio and
-  io_uring create/rename handoffs retain matching ownership until the request acknowledges them, so
-  backend work that finishes after request cancellation cannot recreate an orphan behind the guard.
-- **A newly-created bucket directory triggers an extra `data_root` fsync** (`ensure_bucket_dir`, F-1):
-  the rename is not durable until the parent records the new dir entry. Paid only on the first write
-  into a bucket. Don't drop it.
+  an authoritative object row references it; a crash here leaves admitted paths for startup intent
+  resolution and exact cleanup.
+- **Every physical write requires committed admission.** `stage`, `stage_part` and `assemble`
+  consume a `StorageCreationPermit` for the exact Writer-admitted plan and its `StorageIoLease`.
+  The plan includes all possible temporary, final and index-spool names before creation; namespace
+  operations may not invent more names. Multipart reservation/completion ownership and admission
+  share a Writer savepoint. Publication consumes the matching intent atomically with metadata.
+- **Cancellation retains ownership; it does not unlink on Drop.** Recovery admission and the exact
+  plan guard precede the Writer submission. Blocking jobs, io_uring work, returned descriptors and
+  buffers, and coalesced directory-sync requests retain child leases through actual completion.
+  Leases retain the bounded recovery slot and exclusive node lifetime. Recovery waits for lease
+  quiescence and probes exact file locks before resolving intent; a timeout is not quiescence.
+- **Reclamation uses exact Writer claims.** Publication and resolution preserve live references
+  and enqueue unreferenced aliases/superseded paths as durable debt. `cleanup_storage` requires the
+  matching claim and lease, acquires the file lock, unlinks only that path and synchronizes its
+  directory, including when the name is already absent. It prunes only empty supported parents and
+  synchronizes their parents. Debt/quota retirement validates generation, token and expiry after
+  durable absence. The raw `delete`, `delete_part_attempt` and recursive `delete_session` APIs
+  are removed; do not reintroduce an unleased or unclaimed physical deletion seam. Errors and
+  ambiguous acknowledgements retain ownership/debt.
+- **Store construction requires a maintenance lease.** `LocalBlobStore::open(root, lease)` runs
+  initialization inside a retained blocking job. Production callers supply the actual exclusive
+  node guard; `fixture_storage_io()` is only for isolated tests/examples. The configured root may
+  itself be a mount. Missing roots create only the final component under an existing parent.
+- **A new bucket directory requires a `data_root` fsync** (F-1). Anchored directory preparation
+  synchronizes the parent before a child can hold admitted file bytes; do not remove that barrier.
 - **Multipart directory creation is durable before part data is accepted.** `open` creates
   `.staging/multipart` and fsyncs each newly-mutated parent; the first `stage_part` for an upload
   creates its session directory and fsyncs `.staging/multipart` before opening the part file. Each
@@ -108,13 +133,18 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   still owns buffers. `BlobStore::read_memory_bound` owns decoder/page/frame accounting and is what
   replication reserves. Include configurable small-read coalescing; raw reads cannot grow their
   allocation past the probed length. Kernel cache and allocator retention are separate costs.
-- **One filesystem.** `data_root`, `.staging`, and every bucket dir must share a filesystem or the
-  atomic rename fails with `EXDEV`. `check_single_filesystem` is called at startup to fail fast.
+- **One filesystem and no descendant mount crossings.** Linux 5.6+ with `openat2` support for
+  `BENEATH | NO_SYMLINKS | NO_XDEV` is required. Initialization, admitted creation, referenced input
+  opens and cleanup reject descendant symlinks and mounts, including same-device bind mounts.
+  Device/inode equality alone is insufficient. The explicitly configured root mount is allowed;
+  unsupported kernels/platforms fail closed. `check_single_filesystem` also runs at startup.
 - ENOSPC (errno 28 / `StorageFull`) → `BlobError::OutOfSpace` → HTTP 507. Map it via `io_err`.
-- Reconcile safety margin: a blob/staging artifact younger than `staging_safety_margin_secs` is **not**
-  reclaimed even if the oracle reports it not-live (it may be an in-flight PUT whose row hasn't
-  committed — audit #7). Margin `0` reclaims immediately (the legacy behavior; what tests and on-demand
-  reconcile use). Per-bucket reconciles run concurrently; the staging area is reconciled inline.
+- **Full scans preserve journal ownership.** The membership oracle protects authoritative object
+  and part references, every intent alias, and all cleanup rows (pending, claimed or expired).
+  Root staging aliases fan out across metadata shards. Session absence alone never authorizes
+  recursive deletion. Even an unprotected artifact younger than `staging_safety_margin_secs` is
+  preserved; margin `0` removes only that age constraint. Bucket workers are bounded; staging is
+  scanned inline. A failed/incomplete scan cannot authorize legacy orphan-accounting release.
 - Blob transfers are bounded by **two SEPARATE permit pools** (both default `DEFAULT_BLOB_IO_CONCURRENCY
   = 64`; `with_read_pool_size` / `with_io_pool_size` to tune) — `read_permits` for GETs and `write_permits`
   for stage/stage_part/assemble (ARCH 7.4). The split is deliberate: a read permit is held for the whole
@@ -150,10 +180,16 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - New `StagedBlob` values always carry `internal_sha256`, computed over logical plaintext in the
   same ingest/assembly pass. It never adds an unrequested S3 checksum. `hash::Hashers` is shared with
   the scrubber so full-object supplementary checksum algorithms use the ingest implementations.
-- Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`
-  (8–10), SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.
+- Tests: unit tests in each module; integration in `tests/blob.rs`. The ignored namespace bind-mount
+  regression reexecutes in a private mount namespace. `tests/uring_process_death.rs` requires root,
+  private mounts, an owned ext4 loop image and readable kernel stacks: a real ring write remains
+  pending during SIGKILL and exclusion holds through process teardown until thaw/reap. This is not
+  evidence of a post-exit detached-kernel-reference interval or power-loss durability. Its fixture
+  owns and cleans up its mount, loop device and image. Spec: `docs/storage-durability.md` (8–10),
+  SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.
 
-New writes remain flat. POSIX reconciliation recognizes only the approved nested UUID grammar,
+New writes remain flat. Linux reconciliation recognizes only the approved nested UUID grammar,
 keeps bounded bucket/leaf pages and one leaf cursor per worker, and preserves/reports unknown paths and symlinks.
 Bucket enumeration is streamed too. File unlink batches sync their directory; pruning syncs the
-parent before reporting success. Full startup scans remain active; no journal coverage is asserted.
+parent before reporting success. Full startup scans remain active; intent recovery and exact debt
+cleanup do not authorize scan-free startup or nested writes. Phase 3D remains unactivated.

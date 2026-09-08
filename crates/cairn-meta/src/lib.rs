@@ -237,7 +237,7 @@ impl ReconcileOracle for SqliteReconcileOracle {
             let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 )
                 .map_err(|e| MetaError::Engine(e.to_string()))?;
             paths
@@ -280,7 +280,7 @@ impl ReconcileOracle for SqliteReconcileOracle {
             let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 )
                 .map_err(|e| MetaError::Engine(e.to_string()))?;
             paths

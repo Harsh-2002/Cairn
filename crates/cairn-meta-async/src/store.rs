@@ -705,8 +705,8 @@ impl MetadataStore for AsyncMetadataStore {
             .await
             .query(
                 "SELECT attempt_id, upload_id, part_number, reserved_bytes, created_at
-                 FROM multipart_part_reservations
-                 WHERE created_at < ?1
+                 FROM multipart_part_reservations AS r
+                 WHERE created_at < ?1 AND NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)
                  ORDER BY created_at, attempt_id LIMIT ?2",
                 vec![
                     Value::Int(older_than.0),
@@ -729,7 +729,7 @@ impl MetadataStore for AsyncMetadataStore {
             .await
             .query(
                 "SELECT id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at
-                 FROM multipart_staging_cleanups
+                 FROM multipart_staging_cleanups WHERE storage_protocol=1
                  ORDER BY storage_path IS NULL, created_at, id LIMIT ?1",
                 vec![Value::Int(i64::from(limit.clamp(1, 1_000)))],
             )
@@ -1548,7 +1548,7 @@ impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
         for p in candidates {
             let row: Option<Row> = query_one(
                 driver,
-                "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)",
+                "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 vec![Value::Text(p.as_str().to_owned())],
             )
             .await?;
@@ -1577,7 +1577,7 @@ impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
         for path in candidates {
             let row = query_one(
                 driver,
-                "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1)",
+                "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 vec![Value::Text(path.as_str().to_owned())],
             )
             .await?;

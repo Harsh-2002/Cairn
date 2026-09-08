@@ -120,6 +120,8 @@ pub enum StorageWriteTarget {
     Part {
         upload_id: UploadId,
         part_number: u16,
+        /// Existing v26 quota reservation identity; the physical part name retains this token.
+        reservation_id: String,
     },
     /// Assembly owned by one exact multipart completion claim.
     Completion {
@@ -173,6 +175,117 @@ impl StorageWritePlan {
         Ok(())
     }
 
+    /// Restrict joint admission to the exact quota reservation or completion owner.
+    pub fn validate_admission(&self, operation: &crate::meta::Mutation) -> Result<(), MetaError> {
+        use crate::meta::Mutation;
+        self.validate()?;
+        let valid = match (&self.target, operation) {
+            (
+                StorageWriteTarget::Part {
+                    upload_id,
+                    part_number,
+                    reservation_id,
+                },
+                Mutation::ReserveMultipartPart {
+                    upload_id: actual_upload,
+                    part_number: actual_part,
+                    attempt_id,
+                    ..
+                },
+            ) => {
+                upload_id == actual_upload
+                    && part_number == actual_part
+                    && reservation_id == attempt_id
+            }
+            (
+                StorageWriteTarget::Completion {
+                    upload_id,
+                    claim_token,
+                    ..
+                },
+                Mutation::ClaimMultipart {
+                    upload_id: actual_upload,
+                    claim_token: actual_token,
+                },
+            ) => upload_id == actual_upload && claim_token == actual_token.as_str(),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid("storage admission target mismatch"))
+        }
+    }
+
+    /// The durable blob result and metadata identity must match the admitted target exactly.
+    pub fn validate_publication(&self, operation: &crate::meta::Mutation) -> Result<(), MetaError> {
+        use crate::meta::Mutation;
+        let final_path = self.final_path()?;
+        let matches_row = |row: &crate::object::ObjectVersionRow,
+                           key: &ObjectKey,
+                           version_id: &VersionId,
+                           row_id: &str| {
+            row.bucket == self.bucket
+                && &row.key == key
+                && &row.version_id == version_id
+                && row.id == row_id
+                && !row.is_delete_marker
+                && row.storage_path.as_ref() == Some(final_path)
+        };
+        let valid = match (&self.target, operation) {
+            (
+                StorageWriteTarget::Object {
+                    key,
+                    version_id,
+                    row_id,
+                },
+                Mutation::PutObjectVersion { row, .. },
+            ) => matches_row(row, key, version_id, row_id),
+            (
+                StorageWriteTarget::Part {
+                    upload_id,
+                    part_number,
+                    reservation_id,
+                },
+                Mutation::RecordPart {
+                    upload_id: actual_upload,
+                    attempt_id,
+                    part,
+                },
+            ) => {
+                upload_id == actual_upload
+                    && reservation_id == attempt_id
+                    && *part_number == part.part_number
+                    && &part.storage_path == final_path
+            }
+            (
+                StorageWriteTarget::Completion {
+                    upload_id,
+                    claim_token,
+                    key,
+                    version_id,
+                    row_id,
+                },
+                Mutation::CompleteMultipart {
+                    upload_id: actual_upload,
+                    claim_token: actual_token,
+                    row,
+                    ..
+                },
+            ) => {
+                upload_id == actual_upload
+                    && claim_token == actual_token.as_str()
+                    && matches_row(row, key, version_id, row_id)
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid("storage publication target mismatch"))
+        }
+    }
+
     fn expected_paths(&self) -> Result<Vec<StorageIntentPath>, MetaError> {
         let mut paths = Vec::with_capacity(3);
         let id = self.attempt.as_str();
@@ -180,11 +293,19 @@ impl StorageWritePlan {
             StorageWriteTarget::Part {
                 upload_id,
                 part_number,
+                reservation_id,
             } => {
-                if !upload_name(upload_id.as_str()) || !(1..=10_000).contains(part_number) {
+                if !upload_name(upload_id.as_str())
+                    || !(1..=10_000).contains(part_number)
+                    || reservation_id.is_empty()
+                    || reservation_id.len() > 64
+                    || !reservation_id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                {
                     return Err(invalid("invalid storage part target"));
                 }
-                format!(".staging/multipart/{upload_id}/{part_number:05}-{id}")
+                format!(".staging/multipart/{upload_id}/{part_number:05}-{reservation_id}")
             }
             StorageWriteTarget::Object { key, row_id, .. }
             | StorageWriteTarget::Completion { key, row_id, .. } => {
@@ -260,6 +381,12 @@ pub enum StorageMutation {
     /// Resolve only after the matching backend has stopped. Live paths remain authoritative;
     /// every other planned alias becomes exact durable cleanup debt.
     Resolve { quiescence: io::StorageQuiescence },
+    /// Resolve one prior-generation plan after exclusive restart has confirmed actual backend
+    /// quiescence, including outstanding kernel I/O. A generation change alone is insufficient.
+    ResolveRecovered {
+        current_generation: StorageToken,
+        quiescence: io::StorageQuiescence,
+    },
     /// Retire only after successful unlink and namespace synchronization, matching this exact
     /// still-owned claim. A failed/expired claim leaves both physical debt and quota intact.
     FinishCleanup {
@@ -349,6 +476,24 @@ fn invalid(message: &str) -> MetaError {
     MetaError::Engine(message.to_owned())
 }
 
+/// Protocol-2 publication has no bare mutation escape hatch. Metadata-only marker rows do not
+/// create physical references and remain valid without a file admission.
+pub fn validate_unadmitted_mutation(operation: &crate::meta::Mutation) -> Result<(), MetaError> {
+    use crate::meta::Mutation;
+    let physical = match operation {
+        Mutation::PutObjectVersion { row, .. } | Mutation::CompleteMultipart { row, .. } => {
+            row.storage_path.is_some()
+        }
+        Mutation::RecordPart { .. } => true,
+        _ => false,
+    };
+    if physical {
+        Err(invalid("physical publication requires storage admission"))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +566,7 @@ mod tests {
                 StorageWriteTarget::Part {
                     upload_id: UploadId::from_string(upload),
                     part_number: 10_000,
+                    reservation_id: StorageToken::generate().as_str().to_owned(),
                 },
             )
             .unwrap();
@@ -441,6 +587,7 @@ mod tests {
                     StorageWriteTarget::Part {
                         upload_id: UploadId::from_string(upload.to_owned()),
                         part_number: 1,
+                        reservation_id: StorageToken::generate().as_str().to_owned(),
                     },
                 )
                 .is_err()

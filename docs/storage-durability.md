@@ -10,15 +10,55 @@ Cairn guarantees that after any crash, on restart it converges to a state in whi
 
 ### 8.2 The commit sequence
 
-Every mutating operation follows one ordered sequence, and the order is the durability design.
+Every physical object or part write starts with a bounded, immutable storage plan: attempt and
+server-generation tokens, the exact target identity, and every possible temporary, final and index
+spool filename. Before any file can be created, the single metadata Writer durably admits that
+plan; multipart reservation or completion-claim admission occurs in the same savepoint. A matching
+typed `StorageCreationPermit` and `StorageIoLease` are mandatory at `stage`, `stage_part` and
+`assemble`. A missing, rejected or unacknowledged admission cannot authorize file creation.
 
-First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch the blob is deleted and the operation fails with no metadata written. Sixth, the metadata transaction is submitted to the writer and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, after the commit, any superseded blob is deleted on a best-effort basis and the activity and metrics are recorded.
+After admission, object publication follows one ordered sequence, and the order is the durability design.
 
-The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob with no row, which is an orphan that reconciliation reclaims; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
+First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch publication fails and the admitted paths enter exact recovery, with no visible object metadata written. Sixth, the metadata transaction is submitted to the writer with the exact admitted plan and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, exact cleanup debt recorded with publication reclaims superseded blobs and remaining provisional aliases, and the activity and metrics are recorded. Physical cleanup is retried independently; its failure cannot revoke an already committed object.
 
-Request cancellation is handled more eagerly than process crash. Until `stage` or multipart `assemble` returns its `StagedBlob`, the blob layer retains ownership of both the unique staging name and its possible post-rename bucket name with a POSIX unlink-on-drop guard. That guard remains armed across every await, including the directory-fsync barrier; the Tokio and io_uring backend handoffs retain equivalent ownership until their result is acknowledged, so work that finishes after its caller is dropped cannot strand an unreferenced file. Once an ordinary PUT or Copy receives the durable staged blob, a protocol drop guard owns an exact recovery record — bucket, key, version id, immutable row id, and unique storage path — across checksum cleanup, replication-rule reads, writer queue admission, and the commit acknowledgement. Cancellation synchronously enqueues that record to a retained server worker. The worker submits a `ResolveObjectWrite` probe through the same serialized writer, behind any original put that reached it: an exact row/path match preserves the now-live blob, an exact miss proves that unique path unreferenced and permits deletion, and an error remains ambiguous and preserves the file for startup reconciliation. UploadPart and UploadPartCopy use the equivalent `(upload_id, part_number, attempt_id, storage_path)` guard immediately after part staging; `ResolveMultipartPartWrite` preserves an exact current part and deletes/releases only an exact miss. The attempt-derived path prevents a delayed resolver from confusing a superseded retry at the same part number. A successful write disarms its guard before any post-commit await.
+The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob without a visible object row, whose admitted intent is resolved into exact cleanup during recovery; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
 
-All ordinary-object, multipart-part, and completion-claim guards acquire a bounded recovery slot before staging or claiming. The slot follows the guard into the retained FIFO worker and is released only after resolution, so synchronous Drop enqueue remains safe without allowing disconnected request waves to grow the process queue without bound. Together these boundaries close both directions of the acknowledgement race: cancellation cannot strand a staged orphan, and a lost acknowledgement cannot cause a committed object's bytes to be unlinked.
+Cancellation does not synchronously unlink admitted paths. A bounded recovery slot and an exact
+plan guard are acquired before admission can reach the Writer, covering a lost admission
+acknowledgement as well as cancellation during staging, checksum validation and publication.
+Dropping the request cancels further lease acquisition and enqueues its record to a retained
+worker. Existing file owners, queued or executing blocking jobs, io_uring operations, returned
+results and directory-sync waiters retain child leases through their actual completion. Each
+lease retains the exclusive node lifetime and recovery slot; dropping an async future does not
+prove that its I/O has stopped.
+
+The worker submits exact cancellation through the serialized Writer, waits for all existing I/O
+leases to drain, and probes exclusive locks on the plan's existing files. Only then
+may typed quiescence resolve the intent. Resolution preserves an exact authoritative object or
+part reference and converts unreferenced aliases into durable cleanup debt. Successful publication
+atomically consumes the matching intent and records provisional/superseded cleanup; its guard is
+disarmed before any post-commit await. An ambiguous Writer result preserves ownership for exclusive
+startup recovery. A timeout or a lost acknowledgement is never evidence that bytes are unreferenced.
+
+Cleanup uses exact Writer claims bound to a generation, claim token and expiry. Claims recheck
+that no authoritative reference or active intent owns the path. The blob layer rejects a still
+locked file, unlinks only the claimed filename, synchronizes its directory, and prunes only empty
+supported parents with parent synchronization. Already-absent names still require a namespace
+barrier. The Writer retires debt and associated quota only after durable absence and a matching,
+unexpired acknowledgement. Unknown siblings survive; filesystem errors and stale acknowledgements
+retain debt. Request abort and multipart termination do not authorize recursive session deletion.
+
+Store construction also requires a maintenance `StorageIoLease` retaining the actual exclusive
+node guard. Initialization executes in a leased blocking job, so cancelling construction cannot
+release exclusion ahead of directory creation or synchronization. Serving and offline recovery
+retain the same node lifetime through their dependent I/O and runtime teardown.
+
+The Linux io_uring process-kill regression uses an isolated, frozen ext4 loop filesystem and
+requires a real submitted write without a completion plus a kernel write-stack witness before
+SIGKILL. It observes node exclusion and the staging-file lock remaining held while process teardown
+is pending, rejects quiescence and cleanup, then permits them after thaw and process reap. This
+qualifies exclusion through teardown; it does not demonstrate a detached kernel-reference interval
+after process exit or power-loss durability.
 
 ### 8.3 Durability and group commit
 
@@ -30,7 +70,26 @@ The metadata database's own durability is governed by its synchronous setting. C
 
 ### 8.5 Reconciliation as the recovery and integrity mechanism
 
-Reconciliation reconciles the on-disk blobs against the metadata. It exists to reclaim orphaned blobs left by crashes in the step-four-to-six window and to detect, as an integrity check, any divergence. Its working memory and concurrency are bounded (F-8, F-9); total work remains proportional to stored artifacts: it walks the per-bucket directories and, for each blob it encounters, checks membership against the metadata in fixed-size batches rather than loading the keyspace, deleting any blob and its index trailer that no row references and any staging artifact older than a safety margin and any multipart staging directory whose upload session no longer exists. It prunes emptied directories. It runs with bounded parallelism across buckets, logs progress, and reports counts as metrics. The full walk is a mandatory pre-bind startup gate: an oracle error, filesystem walk failure, or any other reconciliation error aborts stack construction, so the listener can never serve while known divergence is unresolved. Operators of very large stores can run the explicit integrity command for additional out-of-band checks, but there is no startup opt-out. A lazy per-read integrity check remains an always-on safety net: a read whose blob is unexpectedly missing returns a clear error, emits a metric, and flags the row for repair. A repair mode of reconciliation can additionally drop rows whose blobs are missing, which is needed only for recovery from external damage or from a backup taken in the narrow window described in Section 31.4. It cannot bypass Object Lock: the writer preserves still-retained or legally-held rows even when their blobs are missing, reports them as unresolved protected damage, and makes the repair command fail rather than manufacturing a clean report by deleting WORM metadata.
+Reconciliation compares on-disk artifacts with metadata using bounded pages and bucket workers
+(F-8, F-9); total work remains proportional to stored artifacts. Membership protects authoritative
+object and part references, every outstanding storage intent alias, and every cleanup-debt path,
+including pending, claimed and expired claims. Root staging aliases are checked across metadata
+shards. Session absence alone never authorizes recursive deletion. The walker reclaims only
+recognized, unprotected files older than the safety margin and prunes empty directories; unknown
+layouts and symlinks are preserved and reported. A missing directory-entry type (`DT_UNKNOWN`) is
+resolved with descriptor-relative, no-follow metadata lookup; lookup failure fails the scan rather
+than silently skipping a subtree.
+
+The full walk remains a mandatory pre-bind startup gate. Under exclusive node ownership, startup
+commits a new generation, invalidates old cleanup claims, probes prior intent files for outstanding
+I/O, resolves those intents and recovers multipart completion ownership. It then performs the full
+scan, releases only eligible legacy orphan accounting after that scan succeeds, and drains exact
+cleanup claims before serving. Current intent and cleanup accounting cannot be retired merely
+because a scan completed. An oracle error, filesystem walk/barrier failure or unresolved cleanup
+aborts stack construction. Full scans remain active; the journal does not authorize scan-free
+startup or nested placement.
+
+Operators of very large stores can run the explicit integrity command for additional out-of-band checks, but there is no startup opt-out. A lazy per-read integrity check remains an always-on safety net: a read whose blob is unexpectedly missing returns a clear error, emits a metric, and flags the row for repair. A repair mode of reconciliation can additionally drop rows whose blobs are missing, which is needed only for recovery from external damage or from a backup taken in the narrow window described in Section 31.4. It cannot bypass Object Lock: the writer preserves still-retained or legally-held rows even when their blobs are missing, reports them as unresolved protected damage, and makes the repair command fail rather than manufacturing a clean report by deleting WORM metadata.
 
 ### 8.6 Single-node durability guidance for operators
 
@@ -43,11 +102,18 @@ Because Cairn does not implement drive redundancy, its single-node durability is
 
 ### 9.1 Principles
 
-Object bytes live as files named by an opaque identifier, never by key; metadata is the source of truth; a blob is live only when referenced. Versioning, tagging, ACLs, and the rest are metadata concerns and do not change the fundamental on-disk shape: a version of an object is simply another row referencing another blob, and a delete marker is a row with no blob at all. This is why the storage model scales to the full feature set without a redesign: features accrete in metadata, not on disk.
+Object bytes live as files named by an opaque identifier, never by key; metadata is the source of truth; a blob is visible only when referenced, while admitted writes and cleanup debt also protect their exact physical paths during recovery. Versioning, tagging, ACLs, and the rest are metadata concerns and do not change the fundamental on-disk shape: a version of an object is simply another row referencing another blob, and a delete marker is a row with no blob at all. This is why the storage model scales to the full feature set without a redesign: features accrete in metadata, not on disk.
 
 ### 9.2 Directory layout
 
-The data filesystem holds a staging area for in-progress single-part writes, a multipart staging area organised per upload session, and one directory per bucket holding that bucket's committed blobs under their opaque identifiers. The database file lives on the same filesystem. The staging areas exist so that the only way a blob enters a bucket directory is by atomic rename after being fully written and fsynced, which is the basis of the commit protocol. New writes use `bucket/<32-lowercase-hex-UUID>` (flat placement). On POSIX, reconciliation also understands exactly `bucket/<first-two-UUID-hex-digits>/<32-lowercase-hex-UUID>`; this is a compatibility safeguard for the laboratory fanout evaluation, not adoption of nested writes. Existing metadata-named flat and nested reads remain valid. Unknown names, prefixes, depths and symlinks are preserved and reported as errors, never recursively reclaimed. Bucket enumeration streams directly into the bounded worker set; each worker holds bounded bucket/leaf entry pages and at most one nested leaf cursor. Directory-relative descriptors anchor nested traversal and unlink, with no-follow opens and identity checks before pruning. Empty removal uses `rmdir` semantics, so a repopulated directory survives. Reclaimed files are followed by directory synchronization; a removed leaf or bucket is acknowledged only after its parent synchronizes. A sync failure propagates as a reconciliation failure. Full startup scans remain mandatory and proportional to stored artifacts; fanout reduces neither inode count nor the amount of scan work. The non-POSIX fallback retains its previous flat traversal.
+The data filesystem holds a staging area for in-progress single-part writes, a multipart staging area organised per upload session, and one directory per bucket holding that bucket's committed blobs under their opaque identifiers. The database file lives on the same filesystem. The staging areas exist so that the only way a blob enters a bucket directory is by atomic rename after being fully written and fsynced, which is the basis of the commit protocol. New writes use `bucket/<32-lowercase-hex-UUID>` (flat placement). On Linux, reconciliation also understands exactly `bucket/<first-two-UUID-hex-digits>/<32-lowercase-hex-UUID>`; this is a compatibility safeguard for the laboratory fanout evaluation, not adoption of nested writes. Existing metadata-named flat and nested reads remain valid. Unknown names, prefixes, depths and symlinks are preserved and reported as errors, never recursively reclaimed. Bucket enumeration streams directly into the bounded worker set; each worker holds bounded bucket/leaf entry pages and at most one nested leaf cursor. Directory-relative descriptors anchor creation, referenced input opens, traversal and exact cleanup.
+Descendant opens require Linux `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS` and
+`RESOLVE_NO_XDEV`; this rejects descendant mounts, including same-device bind mounts that device
+comparisons cannot detect. The configured root itself may be a mount. Linux 5.6 or newer with those
+resolution flags available is required; unavailable support fails closed. Root initialization
+creates at most the final configured directory under an existing parent, then creates known staging
+children through those descriptors; it rejects staging symlinks or mount crossings before writing
+through them. Identity checks also precede pruning. Empty removal uses `rmdir` semantics, so a repopulated directory survives. Reclaimed files are followed by directory synchronization; a removed leaf or bucket is acknowledged only after its parent synchronizes. A sync failure propagates as a reconciliation failure. Full startup scans remain mandatory and proportional to stored artifacts; fanout reduces neither inode count nor the amount of scan work. Unsupported platforms do not fall back to a weaker namespace walk.
 
 ### 9.3 The blob file format
 
@@ -78,11 +144,13 @@ Larger encoded objects or sublinear authenticated opening require a separately r
 
 The encoder drains serialized entries after each 64-KiB input batch and updates the v3 metadata
 HMAC incrementally. An index of at most 64 KiB stays in a bounded request-owned buffer. Larger
-indexes spill to a buffered temporary file on the data filesystem; its unique `.staging` name is
-unlinked before the file descriptor leaves the create task. Cancellation and detached writes thus
-cannot leave a named scratch file. A crash between create and unlink can leave an ordinary staging
-artifact, reclaimed by the existing full startup reconciliation. The spool is flushed and copied
-in 64-KiB batches into the final blob, followed by its unchanged MAC and trailer, **before** that
+indexes spill to a buffered temporary file on the data filesystem at the exact index-spool alias
+already included in admission. Creation uses the anchored namespace and locks the file; the create
+job unlinks only that newly created inode before returning its leased file owner. Queued writes,
+reads and returned buffers retain that owner after request cancellation. A crash before unlink or
+before its namespace barrier can leave or restore the alias, so publication/recovery records exact
+cleanup even when the spool name appears absent. Full scans protect that debt until its claimed
+cleanup proves durable absence. The spool is flushed and copied in 64-KiB batches into the final blob, followed by its unchanged MAC and trailer, **before** that
 blob's existing file-sync/rename/directory-sync sequence. Scratch data has no separate fsync or
 committed sidecar. Errors, including ENOSPC during spool flush/copy, abort publication.
 
@@ -103,13 +171,13 @@ A storage path identifies a blob within the data directory and is recorded on th
 
 ### 9.5 Multipart staging
 
-Each multipart upload session has a staging directory holding its parts. An UploadPart request must declare its exact decoded length; before the blob layer opens a file, the metadata writer transaction reserves that many bytes against both the bucket and initiating principal, and reserves the `(upload, part-number)` cardinality slot. It refuses a request that would exceed the byte quota or configured session/part ceilings. The reservation carries a fresh attempt identifier, and the blob is written under the deterministic `{part-number}-{attempt-id}` name. This gives every failure path an exact artifact to delete even if staging failed before it could return a storage path; the reservation is released only after that idempotent deletion succeeds.
+Each multipart upload session has a staging directory holding its parts. An UploadPart request must declare its exact decoded length; before the blob layer opens a file, the metadata writer transaction reserves that many bytes against both the bucket and initiating principal, and reserves the `(upload, part-number)` cardinality slot. It refuses a request that would exceed the byte quota or configured session/part ceilings. The reservation carries a fresh attempt identifier, and the blob is written under the deterministic `{part-number}-{attempt-id}` name. The same Writer savepoint admits its complete storage plan, including the optional index-spool alias. Every failure therefore has exact recovery identities even if staging never returns a path; abandoned bytes remain charged until all associated physical cleanup debt is durably retired.
 
-Recording a successful attempt atomically consumes its reservation. Re-uploading a part number never clobbers the previous file: the replacement becomes authoritative and the superseded path becomes explicit cleanup debt whose bytes remain charged until deletion succeeds. The same conservative accounting applies to completion and abort: terminal metadata removal converts any remaining part/reservation bytes into per-session cleanup debt, directory deletion is retried, and only then are the charges released. Thus a crash or filesystem error can temporarily over-count staging use but can never make unremoved bytes disappear from quota accounting.
+Recording a successful attempt atomically consumes its reservation. Re-uploading a part number never clobbers the previous file: the replacement becomes authoritative and the superseded path becomes explicit cleanup debt whose bytes remain charged until deletion succeeds. The same conservative accounting applies to completion and abort: terminal metadata removal converts remaining part/reservation bytes into accounting debt linked to exact physical cleanup paths. Admitted attempts retain their ownership until quiescence is established. Each filename is reclaimed under a Writer claim; empty session directories may then be pruned. Charges are released only after the last associated physical debt retires. Thus a crash or filesystem error can temporarily over-count staging use but can never make unremoved bytes disappear from quota accounting.
 
 The directory chain is made durable from parent to child: store initialization creates `.staging/multipart` and fsyncs each parent whose directory entry changed, and the first part for a session creates its session directory and fsyncs `.staging/multipart` before opening the part file. A completed part is fsynced before its session directory is fsynced. This ordering means a successful part upload cannot depend on directory entries that a power loss is still permitted to forget. Assembly streams the ordered parts into a single committed blob through the same durable commit sequence as a single-part write, applying compression during the assembly pass if the bucket enables it. When the upload is server-side encrypted, each part is instead staged as an encrypted block container under its own fresh data key so that nothing plaintext reaches disk; assembly then decrypts each part on read — failing closed on a wrong key or tampered part rather than writing a partial or plaintext object — before re-encrypting the assembled object under its own data key. The decision to encrypt parts is fixed when the upload is initiated, an encrypted part is physically larger than its plaintext, and a re-uploaded part number is staged under a distinct data key.
 
-Metadata status and the persisted per-attempt claim token protect those bytes during the terminal race: completion atomically owns `completing` under its token, abort can remove only `active`, and release or final completion must match that exact owner. A stale cancellation cannot release a newer completer. A failed completion releases its claim before a retry; a successful completion removes the session in the same transaction that installs the already-durable assembled object, then reclaims the parts. A bounded background pass first retries exact-path cleanup debt, then abandoned reservations, then stale sessions. The mandatory full startup reconciliation additionally removes files inside a live session directory unless their exact paths are referenced by authoritative part rows; only after that full walk succeeds may the writer release orphaned accounting rows. The recurring sweeper is deliberately bounded to 10,000 items or 30 seconds per pass.
+Metadata status and the persisted per-attempt claim token protect those bytes during the terminal race: completion atomically owns `completing` under its token, abort can remove only `active`, and release or final completion must match that exact owner. A stale cancellation cannot release a newer completer. A failed or cancelled completion releases only its exact claim after outstanding storage I/O is quiescent; a successful completion removes the session in the same transaction that installs the already-durable assembled object, then reclaims the parts. A bounded background pass retries exact-path cleanup debt and aborts eligible stale sessions through the Writer. An admitted reservation is not reclaimed merely because it is old: cancellation recovery or exclusive startup recovery must first establish I/O quiescence. The mandatory full startup reconciliation protects exact part references, intent aliases and every cleanup-debt path even inside an absent session; only after a successful full walk may the writer release eligible legacy orphan accounting (Section 8.5). The stale-session pass is bounded to 10,000 items or 30 seconds. The same task independently checks exact cleanup every second while idle, processes at most eight paths concurrently from a 1,000-path batch, and limits each batch to 30 seconds. A full successful batch continues promptly after yielding and checking shutdown and the stale-session deadline; failures retain their claims and debt for retry.
 
 ---
 

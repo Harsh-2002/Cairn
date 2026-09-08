@@ -284,3 +284,19 @@ migration, ownership and journal tests pass across SQLite, libSQL, Turso, double
 owning all-feature Clippy passes. Blob I/O, strict publication, v26 quota retirement and recovery
 consumer integration are still required before this phase or its PR can be considered complete.
 No new performance experiment has run; the cumulative campaign remains 390.191882 seconds.
+
+Phase 3C integration: all ordinary/import/replica PUT and Copy paths, multipart part/completion
+admission and publication, and deletion/lifecycle/control paths now use exact durable ownership.
+v37 additionally retains multipart scratch-alias ownership so quota cannot retire before all
+aliases are durably absent. Constructor, staging, blocking work, io_uring, reconciliation and
+cleanup retain node/I/O lifetime; Linux descriptor-anchored traversal rejects descendant mounts
+and symlinks. Focused protocol/blob/backend and five real-filesystem startup integration tests
+pass, including across all four metadata configurations. The actual io_uring SIGKILL fixture
+passes with the limits stated in `storage-journal-2026-09.md`. Review identified an import recovery
+shutdown-sentinel race; its fix and deterministic producer-order regression pass. Exact cleanup
+now runs promptly in the existing sweeper independently of the configured stale-upload interval;
+three regressions cover multi-page progress, shutdown and locked-file debt retention. The final
+local gate passes 1,388 default-feature and 1,413 all-feature tests, both Clippy configurations,
+formatting and two doctests. Web, npm audits, cargo audits and installer checks pass. Final-head CI,
+the admission-cost comparison, final review and merge remain pending.
+Phase 3C is not complete and Phase 3D is not activated. Campaign consumption is unchanged.

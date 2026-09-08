@@ -4,24 +4,28 @@
 
 use crate::compress::BlockEncoder;
 use crate::io_err;
-use crate::staging::{Staging, UncommittedBlobCleanup};
+use crate::namespace::AnchoredPath;
+use crate::owned_file::{FileOwner, OwnedFile};
+use crate::staging::Staging;
+use cairn_types::storage::io::StorageIoLease;
 use cairn_types::{SecretKey32, bucket::CompressionPolicy, error::BlobError};
-use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 const BATCH_BYTES: usize = 64 * 1024;
 
 struct IndexSpool {
-    dir: PathBuf,
+    path: AnchoredPath,
+    lease: StorageIoLease,
     buffered: Vec<u8>,
-    file: Option<BufWriter<tokio::fs::File>>,
+    file: Option<BufWriter<OwnedFile>>,
     len: u64,
 }
 
 impl IndexSpool {
-    fn new(dir: &Path) -> Self {
+    fn new(path: AnchoredPath, lease: StorageIoLease) -> Self {
         Self {
-            dir: dir.to_owned(),
+            path,
+            lease,
             buffered: Vec::new(),
             file: None,
             len: 0,
@@ -37,30 +41,16 @@ impl IndexSpool {
             self.buffered.extend_from_slice(bytes);
         } else {
             if self.file.is_none() {
-                let path = self
-                    .dir
-                    .join(format!("{}.index.tmp", uuid::Uuid::new_v4().simple()));
-                let file = tokio::task::spawn_blocking(move || {
-                    // Arm after create_new: a collision must never delete somebody else's path.
-                    // The guard and descriptor live in the blocking task, so cancellation cannot
-                    // race creation. Unlink before returning: even detached later writes have no
-                    // name to resurrect. A process crash between create/unlink leaves an ordinary
-                    // .staging artifact for the mandatory startup reconciliation.
-                    let file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .map_err(io_err)?;
-                    let mut cleanup = UncommittedBlobCleanup::staging_only(path.clone());
-                    std::fs::remove_file(path).map_err(io_err)?;
-                    cleanup.disarm();
-                    Ok::<_, BlobError>(file)
+                let path = self.path.clone();
+                let lease = self.lease.try_child()?;
+                let owner = tokio::task::spawn_blocking(move || {
+                    let file = path.create_new().map_err(io_err)?;
+                    path.unlink_created(&file).map_err(io_err)?;
+                    Ok::<_, BlobError>(FileOwner::new(file, lease))
                 })
                 .await
-                .map_err(|e| BlobError::Io(e.to_string()))??;
-                let mut writer =
-                    BufWriter::with_capacity(BATCH_BYTES, tokio::fs::File::from_std(file));
+                .map_err(|error| BlobError::Io(error.to_string()))??;
+                let mut writer = BufWriter::with_capacity(BATCH_BYTES, OwnedFile::new(owner));
                 writer.write_all(&self.buffered).await.map_err(io_err)?;
                 self.buffered = Vec::new();
                 self.file = Some(writer);
@@ -81,14 +71,15 @@ impl IndexSpool {
             // Flush userspace bytes, then rewind. No durability barrier belongs to this scratch
             // file; the caller syncs the complete final blob after index + MAC + trailer append.
             writer.flush().await.map_err(io_err)?;
-            let mut file = writer.into_inner();
-            file.rewind().await.map_err(io_err)?;
-            let mut buf = vec![0u8; BATCH_BYTES];
+            let file = writer.into_inner();
             let mut remaining = self.len;
             while remaining != 0 {
                 let n = remaining.min(BATCH_BYTES as u64) as usize;
-                file.read_exact(&mut buf[..n]).await.map_err(io_err)?;
-                sink.write_all(&buf[..n]).await?;
+                let buf = file
+                    .read_chunk(self.len - remaining, n)
+                    .await
+                    .map_err(io_err)?;
+                sink.write_all(&buf).await?;
                 remaining -= n as u64;
             }
         } else {
@@ -105,14 +96,19 @@ pub(crate) struct StagedEncoder {
 }
 
 impl StagedEncoder {
-    pub(crate) fn new(policy: CompressionPolicy, dek: Option<SecretKey32>, dir: &Path) -> Self {
+    pub(crate) fn new(
+        policy: CompressionPolicy,
+        dek: Option<SecretKey32>,
+        path: AnchoredPath,
+        lease: StorageIoLease,
+    ) -> Self {
         let encoder = match dek {
             Some(key) => BlockEncoder::new_encrypted(policy.algorithm, policy.block_size, key),
             None => BlockEncoder::new(policy.algorithm, policy.block_size),
         };
         Self {
             encoder,
-            index: IndexSpool::new(dir),
+            index: IndexSpool::new(path, lease),
         }
     }
 
@@ -143,6 +139,23 @@ impl StagedEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_file::test_lease;
+    use std::path::Path;
+
+    fn spool(dir: &Path) -> IndexSpool {
+        IndexSpool::new(
+            AnchoredPath::fixture(
+                &dir.join(format!("{}.index.tmp", uuid::Uuid::new_v4().simple())),
+            ),
+            test_lease(),
+        )
+    }
+
+    async fn sink(path: &Path) -> Staging {
+        Staging::create(AnchoredPath::fixture(path), false, None, test_lease())
+            .await
+            .unwrap()
+    }
     use crate::compress::{CompressedReader, CompressionAlgorithm};
     use cairn_types::{blob::BlobCipher, object::CompressionDescriptor};
 
@@ -157,7 +170,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let data: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
-            let mut spool = IndexSpool::new(dir.path());
+            let mut spool = spool(dir.path());
             for chunk in data.chunks(733) {
                 spool.append(chunk).await.unwrap();
                 assert!(spool.buffered.capacity() <= BATCH_BYTES);
@@ -165,7 +178,7 @@ mod tests {
             assert_eq!(spool.file.is_some(), len > BATCH_BYTES);
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             let path = dir.path().join("final.tmp");
-            let mut sink = Staging::create(path.clone(), false, None).await.unwrap();
+            let mut sink = sink(&path).await;
             assert_eq!(spool.append_to(&mut sink).await.unwrap(), len as u64);
             sink.fsync_in_place().await.unwrap();
             assert_eq!(std::fs::read(path).unwrap(), data);
@@ -175,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_spilled_writer_has_no_named_scratch() {
         let dir = tempfile::tempdir().unwrap();
-        let mut spool = IndexSpool::new(dir.path());
+        let mut spool = spool(dir.path());
         spool.append(&vec![1; BATCH_BYTES + 1]).await.unwrap();
         let (ready, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -209,7 +222,7 @@ mod tests {
             });
             started.await.unwrap();
             {
-                let mut spool = IndexSpool::new(dir.path());
+                let mut spool = spool(dir.path());
                 let data = vec![1; BATCH_BYTES + 1];
                 let append = spool.append(&data);
                 futures_util::pin_mut!(append);
@@ -231,43 +244,48 @@ mod tests {
     #[tokio::test]
     async fn spool_create_and_read_errors_propagate_before_commit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut missing = IndexSpool::new(&dir.path().join("missing"));
+        let missing_dir = dir.path().join("missing");
+        std::fs::create_dir(&missing_dir).unwrap();
+        let mut missing = spool(&missing_dir);
+        std::fs::remove_dir(&missing_dir).unwrap();
         assert!(matches!(
             missing.append(&vec![1; BATCH_BYTES + 1]).await,
             Err(BlobError::Io(_))
         ));
-        let mut truncated = IndexSpool::new(dir.path());
+        let mut truncated = spool(dir.path());
         truncated.append(&vec![2; BATCH_BYTES + 1]).await.unwrap();
         let writer = truncated.file.as_mut().unwrap();
         writer.flush().await.unwrap();
-        writer.get_mut().set_len(1).await.unwrap();
-        let mut sink = Staging::create(dir.path().join("output.tmp"), false, None)
-            .await
-            .unwrap();
+        writer.get_ref().owner.file.set_len(1).unwrap();
+        let mut sink = sink(&dir.path().join("output.tmp")).await;
         assert!(matches!(
             truncated.append_to(&mut sink).await,
             Err(BlobError::Io(_))
         ));
         sink.abort().await;
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(
+            dir.path().join("output.tmp").exists(),
+            "failed data remains journal-owned"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn spool_enospc_is_out_of_space() {
         let dir = tempfile::tempdir().unwrap();
-        let mut spool = IndexSpool::new(dir.path());
-        let file = tokio::fs::OpenOptions::new()
+        let mut spool = spool(dir.path());
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/full")
-            .await
             .unwrap();
-        spool.file = Some(BufWriter::with_capacity(BATCH_BYTES, file));
+        spool.file = Some(BufWriter::with_capacity(
+            BATCH_BYTES,
+            OwnedFile::new(FileOwner::new(file, test_lease())),
+        ));
         // /dev/full supplies real ENOSPC without filling a filesystem. Tokio may surface it
         // on write or on the subsequent flush; either must prevent a successful finalization.
-        let mut sink = Staging::create(dir.path().join("output.tmp"), false, None)
-            .await
-            .unwrap();
+        let mut sink = sink(&dir.path().join("output.tmp")).await;
         let outcome = match spool.append(&vec![3; 2 * BATCH_BYTES]).await {
             Err(err) => Err(err),
             Ok(()) => spool.append_to(&mut sink).await,
@@ -294,8 +312,13 @@ mod tests {
             // >7,281 entries forces the actual encoded-index spill; about 8 MiB of logical data.
             let data = vec![42; 8 * 1024 * 1024 + 3];
             let path = dir.path().join("output.tmp");
-            let mut sink = Staging::create(path.clone(), false, None).await.unwrap();
-            let mut encoder = StagedEncoder::new(policy, cipher.dek(), dir.path());
+            let mut sink = sink(&path).await;
+            let mut encoder = StagedEncoder::new(
+                policy,
+                cipher.dek(),
+                AnchoredPath::fixture(&dir.path().join("encoding.index.tmp")),
+                test_lease(),
+            );
             let physical = encoder.feed(&data, &mut sink).await.unwrap();
             assert!(encoder.index.file.is_some());
             assert!(encoder.encoder.take_index().is_empty());

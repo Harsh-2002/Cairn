@@ -27,11 +27,13 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
   timestamp. The row id distinguishes an unversioned sentinel replacement even when both writes
   share one timestamp tick; a concurrently arrived older replica likewise cannot be exposed.
   NEVER add an action that isn't a no-op once applied.
-- Incomplete-upload abort obeys the multipart terminal-owner outcome: reclaim staged parts only
-  after the writer returns `Aborted`. `NotOwner` means a concurrent Complete owns `completing`; it is
+- Incomplete-upload abort obeys the multipart terminal-owner outcome: only `Aborted` records
+  exact terminal cleanup debt. Physical cleanup is deferred until owning I/O quiesces and exact
+  Writer claims authorize it; the scanner never deletes a session directory. `NotOwner` means a concurrent Complete owns `completing`; it is
   an expected skip, and deleting that session's bytes would corrupt the winning completion.
 - **Versioned vs not.** Expiring a current object in a versioning-*enabled* bucket inserts a delete
-  marker (`CreateDeleteMarker`); unversioned/suspended permanently deletes and reclaims the blob.
+  marker (`CreateDeleteMarker`); unversioned/suspended removes metadata and atomically records
+  exact cleanup debt. Expiration counts describe authoritative removal, not completed unlink.
 - **Object Lock outranks expiry at the Writer.** Lifecycle passes one trusted `now` and
   `GovernanceBypass::Denied` with every permanent-delete or delete-marker mutation. The Writer
   evaluates the version's current retention/legal-hold state in the same savepoint as deletion and

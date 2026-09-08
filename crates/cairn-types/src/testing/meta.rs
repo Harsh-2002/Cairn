@@ -55,7 +55,7 @@ struct StoredDefaultRetention {
     period: RetentionPeriod,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct State {
     buckets: BTreeMap<String, Bucket>,
     /// Per-bucket byte quota (`buckets.quota_bytes`), absent when unlimited. Multipart reservations
@@ -338,13 +338,19 @@ impl State {
         Ok(())
     }
 
-    fn upsert_version(&mut self, mut row: ObjectVersionRow) -> Option<StoragePath> {
+    fn upsert_version(
+        &mut self,
+        mut row: ObjectVersionRow,
+    ) -> Result<Option<StoragePath>, MetaError> {
         let vk: VKey = (
             row.bucket.as_str().to_owned(),
             row.key.as_str().to_owned(),
             row.version_id.as_str().to_owned(),
         );
         let superseded = self.versions.get(&vk).and_then(|r| r.storage_path.clone());
+        if let Some(path) = &superseded {
+            storage::enqueue(self, &row.bucket, path)?;
+        }
         // A replica carries the source's (uuidv7-ordered) version id, which may be older than a
         // version already here; it is latest only if its id is the max for the key (mirrors the SQL
         // store's replica-scoped ordering). A normal write keeps last-write-is-latest.
@@ -369,7 +375,7 @@ impl State {
         }
         row.is_latest = becomes_latest;
         self.versions.insert(vk, row);
-        superseded
+        Ok(superseded)
     }
 
     fn multipart_staged_for_bucket(&self, bucket: &str) -> u64 {
@@ -442,29 +448,7 @@ impl State {
             .get(upload_id.as_str())
             .cloned()
             .ok_or(MetaError::MultipartNotActive)?;
-        let part_bytes: u64 = self
-            .parts
-            .iter()
-            .filter(|((upload, _), _)| upload == upload_id.as_str())
-            .map(|(_, part)| part.size)
-            .sum();
-        let reservation_bytes: u64 = self
-            .multipart_reservations
-            .values()
-            .filter(|reservation| reservation.upload_id == *upload_id)
-            .map(|reservation| reservation.reserved_bytes)
-            .sum();
-        let bytes = part_bytes.saturating_add(reservation_bytes);
-        let cleanup = MultipartCleanup {
-            id: format!("session:{}", upload_id.as_str()),
-            upload_id: upload_id.clone(),
-            bucket: session.bucket,
-            principal_id: session.initiated_by,
-            bytes,
-            storage_path: None,
-            created_at: session.updated_at,
-        };
-        self.multipart_cleanups.insert(cleanup.id.clone(), cleanup);
+        storage::retire_multipart(self, &session)?;
         self.multipart.remove(upload_id.as_str());
         self.multipart_claims.remove(upload_id.as_str());
         self.parts
@@ -492,6 +476,9 @@ pub struct InMemoryMetadataStore {
     fail_next_part_record_ack: AtomicBool,
     hang_next_part_record_ack: AtomicBool,
     part_record_ack_hanging: AtomicBool,
+    fail_next_storage_admission_ack: AtomicBool,
+    hang_next_storage_admission_ack: AtomicBool,
+    storage_admission_ack_hanging: AtomicBool,
 }
 
 impl std::fmt::Debug for InMemoryMetadataStore {
@@ -506,6 +493,27 @@ impl InMemoryMetadataStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Commit the next physical admission, then lose its acknowledgement before a caller can
+    /// obtain a creation permit. The retained consumer must resolve its persisted exact plan.
+    pub fn fail_next_storage_admission_ack(&self) {
+        self.fail_next_storage_admission_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Commit the next admission and hold its acknowledgement until the waiting task is dropped.
+    pub fn hang_next_storage_admission_ack(&self) {
+        self.storage_admission_ack_hanging
+            .store(false, Ordering::Release);
+        self.hang_next_storage_admission_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether the admission has committed and reached the injected acknowledgement barrier.
+    #[must_use]
+    pub fn storage_admission_ack_is_hanging(&self) -> bool {
+        self.storage_admission_ack_hanging.load(Ordering::Acquire)
     }
 
     /// Apply the next replication completion, then withhold its writer acknowledgement.
@@ -592,93 +600,6 @@ impl InMemoryMetadataStore {
     #[must_use]
     pub fn part_record_ack_is_hanging(&self) -> bool {
         self.part_record_ack_hanging.load(Ordering::Acquire)
-    }
-
-    async fn submit_record_part(
-        &self,
-        upload_id: UploadId,
-        attempt_id: String,
-        part: PartRecord,
-    ) -> Result<MutationOutcome, MetaError> {
-        let outcome = {
-            let mut st = self.state.lock().unwrap();
-            let session = st
-                .multipart
-                .get(upload_id.as_str())
-                .filter(|session| session.status == MultipartStatus::Active)
-                .cloned()
-                .ok_or(MetaError::MultipartNotActive)?;
-            let reservation = st
-                .multipart_reservations
-                .get(&attempt_id)
-                .filter(|reservation| reservation.upload_id == upload_id)
-                .cloned()
-                .ok_or(MetaError::MultipartNotActive)?;
-            if reservation.part_number != part.part_number
-                || reservation.reserved_bytes != part.size
-            {
-                return Err(MetaError::QuotaExceeded);
-            }
-            let pk = (upload_id.as_str().to_owned(), part.part_number);
-            let cleanup = st.parts.get(&pk).map(|previous| MultipartCleanup {
-                id: format!("part:{attempt_id}"),
-                upload_id: upload_id.clone(),
-                bucket: session.bucket.clone(),
-                principal_id: session.initiated_by.clone(),
-                bytes: previous.size,
-                storage_path: Some(previous.storage_path.clone()),
-                created_at: reservation.created_at,
-            });
-            if let Some(cleanup) = &cleanup {
-                st.multipart_cleanups
-                    .insert(cleanup.id.clone(), cleanup.clone());
-            }
-            st.parts.insert(pk, part);
-            st.multipart_reservations.remove(&attempt_id);
-            MutationOutcome::PartRecorded { cleanup }
-        };
-        let fail = self.fail_next_part_record_ack.swap(false, Ordering::AcqRel);
-        let hang = self.hang_next_part_record_ack.swap(false, Ordering::AcqRel);
-        if hang {
-            self.part_record_ack_hanging.store(true, Ordering::Release);
-            std::future::pending::<()>().await;
-            unreachable!("pending future returned")
-        }
-        if fail {
-            return Err(MetaError::Engine(
-                "multipart part acknowledgement lost".to_owned(),
-            ));
-        }
-        Ok(outcome)
-    }
-
-    async fn submit_multipart_claim(
-        &self,
-        upload_id: UploadId,
-        claim_token: MultipartClaimToken,
-    ) -> Result<MutationOutcome, MetaError> {
-        let outcome = {
-            let mut st = self.state.lock().unwrap();
-            let claimed = match st.multipart.get_mut(upload_id.as_str()) {
-                Some(session) if session.status == MultipartStatus::Active => {
-                    session.status = MultipartStatus::Completing;
-                    session.clone()
-                }
-                Some(_) => {
-                    return Ok(MutationOutcome::MultipartClaim(
-                        ClaimOutcome::AlreadyClaimed,
-                    ));
-                }
-                None => return Ok(MutationOutcome::MultipartClaim(ClaimOutcome::NotFound)),
-            };
-            st.multipart_claims
-                .insert(upload_id.as_str().to_owned(), claim_token);
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(Box::new(claimed)))
-        };
-        if self.hang_next_claim_ack.swap(false, Ordering::AcqRel) {
-            return std::future::pending().await;
-        }
-        Ok(outcome)
     }
 
     /// Mark one Object Lock side row structurally corrupt.
@@ -963,43 +884,1326 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             return Ok(outcome);
         }
-        let mutation = match mutation {
-            Mutation::ClaimMultipart {
-                upload_id,
-                claim_token,
-            } => return self.submit_multipart_claim(upload_id, claim_token).await,
-            Mutation::RecordPart {
-                upload_id,
-                attempt_id,
-                part,
-            } => {
-                return self.submit_record_part(upload_id, attempt_id, part).await;
-            }
-            other => other,
+        let outcome = {
+            let mut committed = self.state.lock().unwrap();
+            let mut transaction = committed.clone();
+            let outcome = State::apply(&mut transaction, mutation)?;
+            *committed = transaction;
+            outcome
         };
-        let mut st = self.state.lock().unwrap();
-        match mutation {
-            Mutation::BeginStorageGeneration { generation } => {
-                Ok(storage::begin(&mut st, generation))
+        if matches!(
+            &outcome,
+            MutationOutcome::StorageAdmission(crate::storage::StorageAdmission::Granted(_))
+                | MutationOutcome::StorageMultipartClaim {
+                    admission: crate::storage::StorageAdmission::Granted(_),
+                    ..
+                }
+        ) {
+            let fail = self
+                .fail_next_storage_admission_ack
+                .swap(false, Ordering::AcqRel);
+            if self
+                .hang_next_storage_admission_ack
+                .swap(false, Ordering::AcqRel)
+            {
+                self.storage_admission_ack_hanging
+                    .store(true, Ordering::Release);
+                return std::future::pending().await;
             }
-            Mutation::Storage { bucket, operation } => storage::apply(&mut st, &bucket, operation),
-            Mutation::RecoverStorageIntents { generation, limit } => {
-                storage::recover(&mut st, &generation, limit)
+            if fail {
+                return Err(MetaError::Engine(
+                    "storage admission acknowledgement lost".into(),
+                ));
+            }
+        }
+        // Fault injection follows the entire savepoint, including physical intent/debt changes.
+        if matches!(&outcome, MutationOutcome::Put { .. })
+            && self.fail_next_object_put_ack.swap(false, Ordering::AcqRel)
+        {
+            return Err(MetaError::Engine("object put acknowledgement lost".into()));
+        }
+        if matches!(
+            &outcome,
+            MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed { .. })
+        ) && self.fail_next_complete_ack.swap(false, Ordering::AcqRel)
+        {
+            return Err(MetaError::Engine(
+                "multipart completion acknowledgement lost".into(),
+            ));
+        }
+        if matches!(&outcome, MutationOutcome::PartRecorded { .. }) {
+            let fail = self.fail_next_part_record_ack.swap(false, Ordering::AcqRel);
+            if self.hang_next_part_record_ack.swap(false, Ordering::AcqRel) {
+                self.part_record_ack_hanging.store(true, Ordering::Release);
+                return std::future::pending().await;
+            }
+            if fail {
+                return Err(MetaError::Engine(
+                    "multipart part acknowledgement lost".into(),
+                ));
+            }
+        }
+        if matches!(
+            &outcome,
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+                | MutationOutcome::StorageMultipartClaim {
+                    claim: ClaimOutcome::Claimed(_),
+                    ..
+                }
+        ) && self.hang_next_claim_ack.swap(false, Ordering::AcqRel)
+        {
+            return std::future::pending().await;
+        }
+        Ok(outcome)
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        // Mirror a real read-pool checkout by acquiring the double's source-of-truth lock. Do not
+        // inspect any collection: readiness cost must be independent of the number of rows.
+        drop(
+            self.state
+                .lock()
+                .map_err(|e| MetaError::Engine(e.to_string()))?,
+        );
+        Ok(())
+    }
+
+    async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .buckets
+            .get(name.as_str())
+            .cloned())
+    }
+
+    async fn list_buckets(&self, owner: Option<&UserId>) -> Result<Vec<Bucket>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .buckets
+            .values()
+            .filter(|b| owner.is_none_or(|o| &b.owner_id == o))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_bucket_config(
+        &self,
+        name: &BucketName,
+        aspect: ConfigAspect,
+    ) -> Result<Option<ConfigDoc>, MetaError> {
+        if aspect == ConfigAspect::Replication
+            && self.fail_replication_config_reads.load(Ordering::Acquire)
+        {
+            return Err(MetaError::Engine(
+                "injected replication configuration read failure".to_owned(),
+            ));
+        }
+        if aspect == ConfigAspect::Replication
+            && self
+                .hang_next_replication_config_read
+                .swap(false, Ordering::AcqRel)
+        {
+            self.replication_config_read_hanging
+                .store(true, Ordering::Release);
+            return std::future::pending().await;
+        }
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .config
+            .get(&(name.as_str().to_owned(), aspect))
+            .cloned())
+    }
+
+    async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
+        Ok(self.state.lock().unwrap().account_bpa)
+    }
+
+    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .bucket_quotas
+            .get(bucket.as_str())
+            .copied())
+    }
+
+    async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
+        // Empty means NO versions (any version or delete marker) AND no in-progress multipart uploads,
+        // matching S3 DeleteBucket semantics (audit #3; multipart added 2026-07).
+        let st = self.state.lock().unwrap();
+        let has_versions = st
+            .versions
+            .values()
+            .any(|r| r.bucket.as_str() == name.as_str());
+        let has_multipart = st
+            .multipart
+            .values()
+            .any(|s| s.bucket.as_str() == name.as_str());
+        Ok(!has_versions && !has_multipart)
+    }
+
+    async fn current_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectVersionRow>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .latest(bucket.as_str(), key.as_str())
+            .cloned())
+    }
+
+    async fn get_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ObjectVersionRow>, MetaError> {
+        let vk = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        Ok(self.state.lock().unwrap().versions.get(&vk).cloned())
+    }
+
+    async fn list_current(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let rows: Vec<&ObjectVersionRow> = st
+            .versions
+            .values()
+            .filter(|r| r.bucket.as_str() == bucket.as_str() && r.is_latest && !r.is_delete_marker)
+            .collect();
+        Ok(page_rows(rows, query, false))
+    }
+
+    async fn list_versions(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let rows: Vec<&ObjectVersionRow> = st
+            .versions
+            .values()
+            .filter(|r| r.bucket.as_str() == bucket.as_str())
+            .collect();
+        Ok(page_rows(rows, query, true))
+    }
+
+    async fn enumerate_storage_paths(
+        &self,
+        bucket: &BucketName,
+        cursor: Option<&str>,
+        batch: u32,
+    ) -> Result<ListPage<StoragePath>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut paths: Vec<String> = st
+            .versions
+            .values()
+            .filter(|r| r.bucket.as_str() == bucket.as_str())
+            .filter_map(|r| r.storage_path.as_ref().map(|p| p.as_str().to_owned()))
+            .filter(|p| cursor.is_none_or(|c| p.as_str() > c))
+            .collect();
+        paths.sort();
+        let truncated = paths.len() > batch as usize;
+        paths.truncate(batch as usize);
+        let next_cursor = if truncated {
+            paths.last().cloned()
+        } else {
+            None
+        };
+        Ok(ListPage {
+            items: paths.into_iter().map(StoragePath::from_string).collect(),
+            common_prefixes: Vec::new(),
+            next_cursor,
+            next_version_id_marker: None,
+            truncated,
+        })
+    }
+
+    async fn get_object_tags(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Vec<(String, String)>, MetaError> {
+        let vk = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .tags
+            .get(&vk)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<ObjectLockState, MetaError> {
+        let vk = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        self.state.lock().unwrap().strict_lock_state(&vk)
+    }
+
+    async fn get_multipart(
+        &self,
+        upload: &UploadId,
+    ) -> Result<Option<MultipartSession>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .multipart
+            .get(upload.as_str())
+            .cloned())
+    }
+
+    async fn list_parts(
+        &self,
+        upload: &UploadId,
+        part_number_marker: u16,
+        limit: u32,
+    ) -> Result<ListPage<PartRecord>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut items: Vec<PartRecord> = st
+            .parts
+            .iter()
+            .filter(|((u, n), _)| u == upload.as_str() && *n > part_number_marker)
+            .map(|(_, p)| p.clone())
+            .collect();
+        items.sort_by_key(|p| p.part_number);
+        let truncated = items.len() > limit as usize;
+        items.truncate(limit as usize);
+        let next_cursor = if truncated {
+            items.last().map(|p| p.part_number.to_string())
+        } else {
+            None
+        };
+        Ok(ListPage {
+            items,
+            common_prefixes: Vec::new(),
+            next_cursor,
+            next_version_id_marker: None,
+            truncated,
+        })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<MultipartSession>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let prefix = query.prefix.clone().unwrap_or_default();
+        // S3 pages this listing on the (key-marker, upload-id-marker) PAIR — mirror the SQL
+        // engines exactly: key-marker alone skips that key, the pair resumes mid-key. The
+        // `>= prefix` filter is load-bearing parity: both SQL engines seek from
+        // `key_marker.unwrap_or(prefix)` and leave the exclusion to the tuple predicate, so only a
+        // marker strictly BELOW the prefix may be ignored. A marker EQUAL to the prefix is a real
+        // resume point and must be kept — discarding it discarded the upload-id-marker with it and
+        // re-served page 1 forever (issue #2).
+        let key_marker = query.cursor.as_deref().filter(|c| *c >= prefix.as_str());
+        let upload_marker = key_marker.and(query.version_id_marker.as_deref());
+        let mut items: Vec<MultipartSession> = st
+            .multipart
+            .values()
+            .filter(|s| {
+                s.bucket.as_str() == bucket.as_str()
+                    && s.status == MultipartStatus::Active
+                    && s.key.as_str().starts_with(&prefix)
+                    && match (key_marker, upload_marker) {
+                        (None, _) => true,
+                        (Some(km), None) => s.key.as_str() > km,
+                        (Some(km), Some(uim)) => (s.key.as_str(), s.upload_id.as_str()) > (km, uim),
+                    }
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            a.key
+                .as_str()
+                .cmp(b.key.as_str())
+                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
+        });
+        let limit = query.limit.max(1) as usize;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        // The next page resumes strictly after the last returned (key, upload id).
+        let (next_cursor, next_upload_marker) = match (truncated, items.last()) {
+            (true, Some(s)) => (
+                Some(s.key.as_str().to_owned()),
+                Some(s.upload_id.as_str().to_owned()),
+            ),
+            _ => (None, None),
+        };
+        Ok(ListPage {
+            items,
+            common_prefixes: Vec::new(),
+            next_cursor,
+            next_version_id_marker: next_upload_marker,
+            truncated,
+        })
+    }
+
+    async fn enumerate_stale_sessions(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartSession>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut sessions: Vec<_> = st
+            .multipart
+            .values()
+            .filter(|session| {
+                session.status == MultipartStatus::Active && session.updated_at < older_than
+            })
+            .cloned()
+            .collect();
+        sessions.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
+        });
+        sessions.truncate(batch.clamp(1, 1_000) as usize);
+        Ok(sessions)
+    }
+
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut reservations: Vec<_> = st
+            .multipart_reservations
+            .values()
+            .filter(|reservation| {
+                reservation.created_at < older_than
+                    && !storage::reservation_owned(&st, &reservation.attempt_id)
+            })
+            .cloned()
+            .collect();
+        reservations.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.attempt_id.cmp(&b.attempt_id))
+        });
+        reservations.truncate(batch.clamp(1, 1_000) as usize);
+        Ok(reservations)
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut cleanups: Vec<_> = st
+            .multipart_cleanups
+            .values()
+            .filter(|row| !storage::exact_quota(&st, &row.id))
+            .cloned()
+            .collect();
+        cleanups.sort_by(|a, b| {
+            a.storage_path
+                .is_none()
+                .cmp(&b.storage_path.is_none())
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        cleanups.truncate(limit.clamp(1, 1_000) as usize);
+        Ok(cleanups)
+    }
+
+    async fn object_replication_status(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ReplicationStatus>, MetaError> {
+        let vk = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .versions
+            .get(&vk)
+            .and_then(|r| r.replication_status))
+    }
+
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+        target: Option<&str>,
+    ) -> Result<bool, MetaError> {
+        // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write. A
+        // pending/claimed predecessor is still owed and blocks; a `Completed` or terminal `Failed`
+        // one is settled and does NOT block (a terminal failure must not freeze newer versions
+        // forever — best-effort/at-least-once, ARCH 20.4). Mirrors the SQL `NOT IN
+        // ('completed','failed')`. Scoped per target so a later version to target X only waits on
+        // earlier versions to the same X (fan-out).
+        let st = self.state.lock().unwrap();
+        Ok(st.outbox.iter().any(|e| {
+            e.bucket.as_str() == bucket.as_str()
+                && e.key.as_str() == key.as_str()
+                && e.target_arn.as_deref() == target
+                && e.version_id.as_str() < before.as_str()
+                && !matches!(
+                    e.status,
+                    ReplicationStatus::Completed | ReplicationStatus::Failed
+                )
+        }))
+    }
+
+    async fn claim_replication_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Mirror the real stores: claiming is a write that marks entries `claimed` under a lease.
+        match self
+            .submit(Mutation::ClaimReplicationBatch {
+                limit,
+                now,
+                lease_secs: 300,
+            })
+            .await?
+        {
+            MutationOutcome::ReplicationBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimReplicationBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_replication(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Read-only mirror of the claim predicate; no mutation.
+        let st = self.state.lock().unwrap();
+        let mut due: Vec<OutboxEntry> = st
+            .outbox
+            .iter()
+            .filter(|e| {
+                e.next_attempt_at <= now
+                    && (e.status == ReplicationStatus::Pending
+                        || (e.status == ReplicationStatus::Claimed
+                            && e.lease_until.is_some_and(|l| l < now)))
+            })
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
+        });
+        due.truncate(limit as usize);
+        Ok(due)
+    }
+
+    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        // Terminal entries are those the engine marked `Failed` (retries exhausted). Return them
+        // most-recently-due first, matching the SQLite reader's `ORDER BY next_attempt_at DESC`.
+        let mut failed: Vec<OutboxEntry> = st
+            .outbox
+            .iter()
+            .filter(|e| e.status == ReplicationStatus::Failed)
+            .cloned()
+            .collect();
+        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
+        failed.truncate(limit as usize);
+        Ok(failed)
+    }
+
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut counts = ReplicationCounts::default();
+        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
+            std::collections::HashMap::new();
+        for e in st
+            .outbox
+            .iter()
+            .filter(|e| bucket.is_none_or(|b| e.bucket.as_str() == b.as_str()))
+        {
+            match e.status {
+                ReplicationStatus::Pending => counts.pending += 1,
+                ReplicationStatus::Claimed => counts.claimed += 1,
+                ReplicationStatus::Failed => counts.failed += 1,
+                ReplicationStatus::Completed => counts.completed += 1,
+                ReplicationStatus::Replica => {}
+            }
+            if e.status == ReplicationStatus::Pending {
+                if e.enqueued_at.0 != 0
+                    && (counts.oldest_pending_at_ms == 0
+                        || e.enqueued_at.0 < counts.oldest_pending_at_ms)
+                {
+                    counts.oldest_pending_at_ms = e.enqueued_at.0;
+                }
+                by_target.entry(e.target_arn.clone()).or_default().0 += 1;
+            } else if e.status == ReplicationStatus::Failed {
+                by_target.entry(e.target_arn.clone()).or_default().1 += 1;
+            }
+        }
+        counts.by_target = by_target
+            .into_iter()
+            .filter(|(_, (p, f))| *p > 0 || *f > 0)
+            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
+                target_arn,
+                pending,
+                failed,
+            })
+            .collect();
+        Ok(counts)
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        match self
+            .submit(Mutation::ClaimWebhookBatch {
+                limit,
+                now,
+                lease_secs: 300,
+            })
+            .await?
+        {
+            MutationOutcome::WebhookBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimWebhookBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut due: Vec<WebhookEntry> = st
+            .webhook_outbox
+            .iter()
+            .filter(|e| {
+                e.next_attempt_at <= now
+                    && (e.status == WebhookStatus::Pending
+                        || (e.status == WebhookStatus::Claimed
+                            && e.lease_until.is_some_and(|l| l < now)))
+            })
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
+        });
+        due.truncate(limit as usize);
+        Ok(due)
+    }
+
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut failed: Vec<WebhookEntry> = st
+            .webhook_outbox
+            .iter()
+            .filter(|e| e.status == WebhookStatus::Failed)
+            .cloned()
+            .collect();
+        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
+        failed.truncate(limit as usize);
+        Ok(failed)
+    }
+
+    async fn user_by_bearer_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserWithBearerHash>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .users
+            .values()
+            .find(|r| r.user.access_key_id == access_key_id)
+            .map(|r| UserWithBearerHash {
+                user: r.user.clone(),
+                secret_hash: r.bearer_secret_hash.clone(),
+            }))
+    }
+
+    async fn user_by_sigv4_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSigV4Credentials>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .users
+            .values()
+            .find(|r| r.user.sigv4_access_key_id.as_deref() == Some(access_key_id))
+            .and_then(|r| {
+                Some(UserSigV4Credentials {
+                    user: r.user.clone(),
+                    secret_ciphertext: r.sigv4_secret_ciphertext.clone()?,
+                    secret_nonce: r.sigv4_secret_nonce.clone()?,
+                })
+            }))
+    }
+
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let Some(rec) = st.session_creds.get(access_key_id) else {
+            return Ok(None);
+        };
+        let parent = st.users.get(&rec.parent_user_id.to_string());
+        Ok(Some(UserSessionCredentials {
+            parent_user_id: rec.parent_user_id.clone(),
+            parent_display_name: parent
+                .map(|p| p.user.display_name.clone())
+                .unwrap_or_default(),
+            parent_is_active: parent.is_none_or(|p| p.user.is_active),
+            secret_ciphertext: rec.secret_ciphertext.clone(),
+            secret_nonce: rec.secret_nonce.clone().unwrap_or_default(),
+            session_token_hash: rec.session_token_hash.clone(),
+            inline_policy: rec.inline_policy.clone(),
+            expires_at: rec.expires_at,
+        }))
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<SessionCredentialSummary> = st
+            .session_creds
+            .values()
+            .filter(|r| r.expires_at > now)
+            .map(|r| SessionCredentialSummary {
+                access_key_id: r.access_key_id.clone(),
+                parent_user_id: r.parent_user_id.clone(),
+                has_inline_policy: r.inline_policy.is_some(),
+                created_at: r.created_at,
+                expires_at: r.expires_at,
+            })
+            .collect();
+        // Newest first, mirroring the SQL stores.
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
+        Ok(out)
+    }
+
+    async fn count_users(&self) -> Result<u64, MetaError> {
+        Ok(self.state.lock().unwrap().users.len() as u64)
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .users
+            .values()
+            .map(|r| r.user.clone())
+            .collect())
+    }
+
+    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
+        if self.fail_user_policy_reads.load(Ordering::Acquire) {
+            return Err(MetaError::Engine(
+                "injected identity-policy read failure".to_owned(),
+            ));
+        }
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .user_policies
+            .get(user_id.0.as_str())
+            .cloned())
+    }
+
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
+        let st = self.state.lock().unwrap();
+        let fetch = query.bounded_limit() as usize + 1;
+        // Keep only the best `limit + 1` references while scanning. The double is already
+        // memory-backed, but its listing must not allocate another history-sized vector.
+        let mut selected: Vec<&ImportJobRecord> = Vec::with_capacity(fetch);
+        for job in st.import_jobs.values() {
+            if query.cursor.as_ref().is_some_and(|cursor| {
+                job.created_at > cursor.created_at
+                    || (job.created_at == cursor.created_at && job.id >= cursor.id)
+            }) {
+                continue;
+            }
+            let pos = selected.partition_point(|other| {
+                other.created_at > job.created_at
+                    || (other.created_at == job.created_at && other.id > job.id)
+            });
+            if pos < fetch {
+                selected.insert(pos, job);
+                if selected.len() > fetch {
+                    selected.pop();
+                }
+            }
+        }
+        let jobs = selected
+            .into_iter()
+            .map(ImportJobRecord::to_summary)
+            .collect();
+        Ok(ImportJobPage::from_overfetch(jobs, query.bounded_limit()))
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .import_jobs
+            .values()
+            .filter(|job| job.state == state)
+            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
+            .map(|job| job.id.clone()))
+    }
+
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .import_jobs
+            .get(id)
+            .map(ImportJobRecord::to_view))
+    }
+
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        Ok(self.state.lock().unwrap().import_jobs.get(id).cloned())
+    }
+
+    async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .activity
+            .iter()
+            .rev()
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.shares.get(id).cloned())
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .share_ids_by_hash
+            .get(token_hash)
+            .and_then(|id| st.shares.get(id))
+            .cloned())
+    }
+
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<ShareRow> = st
+            .shares
+            .values()
+            .filter(|s| {
+                s.bucket.as_str() == bucket.as_str()
+                    && key.is_none_or(|k| s.key.as_str() == k.as_str())
+            })
+            .cloned()
+            .collect();
+        // Most recent first, matching the SQL stores.
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
+        Ok(out)
+    }
+
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for (vkey, tag_list) in &st.tags {
+            let Some(v) = st.versions.get(vkey) else {
+                continue;
+            };
+            // Only current objects (latest, non-delete-marker), optionally bucket-scoped.
+            if !v.is_latest || v.is_delete_marker {
+                continue;
+            }
+            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
+                continue;
+            }
+            for (k, val) in tag_list {
+                *counts.entry((k.clone(), val.clone())).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<TagSummary> = counts
+            .into_iter()
+            .map(|((tag_key, tag_value), object_count)| TagSummary {
+                tag_key,
+                tag_value,
+                object_count,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.object_count
+                .cmp(&a.object_count)
+                .then(a.tag_key.cmp(&b.tag_key))
+                .then(a.tag_value.cmp(&b.tag_value))
+        });
+        Ok(out)
+    }
+
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<TaggedObject> = Vec::new();
+        for (vkey, tag_list) in &st.tags {
+            let Some(v) = st.versions.get(vkey) else {
+                continue;
+            };
+            if !v.is_latest || v.is_delete_marker {
+                continue;
+            }
+            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
+                continue;
+            }
+            if tag_list
+                .iter()
+                .any(|(k, val)| k == tag_key && val == tag_value)
+            {
+                out.push(TaggedObject {
+                    bucket: vkey.0.clone(),
+                    key: vkey.1.clone(),
+                    version_id: vkey.2.clone(),
+                    size: v.size_logical,
+                    last_modified: v.updated_at,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.bucket.cmp(&b.bucket).then(a.key.cmp(&b.key)));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut c = StoreCounts {
+            buckets: st.buckets.len() as u64,
+            ..Default::default()
+        };
+        for r in st.versions.values() {
+            c.versions += 1;
+            if r.is_latest && !r.is_delete_marker {
+                c.objects += 1;
+            }
+            c.logical_bytes += r.size_logical;
+            c.physical_bytes += r.size_physical;
+        }
+        Ok(c)
+    }
+
+    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
+        let st = self.state.lock().unwrap();
+        // `st.buckets` is a BTreeMap, so the seed map is already name-ordered with empty
+        // buckets present at zero — matching the SQL LEFT JOIN ... GROUP BY semantics.
+        let mut by_bucket: BTreeMap<String, BucketCounts> = st
+            .buckets
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    BucketCounts {
+                        bucket: name.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for r in st.versions.values() {
+            let Some(c) = by_bucket.get_mut(r.bucket.as_str()) else {
+                continue;
+            };
+            if r.is_latest && !r.is_delete_marker {
+                c.objects += 1;
+            }
+            c.logical_bytes += r.size_logical;
+            c.physical_bytes += r.size_physical;
+        }
+        Ok(by_bucket.into_values().collect())
+    }
+
+    async fn query_request_metrics(
+        &self,
+        range: MetricsRange,
+        now_secs: i64,
+    ) -> Result<RequestMetricsSeries, MetaError> {
+        let since = range.since_secs(now_secs);
+        let window = range.window_secs().max(1);
+        let st = self.state.lock().unwrap();
+
+        // (count, errors, bytes_in, bytes_out, lat_sum) accumulators per dimension.
+        let mut tl: BTreeMap<i64, (u64, u64, u64, u64, u64)> = BTreeMap::new();
+        let mut by_op: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new(); // count, bytes, lat_sum
+        let mut by_bkt: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // count, bytes
+        let mut by_st: BTreeMap<String, u64> = BTreeMap::new();
+        let (mut t_in, mut t_out, mut t_lat) = (0u64, 0u64, 0u64);
+        let mut hist = [0u64; LATENCY_BUCKETS];
+
+        for ((ts, op, bucket, status), c) in &st.request_metrics {
+            if *ts < since {
+                continue;
+            }
+            let is_err = status == "4xx" || status == "5xx";
+            let bytes = c.bytes_in + c.bytes_out;
+            let e = tl.entry((ts / window) * window).or_default();
+            e.0 += c.count;
+            e.1 += if is_err { c.count } else { 0 };
+            e.2 += c.bytes_in;
+            e.3 += c.bytes_out;
+            e.4 += c.lat_sum_ms;
+            let o = by_op.entry(op.clone()).or_default();
+            o.0 += c.count;
+            o.1 += bytes;
+            o.2 += c.lat_sum_ms;
+            if !bucket.is_empty() {
+                let b = by_bkt.entry(bucket.clone()).or_default();
+                b.0 += c.count;
+                b.1 += bytes;
+            }
+            *by_st.entry(status.clone()).or_insert(0) += c.count;
+            t_in += c.bytes_in;
+            t_out += c.bytes_out;
+            t_lat += c.lat_sum_ms;
+            for (h, x) in hist.iter_mut().zip(c.lat_hist.iter()) {
+                *h += *x;
+            }
+        }
+
+        let timeline: Vec<TimePoint> = tl
+            .into_iter()
+            .map(|(ts, (count, errors, bi, bo, lat))| TimePoint {
+                ts,
+                count,
+                errors,
+                bytes_in: bi,
+                bytes_out: bo,
+                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
+            })
+            .collect();
+
+        let mut by_operation: Vec<OpCount> = by_op
+            .into_iter()
+            .map(|(operation, (count, bytes, lat))| OpCount {
+                operation,
+                count,
+                bytes,
+                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
+            })
+            .collect();
+        by_operation.sort_by(|a, b| b.count.cmp(&a.count).then(a.operation.cmp(&b.operation)));
+
+        let all_buckets: Vec<BucketRequestCount> = by_bkt
+            .into_iter()
+            .map(|(bucket, (count, bytes))| BucketRequestCount {
+                bucket,
+                count,
+                bytes,
+            })
+            .collect();
+        let active_buckets = all_buckets.len() as u64;
+        let mut top_buckets = all_buckets.clone();
+        top_buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.bucket.cmp(&b.bucket)));
+        top_buckets.truncate(10);
+        // A genuinely different ranking: by bytes transferred, not by count.
+        let mut top_buckets_by_bytes = all_buckets;
+        top_buckets_by_bytes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.bucket.cmp(&b.bucket)));
+        top_buckets_by_bytes.truncate(10);
+
+        let mut by_status: Vec<StatusCount> = by_st
+            .into_iter()
+            .map(|(status_class, count)| StatusCount {
+                status_class,
+                count,
+            })
+            .collect();
+        by_status.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then(a.status_class.cmp(&b.status_class))
+        });
+
+        let total: u64 = by_operation.iter().map(|o| o.count).sum();
+        let total_errors: u64 = timeline.iter().map(|p| p.errors).sum();
+        let peak_window_count = timeline.iter().map(|p| p.count).max().unwrap_or(0);
+        Ok(RequestMetricsSeries {
+            timeline,
+            by_operation,
+            top_buckets,
+            top_buckets_by_bytes,
+            by_status,
+            total,
+            total_errors,
+            total_bytes_in: t_in,
+            total_bytes_out: t_out,
+            latency_avg_ms: t_lat.checked_div(total).unwrap_or(0),
+            latency_p95_ms: latency_quantile_ms(&hist, 0.95),
+            peak_window_count,
+            active_buckets,
+            window_secs: window,
+        })
+    }
+}
+
+fn uuid_like(seed: &VersionId) -> String {
+    format!("dm-{}", seed.as_str())
+}
+
+/// A reconcile oracle backed by snapshot sets of live paths/sessions.
+#[derive(Debug, Clone, Default)]
+pub struct SetReconcileOracle {
+    /// Storage paths a metadata row references.
+    pub live_paths: HashSet<String>,
+    /// Upload sessions that still exist.
+    pub live_uploads: HashSet<String>,
+    /// Multipart part paths a committed part row references.
+    pub live_multipart_paths: HashSet<String>,
+}
+
+#[async_trait::async_trait]
+impl ReconcileOracle for SetReconcileOracle {
+    async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError> {
+        Ok(candidates
+            .iter()
+            .map(|p| self.live_paths.contains(p.as_str()))
+            .collect())
+    }
+
+    async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
+        Ok(self.live_uploads.contains(upload.as_str()))
+    }
+
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError> {
+        Ok(candidates
+            .iter()
+            .map(|path| self.live_multipart_paths.contains(path.as_str()))
+            .collect())
+    }
+}
+
+impl State {
+    fn record_part(
+        st: &mut Self,
+        upload_id: UploadId,
+        attempt_id: String,
+        part: PartRecord,
+    ) -> Result<MutationOutcome, MetaError> {
+        Ok({
+            let session = st
+                .multipart
+                .get(upload_id.as_str())
+                .filter(|session| session.status == MultipartStatus::Active)
+                .cloned()
+                .ok_or(MetaError::MultipartNotActive)?;
+            let reservation = st
+                .multipart_reservations
+                .get(&attempt_id)
+                .filter(|reservation| reservation.upload_id == upload_id)
+                .cloned()
+                .ok_or(MetaError::MultipartNotActive)?;
+            if reservation.part_number != part.part_number
+                || reservation.reserved_bytes != part.size
+            {
+                return Err(MetaError::QuotaExceeded);
+            }
+            let pk = (upload_id.as_str().to_owned(), part.part_number);
+            let cleanup = st.parts.get(&pk).map(|previous| MultipartCleanup {
+                id: format!("part:{attempt_id}"),
+                upload_id: upload_id.clone(),
+                bucket: session.bucket.clone(),
+                principal_id: session.initiated_by.clone(),
+                bytes: previous.size,
+                storage_path: Some(previous.storage_path.clone()),
+                created_at: reservation.created_at,
+            });
+            if let Some(cleanup) = &cleanup {
+                st.multipart_cleanups
+                    .insert(cleanup.id.clone(), cleanup.clone());
+                storage::link_quota(st, cleanup)?;
+            }
+            st.parts.insert(pk, part);
+            st.multipart_reservations.remove(&attempt_id);
+            MutationOutcome::PartRecorded { cleanup }
+        })
+    }
+    fn claim_multipart(
+        st: &mut Self,
+        upload_id: UploadId,
+        claim_token: MultipartClaimToken,
+    ) -> Result<MutationOutcome, MetaError> {
+        Ok({
+            let claimed = match st.multipart.get_mut(upload_id.as_str()) {
+                Some(session) if session.status == MultipartStatus::Active => {
+                    session.status = MultipartStatus::Completing;
+                    session.clone()
+                }
+                Some(_) => {
+                    return Ok(MutationOutcome::MultipartClaim(
+                        ClaimOutcome::AlreadyClaimed,
+                    ));
+                }
+                None => return Ok(MutationOutcome::MultipartClaim(ClaimOutcome::NotFound)),
+            };
+            st.multipart_claims
+                .insert(upload_id.as_str().to_owned(), claim_token);
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(Box::new(claimed)))
+        })
+    }
+    fn apply(st: &mut Self, m: Mutation) -> Result<MutationOutcome, MetaError> {
+        match m {
+            Mutation::AdmitStorageWrite {
+                plan,
+                operation,
+                now,
+            } => {
+                plan.validate_admission(&operation)?;
+                let admission = storage::reserve_joint(st, &plan.bucket, (*plan).clone(), now)?;
+                if matches!(admission, crate::storage::StorageAdmission::NotApplied) {
+                    return Ok(MutationOutcome::StorageAdmission(admission));
+                }
+                match Self::apply_inner(st, *operation)? {
+                    MutationOutcome::MultipartReserved => {
+                        Ok(MutationOutcome::StorageAdmission(admission))
+                    }
+                    MutationOutcome::MultipartClaim(claim) => {
+                        let admission = if let crate::meta::ClaimOutcome::Claimed(session) = &claim
+                        {
+                            if session.bucket != plan.bucket
+                                || !matches!(
+                                    &plan.target, crate::storage::StorageWriteTarget::Completion { key, .. }
+                                        if key == &session.key
+                                )
+                            {
+                                return Err(MetaError::Engine(
+                                    "storage completion routing mismatch".into(),
+                                ));
+                            }
+                            admission
+                        } else {
+                            storage::discard_unacknowledged(st, &plan);
+                            crate::storage::StorageAdmission::NotApplied
+                        };
+                        Ok(MutationOutcome::StorageMultipartClaim { admission, claim })
+                    }
+                    _ => Err(MetaError::Engine(
+                        "invalid joint storage admission outcome".into(),
+                    )),
+                }
+            }
+            Mutation::PublishStorageWrite { plan, operation } => {
+                plan.validate_publication(&operation)?;
+                if !storage::owns_publication(st, &plan)? {
+                    return Ok(MutationOutcome::StoragePublicationNotApplied);
+                }
+                let outcome = Self::apply_inner(st, *operation)?;
+                if matches!(
+                    &outcome,
+                    MutationOutcome::Put { .. }
+                        | MutationOutcome::PartRecorded { .. }
+                        | MutationOutcome::MultipartTerminal(
+                            MultipartTerminalOutcome::Completed { .. }
+                        )
+                ) {
+                    storage::consume_published(st, &plan)?;
+                }
+                Ok(outcome)
+            }
+            other => {
+                crate::storage::validate_unadmitted_mutation(&other)?;
+                Self::apply_inner(st, other)
+            }
+        }
+    }
+
+    fn apply_inner(st: &mut Self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        match mutation {
+            Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+                Err(MetaError::Engine("nested storage operation".into()))
+            }
+            Mutation::BeginStorageGeneration { generation } => Ok(storage::begin(st, generation)),
+            Mutation::Storage { bucket, operation } => storage::apply(st, &bucket, operation),
+            Mutation::ListStorageIntents { generation, limit } => {
+                storage::recover(st, &generation, limit)
             }
             Mutation::ClaimStorageCleanup {
                 generation,
                 limit,
                 now,
                 lease_secs,
-            } => storage::claim(&mut st, &generation, limit, now, lease_secs),
+            } => storage::claim(st, &generation, limit, now, lease_secs),
             Mutation::ReplicationUpload { bucket, operation } => {
-                replication_upload::apply(&mut st, &bucket, operation)
+                replication_upload::apply(st, &bucket, operation)
             }
             Mutation::ClaimReplicationUploadCleanup {
                 limit,
                 now,
                 lease_secs,
-            } => replication_upload::claim(&mut st, limit, now, lease_secs),
+            } => replication_upload::claim(st, limit, now, lease_secs),
             Mutation::PutObjectVersion {
                 row,
                 precondition,
@@ -1019,7 +2223,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 };
                 State::validate_initial_tags(&tags)?;
                 st.validate_outbox_inserts(&replication)?;
-                let superseded = st.upsert_version(*row);
+                let superseded = st.upsert_version(*row)?;
                 st.replace_initial_state(version_key, tags, lock);
                 for entry in replication {
                     st.outbox.push(entry);
@@ -1028,11 +2232,6 @@ impl MetadataStore for InMemoryMetadataStore {
                     superseded,
                     version_id,
                 };
-                if self.fail_next_object_put_ack.swap(false, Ordering::AcqRel) {
-                    return Err(MetaError::Engine(
-                        "object put acknowledgement lost".to_owned(),
-                    ));
-                }
                 Ok(outcome)
             }
             Mutation::ResolveObjectWrite {
@@ -1122,7 +2321,7 @@ impl MetadataStore for InMemoryMetadataStore {
                     return Ok(MutationOutcome::DeleteProtected);
                 }
                 st.validate_outbox_inserts(&replication)?;
-                let freed = st.upsert_version(row);
+                let freed = st.upsert_version(row)?;
                 st.replace_initial_state(vk, Vec::new(), ObjectLockState::default());
                 for entry in replication {
                     st.outbox.push(entry);
@@ -1190,6 +2389,9 @@ impl MetadataStore for InMemoryMetadataStore {
                 st.locks.remove(&vk);
                 st.invalid_lock_rows.remove(&vk);
                 let freed = removed.as_ref().and_then(|r| r.storage_path.clone());
+                if let Some(path) = &freed {
+                    storage::enqueue(st, &bucket, path)?;
+                }
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;
                 if was_latest {
@@ -1339,12 +2541,17 @@ impl MetadataStore for InMemoryMetadataStore {
                     .multipart_reservations
                     .get(&attempt_id)
                     .is_some_and(|reservation| reservation.upload_id == upload_id)
+                    && !storage::reservation_owned(st, &attempt_id)
                 {
                     st.multipart_reservations.remove(&attempt_id);
                 }
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::RecordPart { .. } => unreachable!("RecordPart handled before state lock"),
+            Mutation::RecordPart {
+                upload_id,
+                attempt_id,
+                part,
+            } => Self::record_part(st, upload_id, attempt_id, part),
             Mutation::ResolveMultipartPartWrite {
                 upload_id,
                 part_number,
@@ -1357,18 +2564,33 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::MultipartPartWriteResolved { referenced })
             }
             Mutation::ReleaseMultipartCleanup { cleanup_id } => {
-                st.multipart_cleanups.remove(&cleanup_id);
+                if !storage::exact_quota(st, &cleanup_id) {
+                    st.multipart_cleanups.remove(&cleanup_id);
+                }
                 Ok(MutationOutcome::Ack)
             }
             Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
-                st.multipart_cleanups
-                    .retain(|_, cleanup| cleanup.upload_id != upload_id);
+                let legacy: Vec<_> = st
+                    .multipart_cleanups
+                    .values()
+                    .filter(|cleanup| {
+                        cleanup.upload_id == upload_id && !storage::exact_quota(st, &cleanup.id)
+                    })
+                    .map(|cleanup| cleanup.id.clone())
+                    .collect();
+                for id in legacy {
+                    st.multipart_cleanups.remove(&id);
+                }
                 Ok(MutationOutcome::Ack)
             }
             Mutation::RecoverMultipartStagingAccounting { limit } => {
                 let limit = limit.clamp(1, 1_000) as usize;
-                let mut reservations: Vec<_> =
-                    st.multipart_reservations.values().cloned().collect();
+                let mut reservations: Vec<_> = st
+                    .multipart_reservations
+                    .values()
+                    .filter(|row| !storage::reservation_owned(st, &row.attempt_id))
+                    .cloned()
+                    .collect();
                 reservations.sort_by(|a, b| {
                     a.created_at
                         .cmp(&b.created_at)
@@ -1380,7 +2602,12 @@ impl MetadataStore for InMemoryMetadataStore {
                     released += 1;
                 }
                 if released < limit as u64 {
-                    let mut cleanups: Vec<_> = st.multipart_cleanups.values().cloned().collect();
+                    let mut cleanups: Vec<_> = st
+                        .multipart_cleanups
+                        .values()
+                        .filter(|row| !storage::exact_quota(st, &row.id))
+                        .cloned()
+                        .collect();
                     cleanups.sort_by(|a, b| {
                         a.created_at
                             .cmp(&b.created_at)
@@ -1396,9 +2623,10 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::MultipartAccountingReleased(released))
             }
-            Mutation::ClaimMultipart { .. } => {
-                unreachable!("multipart claims are handled before locking the general state")
-            }
+            Mutation::ClaimMultipart {
+                upload_id,
+                claim_token,
+            } => Self::claim_multipart(st, upload_id, claim_token),
             Mutation::ReleaseMultipartClaim {
                 upload_id,
                 claim_token,
@@ -1471,7 +2699,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 };
                 State::validate_initial_tags(&tags)?;
                 st.validate_outbox_inserts(&replication)?;
-                let superseded = st.upsert_version(*row);
+                let superseded = st.upsert_version(*row)?;
                 st.replace_initial_state(version_key, tags, lock);
                 st.retire_multipart(&upload_id)?;
                 for entry in replication {
@@ -1482,11 +2710,6 @@ impl MetadataStore for InMemoryMetadataStore {
                         superseded,
                         version_id,
                     });
-                if self.fail_next_complete_ack.swap(false, Ordering::AcqRel) {
-                    return Err(MetaError::Engine(
-                        "multipart completion acknowledgement lost".to_owned(),
-                    ));
-                }
                 Ok(outcome)
             }
             Mutation::AbortMultipart(upload_id) => {
@@ -1543,6 +2766,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 if has_versions || has_multipart {
                     return Err(MetaError::NotEmpty);
                 }
+                storage::cancel_bucket(st, &name);
                 st.buckets.remove(name.as_str());
                 // Mirror the SQL backends, where `DELETE FROM buckets` takes the quota column with
                 // it: drop the bucket's quota, and its per-bucket usage-analytics rows, so deleting a
@@ -2356,1091 +3580,12 @@ impl MetadataStore for InMemoryMetadataStore {
             }
         }
     }
-
-    async fn read_probe(&self) -> Result<(), MetaError> {
-        // Mirror a real read-pool checkout by acquiring the double's source-of-truth lock. Do not
-        // inspect any collection: readiness cost must be independent of the number of rows.
-        drop(
-            self.state
-                .lock()
-                .map_err(|e| MetaError::Engine(e.to_string()))?,
-        );
-        Ok(())
-    }
-
-    async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .buckets
-            .get(name.as_str())
-            .cloned())
-    }
-
-    async fn list_buckets(&self, owner: Option<&UserId>) -> Result<Vec<Bucket>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .buckets
-            .values()
-            .filter(|b| owner.is_none_or(|o| &b.owner_id == o))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_bucket_config(
-        &self,
-        name: &BucketName,
-        aspect: ConfigAspect,
-    ) -> Result<Option<ConfigDoc>, MetaError> {
-        if aspect == ConfigAspect::Replication
-            && self.fail_replication_config_reads.load(Ordering::Acquire)
-        {
-            return Err(MetaError::Engine(
-                "injected replication configuration read failure".to_owned(),
-            ));
-        }
-        if aspect == ConfigAspect::Replication
-            && self
-                .hang_next_replication_config_read
-                .swap(false, Ordering::AcqRel)
-        {
-            self.replication_config_read_hanging
-                .store(true, Ordering::Release);
-            return std::future::pending().await;
-        }
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .config
-            .get(&(name.as_str().to_owned(), aspect))
-            .cloned())
-    }
-
-    async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
-        Ok(self.state.lock().unwrap().account_bpa)
-    }
-
-    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .bucket_quotas
-            .get(bucket.as_str())
-            .copied())
-    }
-
-    async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
-        // Empty means NO versions (any version or delete marker) AND no in-progress multipart uploads,
-        // matching S3 DeleteBucket semantics (audit #3; multipart added 2026-07).
-        let st = self.state.lock().unwrap();
-        let has_versions = st
-            .versions
-            .values()
-            .any(|r| r.bucket.as_str() == name.as_str());
-        let has_multipart = st
-            .multipart
-            .values()
-            .any(|s| s.bucket.as_str() == name.as_str());
-        Ok(!has_versions && !has_multipart)
-    }
-
-    async fn current_version(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectVersionRow>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .latest(bucket.as_str(), key.as_str())
-            .cloned())
-    }
-
-    async fn get_version(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version: &VersionId,
-    ) -> Result<Option<ObjectVersionRow>, MetaError> {
-        let vk = (
-            bucket.as_str().to_owned(),
-            key.as_str().to_owned(),
-            version.as_str().to_owned(),
-        );
-        Ok(self.state.lock().unwrap().versions.get(&vk).cloned())
-    }
-
-    async fn list_current(
-        &self,
-        bucket: &BucketName,
-        query: &ListQuery,
-    ) -> Result<ListPage<ObjectSummary>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let rows: Vec<&ObjectVersionRow> = st
-            .versions
-            .values()
-            .filter(|r| r.bucket.as_str() == bucket.as_str() && r.is_latest && !r.is_delete_marker)
-            .collect();
-        Ok(page_rows(rows, query, false))
-    }
-
-    async fn list_versions(
-        &self,
-        bucket: &BucketName,
-        query: &ListQuery,
-    ) -> Result<ListPage<ObjectSummary>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let rows: Vec<&ObjectVersionRow> = st
-            .versions
-            .values()
-            .filter(|r| r.bucket.as_str() == bucket.as_str())
-            .collect();
-        Ok(page_rows(rows, query, true))
-    }
-
-    async fn enumerate_storage_paths(
-        &self,
-        bucket: &BucketName,
-        cursor: Option<&str>,
-        batch: u32,
-    ) -> Result<ListPage<StoragePath>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut paths: Vec<String> = st
-            .versions
-            .values()
-            .filter(|r| r.bucket.as_str() == bucket.as_str())
-            .filter_map(|r| r.storage_path.as_ref().map(|p| p.as_str().to_owned()))
-            .filter(|p| cursor.is_none_or(|c| p.as_str() > c))
-            .collect();
-        paths.sort();
-        let truncated = paths.len() > batch as usize;
-        paths.truncate(batch as usize);
-        let next_cursor = if truncated {
-            paths.last().cloned()
-        } else {
-            None
-        };
-        Ok(ListPage {
-            items: paths.into_iter().map(StoragePath::from_string).collect(),
-            common_prefixes: Vec::new(),
-            next_cursor,
-            next_version_id_marker: None,
-            truncated,
-        })
-    }
-
-    async fn get_object_tags(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version: &VersionId,
-    ) -> Result<Vec<(String, String)>, MetaError> {
-        let vk = (
-            bucket.as_str().to_owned(),
-            key.as_str().to_owned(),
-            version.as_str().to_owned(),
-        );
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .tags
-            .get(&vk)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn get_object_lock(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version: &VersionId,
-    ) -> Result<ObjectLockState, MetaError> {
-        let vk = (
-            bucket.as_str().to_owned(),
-            key.as_str().to_owned(),
-            version.as_str().to_owned(),
-        );
-        self.state.lock().unwrap().strict_lock_state(&vk)
-    }
-
-    async fn get_multipart(
-        &self,
-        upload: &UploadId,
-    ) -> Result<Option<MultipartSession>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .multipart
-            .get(upload.as_str())
-            .cloned())
-    }
-
-    async fn list_parts(
-        &self,
-        upload: &UploadId,
-        part_number_marker: u16,
-        limit: u32,
-    ) -> Result<ListPage<PartRecord>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut items: Vec<PartRecord> = st
-            .parts
-            .iter()
-            .filter(|((u, n), _)| u == upload.as_str() && *n > part_number_marker)
-            .map(|(_, p)| p.clone())
-            .collect();
-        items.sort_by_key(|p| p.part_number);
-        let truncated = items.len() > limit as usize;
-        items.truncate(limit as usize);
-        let next_cursor = if truncated {
-            items.last().map(|p| p.part_number.to_string())
-        } else {
-            None
-        };
-        Ok(ListPage {
-            items,
-            common_prefixes: Vec::new(),
-            next_cursor,
-            next_version_id_marker: None,
-            truncated,
-        })
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        bucket: &BucketName,
-        query: &ListQuery,
-    ) -> Result<ListPage<MultipartSession>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let prefix = query.prefix.clone().unwrap_or_default();
-        // S3 pages this listing on the (key-marker, upload-id-marker) PAIR — mirror the SQL
-        // engines exactly: key-marker alone skips that key, the pair resumes mid-key. The
-        // `>= prefix` filter is load-bearing parity: both SQL engines seek from
-        // `key_marker.unwrap_or(prefix)` and leave the exclusion to the tuple predicate, so only a
-        // marker strictly BELOW the prefix may be ignored. A marker EQUAL to the prefix is a real
-        // resume point and must be kept — discarding it discarded the upload-id-marker with it and
-        // re-served page 1 forever (issue #2).
-        let key_marker = query.cursor.as_deref().filter(|c| *c >= prefix.as_str());
-        let upload_marker = key_marker.and(query.version_id_marker.as_deref());
-        let mut items: Vec<MultipartSession> = st
-            .multipart
-            .values()
-            .filter(|s| {
-                s.bucket.as_str() == bucket.as_str()
-                    && s.status == MultipartStatus::Active
-                    && s.key.as_str().starts_with(&prefix)
-                    && match (key_marker, upload_marker) {
-                        (None, _) => true,
-                        (Some(km), None) => s.key.as_str() > km,
-                        (Some(km), Some(uim)) => (s.key.as_str(), s.upload_id.as_str()) > (km, uim),
-                    }
-            })
-            .cloned()
-            .collect();
-        items.sort_by(|a, b| {
-            a.key
-                .as_str()
-                .cmp(b.key.as_str())
-                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
-        });
-        let limit = query.limit.max(1) as usize;
-        let truncated = items.len() > limit;
-        items.truncate(limit);
-        // The next page resumes strictly after the last returned (key, upload id).
-        let (next_cursor, next_upload_marker) = match (truncated, items.last()) {
-            (true, Some(s)) => (
-                Some(s.key.as_str().to_owned()),
-                Some(s.upload_id.as_str().to_owned()),
-            ),
-            _ => (None, None),
-        };
-        Ok(ListPage {
-            items,
-            common_prefixes: Vec::new(),
-            next_cursor,
-            next_version_id_marker: next_upload_marker,
-            truncated,
-        })
-    }
-
-    async fn enumerate_stale_sessions(
-        &self,
-        older_than: Timestamp,
-        batch: u32,
-    ) -> Result<Vec<MultipartSession>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut sessions: Vec<_> = st
-            .multipart
-            .values()
-            .filter(|session| {
-                session.status == MultipartStatus::Active && session.updated_at < older_than
-            })
-            .cloned()
-            .collect();
-        sessions.sort_by(|a, b| {
-            a.updated_at
-                .cmp(&b.updated_at)
-                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
-        });
-        sessions.truncate(batch.clamp(1, 1_000) as usize);
-        Ok(sessions)
-    }
-
-    async fn enumerate_stale_multipart_reservations(
-        &self,
-        older_than: Timestamp,
-        batch: u32,
-    ) -> Result<Vec<MultipartReservation>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut reservations: Vec<_> = st
-            .multipart_reservations
-            .values()
-            .filter(|reservation| reservation.created_at < older_than)
-            .cloned()
-            .collect();
-        reservations.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.attempt_id.cmp(&b.attempt_id))
-        });
-        reservations.truncate(batch.clamp(1, 1_000) as usize);
-        Ok(reservations)
-    }
-
-    async fn list_multipart_cleanups(
-        &self,
-        limit: u32,
-    ) -> Result<Vec<MultipartCleanup>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut cleanups: Vec<_> = st.multipart_cleanups.values().cloned().collect();
-        cleanups.sort_by(|a, b| {
-            a.storage_path
-                .is_none()
-                .cmp(&b.storage_path.is_none())
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        cleanups.truncate(limit.clamp(1, 1_000) as usize);
-        Ok(cleanups)
-    }
-
-    async fn object_replication_status(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version: &VersionId,
-    ) -> Result<Option<ReplicationStatus>, MetaError> {
-        let vk = (
-            bucket.as_str().to_owned(),
-            key.as_str().to_owned(),
-            version.as_str().to_owned(),
-        );
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .versions
-            .get(&vk)
-            .and_then(|r| r.replication_status))
-    }
-
-    async fn has_unreplicated_predecessor(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        before: &VersionId,
-        target: Option<&str>,
-    ) -> Result<bool, MetaError> {
-        // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write. A
-        // pending/claimed predecessor is still owed and blocks; a `Completed` or terminal `Failed`
-        // one is settled and does NOT block (a terminal failure must not freeze newer versions
-        // forever — best-effort/at-least-once, ARCH 20.4). Mirrors the SQL `NOT IN
-        // ('completed','failed')`. Scoped per target so a later version to target X only waits on
-        // earlier versions to the same X (fan-out).
-        let st = self.state.lock().unwrap();
-        Ok(st.outbox.iter().any(|e| {
-            e.bucket.as_str() == bucket.as_str()
-                && e.key.as_str() == key.as_str()
-                && e.target_arn.as_deref() == target
-                && e.version_id.as_str() < before.as_str()
-                && !matches!(
-                    e.status,
-                    ReplicationStatus::Completed | ReplicationStatus::Failed
-                )
-        }))
-    }
-
-    async fn claim_replication_batch(
-        &self,
-        limit: u32,
-        now: Timestamp,
-    ) -> Result<Vec<OutboxEntry>, MetaError> {
-        // Mirror the real stores: claiming is a write that marks entries `claimed` under a lease.
-        match self
-            .submit(Mutation::ClaimReplicationBatch {
-                limit,
-                now,
-                lease_secs: 300,
-            })
-            .await?
-        {
-            MutationOutcome::ReplicationBatch(entries) => Ok(entries),
-            other => Err(MetaError::Engine(format!(
-                "unexpected outcome for ClaimReplicationBatch: {other:?}"
-            ))),
-        }
-    }
-
-    async fn list_due_replication(
-        &self,
-        limit: u32,
-        now: Timestamp,
-    ) -> Result<Vec<OutboxEntry>, MetaError> {
-        // Read-only mirror of the claim predicate; no mutation.
-        let st = self.state.lock().unwrap();
-        let mut due: Vec<OutboxEntry> = st
-            .outbox
-            .iter()
-            .filter(|e| {
-                e.next_attempt_at <= now
-                    && (e.status == ReplicationStatus::Pending
-                        || (e.status == ReplicationStatus::Claimed
-                            && e.lease_until.is_some_and(|l| l < now)))
-            })
-            .cloned()
-            .collect();
-        due.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
-        });
-        due.truncate(limit as usize);
-        Ok(due)
-    }
-
-    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
-        let st = self.state.lock().unwrap();
-        // Terminal entries are those the engine marked `Failed` (retries exhausted). Return them
-        // most-recently-due first, matching the SQLite reader's `ORDER BY next_attempt_at DESC`.
-        let mut failed: Vec<OutboxEntry> = st
-            .outbox
-            .iter()
-            .filter(|e| e.status == ReplicationStatus::Failed)
-            .cloned()
-            .collect();
-        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
-        failed.truncate(limit as usize);
-        Ok(failed)
-    }
-
-    async fn replication_counts(
-        &self,
-        bucket: Option<&BucketName>,
-    ) -> Result<ReplicationCounts, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut counts = ReplicationCounts::default();
-        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
-            std::collections::HashMap::new();
-        for e in st
-            .outbox
-            .iter()
-            .filter(|e| bucket.is_none_or(|b| e.bucket.as_str() == b.as_str()))
-        {
-            match e.status {
-                ReplicationStatus::Pending => counts.pending += 1,
-                ReplicationStatus::Claimed => counts.claimed += 1,
-                ReplicationStatus::Failed => counts.failed += 1,
-                ReplicationStatus::Completed => counts.completed += 1,
-                ReplicationStatus::Replica => {}
-            }
-            if e.status == ReplicationStatus::Pending {
-                if e.enqueued_at.0 != 0
-                    && (counts.oldest_pending_at_ms == 0
-                        || e.enqueued_at.0 < counts.oldest_pending_at_ms)
-                {
-                    counts.oldest_pending_at_ms = e.enqueued_at.0;
-                }
-                by_target.entry(e.target_arn.clone()).or_default().0 += 1;
-            } else if e.status == ReplicationStatus::Failed {
-                by_target.entry(e.target_arn.clone()).or_default().1 += 1;
-            }
-        }
-        counts.by_target = by_target
-            .into_iter()
-            .filter(|(_, (p, f))| *p > 0 || *f > 0)
-            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
-                target_arn,
-                pending,
-                failed,
-            })
-            .collect();
-        Ok(counts)
-    }
-
-    async fn claim_webhook_batch(
-        &self,
-        limit: u32,
-        now: Timestamp,
-    ) -> Result<Vec<WebhookEntry>, MetaError> {
-        match self
-            .submit(Mutation::ClaimWebhookBatch {
-                limit,
-                now,
-                lease_secs: 300,
-            })
-            .await?
-        {
-            MutationOutcome::WebhookBatch(entries) => Ok(entries),
-            other => Err(MetaError::Engine(format!(
-                "unexpected outcome for ClaimWebhookBatch: {other:?}"
-            ))),
-        }
-    }
-
-    async fn list_due_webhooks(
-        &self,
-        limit: u32,
-        now: Timestamp,
-    ) -> Result<Vec<WebhookEntry>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut due: Vec<WebhookEntry> = st
-            .webhook_outbox
-            .iter()
-            .filter(|e| {
-                e.next_attempt_at <= now
-                    && (e.status == WebhookStatus::Pending
-                        || (e.status == WebhookStatus::Claimed
-                            && e.lease_until.is_some_and(|l| l < now)))
-            })
-            .cloned()
-            .collect();
-        due.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
-        });
-        due.truncate(limit as usize);
-        Ok(due)
-    }
-
-    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut failed: Vec<WebhookEntry> = st
-            .webhook_outbox
-            .iter()
-            .filter(|e| e.status == WebhookStatus::Failed)
-            .cloned()
-            .collect();
-        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
-        failed.truncate(limit as usize);
-        Ok(failed)
-    }
-
-    async fn user_by_bearer_key(
-        &self,
-        access_key_id: &str,
-    ) -> Result<Option<UserWithBearerHash>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .users
-            .values()
-            .find(|r| r.user.access_key_id == access_key_id)
-            .map(|r| UserWithBearerHash {
-                user: r.user.clone(),
-                secret_hash: r.bearer_secret_hash.clone(),
-            }))
-    }
-
-    async fn user_by_sigv4_key(
-        &self,
-        access_key_id: &str,
-    ) -> Result<Option<UserSigV4Credentials>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .users
-            .values()
-            .find(|r| r.user.sigv4_access_key_id.as_deref() == Some(access_key_id))
-            .and_then(|r| {
-                Some(UserSigV4Credentials {
-                    user: r.user.clone(),
-                    secret_ciphertext: r.sigv4_secret_ciphertext.clone()?,
-                    secret_nonce: r.sigv4_secret_nonce.clone()?,
-                })
-            }))
-    }
-
-    async fn user_by_session_key(
-        &self,
-        access_key_id: &str,
-    ) -> Result<Option<UserSessionCredentials>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let Some(rec) = st.session_creds.get(access_key_id) else {
-            return Ok(None);
-        };
-        let parent = st.users.get(&rec.parent_user_id.to_string());
-        Ok(Some(UserSessionCredentials {
-            parent_user_id: rec.parent_user_id.clone(),
-            parent_display_name: parent
-                .map(|p| p.user.display_name.clone())
-                .unwrap_or_default(),
-            parent_is_active: parent.is_none_or(|p| p.user.is_active),
-            secret_ciphertext: rec.secret_ciphertext.clone(),
-            secret_nonce: rec.secret_nonce.clone().unwrap_or_default(),
-            session_token_hash: rec.session_token_hash.clone(),
-            inline_policy: rec.inline_policy.clone(),
-            expires_at: rec.expires_at,
-        }))
-    }
-
-    async fn list_session_credentials(
-        &self,
-        now: Timestamp,
-    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut out: Vec<SessionCredentialSummary> = st
-            .session_creds
-            .values()
-            .filter(|r| r.expires_at > now)
-            .map(|r| SessionCredentialSummary {
-                access_key_id: r.access_key_id.clone(),
-                parent_user_id: r.parent_user_id.clone(),
-                has_inline_policy: r.inline_policy.is_some(),
-                created_at: r.created_at,
-                expires_at: r.expires_at,
-            })
-            .collect();
-        // Newest first, mirroring the SQL stores.
-        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
-        Ok(out)
-    }
-
-    async fn count_users(&self) -> Result<u64, MetaError> {
-        Ok(self.state.lock().unwrap().users.len() as u64)
-    }
-
-    async fn list_users(&self) -> Result<Vec<User>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .users
-            .values()
-            .map(|r| r.user.clone())
-            .collect())
-    }
-
-    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
-        if self.fail_user_policy_reads.load(Ordering::Acquire) {
-            return Err(MetaError::Engine(
-                "injected identity-policy read failure".to_owned(),
-            ));
-        }
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .user_policies
-            .get(user_id.0.as_str())
-            .cloned())
-    }
-
-    async fn list_import_jobs(
-        &self,
-        query: &ImportJobListQuery,
-    ) -> Result<ImportJobPage, MetaError> {
-        let st = self.state.lock().unwrap();
-        let fetch = query.bounded_limit() as usize + 1;
-        // Keep only the best `limit + 1` references while scanning. The double is already
-        // memory-backed, but its listing must not allocate another history-sized vector.
-        let mut selected: Vec<&ImportJobRecord> = Vec::with_capacity(fetch);
-        for job in st.import_jobs.values() {
-            if query.cursor.as_ref().is_some_and(|cursor| {
-                job.created_at > cursor.created_at
-                    || (job.created_at == cursor.created_at && job.id >= cursor.id)
-            }) {
-                continue;
-            }
-            let pos = selected.partition_point(|other| {
-                other.created_at > job.created_at
-                    || (other.created_at == job.created_at && other.id > job.id)
-            });
-            if pos < fetch {
-                selected.insert(pos, job);
-                if selected.len() > fetch {
-                    selected.pop();
-                }
-            }
-        }
-        let jobs = selected
-            .into_iter()
-            .map(ImportJobRecord::to_summary)
-            .collect();
-        Ok(ImportJobPage::from_overfetch(jobs, query.bounded_limit()))
-    }
-
-    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .import_jobs
-            .values()
-            .filter(|job| job.state == state)
-            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
-            .map(|job| job.id.clone()))
-    }
-
-    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .import_jobs
-            .get(id)
-            .map(ImportJobRecord::to_view))
-    }
-
-    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
-        Ok(self.state.lock().unwrap().import_jobs.get(id).cloned())
-    }
-
-    async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .activity
-            .iter()
-            .rev()
-            .take(limit as usize)
-            .cloned()
-            .collect())
-    }
-
-    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st.shares.get(id).cloned())
-    }
-
-    async fn get_share_by_token_hash(
-        &self,
-        token_hash: &ShareLookupHash,
-    ) -> Result<Option<ShareRow>, MetaError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
-            .share_ids_by_hash
-            .get(token_hash)
-            .and_then(|id| st.shares.get(id))
-            .cloned())
-    }
-
-    async fn list_shares(
-        &self,
-        bucket: &BucketName,
-        key: Option<&ObjectKey>,
-    ) -> Result<Vec<ShareRow>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut out: Vec<ShareRow> = st
-            .shares
-            .values()
-            .filter(|s| {
-                s.bucket.as_str() == bucket.as_str()
-                    && key.is_none_or(|k| s.key.as_str() == k.as_str())
-            })
-            .cloned()
-            .collect();
-        // Most recent first, matching the SQL stores.
-        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
-        Ok(out)
-    }
-
-    async fn list_tag_summary(
-        &self,
-        bucket: Option<&BucketName>,
-    ) -> Result<Vec<TagSummary>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
-        for (vkey, tag_list) in &st.tags {
-            let Some(v) = st.versions.get(vkey) else {
-                continue;
-            };
-            // Only current objects (latest, non-delete-marker), optionally bucket-scoped.
-            if !v.is_latest || v.is_delete_marker {
-                continue;
-            }
-            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
-                continue;
-            }
-            for (k, val) in tag_list {
-                *counts.entry((k.clone(), val.clone())).or_insert(0) += 1;
-            }
-        }
-        let mut out: Vec<TagSummary> = counts
-            .into_iter()
-            .map(|((tag_key, tag_value), object_count)| TagSummary {
-                tag_key,
-                tag_value,
-                object_count,
-            })
-            .collect();
-        out.sort_by(|a, b| {
-            b.object_count
-                .cmp(&a.object_count)
-                .then(a.tag_key.cmp(&b.tag_key))
-                .then(a.tag_value.cmp(&b.tag_value))
-        });
-        Ok(out)
-    }
-
-    async fn list_objects_by_tag(
-        &self,
-        bucket: Option<&BucketName>,
-        tag_key: &str,
-        tag_value: &str,
-        limit: u32,
-    ) -> Result<Vec<TaggedObject>, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut out: Vec<TaggedObject> = Vec::new();
-        for (vkey, tag_list) in &st.tags {
-            let Some(v) = st.versions.get(vkey) else {
-                continue;
-            };
-            if !v.is_latest || v.is_delete_marker {
-                continue;
-            }
-            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
-                continue;
-            }
-            if tag_list
-                .iter()
-                .any(|(k, val)| k == tag_key && val == tag_value)
-            {
-                out.push(TaggedObject {
-                    bucket: vkey.0.clone(),
-                    key: vkey.1.clone(),
-                    version_id: vkey.2.clone(),
-                    size: v.size_logical,
-                    last_modified: v.updated_at,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.bucket.cmp(&b.bucket).then(a.key.cmp(&b.key)));
-        out.truncate(limit as usize);
-        Ok(out)
-    }
-
-    async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
-        let st = self.state.lock().unwrap();
-        let mut c = StoreCounts {
-            buckets: st.buckets.len() as u64,
-            ..Default::default()
-        };
-        for r in st.versions.values() {
-            c.versions += 1;
-            if r.is_latest && !r.is_delete_marker {
-                c.objects += 1;
-            }
-            c.logical_bytes += r.size_logical;
-            c.physical_bytes += r.size_physical;
-        }
-        Ok(c)
-    }
-
-    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
-        let st = self.state.lock().unwrap();
-        // `st.buckets` is a BTreeMap, so the seed map is already name-ordered with empty
-        // buckets present at zero — matching the SQL LEFT JOIN ... GROUP BY semantics.
-        let mut by_bucket: BTreeMap<String, BucketCounts> = st
-            .buckets
-            .keys()
-            .map(|name| {
-                (
-                    name.clone(),
-                    BucketCounts {
-                        bucket: name.clone(),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
-        for r in st.versions.values() {
-            let Some(c) = by_bucket.get_mut(r.bucket.as_str()) else {
-                continue;
-            };
-            if r.is_latest && !r.is_delete_marker {
-                c.objects += 1;
-            }
-            c.logical_bytes += r.size_logical;
-            c.physical_bytes += r.size_physical;
-        }
-        Ok(by_bucket.into_values().collect())
-    }
-
-    async fn query_request_metrics(
-        &self,
-        range: MetricsRange,
-        now_secs: i64,
-    ) -> Result<RequestMetricsSeries, MetaError> {
-        let since = range.since_secs(now_secs);
-        let window = range.window_secs().max(1);
-        let st = self.state.lock().unwrap();
-
-        // (count, errors, bytes_in, bytes_out, lat_sum) accumulators per dimension.
-        let mut tl: BTreeMap<i64, (u64, u64, u64, u64, u64)> = BTreeMap::new();
-        let mut by_op: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new(); // count, bytes, lat_sum
-        let mut by_bkt: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // count, bytes
-        let mut by_st: BTreeMap<String, u64> = BTreeMap::new();
-        let (mut t_in, mut t_out, mut t_lat) = (0u64, 0u64, 0u64);
-        let mut hist = [0u64; LATENCY_BUCKETS];
-
-        for ((ts, op, bucket, status), c) in &st.request_metrics {
-            if *ts < since {
-                continue;
-            }
-            let is_err = status == "4xx" || status == "5xx";
-            let bytes = c.bytes_in + c.bytes_out;
-            let e = tl.entry((ts / window) * window).or_default();
-            e.0 += c.count;
-            e.1 += if is_err { c.count } else { 0 };
-            e.2 += c.bytes_in;
-            e.3 += c.bytes_out;
-            e.4 += c.lat_sum_ms;
-            let o = by_op.entry(op.clone()).or_default();
-            o.0 += c.count;
-            o.1 += bytes;
-            o.2 += c.lat_sum_ms;
-            if !bucket.is_empty() {
-                let b = by_bkt.entry(bucket.clone()).or_default();
-                b.0 += c.count;
-                b.1 += bytes;
-            }
-            *by_st.entry(status.clone()).or_insert(0) += c.count;
-            t_in += c.bytes_in;
-            t_out += c.bytes_out;
-            t_lat += c.lat_sum_ms;
-            for (h, x) in hist.iter_mut().zip(c.lat_hist.iter()) {
-                *h += *x;
-            }
-        }
-
-        let timeline: Vec<TimePoint> = tl
-            .into_iter()
-            .map(|(ts, (count, errors, bi, bo, lat))| TimePoint {
-                ts,
-                count,
-                errors,
-                bytes_in: bi,
-                bytes_out: bo,
-                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
-            })
-            .collect();
-
-        let mut by_operation: Vec<OpCount> = by_op
-            .into_iter()
-            .map(|(operation, (count, bytes, lat))| OpCount {
-                operation,
-                count,
-                bytes,
-                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
-            })
-            .collect();
-        by_operation.sort_by(|a, b| b.count.cmp(&a.count).then(a.operation.cmp(&b.operation)));
-
-        let all_buckets: Vec<BucketRequestCount> = by_bkt
-            .into_iter()
-            .map(|(bucket, (count, bytes))| BucketRequestCount {
-                bucket,
-                count,
-                bytes,
-            })
-            .collect();
-        let active_buckets = all_buckets.len() as u64;
-        let mut top_buckets = all_buckets.clone();
-        top_buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.bucket.cmp(&b.bucket)));
-        top_buckets.truncate(10);
-        // A genuinely different ranking: by bytes transferred, not by count.
-        let mut top_buckets_by_bytes = all_buckets;
-        top_buckets_by_bytes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.bucket.cmp(&b.bucket)));
-        top_buckets_by_bytes.truncate(10);
-
-        let mut by_status: Vec<StatusCount> = by_st
-            .into_iter()
-            .map(|(status_class, count)| StatusCount {
-                status_class,
-                count,
-            })
-            .collect();
-        by_status.sort_by(|a, b| {
-            b.count
-                .cmp(&a.count)
-                .then(a.status_class.cmp(&b.status_class))
-        });
-
-        let total: u64 = by_operation.iter().map(|o| o.count).sum();
-        let total_errors: u64 = timeline.iter().map(|p| p.errors).sum();
-        let peak_window_count = timeline.iter().map(|p| p.count).max().unwrap_or(0);
-        Ok(RequestMetricsSeries {
-            timeline,
-            by_operation,
-            top_buckets,
-            top_buckets_by_bytes,
-            by_status,
-            total,
-            total_errors,
-            total_bytes_in: t_in,
-            total_bytes_out: t_out,
-            latency_avg_ms: t_lat.checked_div(total).unwrap_or(0),
-            latency_p95_ms: latency_quantile_ms(&hist, 0.95),
-            peak_window_count,
-            active_buckets,
-            window_secs: window,
-        })
-    }
-}
-
-fn uuid_like(seed: &VersionId) -> String {
-    format!("dm-{}", seed.as_str())
-}
-
-/// A reconcile oracle backed by snapshot sets of live paths/sessions.
-#[derive(Debug, Clone, Default)]
-pub struct SetReconcileOracle {
-    /// Storage paths a metadata row references.
-    pub live_paths: HashSet<String>,
-    /// Upload sessions that still exist.
-    pub live_uploads: HashSet<String>,
-    /// Multipart part paths a committed part row references.
-    pub live_multipart_paths: HashSet<String>,
-}
-
-#[async_trait::async_trait]
-impl ReconcileOracle for SetReconcileOracle {
-    async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError> {
-        Ok(candidates
-            .iter()
-            .map(|p| self.live_paths.contains(p.as_str()))
-            .collect())
-    }
-
-    async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
-        Ok(self.live_uploads.contains(upload.as_str()))
-    }
-
-    async fn live_multipart_parts(
-        &self,
-        candidates: &[StoragePath],
-    ) -> Result<Vec<bool>, MetaError> {
-        Ok(candidates
-            .iter()
-            .map(|path| self.live_multipart_paths.contains(path.as_str()))
-            .collect())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::FixtureMetadataStore;
 
     // The in-memory double must mirror the SQL backends, where `DELETE FROM users` /
     // `DELETE FROM buckets` take the row's policy / quota columns with it. These guard against the
@@ -3472,7 +3617,7 @@ mod tests {
     /// A minimal current-version row for `key`; only the fields listing reads matter.
     fn list_row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
         ObjectVersionRow {
-            id: format!("id-{key}"),
+            id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: bucket.clone(),
             key: ObjectKey::parse(key).unwrap(),
             version_id: VersionId::null(),
@@ -3514,16 +3659,32 @@ mod tests {
     async fn delimiter_pagination_advances_past_a_common_prefix() {
         let store = InMemoryMetadataStore::new();
         let bucket = BucketName::parse("photos").unwrap();
+        let fixture = store.begin_fixture().await.unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(Bucket {
+                name: bucket.clone(),
+                owner_id: UserId::generate(),
+                created_at: Timestamp::EPOCH,
+                versioning: VersioningState::Unversioned,
+                ownership_mode: crate::OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".into(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
         // Two groups (a/, b/) then a bare key. With max-keys=2 the first page is exactly the two
         // CommonPrefixes, so the page ENDS on the b/ group — the case the old cursor got wrong.
         for k in ["a/1", "a/2", "b/1", "b/2", "c"] {
             store
-                .submit(Mutation::PutObjectVersion {
-                    row: Box::new(list_row(&bucket, k)),
-                    precondition: Precondition::default(),
-                    initial_state: crate::meta::InitialObjectState::default(),
-                    replication: Vec::new(),
-                })
+                .submit_fixture(
+                    &fixture,
+                    Mutation::PutObjectVersion {
+                        row: Box::new(list_row(&bucket, k)),
+                        precondition: Precondition::default(),
+                        initial_state: crate::meta::InitialObjectState::default(),
+                        replication: Vec::new(),
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -3587,14 +3748,30 @@ mod tests {
     async fn plain_pagination_inclusive_cursor_skips_no_key() {
         let store = InMemoryMetadataStore::new();
         let bucket = BucketName::parse("photos").unwrap();
+        let fixture = store.begin_fixture().await.unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(Bucket {
+                name: bucket.clone(),
+                owner_id: UserId::generate(),
+                created_at: Timestamp::EPOCH,
+                versioning: VersioningState::Unversioned,
+                ownership_mode: crate::OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".into(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
         for k in ["a", "b", "c", "d"] {
             store
-                .submit(Mutation::PutObjectVersion {
-                    row: Box::new(list_row(&bucket, k)),
-                    precondition: Precondition::default(),
-                    initial_state: crate::meta::InitialObjectState::default(),
-                    replication: Vec::new(),
-                })
+                .submit_fixture(
+                    &fixture,
+                    Mutation::PutObjectVersion {
+                        row: Box::new(list_row(&bucket, k)),
+                        precondition: Precondition::default(),
+                        initial_state: crate::meta::InitialObjectState::default(),
+                        replication: Vec::new(),
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -3646,6 +3823,18 @@ mod tests {
     async fn delete_bucket_clears_quota() {
         let store = InMemoryMetadataStore::new();
         let bucket = BucketName::parse("photos").unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(Bucket {
+                name: bucket.clone(),
+                owner_id: UserId::generate(),
+                created_at: Timestamp::EPOCH,
+                versioning: VersioningState::Unversioned,
+                ownership_mode: crate::OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".into(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
         store
             .submit(Mutation::SetBucketQuota {
                 bucket: bucket.clone(),

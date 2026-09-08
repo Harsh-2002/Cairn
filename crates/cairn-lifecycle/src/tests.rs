@@ -5,6 +5,8 @@
 use crate::{
     Action, BucketLifecycle, Expiration, Filter, LifecycleRule, LifecycleScanner, parse_lifecycle,
 };
+use cairn_types::storage::{StorageToken, StorageWriteTarget};
+use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, TestClock};
 use cairn_types::{
     BlobStore, Bucket, BucketName, CompressionDescriptor, GovernanceBypass, ListQuery,
@@ -18,6 +20,54 @@ use cairn_types::{
 // --------------------------------------------------------------------------------------------
 
 const DAY: i64 = 86_400;
+
+async fn drain_cleanup(
+    fixture: &PublicationFixture,
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+) -> Vec<cairn_types::StoragePath> {
+    use cairn_types::storage::{StorageMutation, io::StorageIoWatch};
+    use cairn_types::{MutationOutcome, Timestamp};
+    let mut removed = Vec::new();
+    loop {
+        let MutationOutcome::StorageCleanupBatch(batch) = meta
+            .submit(Mutation::ClaimStorageCleanup {
+                generation: fixture.generation().clone(),
+                limit: 256,
+                now: Timestamp(1),
+                lease_secs: 60,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("exact cleanup batch expected")
+        };
+        if batch.is_empty() {
+            return removed;
+        }
+        for cleanup in batch {
+            let (_, lease) = StorageIoWatch::new(
+                cleanup.id.clone(),
+                cleanup.generation.clone(),
+                std::sync::Arc::new(()),
+            );
+            blob.cleanup_storage(&cleanup, lease).await.unwrap();
+            removed.push(cleanup.path.clone());
+            assert!(matches!(
+                meta.submit(Mutation::Storage {
+                    bucket: cleanup.bucket.clone(),
+                    operation: StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: Timestamp(1)
+                    },
+                })
+                .await
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            ));
+        }
+    }
+}
 
 fn owner() -> UserId {
     UserId("owner-1".to_owned())
@@ -60,6 +110,7 @@ async fn make_object_lock_bucket(meta: &InMemoryMetadataStore) {
 /// Stage a blob through the blob store and upsert a version row referencing it, so the object
 /// is fully realized (metadata + bytes) exactly as the put path would leave it.
 async fn put_object(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blob: &InMemoryBlobStore,
     key: &str,
@@ -67,10 +118,24 @@ async fn put_object(
     created_secs: i64,
     version_id: VersionId,
 ) -> StoragePath {
+    let ts = Timestamp::from_secs(created_secs);
+    let row_id = StorageToken::generate().as_str().to_owned();
+    let planned = blob
+        .plan_write(
+            bucket_name(),
+            fixture.generation().clone(),
+            StorageWriteTarget::Object {
+                key: ObjectKey::parse(key).unwrap(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+            },
+        )
+        .unwrap();
+    let (plan, permit) = fixture.admit_object(meta, planned, ts).await.unwrap();
     let stream = once_body(body.to_vec());
     let staged = blob
         .stage(
-            &bucket_name(),
+            permit,
             stream,
             cairn_types::StageOptions {
                 compression: None,
@@ -83,11 +148,10 @@ async fn put_object(
         )
         .await
         .unwrap();
-    let ts = Timestamp::from_secs(created_secs);
     let row = ObjectVersionRow {
         // A sentinel version id can be reused by an unversioned overwrite; the metadata-row id
         // remains replacement-specific, as it is in the production PUT path.
-        id: format!("row-{}", staged.storage_path.as_str()),
+        id: row_id,
         bucket: bucket_name(),
         key: ObjectKey::parse(key).unwrap(),
         version_id,
@@ -117,12 +181,18 @@ async fn put_object(
         created_at: ts,
         updated_at: ts,
     };
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: cairn_types::Precondition::default(),
-        initial_state: cairn_types::InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: cairn_types::Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     staged.storage_path
@@ -137,6 +207,7 @@ fn once_body(bytes: Vec<u8>) -> cairn_types::BodyStream {
 /// Create a multipart session whose `created_at`/`updated_at` are the given time, and stage one
 /// part for it so a successful abort must reclaim staged bytes.
 async fn make_session(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blob: &InMemoryBlobStore,
     key: &str,
@@ -171,23 +242,50 @@ async fn make_session(
     })
     .await
     .unwrap();
-    // Stage a part and record it.
-    let attempt_id = "lifecycle-part".to_owned();
-    meta.submit(Mutation::ReserveMultipartPart {
-        upload_id: upload.clone(),
-        part_number: 1,
-        attempt_id: attempt_id.clone(),
-        reserved_bytes: 16,
-        max_parts_per_upload: 10_000,
-        now: ts,
-    })
-    .await
-    .unwrap();
+    // Reserve exact quota and physical ownership before any part bytes can be created.
+    let attempt_id = StorageToken::generate().as_str().to_owned();
+    let planned = blob
+        .plan_write(
+            bucket_name(),
+            fixture.generation().clone(),
+            StorageWriteTarget::Part {
+                upload_id: upload.clone(),
+                part_number: 1,
+                reservation_id: attempt_id.clone(),
+            },
+        )
+        .unwrap();
+    let plan = planned.plan().clone();
+    let outcome = meta
+        .submit(
+            PublicationFixture::admission(
+                plan.clone(),
+                Mutation::ReserveMultipartPart {
+                    upload_id: upload.clone(),
+                    part_number: 1,
+                    attempt_id: attempt_id.clone(),
+                    reserved_bytes: 16,
+                    max_parts_per_upload: 10_000,
+                    now: ts,
+                },
+                ts,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cairn_types::MutationOutcome::StorageAdmission(receipt) = outcome else {
+        panic!("part admission expected")
+    };
+    let (_, lease) = cairn_types::storage::io::StorageIoWatch::new(
+        plan.attempt.clone(),
+        plan.generation.clone(),
+        std::sync::Arc::new(()),
+    );
+    let permit = planned.admit(receipt, lease).unwrap();
     let staged = blob
         .stage_part(
-            &upload,
-            1,
-            &attempt_id,
+            permit,
             once_body(vec![1u8; 16]),
             cairn_types::ChecksumSet::none(),
             1 << 30,
@@ -195,18 +293,24 @@ async fn make_session(
         )
         .await
         .unwrap();
-    meta.submit(Mutation::RecordPart {
-        upload_id: upload.clone(),
-        attempt_id,
-        part: PartRecord {
-            part_number: 1,
-            size: staged.size,
-            etag: staged.md5_hex,
-            storage_path: staged.storage_path,
-            checksum: None,
-            part_dek: None,
-        },
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::RecordPart {
+                upload_id: upload.clone(),
+                attempt_id,
+                part: PartRecord {
+                    part_number: 1,
+                    size: staged.size,
+                    etag: staged.md5_hex,
+                    storage_path: staged.storage_path,
+                    checksum: None,
+                    part_dek: None,
+                },
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     upload
@@ -300,11 +404,21 @@ async fn count_current(meta: &InMemoryMetadataStore) -> usize {
 #[tokio::test]
 async fn current_expiration_unversioned_deletes_and_reclaims_blob() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Unversioned).await;
 
-    let path = put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::null()).await;
+    let path = put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::null(),
+    )
+    .await;
     assert_eq!(blob.blob_count(), 1);
 
     // 31 days later, a 30-day expiration is due.
@@ -319,6 +433,15 @@ async fn current_expiration_unversioned_deletes_and_reclaims_blob() {
     assert_eq!(report.errors, 0);
     assert_eq!(count_current(&meta).await, 0, "object permanently gone");
     assert_eq!(count_versions(&meta).await, 0, "no versions remain");
+    assert!(
+        blob.get_bytes(&path).is_some(),
+        "deletion retains bytes as exact debt"
+    );
+    let removed = drain_cleanup(&fixture, &meta, &blob).await;
+    assert!(
+        removed.contains(&path),
+        "the deleted row's exact path was journaled"
+    );
     assert_eq!(blob.blob_count(), 0, "blob reclaimed");
     assert!(blob.get_bytes(&path).is_none());
 }
@@ -326,10 +449,20 @@ async fn current_expiration_unversioned_deletes_and_reclaims_blob() {
 #[tokio::test]
 async fn current_expiration_not_due_before_threshold() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Unversioned).await;
-    put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::null(),
+    )
+    .await;
 
     // Only 29 days have passed; a 30-day rule is not yet due.
     clock.set(Timestamp::from_secs(29 * DAY));
@@ -347,11 +480,21 @@ async fn current_expiration_not_due_before_threshold() {
 #[tokio::test]
 async fn current_expiration_versioned_inserts_delete_marker() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
 
-    let path = put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::generate()).await;
+    let path = put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::generate(),
+    )
+    .await;
 
     clock.set(Timestamp::from_secs(31 * DAY));
     let scanner = LifecycleScanner::new();
@@ -373,11 +516,12 @@ async fn current_expiration_versioned_inserts_delete_marker() {
 #[tokio::test]
 async fn current_expiration_skips_marker_after_concurrent_new_version() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     make_bucket(&meta, VersioningState::Enabled).await;
 
     let v1 = VersionId::from_string("00000001".to_owned());
-    put_object(&meta, &blob, "doc.txt", b"old", 0, v1).await;
+    put_object(&fixture, &meta, &blob, "doc.txt", b"old", 0, v1).await;
     let enumerated = meta
         .list_current(
             &bucket_name(),
@@ -394,7 +538,7 @@ async fn current_expiration_skips_marker_after_concurrent_new_version() {
         .unwrap();
 
     let v2 = VersionId::from_string("00000002".to_owned());
-    put_object(&meta, &blob, "doc.txt", b"fresh", DAY, v2.clone()).await;
+    put_object(&fixture, &meta, &blob, "doc.txt", b"fresh", DAY, v2.clone()).await;
     let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
     let applied = LifecycleScanner::new()
         .insert_delete_marker(&meta, &bucket, &enumerated, Timestamp::from_secs(31 * DAY))
@@ -422,10 +566,20 @@ async fn current_expiration_skips_marker_after_concurrent_new_version() {
 #[tokio::test]
 async fn current_expiration_skips_same_timestamp_unversioned_overwrite() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     make_bucket(&meta, VersioningState::Unversioned).await;
 
-    put_object(&meta, &blob, "doc.txt", b"old", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"old",
+        0,
+        VersionId::null(),
+    )
+    .await;
     let enumerated = meta
         .list_current(
             &bucket_name(),
@@ -443,7 +597,16 @@ async fn current_expiration_skips_same_timestamp_unversioned_overwrite() {
 
     // The replacement deliberately reuses both the unversioned sentinel and the exact same
     // timestamp. Only the immutable object_versions.id can distinguish it from the stale listing.
-    put_object(&meta, &blob, "doc.txt", b"fresh", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"fresh",
+        0,
+        VersionId::null(),
+    )
+    .await;
     let replacement = meta
         .list_current(
             &bucket_name(),
@@ -494,6 +657,7 @@ async fn current_expiration_skips_same_timestamp_unversioned_overwrite() {
 #[tokio::test]
 async fn lifecycle_expiration_replicates_delete_marker() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -508,7 +672,16 @@ async fn lifecycle_expiration_replicates_delete_marker() {
     .await
     .unwrap();
 
-    put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::generate()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::generate(),
+    )
+    .await;
 
     clock.set(Timestamp::from_secs(31 * DAY));
     let scanner = LifecycleScanner::new();
@@ -538,6 +711,7 @@ async fn lifecycle_expiration_replicates_delete_marker() {
 #[tokio::test]
 async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -550,6 +724,7 @@ async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
         // Slight sleep keeps v7 ids monotonic across the loop.
         std::thread::sleep(std::time::Duration::from_millis(2));
         let p = put_object(
+            &fixture,
             &meta,
             &blob,
             "doc.txt",
@@ -588,6 +763,15 @@ async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
     // Remaining: latest (day 3) + kept newest noncurrent (day 2) = 2 versions.
     assert_eq!(count_versions(&meta).await, 2);
     assert_eq!(count_current(&meta).await, 1, "latest still current");
+    assert_eq!(blob.blob_count(), 4, "expiration queues physical debt");
+    let removed = drain_cleanup(&fixture, &meta, &blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("test-bucket/"))
+            .count(),
+        2
+    );
     assert_eq!(blob.blob_count(), 2, "two blobs reclaimed");
 }
 
@@ -597,6 +781,7 @@ async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
 #[tokio::test]
 async fn noncurrent_expiration_ages_from_becoming_noncurrent_not_creation() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -604,10 +789,10 @@ async fn noncurrent_expiration_ages_from_becoming_noncurrent_not_creation() {
     // V1 created on day 0, stays current until day 100 when V2 supersedes it.
     let v1 = VersionId::generate();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    put_object(&meta, &blob, "k", b"one", 0, v1).await;
+    put_object(&fixture, &meta, &blob, "k", b"one", 0, v1).await;
     let v2 = VersionId::generate();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    put_object(&meta, &blob, "k", b"two", 100 * DAY, v2).await;
+    put_object(&fixture, &meta, &blob, "k", b"two", 100 * DAY, v2).await;
 
     let rule = LifecycleRule {
         id: "ncv".to_owned(),
@@ -650,6 +835,7 @@ async fn noncurrent_expiration_ages_from_becoming_noncurrent_not_creation() {
 #[tokio::test]
 async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -657,6 +843,7 @@ async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
     let total = crate::scanner::PAGE_LIMIT as usize * 2 + 49;
     for ordinal in 0..total {
         put_object(
+            &fixture,
             &meta,
             &blob,
             "deep-history",
@@ -698,6 +885,19 @@ async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
     );
     assert_eq!(
         blob.blob_count(),
+        total,
+        "physical debt remains until exact cleanup"
+    );
+    let removed = drain_cleanup(&fixture, &meta, &blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("test-bucket/"))
+            .count(),
+        expected_expired
+    );
+    assert_eq!(
+        blob.blob_count(),
         keep as usize + 1,
         "every expired version's blob was reclaimed"
     );
@@ -706,11 +906,12 @@ async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
 #[tokio::test]
 async fn abort_incomplete_multipart_removes_session_and_parts() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Unversioned).await;
 
-    let upload = make_session(&meta, &blob, "big.bin", 0).await;
+    let upload = make_session(&fixture, &meta, &blob, "big.bin", 0).await;
     assert!(meta.get_multipart(&upload).await.unwrap().is_some());
     assert_eq!(
         meta.list_parts(&upload, 0, 100).await.unwrap().items.len(),
@@ -745,15 +946,34 @@ async fn abort_incomplete_multipart_removes_session_and_parts() {
         0,
         "parts gone"
     );
+    assert_eq!(
+        blob.multipart_part_count(),
+        1,
+        "abort leaves exact physical quota debt"
+    );
+    let removed = drain_cleanup(&fixture, &meta, &blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().contains(upload.as_str()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        blob.multipart_part_count(),
+        0,
+        "part debt retires after physical cleanup"
+    );
 }
 
 #[tokio::test]
 async fn abort_incomplete_multipart_respects_threshold() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Unversioned).await;
-    let upload = make_session(&meta, &blob, "big.bin", 0).await;
+    let upload = make_session(&fixture, &meta, &blob, "big.bin", 0).await;
 
     let rule = LifecycleRule {
         id: "abort".to_owned(),
@@ -781,6 +1001,7 @@ async fn abort_incomplete_multipart_respects_threshold() {
 #[tokio::test]
 async fn abort_incomplete_multipart_pages_per_bucket_past_a_hot_prefix() {
     let meta = InMemoryMetadataStore::new();
+    let _fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(8 * DAY);
     make_bucket(&meta, VersioningState::Unversioned).await;
@@ -888,6 +1109,7 @@ async fn abort_incomplete_multipart_pages_per_bucket_past_a_hot_prefix() {
 #[tokio::test]
 async fn expired_object_delete_marker_removed_when_sole_version() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -895,7 +1117,7 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
     // Put an object, then permanently delete its only version, then drop a delete marker so the
     // marker becomes the sole remaining version of the key.
     let v = VersionId::generate();
-    put_object(&meta, &blob, "ghost.txt", b"x", 0, v.clone()).await;
+    put_object(&fixture, &meta, &blob, "ghost.txt", b"x", 0, v.clone()).await;
     meta.submit(Mutation::DeleteVersion {
         bucket: bucket_name(),
         key: ObjectKey::parse("ghost.txt").unwrap(),
@@ -943,12 +1165,22 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
 #[tokio::test]
 async fn expired_object_delete_marker_kept_when_other_versions_exist() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
 
     // A live version plus a delete marker: the marker is NOT the sole version, so it stays.
-    put_object(&meta, &blob, "doc.txt", b"x", 0, VersionId::generate()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"x",
+        0,
+        VersionId::generate(),
+    )
+    .await;
     meta.submit(Mutation::CreateDeleteMarker {
         bucket: bucket_name(),
         key: ObjectKey::parse("doc.txt").unwrap(),
@@ -982,6 +1214,7 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
 #[tokio::test]
 async fn expired_delete_marker_cleanup_skips_concurrently_arrived_version() {
     let meta = InMemoryMetadataStore::new();
+    let _fixture = meta.begin_fixture().await.unwrap();
     make_bucket(&meta, VersioningState::Enabled).await;
     let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
     let key = ObjectKey::parse("ghost.txt").unwrap();
@@ -1056,6 +1289,7 @@ async fn expired_delete_marker_cleanup_skips_concurrently_arrived_version() {
 #[tokio::test]
 async fn delete_marker_cleanup_streams_many_listing_pages() {
     let meta = InMemoryMetadataStore::new();
+    let _fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Enabled).await;
@@ -1103,6 +1337,7 @@ async fn scanner_is_idempotent_running_twice_equals_once() {
     // a zero second-pass tally for the now-no-op actions.
     let build = || async {
         let meta = InMemoryMetadataStore::new();
+        let fixture = meta.begin_fixture().await.unwrap();
         let blob = InMemoryBlobStore::new();
         make_bucket(&meta, VersioningState::Enabled).await;
 
@@ -1110,10 +1345,10 @@ async fn scanner_is_idempotent_running_twice_equals_once() {
         let v1 = VersionId::generate();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let v2 = VersionId::generate();
-        put_object(&meta, &blob, "doc.txt", b"v1", 0, v1).await;
-        put_object(&meta, &blob, "doc.txt", b"v2", 1, v2).await;
-        make_session(&meta, &blob, "big.bin", 0).await;
-        (meta, blob)
+        put_object(&fixture, &meta, &blob, "doc.txt", b"v1", 0, v1).await;
+        put_object(&fixture, &meta, &blob, "doc.txt", b"v2", 1, v2).await;
+        make_session(&fixture, &meta, &blob, "big.bin", 0).await;
+        (meta, blob, fixture)
     };
 
     let rules = vec![
@@ -1141,17 +1376,18 @@ async fn scanner_is_idempotent_running_twice_equals_once() {
     let scanner = LifecycleScanner::new();
 
     // --- Path A: scan once ---
-    let (meta_a, blob_a) = build().await;
+    let (meta_a, blob_a, fixture_a) = build().await;
     scanner
         .run_once(&meta_a, &blob_a, &clock, &cfg(rules.clone()))
         .await
         .unwrap();
     let versions_a = count_versions(&meta_a).await;
     let current_a = count_current(&meta_a).await;
+    drain_cleanup(&fixture_a, &meta_a, &blob_a).await;
     let blobs_a = blob_a.blob_count();
 
     // --- Path B: scan twice ---
-    let (meta_b, blob_b) = build().await;
+    let (meta_b, blob_b, fixture_b) = build().await;
     let first = scanner
         .run_once(&meta_b, &blob_b, &clock, &cfg(rules.clone()))
         .await
@@ -1161,6 +1397,7 @@ async fn scanner_is_idempotent_running_twice_equals_once() {
         .await
         .unwrap();
 
+    drain_cleanup(&fixture_b, &meta_b, &blob_b).await;
     // End state identical regardless of run count.
     assert_eq!(
         count_versions(&meta_b).await,
@@ -1186,10 +1423,20 @@ async fn scanner_is_idempotent_running_twice_equals_once() {
 #[tokio::test]
 async fn disabled_rule_does_nothing() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(100 * DAY);
     make_bucket(&meta, VersioningState::Unversioned).await;
-    put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::null(),
+    )
+    .await;
 
     let mut rule = expiration_rule(1);
     rule.enabled = false;
@@ -1207,12 +1454,31 @@ async fn disabled_rule_does_nothing() {
 #[tokio::test]
 async fn prefix_filter_scopes_the_rule() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(100 * DAY);
     make_bucket(&meta, VersioningState::Unversioned).await;
 
-    put_object(&meta, &blob, "logs/a.txt", b"a", 0, VersionId::null()).await;
-    put_object(&meta, &blob, "data/b.txt", b"b", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "logs/a.txt",
+        b"a",
+        0,
+        VersionId::null(),
+    )
+    .await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "data/b.txt",
+        b"b",
+        0,
+        VersionId::null(),
+    )
+    .await;
 
     let rule = LifecycleRule {
         id: "logs-only".to_owned(),
@@ -1251,10 +1517,20 @@ async fn prefix_filter_scopes_the_rule() {
 #[tokio::test]
 async fn expiration_by_absolute_date() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_bucket(&meta, VersioningState::Unversioned).await;
-    put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "doc.txt",
+        b"hello",
+        0,
+        VersionId::null(),
+    )
+    .await;
 
     // Expire on or after day 10.
     let rule = LifecycleRule {
@@ -1280,16 +1556,27 @@ async fn expiration_by_absolute_date() {
         .await
         .unwrap();
     assert_eq!(r.objects_expired, 1);
+    drain_cleanup(&fixture, &meta, &blob).await;
     assert_eq!(blob.blob_count(), 0);
 }
 
 #[tokio::test]
 async fn transition_action_is_a_documented_noop() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(100 * DAY);
     make_bucket(&meta, VersioningState::Unversioned).await;
-    put_object(&meta, &blob, "cold.txt", b"data", 0, VersionId::null()).await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "cold.txt",
+        b"data",
+        0,
+        VersionId::null(),
+    )
+    .await;
 
     let rule = LifecycleRule {
         id: "tier".to_owned(),
@@ -1312,6 +1599,7 @@ async fn transition_action_is_a_documented_noop() {
 #[tokio::test]
 async fn missing_bucket_is_skipped() {
     let meta = InMemoryMetadataStore::new();
+    let _fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::default();
     // No bucket created.
@@ -1493,6 +1781,7 @@ fn filter_matches_semantics() {
 #[tokio::test]
 async fn noncurrent_expiration_preserves_object_locked_version() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
     make_object_lock_bucket(&meta).await;
@@ -1503,6 +1792,7 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
         let v = VersionId::generate();
         std::thread::sleep(std::time::Duration::from_millis(2));
         put_object(
+            &fixture,
             &meta,
             &blob,
             "doc.txt",
@@ -1571,5 +1861,33 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
         .unwrap()
         .is_some(),
         "the Object-Locked version is still present",
+    );
+    assert_eq!(
+        blob.blob_count(),
+        3,
+        "unlocked deletion is pending exact cleanup"
+    );
+    let removed = drain_cleanup(&fixture, &meta, &blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("test-bucket/"))
+            .count(),
+        1
+    );
+    assert_eq!(blob.blob_count(), 2);
+    let protected = meta
+        .get_version(
+            &bucket_name(),
+            &ObjectKey::parse("doc.txt").unwrap(),
+            &versions[0],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        blob.get_bytes(protected.storage_path.as_ref().unwrap())
+            .unwrap(),
+        b"body-0"
     );
 }

@@ -28,9 +28,82 @@ type MultipartInitialColumns = (String, Option<String>, Option<i64>, Option<i64>
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::AdmitStorageWrite {
+            plan,
+            operation,
+            now,
+        } => {
+            plan.validate_admission(&operation)?;
+            let admission = crate::storage::reserve(conn, &plan.bucket, (*plan).clone(), now)?;
+            if matches!(
+                admission,
+                cairn_types::storage::StorageAdmission::NotApplied
+            ) {
+                return Ok(MutationOutcome::StorageAdmission(admission));
+            }
+            match apply_inner(conn, *operation)? {
+                MutationOutcome::MultipartReserved => {
+                    Ok(MutationOutcome::StorageAdmission(admission))
+                }
+                MutationOutcome::MultipartClaim(claim) => {
+                    let admission = if let cairn_types::meta::ClaimOutcome::Claimed(session) =
+                        &claim
+                    {
+                        if session.bucket != plan.bucket
+                            || !matches!(
+                                &plan.target, cairn_types::storage::StorageWriteTarget::Completion { key, .. }
+                                    if key == &session.key
+                            )
+                        {
+                            return Err(MetaError::Engine(
+                                "storage completion routing mismatch".into(),
+                            ));
+                        }
+                        admission
+                    } else {
+                        crate::storage::discard_unacknowledged(conn, &plan)?;
+                        cairn_types::storage::StorageAdmission::NotApplied
+                    };
+                    Ok(MutationOutcome::StorageMultipartClaim { admission, claim })
+                }
+                _ => Err(MetaError::Engine(
+                    "invalid joint storage admission outcome".into(),
+                )),
+            }
+        }
+        Mutation::PublishStorageWrite { plan, operation } => {
+            plan.validate_publication(&operation)?;
+            if !crate::storage::owns_publication(conn, &plan)? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = apply_inner(conn, *operation)?;
+            if matches!(
+                &outcome,
+                MutationOutcome::Put { .. }
+                    | MutationOutcome::PartRecorded { .. }
+                    | MutationOutcome::MultipartTerminal(
+                        MultipartTerminalOutcome::Completed { .. }
+                    )
+            ) {
+                crate::storage::consume_published(conn, &plan)?;
+            }
+            Ok(outcome)
+        }
+        other => {
+            cairn_types::storage::validate_unadmitted_mutation(&other)?;
+            apply_inner(conn, other)
+        }
+    }
+}
+
+fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
+    match m {
+        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+            Err(MetaError::Engine("nested storage operation".into()))
+        }
         Mutation::BeginStorageGeneration { generation } => crate::storage::begin(conn, &generation),
         Mutation::Storage { bucket, operation } => crate::storage::apply(conn, &bucket, operation),
-        Mutation::RecoverStorageIntents { generation, limit } => {
+        Mutation::ListStorageIntents { generation, limit } => {
             crate::storage::recover(conn, &generation, limit)
         }
         Mutation::ClaimStorageCleanup {
@@ -513,6 +586,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             if non_empty {
                 return Err(MetaError::NotEmpty);
             }
+            crate::storage::cancel_bucket(conn, &name)?;
             conn.execute(
                 "DELETE FROM bucket_config WHERE bucket_name=?1",
                 params![name.as_str()],
@@ -2092,6 +2166,9 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
     let before = current_visibility(conn, &bucket, &key)?;
     let result = upsert_version_inner(conn, row)?;
     update_visibility(conn, &bucket, &key, before)?;
+    if let Some(path) = &result {
+        crate::storage::enqueue(conn, &bucket, path, None)?;
+    }
     Ok(result)
 }
 
@@ -2355,6 +2432,9 @@ fn delete_version_inner(
         return Ok(MutationOutcome::DeleteProtected);
     }
     let freed = storage_path.map(StoragePath::from_string);
+    if let Some(path) = &freed {
+        crate::storage::enqueue(conn, bucket, path, None)?;
+    }
     let was_latest = latest != 0;
     conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
@@ -2469,7 +2549,7 @@ fn multipart_stat(
     .map(|value| value.unwrap_or(0))
 }
 
-fn adjust_multipart_stats(
+pub(crate) fn adjust_multipart_stats(
     conn: &Connection,
     bucket: &str,
     principal: &str,
@@ -2586,7 +2666,7 @@ fn release_multipart_reservation(
             "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
              FROM multipart_part_reservations r
              JOIN multipart_uploads u ON u.id=r.upload_id
-             WHERE r.attempt_id=?1 AND r.upload_id=?2",
+             WHERE r.attempt_id=?1 AND r.upload_id=?2 AND NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)",
             params![attempt_id, upload_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -2647,8 +2727,8 @@ fn record_part(
     if let Some(debt) = &cleanup {
         conn.execute(
             "INSERT INTO multipart_staging_cleanups
-             (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+             (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at, storage_protocol)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,2)",
             params![
                 debt.id,
                 debt.upload_id.as_str(),
@@ -2660,6 +2740,11 @@ fn record_part(
             ],
         )
         .map_err(engine_err)?;
+        let path = debt
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| MetaError::Engine("missing superseded part path".into()))?;
+        crate::storage::link_quota(conn, &debt.bucket, path, &debt.id)?;
         conn.execute(
             "UPDATE multipart_parts
              SET size=?3, etag=?4, storage_path=?5, checksum=?6, part_dek=?7
@@ -2711,7 +2796,7 @@ fn release_multipart_cleanup(conn: &Connection, cleanup_id: &str) -> R<()> {
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT bucket_name, principal_id, bytes
-             FROM multipart_staging_cleanups WHERE id=?1",
+             FROM multipart_staging_cleanups WHERE id=?1 AND storage_protocol=1",
             params![cleanup_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -2721,7 +2806,7 @@ fn release_multipart_cleanup(conn: &Connection, cleanup_id: &str) -> R<()> {
         return Ok(());
     };
     conn.execute(
-        "DELETE FROM multipart_staging_cleanups WHERE id=?1",
+        "DELETE FROM multipart_staging_cleanups WHERE id=?1 AND storage_protocol=1",
         params![cleanup_id],
     )
     .map_err(engine_err)?;
@@ -2735,7 +2820,7 @@ fn release_multipart_upload_cleanups(
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
-             FROM multipart_staging_cleanups WHERE upload_id=?1
+             FROM multipart_staging_cleanups WHERE upload_id=?1 AND storage_protocol=1
              GROUP BY bucket_name, principal_id",
             params![upload_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2746,7 +2831,7 @@ fn release_multipart_upload_cleanups(
         return Ok(());
     };
     conn.execute(
-        "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1",
+        "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1 AND storage_protocol=1",
         params![upload_id.as_str()],
     )
     .map_err(engine_err)?;
@@ -2755,39 +2840,15 @@ fn release_multipart_upload_cleanups(
 
 fn retire_multipart_session(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<()> {
     let context = multipart_context(conn, upload_id)?;
-    let part_bytes: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(size),0) FROM multipart_parts WHERE upload_id=?1",
-            params![upload_id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(engine_err)?;
-    let reservation_bytes: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(reserved_bytes),0)
-             FROM multipart_part_reservations WHERE upload_id=?1",
-            params![upload_id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(engine_err)?;
-    let current_bytes = part_bytes + reservation_bytes;
-    // Keep a session-directory cleanup token even when its recorded byte total is zero. A valid
-    // zero-length part still creates a filesystem artifact, and a failed directory deletion must
-    // remain retryable rather than disappearing merely because quota has no bytes to charge.
-    conn.execute(
-        "INSERT INTO multipart_staging_cleanups
-         (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
-         VALUES (?1,?2,?3,?4,?5,NULL,?6)",
-        params![
-            format!("session:{}", upload_id.as_str()),
-            upload_id.as_str(),
-            context.bucket,
-            context.principal,
-            current_bytes,
-            context.updated_at,
-        ],
-    )
-    .map_err(engine_err)?;
+    let bucket = BucketName::parse(&context.bucket)
+        .map_err(|_| MetaError::Engine("invalid multipart bucket".into()))?;
+    crate::storage::retire_multipart(
+        conn,
+        upload_id.as_str(),
+        &bucket,
+        &context.principal,
+        context.updated_at,
+    )?;
     conn.execute(
         "DELETE FROM multipart_uploads WHERE id=?1",
         params![upload_id.as_str()],
@@ -2801,7 +2862,8 @@ fn recover_multipart_staging_accounting(conn: &Connection, limit: u32) -> R<Muta
     let reservations: Vec<(String, String)> = {
         let mut stmt = conn
             .prepare_cached(
-                "SELECT attempt_id, upload_id FROM multipart_part_reservations
+                "SELECT attempt_id, upload_id FROM multipart_part_reservations AS r
+                 WHERE NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)
                  ORDER BY created_at, attempt_id LIMIT ?1",
             )
             .map_err(engine_err)?;
@@ -2824,7 +2886,7 @@ fn recover_multipart_staging_accounting(conn: &Connection, limit: u32) -> R<Muta
         let cleanup_ids: Vec<String> = {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id FROM multipart_staging_cleanups
+                    "SELECT id FROM multipart_staging_cleanups WHERE storage_protocol=1
                      ORDER BY created_at, id LIMIT ?1",
                 )
                 .map_err(engine_err)?;
@@ -3102,11 +3164,20 @@ mod tests {
     use super::*;
     use cairn_types::id::UserId;
     use cairn_types::object::{CompressionDescriptor, StorageClass};
+    use cairn_types::storage::{StorageAdmission, StorageMutation, StorageToken};
+    use cairn_types::testing::PublicationFixture;
     use cairn_types::time::Timestamp;
 
     fn conn_with_schema() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::schema::run_migrations(&conn).unwrap();
+        apply(
+            &conn,
+            Mutation::BeginStorageGeneration {
+                generation: StorageToken::generate(),
+            },
+        )
+        .unwrap();
         conn
     }
 
@@ -3168,7 +3239,10 @@ mod tests {
             content_disposition: None,
             content_language: None,
             expires: None,
-            storage_path: Some(StoragePath::from_string(format!("{bucket}/{version}"))),
+            storage_path: Some(StoragePath::from_string(format!(
+                "{bucket}/{}",
+                StorageToken::generate().as_str()
+            ))),
             compression: CompressionDescriptor::Uncompressed,
             storage_class: StorageClass::Standard,
             cold_locator: None,
@@ -3185,13 +3259,43 @@ mod tests {
         }
     }
 
-    fn put(row: ObjectVersionRow) -> Mutation {
-        Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        }
+    fn publication_fixture(conn: &Connection) -> PublicationFixture {
+        let generation: String = conn
+            .query_row(
+                "SELECT generation FROM storage_recovery_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        PublicationFixture::from_generation(StorageToken::try_from(generation).unwrap())
+    }
+
+    fn put(conn: &Connection, row: ObjectVersionRow) -> Mutation {
+        let plan = publication_fixture(conn).object_plan(&row).unwrap();
+        let outcome = apply_in_savepoint(
+            conn,
+            Mutation::Storage {
+                bucket: row.bucket.clone(),
+                operation: StorageMutation::Reserve {
+                    plan: Box::new(plan.clone()),
+                    now: row.updated_at,
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, MutationOutcome::StorageAdmission(StorageAdmission::Granted(ref admitted)) if **admitted == plan)
+        );
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
+        .unwrap()
     }
 
     fn bucket_logical_bytes(conn: &Connection, bucket: &str) -> i64 {
@@ -3306,17 +3410,37 @@ mod tests {
         assert_counters_match_scan(&conn);
 
         // Inserts across two buckets and two owners.
-        apply(&conn, put(obj_row_owned("bkt", "k1", "v1", 10, "alice"))).unwrap();
-        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 20, "bob"))).unwrap();
-        apply(&conn, put(obj_row_owned("cct", "k1", "v1", 5, "alice"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k1", "v1", 10, "alice")),
+        )
+        .unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k2", "v1", 20, "bob")),
+        )
+        .unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("cct", "k1", "v1", 5, "alice")),
+        )
+        .unwrap();
         assert_counters_match_scan(&conn);
 
         // A new version of k1 (history grows; both versions are counted).
-        apply(&conn, put(obj_row_owned("bkt", "k1", "v2", 15, "alice"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k1", "v2", 15, "alice")),
+        )
+        .unwrap();
         assert_counters_match_scan(&conn);
 
         // Replace the same (key, version) — the upsert delete+insert path must net the size change.
-        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 25, "bob"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k2", "v1", 25, "bob")),
+        )
+        .unwrap();
         assert_counters_match_scan(&conn);
 
         // A delete marker (a zero-byte version row).
@@ -3375,13 +3499,13 @@ mod tests {
     fn visible_counter_handles_old_replicas_and_savepoint_rollback() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", None);
-        apply(&conn, put(obj_row("bkt", "key", "v3", 10))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "key", "v3", 10))).unwrap();
         let mut older = obj_row("bkt", "key", "v1", 20);
         older.replication_status = Some(cairn_types::meta::ReplicationStatus::Replica);
-        apply(&conn, put(older)).unwrap();
+        apply(&conn, put(&conn, older)).unwrap();
         assert_counters_match_scan(&conn);
         conn.execute_batch("SAVEPOINT late_failure").unwrap();
-        apply(&conn, put(obj_row("bkt", "new-key", "v1", 30))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "new-key", "v1", 30))).unwrap();
         assert_counters_match_scan(&conn);
         // A later tag/outbox/MPU failure rolls back the enclosing writer savepoint.
         conn.execute_batch("ROLLBACK TO late_failure; RELEASE late_failure")
@@ -3406,8 +3530,16 @@ mod tests {
         // of an actual users row is irrelevant here — the bug is purely the stats/object interaction.
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", None);
-        apply(&conn, put(obj_row_owned("bkt", "k1", "v1", 10, "alice"))).unwrap();
-        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 20, "bob"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k1", "v1", 10, "alice")),
+        )
+        .unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k2", "v1", 20, "bob")),
+        )
+        .unwrap();
         assert_counters_match_scan(&conn);
 
         // Delete alice while she still owns "k1": her objects — and so her stats — must survive.
@@ -3437,11 +3569,12 @@ mod tests {
     fn rejected_quota_write_leaves_counters_unchanged() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(100));
-        apply_in_savepoint(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
+        apply_in_savepoint(&conn, put(&conn, obj_row("bkt", "k1", "v1", 60))).unwrap();
         assert_counters_match_scan(&conn);
         // This put would exceed the quota: it is rolled back in its savepoint, and the counter
         // upserts — which run inside that savepoint — must be rolled back with it.
-        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        let err =
+            apply_in_savepoint(&conn, put(&conn, obj_row("bkt", "k2", "v1", 50))).unwrap_err();
         assert!(matches!(err, MetaError::QuotaExceeded));
         assert_counters_match_scan(&conn);
         let versions: i64 = conn
@@ -3458,7 +3591,7 @@ mod tests {
     fn put_under_quota_succeeds() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(100));
-        apply(&conn, put(obj_row("bkt", "k", "v1", 60))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k", "v1", 60))).unwrap();
         assert_eq!(bucket_logical_bytes(&conn, "bkt"), 60);
     }
 
@@ -3467,9 +3600,10 @@ mod tests {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(100));
         // First put fits: 60 <= 100.
-        apply_in_savepoint(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
+        apply_in_savepoint(&conn, put(&conn, obj_row("bkt", "k1", "v1", 60))).unwrap();
         // Second put would push the bucket to 60 + 50 = 110 > 100: rejected, rolled back.
-        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        let err =
+            apply_in_savepoint(&conn, put(&conn, obj_row("bkt", "k2", "v1", 50))).unwrap_err();
         assert!(matches!(err, MetaError::QuotaExceeded));
         // The rejected op left nothing behind: the bucket still holds exactly the first object.
         assert_eq!(bucket_logical_bytes(&conn, "bkt"), 60);
@@ -3487,13 +3621,14 @@ mod tests {
     fn raising_quota_lets_the_put_through() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(100));
-        apply(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
-        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        apply(&conn, put(&conn, obj_row("bkt", "k1", "v1", 60))).unwrap();
+        let err =
+            apply_in_savepoint(&conn, put(&conn, obj_row("bkt", "k2", "v1", 50))).unwrap_err();
         assert!(matches!(err, MetaError::QuotaExceeded));
         // Operator raises the quota; the previously-rejected size now fits.
         conn.execute("UPDATE buckets SET quota_bytes=200 WHERE name='bkt'", [])
             .unwrap();
-        apply(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k2", "v1", 50))).unwrap();
         assert_eq!(bucket_logical_bytes(&conn, "bkt"), 110);
     }
 
@@ -3501,7 +3636,7 @@ mod tests {
     fn null_quota_is_unlimited() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", None);
-        apply(&conn, put(obj_row("bkt", "k", "v1", 1_000_000))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k", "v1", 1_000_000))).unwrap();
         assert_eq!(bucket_logical_bytes(&conn, "bkt"), 1_000_000);
     }
 
@@ -3509,10 +3644,10 @@ mod tests {
     fn overwriting_same_version_counts_only_the_new_size() {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(100));
-        apply(&conn, put(obj_row("bkt", "k", "v1", 90))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k", "v1", 90))).unwrap();
         // Overwriting the same (key, version) with a 95-byte body replaces the old 90 bytes,
         // so the bucket total is 95 (not 185) and the quota of 100 is not exceeded.
-        apply(&conn, put(obj_row("bkt", "k", "v1", 95))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k", "v1", 95))).unwrap();
         assert_eq!(bucket_logical_bytes(&conn, "bkt"), 95);
     }
 
@@ -3521,7 +3656,7 @@ mod tests {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", Some(10));
         // Fill to the quota, then a delete marker (no logical bytes) must still be allowed.
-        apply(&conn, put(obj_row("bkt", "k", "v1", 10))).unwrap();
+        apply(&conn, put(&conn, obj_row("bkt", "k", "v1", 10))).unwrap();
         apply(
             &conn,
             Mutation::CreateDeleteMarker {
@@ -3543,7 +3678,11 @@ mod tests {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", None);
         seed_user(&conn, "alice", Some(100));
-        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 60, "alice"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k", "v1", 60, "alice")),
+        )
+        .unwrap();
         assert_eq!(user_logical_bytes(&conn, "alice"), 60);
     }
 
@@ -3554,10 +3693,17 @@ mod tests {
         seed_bucket(&conn, "bkt1", None);
         seed_bucket(&conn, "bkt2", None);
         seed_user(&conn, "alice", Some(100));
-        apply_in_savepoint(&conn, put(obj_row_owned("bkt1", "k1", "v1", 60, "alice"))).unwrap();
+        apply_in_savepoint(
+            &conn,
+            put(&conn, obj_row_owned("bkt1", "k1", "v1", 60, "alice")),
+        )
+        .unwrap();
         // 60 (in bkt1) + 50 (in bkt2) = 110 > 100: rejected and rolled back.
-        let err = apply_in_savepoint(&conn, put(obj_row_owned("bkt2", "k2", "v1", 50, "alice")))
-            .unwrap_err();
+        let err = apply_in_savepoint(
+            &conn,
+            put(&conn, obj_row_owned("bkt2", "k2", "v1", 50, "alice")),
+        )
+        .unwrap_err();
         assert!(matches!(err, MetaError::QuotaExceeded));
         assert_eq!(user_logical_bytes(&conn, "alice"), 60);
         let rows: i64 = conn
@@ -3578,7 +3724,7 @@ mod tests {
         seed_user(&conn, "alice", None);
         apply(
             &conn,
-            put(obj_row_owned("bkt", "k", "v1", 1_000_000, "alice")),
+            put(&conn, obj_row_owned("bkt", "k", "v1", 1_000_000, "alice")),
         )
         .unwrap();
         assert_eq!(user_logical_bytes(&conn, "alice"), 1_000_000);
@@ -3591,7 +3737,7 @@ mod tests {
         // No users row for the owner at all -> no enforcement.
         apply(
             &conn,
-            put(obj_row_owned("bkt", "k", "v1", 1_000_000, "nobody")),
+            put(&conn, obj_row_owned("bkt", "k", "v1", 1_000_000, "nobody")),
         )
         .unwrap();
         assert_eq!(user_logical_bytes(&conn, "nobody"), 1_000_000);
@@ -3602,10 +3748,18 @@ mod tests {
         let conn = conn_with_schema();
         seed_bucket(&conn, "bkt", None);
         seed_user(&conn, "alice", Some(100));
-        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 90, "alice"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k", "v1", 90, "alice")),
+        )
+        .unwrap();
         // Replacing the same (bucket,key,version) with 95 bytes supersedes the old 90, so the
         // user's total is 95 (not 185) and the 100-byte quota is not exceeded.
-        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 95, "alice"))).unwrap();
+        apply(
+            &conn,
+            put(&conn, obj_row_owned("bkt", "k", "v1", 95, "alice")),
+        )
+        .unwrap();
         assert_eq!(user_logical_bytes(&conn, "alice"), 95);
     }
 
@@ -3651,7 +3805,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            apply_in_savepoint(&conn, put(obj_row("repair", "k", "v1", 1))),
+            apply_in_savepoint(&conn, put(&conn, obj_row("repair", "k", "v1", 1))),
             Err(MetaError::InvalidObjectLockState)
         ));
         apply_in_savepoint(
@@ -3665,7 +3819,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_in_savepoint(&conn, put(obj_row("repair", "k", "v1", 1))).unwrap();
+        apply_in_savepoint(&conn, put(&conn, obj_row("repair", "k", "v1", 1))).unwrap();
 
         conn.execute(
             "UPDATE bucket_config
@@ -3763,7 +3917,7 @@ mod tests {
             [],
         )
         .unwrap();
-        apply_in_savepoint(&conn, put(obj_row("strict", "live", "v1", 1))).unwrap();
+        apply_in_savepoint(&conn, put(&conn, obj_row("strict", "live", "v1", 1))).unwrap();
         apply_in_savepoint(
             &conn,
             Mutation::SetObjectLegalHold {
@@ -3808,7 +3962,8 @@ mod tests {
             Mutation::CreateObjectLockBucket(Box::new(bucket.clone())),
         )
         .unwrap();
-        let upload_id = cairn_types::UploadId::from_string("legacy-upload".to_owned());
+        let upload_id =
+            cairn_types::UploadId::from_string(uuid::Uuid::new_v4().simple().to_string());
         let key = ObjectKey::parse("assembled").unwrap();
         apply_in_savepoint(
             &conn,
@@ -3854,29 +4009,44 @@ mod tests {
         )
         .unwrap();
         let claim_token = cairn_types::MultipartClaimToken::generate();
-        apply_in_savepoint(
+        let row = obj_row(bucket.name.as_str(), key.as_str(), "assembled-v1", 1);
+        let plan = publication_fixture(&conn)
+            .completion_plan(&row, &upload_id, &claim_token)
+            .unwrap();
+        let admitted = apply_in_savepoint(
             &conn,
-            Mutation::ClaimMultipart {
-                upload_id: upload_id.clone(),
-                claim_token: claim_token.clone(),
-            },
+            PublicationFixture::admission(
+                plan.clone(),
+                Mutation::ClaimMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: claim_token.clone(),
+                },
+                Timestamp(10),
+            )
+            .unwrap(),
         )
         .unwrap();
+        assert!(matches!(
+            admitted,
+            MutationOutcome::StorageMultipartClaim {
+                admission: StorageAdmission::Granted(_),
+                claim: cairn_types::meta::ClaimOutcome::Claimed(_),
+            }
+        ));
 
         let error = apply_in_savepoint(
             &conn,
-            Mutation::CompleteMultipart {
-                upload_id: upload_id.clone(),
-                claim_token,
-                row: Box::new(obj_row(
-                    bucket.name.as_str(),
-                    key.as_str(),
-                    "assembled-v1",
-                    1,
-                )),
-                precondition: Precondition::default(),
-                replication: Vec::new(),
-            },
+            PublicationFixture::publication(
+                plan,
+                Mutation::CompleteMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token,
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    replication: Vec::new(),
+                },
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert!(matches!(error, MetaError::InvalidObjectLockState));

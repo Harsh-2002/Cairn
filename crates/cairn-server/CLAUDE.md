@@ -68,12 +68,12 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   a failure is fatal. Full blob reconciliation follows claim recovery, so an ambiguous live release
   is resolved before bind. Wires the S3 service's SSE `KeyProvider`
   (`cairn_protocol::LocalRingProvider` from `CAIRN_KMS_KEY_IDS`), `with_encrypt_at_rest`, and the
-  synchronous multipart-cancellation, multipart-part exact-attempt, and ordinary PUT/Copy
-  exact-row recovery callbacks to the process-local shutdown-retained FIFO queue. Each request
-  acquires one bounded recovery slot before staging/claiming and transfers it through its guard to
-  the worker, so Drop stays nonblocking without an unbounded record population. The worker
-  serializes `ResolveObjectWrite`/`ResolveMultipartPartWrite` behind any original mutation and
-  deletes only an exact unreferenced path; ambiguity falls back to startup reconciliation.
+  `StorageWriteRuntime` with the committed generation, actual node-lock lifetime, bounded
+  recovery admission and synchronous enqueue into the retained FIFO worker. Each request captures
+  its complete plan before Writer admission. Recovery waits for backend and kernel quiescence,
+  resolves exact intent through the Writer and drains cleanup claims. Startup retains full
+  reconciliation; intents and all cleanup claims protect paths. Only a successful full scan may
+  retire legacy accounting; protocol-2 debt still requires exact durable cleanup.
 - `sts.rs` — the **AWS-STS wire surface** (ARCH 14): `Action=AssumeRole` / `Action=GetSessionToken`
   as a form `POST /` on the S3 data-plane port, returning AWS-STS XML. A dedicated `sts`-scoped
   SigV4 verification (`AuthChain::authenticate_sts`, no dev bypass) mints a `CAIRNTMP…` session over
@@ -86,7 +86,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 - `server.rs` — the accept/serve loops, the outer middleware (request id, span, concurrency
   `Semaphore`, timeout), graceful shutdown, and `/healthz` `/readyz` `/metrics`. Readiness is
   withdrawn before the shared stop signal. Listener drains return a typed report, force-cancelled
-  connections are awaited, then the multipart-claim queue receives its FIFO drain sentinel. The
+  connections are awaited, then, after ordinary producers also stop, the storage recovery queue receives its FIFO drain sentinel. The
   retained signal/TLS-reload tasks abort on owner drop. The final `shutdown complete` line is gated
   on HTTP, ordinary workers, request-tail recovery, final persistence, and auxiliary joins. Each
   accept loop receives an immutable `ListenerRole` (data or control); never infer or widen it per
@@ -109,12 +109,11 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   is set (unset = the loop never runs, no gauge, no warn, zero cost), and deliberately NOT in
   `metrics_loop`: it is a version-row walk costing one point query per version in a replicating
   bucket, and `replication_status` has no index — a scrape must never trigger it. It also retains the
-  Tokio consumer for multipart cancellation releases; unlike periodic workers, that request-tail
-  task stays alive until every HTTP future has returned or been cancelled, drains through a FIFO
-  sentinel, and is joined under its own bound before final persistence. Each command is attempted
-  once: `Released` also reclaims any captured assembled path, `NotOwner` preserves it because
-  completion may have committed, and an ambiguous error is left for restart. Every command carries
-  the persisted attempt token, so delayed/replayed release cannot affect a newer completer.
+  Tokio storage recovery consumer until HTTP and ordinary producers, including imports, stop.
+  Only then may the server append its FIFO sentinel. Recovery capacity and node exclusivity
+  survive through actual backend jobs. Quiescence/metadata/sync failures preserve durable work
+  for restart and make shutdown incomplete. Cleanup claims retain quota until durable absence,
+  never merely until a request timeout or expired lease.
   `spawn()` returns retained
   ownership of every loop; shutdown checks precede every new pass/claim batch, one shared deadline
   joins or aborts-and-joins ordinary workers, and only after HTTP, workers, and request-tail recovery
@@ -172,9 +171,14 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   multipart cancellation-recovery queue → final metrics/counters/WAL tail. Aborted durable work is
   safe (leases/cursors recover), but its forced cancellation still makes the current shutdown
   report incomplete.
-- The multipart sweeper reclaims session bytes only on the writer's typed `Aborted` terminal
-  outcome. `NotOwner` means an in-flight Complete owns the `completing` session and its parts; skip
-  it without treating the race as a sweep failure.
+- The multipart sweeper aborts sessions only on the Writer's typed `Aborted` terminal outcome.
+  Exact debt authorizes physical cleanup only after owning I/O quiesces. `NotOwner` preserves
+  a concurrent Complete's parts and is not a sweep failure. Reservation age never authorizes
+  deleting an admitted active attempt. This same task drains exact cleanup on a one-second idle
+  cadence, immediately continuing full successful 1,000-path batches with eight concurrent
+  cleanups and a 30-second batch deadline. It yields/checks shutdown between batches and checks
+  the separately configured stale-session/credential deadline, so sustained cleanup cannot
+  suppress those passes. Failed or cancelled claims remain durable.
 - Two features change the link/build, not behaviour: `meta-async` links the libSQL/Turso backends
   (and triggers a `-z muldefs` workaround in `build.rs` for the dual-bundled-SQLite collision);
   `fast-io` is glibc-Linux-only (`ktls` won't build for aarch64-musl). The **shipped static-musl

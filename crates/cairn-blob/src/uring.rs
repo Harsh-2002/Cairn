@@ -6,17 +6,18 @@
 //! threads, each running a `tokio_uring` runtime — and dispatch the durable staging file ops to
 //! it, bridging results back to the async caller over a oneshot channel. The caller's runtime
 //! keeps consuming the request body and doing compression/encryption/hashing exactly as before;
-//! only the raw file syscalls (create, write, fsync, rename, dir-fsync, unlink) move onto the
-//! io_uring threads.
+//! data writes and file syncs run on the io_uring threads. Namespace operations use leased
+//! synchronous syscalls with anchored descriptors; cleanup is exclusively journal-owned.
 //!
 //! The durable-commit ordering is preserved byte-for-byte with the `tokio::fs` path: write the
 //! payload, **fsync the file**, **rename** it into the bucket directory, then **fsync that
 //! directory** (the F-1 ordering, ARCH 8.2). All of those steps are issued as io_uring ops on
 //! the executor thread that owns the staging file's fd.
 
-use cairn_types::error::BlobError;
+use crate::namespace::AnchoredPath;
+use crate::owned_file::FileOwner;
+use cairn_types::{error::BlobError, storage::io::StorageIoLease};
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::OnceLock;
 use tokio::sync::oneshot;
@@ -140,234 +141,171 @@ pub(crate) fn executor() -> &'static UringExecutor {
 pub(crate) struct UringStaging {
     /// Sends chunks (and the terminal commit/abort command) to the executor-side writer task.
     cmd_tx: tokio::sync::mpsc::Sender<WriteCmd>,
+    owner: FileOwner,
     /// Receives the result of the terminal command (commit/abort/fsync) so the caller can confirm
     /// the writer task wound down.
     final_rx: Option<oneshot::Receiver<Result<(), BlobError>>>,
 }
 
 enum WriteCmd {
-    /// Append these bytes at the current offset; ack over the bundled sender.
     Chunk(Vec<u8>, oneshot::Sender<Result<(), BlobError>>),
-    /// fdatasync file → rename(tmp,dst); the staging task ends after this. The destination-directory
-    /// fsync is the caller's coalesced step (see [`crate::commit::DirSyncCoalescer`]).
-    Commit {
-        final_path: PathBuf,
-        reply: oneshot::Sender<Result<(), BlobError>>,
-        /// The caller sends this only after it has observed the successful rename and resumed
-        /// ownership through its request-level cleanup guard. If the caller is canceled while
-        /// awaiting the reply, channel closure tells the executor to unlink the renamed blob.
-        caller_accepted: oneshot::Receiver<()>,
-    },
-    /// fsync the file in place (no rename); the staging task ends after this.
+    Commit(AnchoredPath, oneshot::Sender<Result<(), BlobError>>),
     FsyncInPlace(oneshot::Sender<Result<(), BlobError>>),
-    /// Unlink the staging file; the staging task ends after this.
     Abort(oneshot::Sender<Result<(), BlobError>>),
 }
 
 impl UringStaging {
-    /// Create the staging tmp file on an executor thread and start its long-lived writer task.
-    pub(crate) async fn create(staging: PathBuf) -> Result<Self, BlobError> {
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<WriteCmd>(8);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), BlobError>>();
-        let (final_tx, final_rx) = oneshot::channel::<Result<(), BlobError>>();
-
-        let exec = executor();
-        // Spawn one long-lived task on the executor that owns the staging fd for its whole life.
-        // It is *detached* (not awaited here): it runs until a terminal commit/abort command, and
-        // reports readiness/results over the channels below.
-        exec.spawn_detached(move || async move {
-            writer_task(staging, cmd_rx, ready_tx, final_tx).await;
+    /// Namespace creation is synchronous on the blocking pool. Kernel-ring operations are limited
+    /// to this locked file's data and durability, so process death cannot leave a late create or
+    /// rename queued behind the release of the node lock.
+    pub(crate) async fn create(
+        staging: AnchoredPath,
+        lease: StorageIoLease,
+    ) -> Result<Self, BlobError> {
+        let path = staging.clone();
+        let operation = lease.try_child()?;
+        let owner = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            Ok::<_, BlobError>(FileOwner::new(path.create_new().map_err(io_err)?, lease))
+        })
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))??;
+        let worker_owner = owner.child().map_err(io_err)?;
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (final_tx, final_rx) = oneshot::channel();
+        executor().spawn_detached(move || async move {
+            writer_task(staging, worker_owner, cmd_rx, ready_tx, final_tx).await;
         })?;
-
-        // Wait for the file to actually be created before returning success.
         ready_rx
             .await
             .map_err(|_| BlobError::Io("io_uring staging task ended early".into()))??;
         Ok(Self {
             cmd_tx,
+            owner,
             final_rx: Some(final_rx),
         })
     }
 
-    /// Append `buf` to the staging file (positional write at the running offset), awaiting its
-    /// completion so write errors (e.g. ENOSPC) propagate at the same point they would on the
-    /// `tokio::fs` path.
-    pub(crate) async fn write_all(&mut self, buf: &[u8]) -> Result<(), BlobError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(WriteCmd::Chunk(buf.to_vec(), ack_tx))
-            .await
-            .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
-        ack_rx
-            .await
-            .map_err(|_| BlobError::Io("io_uring staging writer dropped a write".into()))?
-    }
-
-    /// Commit the staged file durably up to the rename: fdatasync the file, then rename it into
-    /// `final_path` — matching the `tokio::fs` path. The caller issues the coalesced
-    /// destination-directory fsync afterward (see [`crate::commit::DirSyncCoalescer`]).
-    pub(crate) async fn commit(mut self, final_path: PathBuf) -> Result<(), BlobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(WriteCmd::Commit {
-                final_path,
-                reply: reply_tx,
-                caller_accepted: accepted_rx,
-            })
-            .await
-            .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| BlobError::Io("io_uring staging writer dropped the commit".into()))??;
-        // No await separates observing success from this acknowledgement. The request-level
-        // two-path guard remains armed; if cancellation happens during the terminal wait below,
-        // that guard removes the final blob instead.
-        let _ = accepted_tx.send(());
-        // Also await the terminal channel so the writer task is fully wound down.
-        if let Some(final_rx) = self.final_rx.take() {
-            return final_rx
+    pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> Result<(), BlobError> {
+        for bytes in bytes.chunks(256 * 1024) {
+            let _operation = self.owner.child().map_err(io_err)?;
+            let (reply, result) = oneshot::channel();
+            self.cmd_tx
+                .send(WriteCmd::Chunk(bytes.to_vec(), reply))
                 .await
-                .map_err(|_| BlobError::Io("io_uring staging task ended early".into()))?;
+                .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
+            result
+                .await
+                .map_err(|_| BlobError::Io("io_uring write acknowledgement lost".into()))??;
         }
         Ok(())
     }
 
-    /// Flush+fsync the staged file in place (no rename), for multipart parts.
-    pub(crate) async fn fsync_in_place(mut self) -> Result<(), BlobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    pub(crate) async fn commit(mut self, destination: AnchoredPath) -> Result<(), BlobError> {
+        let _operation = self.owner.child().map_err(io_err)?;
+        let (reply, result) = oneshot::channel();
         self.cmd_tx
-            .send(WriteCmd::FsyncInPlace(reply_tx))
+            .send(WriteCmd::Commit(destination, reply))
             .await
             .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
-        let res = reply_rx
+        result
             .await
-            .map_err(|_| BlobError::Io("io_uring staging writer dropped the fsync".into()))?;
-        if let Some(final_rx) = self.final_rx.take() {
-            let _ = final_rx.await;
-        }
-        res
+            .map_err(|_| BlobError::Io("io_uring commit acknowledgement lost".into()))??;
+        self.terminal().await
     }
 
-    /// Abort the staged write: unlink the tmp file (best-effort on the executor).
+    pub(crate) async fn fsync_in_place(mut self) -> Result<(), BlobError> {
+        let _operation = self.owner.child().map_err(io_err)?;
+        let (reply, result) = oneshot::channel();
+        self.cmd_tx
+            .send(WriteCmd::FsyncInPlace(reply))
+            .await
+            .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
+        result
+            .await
+            .map_err(|_| BlobError::Io("io_uring sync acknowledgement lost".into()))??;
+        self.terminal().await
+    }
+
     pub(crate) async fn abort(mut self) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.cmd_tx.send(WriteCmd::Abort(reply_tx)).await.is_ok() {
-            let _ = reply_rx.await;
+        let (reply, result) = oneshot::channel();
+        if self.cmd_tx.send(WriteCmd::Abort(reply)).await.is_ok() {
+            let _ = result.await;
         }
-        if let Some(final_rx) = self.final_rx.take() {
-            let _ = final_rx.await;
+        let _ = self.terminal().await;
+    }
+
+    async fn terminal(&mut self) -> Result<(), BlobError> {
+        if let Some(result) = self.final_rx.take() {
+            result
+                .await
+                .map_err(|_| BlobError::Io("io_uring staging task ended early".into()))?
+        } else {
+            Ok(())
         }
     }
 }
 
-/// The long-lived executor-side task that owns one staging file's fd. It creates the file, acks
-/// readiness, then serves chunk-append/commit/abort commands until a terminal command arrives.
+/// This detached task drives every submitted operation to completion even after the request's
+/// channel closes. The original locked descriptor and its node lifetime remain in `owner`.
 async fn writer_task(
-    staging: PathBuf,
-    mut cmd_rx: tokio::sync::mpsc::Receiver<WriteCmd>,
-    ready_tx: oneshot::Sender<Result<(), BlobError>>,
-    final_tx: oneshot::Sender<Result<(), BlobError>>,
+    staging: AnchoredPath,
+    owner: FileOwner,
+    mut commands: tokio::sync::mpsc::Receiver<WriteCmd>,
+    ready: oneshot::Sender<Result<(), BlobError>>,
+    final_result: oneshot::Sender<Result<(), BlobError>>,
 ) {
-    let file = match tokio_uring::fs::File::create(&staging).await {
-        Ok(f) => {
-            let _ = ready_tx.send(Ok(()));
-            f
-        }
-        Err(e) => {
-            let _ = ready_tx.send(Err(io_err(e)));
-            let _ = final_tx.send(Ok(()));
+    let file = match owner.file.try_clone() {
+        Ok(file) => tokio_uring::fs::File::from_std(file),
+        Err(error) => {
+            let _ = ready.send(Err(io_err(error)));
             return;
         }
     };
-    let mut offset: u64 = 0;
-
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            WriteCmd::Chunk(buf, reply) => {
-                let len = buf.len() as u64;
-                // write_all_at submits the buffer and retries short writes internally, returning
-                // the buffer back to us (io_uring requires owned buffers).
-                let (res, _buf) = file.write_all_at(buf, offset).await;
-                match res {
-                    Ok(()) => {
-                        offset += len;
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(io_err(e)));
-                    }
+    let _ = ready.send(Ok(()));
+    let mut offset = 0;
+    while let Some(command) = commands.recv().await {
+        match command {
+            WriteCmd::Chunk(bytes, reply) => {
+                let len = bytes.len() as u64;
+                let (result, _bytes) = file.write_all_at(bytes, offset).await;
+                if result.is_ok() {
+                    offset += len;
                 }
+                let _ = reply.send(result.map_err(io_err));
             }
-            WriteCmd::Commit {
-                final_path,
-                reply,
-                caller_accepted,
-            } => {
-                let result = commit_on_executor(&staging, file, &final_path).await;
-                let committed = result.is_ok();
-                let _ = reply.send(result.clone_shallow());
-                // The executor-side rename can finish after its caller future has been dropped.
-                // Retain ownership until the caller explicitly observes success; channel closure
-                // means nobody can receive a `StagedBlob`, so the new name must be removed here.
-                if committed && caller_accepted.await.is_err() {
-                    match tokio_uring::fs::remove_file(&final_path).await {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                path = %final_path.display(),
-                                %error,
-                                "failed to unlink canceled io_uring blob commit"
-                            );
-                        }
-                    }
+            WriteCmd::Commit(destination, reply) => {
+                let result = async {
+                    file.sync_data().await.map_err(io_err)?;
+                    file.close().await.map_err(io_err)?;
+                    owner
+                        .run(move |_| staging.rename_to(&destination))
+                        .await
+                        .map_err(io_err)
                 }
-                let _ = final_tx.send(result);
+                .await;
+                let _ = reply.send(result.clone_shallow());
+                let _ = final_result.send(result);
                 return;
             }
             WriteCmd::FsyncInPlace(reply) => {
-                // fdatasync: the part's bytes + size must be durable; timestamps need not be.
-                let res = file.sync_data().await.map_err(io_err);
-                let _ = file.close().await;
-                let _ = reply.send(res.clone_shallow());
-                let _ = final_tx.send(res);
+                let result = file.sync_data().await.map_err(io_err);
+                let closed = file.close().await.map_err(io_err);
+                let result = result.and(closed);
+                let _ = reply.send(result.clone_shallow());
+                let _ = final_result.send(result);
                 return;
             }
             WriteCmd::Abort(reply) => {
-                // Close then unlink; both best-effort, but surface the unlink result.
-                let _ = file.close().await;
-                let res = tokio_uring::fs::remove_file(&staging).await.map_err(io_err);
-                let _ = reply.send(res.clone_shallow());
-                let _ = final_tx.send(Ok(()));
+                let result = file.close().await.map_err(io_err);
+                let _ = reply.send(result.clone_shallow());
+                let _ = final_result.send(result);
                 return;
             }
         }
     }
-    // Sender dropped without a terminal command: best-effort clean up the orphaned tmp.
-    let _ = file.close().await;
-    let _ = tokio_uring::fs::remove_file(&staging).await;
-    let _ = final_tx.send(Ok(()));
-}
-
-/// The durable commit up to the rename, issued as io_uring ops on the executor thread that owns
-/// `file`: fdatasync the staged file, then rename it into place. The destination-directory fsync
-/// (F-1 step 3) is the caller's coalesced step (see [`crate::commit::DirSyncCoalescer`]); this
-/// matches the `tokio::fs` path step for step.
-async fn commit_on_executor(
-    staging: &Path,
-    file: tokio_uring::fs::File,
-    final_path: &Path,
-) -> Result<(), BlobError> {
-    // 1) fdatasync the staged file: persist its bytes and size, skipping the timestamp-only
-    //    metadata `sync_all` would also flush — one fewer journal write per PUT (ARCH 8.2).
-    file.sync_data().await.map_err(io_err)?;
-    file.close().await.map_err(io_err)?;
-    // 2) rename the staged file into the (already-ensured) bucket directory.
-    tokio_uring::fs::rename(staging, final_path)
-        .await
-        .map_err(io_err)?;
-    Ok(())
+    let _ = final_result.send(file.close().await.map_err(io_err));
 }
 
 /// `BlobError` is not `Clone`; this gives us a cheap shallow clone for the two-sink fan-out

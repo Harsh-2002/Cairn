@@ -303,7 +303,7 @@ pub async fn serve(
             ListenerRole::Data,
             shutdown_rx.clone(),
         );
-        let report = match web_listener {
+        match web_listener {
             Some(sock) => {
                 let web = accept_loop(
                     sock,
@@ -317,13 +317,7 @@ pub async fn serve(
                 api_report.merge(web_report)
             }
             None => api.await,
-        };
-        // All accepted request futures have now returned or been force-cancelled, and therefore
-        // every armed multipart or ordinary object-write drop guard has synchronously enqueued its
-        // recovery record. The FIFO sentinel lets the retained consumer process those commands and
-        // exit; it is joined before final persistence below.
-        state.stack.multipart_claim_recovery.finish_requests();
-        report
+        }
     };
 
     // Stop accepting/claiming concurrently. Only after BOTH HTTP and workers have drained do the
@@ -339,7 +333,12 @@ pub async fn serve(
         shutdown_state.ready.store(false, Ordering::SeqCst);
         background.stop(SHUTDOWN_DRAIN_GRACE).await
     };
-    let (http_report, stopped_background) = tokio::join!(listeners, stop_background);
+    let (http_report, stopped_background) = drain_storage_producers(
+        listeners,
+        stop_background,
+        &state.stack.multipart_claim_recovery,
+    )
+    .await;
     let background_report = stopped_background
         .finalize(SHUTDOWN_REQUEST_TAIL_GRACE, SHUTDOWN_FINALIZE_GRACE)
         .await;
@@ -363,6 +362,18 @@ pub async fn serve(
         );
     }
     Ok(())
+}
+
+/// Imports call the S3 service directly, so HTTP drain alone cannot close storage recovery.
+/// Both producer groups must join (including cancellation drops) before the FIFO sentinel.
+async fn drain_storage_producers<H: Future, B: Future>(
+    http: H,
+    background: B,
+    recovery: &crate::multipart_claim_recovery::MultipartClaimRecoveryQueue,
+) -> (H::Output, B::Output) {
+    let drained = tokio::join!(http, background);
+    recovery.finish_requests();
+    drained
 }
 
 /// Accept and serve connections on one listener until shutdown, then drain in-flight connections
@@ -1604,6 +1615,140 @@ mod request_budget_tests {
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn storage_recovery_sentinel_waits_for_http_and_import_producers() {
+        use cairn_protocol::StorageWriteRecovery;
+        use cairn_types::storage::io::StorageIoWatch;
+        use cairn_types::storage::{StorageMutation, StorageToken, StorageWriteTarget};
+        use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore};
+        use cairn_types::{BlobStore, MetadataStore, Mutation, MutationOutcome, Timestamp};
+        use futures_util::FutureExt;
+
+        for http_finishes_first in [true, false] {
+            let meta = Arc::new(InMemoryMetadataStore::new());
+            let blob = Arc::new(InMemoryBlobStore::new());
+            let bucket = cairn_types::BucketName::parse("shutdown-import").unwrap();
+            meta.submit(Mutation::CreateBucket(Box::new(cairn_types::Bucket {
+                name: bucket.clone(),
+                owner_id: cairn_types::UserId("owner".into()),
+                created_at: Timestamp(0),
+                versioning: cairn_types::VersioningState::Unversioned,
+                ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".into(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
+            let generation = StorageToken::generate();
+            meta.submit(Mutation::BeginStorageGeneration {
+                generation: generation.clone(),
+            })
+            .await
+            .unwrap();
+            let queue = crate::multipart_claim_recovery::MultipartClaimRecoveryQueue::new(2);
+            let lifetime = (queue.admission_callback())().await.unwrap();
+            let planned = blob
+                .plan_write(
+                    bucket.clone(),
+                    generation.clone(),
+                    StorageWriteTarget::Object {
+                        key: cairn_types::ObjectKey::parse("imported").unwrap(),
+                        version_id: cairn_types::VersionId::null(),
+                        row_id: StorageToken::generate().as_str().to_owned(),
+                    },
+                )
+                .unwrap();
+            let plan = planned.plan().clone();
+            let (io, lease) = StorageIoWatch::new(
+                plan.attempt.clone(),
+                generation.clone(),
+                Arc::new(lifetime.clone()),
+            );
+            let MutationOutcome::StorageAdmission(receipt) = meta
+                .submit(Mutation::Storage {
+                    bucket,
+                    operation: StorageMutation::Reserve {
+                        plan: Box::new(plan.clone()),
+                        now: Timestamp(0),
+                    },
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("expected storage admission");
+            };
+            let permit = planned.admit(receipt, lease).unwrap();
+            let record = StorageWriteRecovery {
+                plan: plan.clone(),
+                io,
+                lifetime,
+            };
+            let callback = queue.callback();
+            let (http_tx, http_rx) = tokio::sync::oneshot::channel();
+            let (import_tx, import_rx) = tokio::sync::oneshot::channel();
+            let http = async {
+                http_rx.await.unwrap();
+            };
+            // Model the import scheduler dropping an admitted S3 write as it terminates. Its
+            // callback is synchronous, but it can run after every HTTP connection has stopped.
+            let import = async move {
+                import_rx.await.unwrap();
+                record.io.cancel();
+                drop(permit);
+                assert!(callback(record));
+            };
+            let mut drained = Box::pin(drain_storage_producers(http, import, &queue));
+            let last_producer = if http_finishes_first {
+                http_tx.send(()).unwrap();
+                import_tx
+            } else {
+                import_tx.send(()).unwrap();
+                http_tx
+            };
+            assert!(drained.as_mut().now_or_never().is_none());
+            assert!(
+                (queue.admission_callback())().await.is_some(),
+                "recovery must remain open while either producer can enqueue cancellation"
+            );
+            last_producer.send(()).unwrap();
+            drained.await;
+
+            // Delay polling the actual consumer until both producers stopped. A sentinel sent
+            // after HTTP alone would precede the late import record and silently discard it.
+            tokio::time::timeout(Duration::from_secs(1), queue.worker(meta.clone(), blob))
+                .await
+                .expect("recovery worker must drain and stop");
+            assert!(queue.is_complete());
+            let MutationOutcome::StorageCleanupBatch(cleanups) = meta
+                .submit(Mutation::ClaimStorageCleanup {
+                    generation,
+                    limit: 10,
+                    now: Timestamp(1),
+                    lease_secs: 60,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("expected storage cleanup batch");
+            };
+            let mut actual = cleanups
+                .iter()
+                .map(|cleanup| cleanup.path.as_str())
+                .collect::<Vec<_>>();
+            let mut expected = plan
+                .paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "late import ownership must resolve before the sentinel"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn idle_listener_reaps_connection_waves_and_preserves_failure_accounting() {
