@@ -74,6 +74,11 @@ admission until recovery establishes quiescence. CI tests these mechanisms with 
 fixtures, including real metadata/blob operations and signed S3; these tests do not establish
 performance. See its README and `storage-evolution-plan.md` for commands, reservations, remaining
 attribution gaps and the independent adoption gates. No laboratory dependency enters `cairn`.
+Profile decoding and reduction are separately admitted and charged. Timestamped load/idle phases,
+executable-specific process samples and heap timelines distinguish application, client and profiler
+memory. The [September attribution record](storage-attribution-2026-09.md) preserves eight baseline
+cases and three heap traces; host permissions prevented CPU-stack attribution. Its results justify
+no architecture change and do not establish a leak-free plateau or a large-store capacity limit.
 
 A deferred post-merge million-object and mixed large-file capacity campaign is recorded in
 [the implementation tracker](implementation-phases-2026-09.md#deferred-final-phase-capacity-sustained-load-and-regression-campaign).

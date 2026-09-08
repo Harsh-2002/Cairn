@@ -102,7 +102,13 @@ Decode a completed profile under the same budget (decoding alone remains INCONCL
 ```sh
 python3 conformance/storage_lab/analyze.py --root /SSD/cairn-storage-campaign \
   --run-id COMPLETED_RUN_ID --profile heap --allow-seconds 45
+python3 conformance/storage_lab/summarize.py --root /SSD/cairn-storage-campaign --device sdb1
 ```
+
+Reduction preserves target/client CPU separately, phase memory samples, Writer sample loss,
+device counters and decoded heap timelines. Phase heap alignment excludes 250 ms at both
+edges because process-start clocks are approximate. Artifact decoding and reduction have
+their own bounded admissions; unavailable inputs do not become successful attribution.
 
 Children start in owned process groups behind an EOF-sensitive gate. The coordinator persists
 the leader's boot/PID/start identity before allowing exec. Teardown keeps the leader unreaped

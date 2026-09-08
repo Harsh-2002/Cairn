@@ -43,6 +43,8 @@ def manifest(args, binary, launch):
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     return {"declared_commit": args.commit, "binary": str(binary), "sha256": digest,
             "build_settings": args.build_settings, "coordinator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "harness_sources_sha256": {str(path.relative_to(HERE)): hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in sorted([*HERE.glob("*.py"), HERE / "src/main.rs", HERE / "Cargo.lock"])},
             "platform": platform.platform(), "python": sys.version, "cpu": tool_output(["lscpu", "--json"], launch),
             "filesystem": tool_output(["findmnt", "-J", "-T", args.root], launch),
             "devices": tool_output(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,ROTA,MOUNTPOINTS"], launch),
@@ -95,6 +97,15 @@ def profile_command(profile, directory, command):
     if shutil.which("heaptrack") is None:
         raise Unavailable("heaptrack is unavailable; live allocation owners unresolved")
     return ["heaptrack", "--record-only", "-o", str(directory / "heap"), *command]
+
+
+def metrics_sample(port):
+    try:
+        return {"metrics": metrics(port)}
+    except (OSError, http.client.HTTPException, Unavailable) as error:
+        # Profiling can delay this auxiliary endpoint. Preserve the telemetry gap,
+        # but allow the workload and profiler to finish so their evidence survives.
+        return {"metrics_unavailable": f"{type(error).__name__}: {error}"}
 
 
 def recover(campaign):
@@ -181,6 +192,7 @@ def run_case(args, campaign):
     directory = campaign.root / token
     children = []
     status, reasons, clean = "INCONCLUSIVE", [], False
+    metrics_gaps = 0
     report = {"id": token, "phase": args.phase, "profile": args.profile, "workload": config.copy(),
               "primary_metric": args.primary_metric, "protected_workloads": args.protected,
               "adoption": "not evaluated by a single diagnostic run", "cache_state": "uncontrolled; restart does not imply cold cache"}
@@ -270,7 +282,8 @@ def run_case(args, campaign):
                 measurement = {"elapsed": now - start, "footprint_bytes": used, "driver": sample(driver.process.pid)}
                 if server:
                     measurement["server"] = sample(server.process.pid)
-                    measurement["metrics"] = metrics(port)
+                    measurement.update(metrics_sample(port))
+                    metrics_gaps += int("metrics_unavailable" in measurement)
                 samples.write(json.dumps(measurement) + "\n")
                 samples.flush()
                 time.sleep(0.25)
@@ -300,6 +313,8 @@ def run_case(args, campaign):
                 raise Unavailable("profiler produced no usable artifact")
             report["profile_analysis"] = "pending; no bottleneck or leak claim established"
             raise Unavailable("profile collected; sample sufficiency and stack attribution require analysis")
+        if metrics_gaps:
+            raise Unavailable("metrics sampling was incomplete")
         status = "PASS"
     except KeyboardInterrupt:
         status, reasons = "CANCELLED", ["operator interruption"]
@@ -325,7 +340,8 @@ def run_case(args, campaign):
         if elapsed > args.allow_seconds:
             status = "INCONCLUSIVE"
             reasons.append("wall time exceeded the reservation; actual time charged")
-        report.update(status=status, reasons=reasons, elapsed_seconds=elapsed, cleaned_data_and_processes=clean)
+        report.update(status=status, reasons=reasons, metrics_sampling_gaps=metrics_gaps,
+                      elapsed_seconds=elapsed, cleaned_data_and_processes=clean)
         atomic_json(campaign.root / f"{token}.result.json", report)
         campaign.finish(time.monotonic() - start, status, clean=clean)
     print(json.dumps({"status": status, "reasons": reasons, "result": str(campaign.root / f"{token}.result.json"),

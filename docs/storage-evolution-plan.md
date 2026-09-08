@@ -232,3 +232,14 @@ Production Rust and console sources are unchanged. The merged branch/worktree ar
 Phase 2B's predeclared screen and later results live in
 [`storage-attribution-2026-09.md`](storage-attribution-2026-09.md). Compilation, tool installation
 and fixed correctness fixtures are tracked separately from experiments.
+
+Phase 2B recorded its experiment design at `cd5216a` and completed eight unprofiled baseline
+cases plus three decoded heap traces. CPU sampling was denied by host perf permissions;
+complete attribution remains INCONCLUSIVE and no production optimization or architecture
+change is justified by this screen. The charged report, failed attempts, ownership evidence
+and provenance are preserved in `docs/storage-attribution-2026-09.md` and its JSON companion.
+After data/profile/process cleanup, the cumulative campaign is **250.787718 seconds** and
+**219,529,216 bytes recorded peak**; 349.212282 unused baseline seconds carry forward. The
+persistent ledger is `/SSD/dev/cairn-storage-campaign/ledger.json`; it must not be reset.
+Local validation passes 21 Python regressions, two Rust driver tests, standalone Clippy,
+formatting and shellcheck. Integration remains pending final-commit CI and review.
