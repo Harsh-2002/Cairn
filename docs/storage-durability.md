@@ -6,7 +6,7 @@
 
 ### 8.1 The guarantee Cairn makes
 
-Cairn guarantees that after any crash, on restart it converges to a state in which every metadata row that is visible references a present, complete, durable blob, and no orphaned blob remains, with no manual intervention. It guarantees that a write acknowledged to a client as successful is durable on the local storage as configured. It does not, by itself, guarantee survival of a drive failure; that is delegated to the storage layer the operator places underneath (Section 8.6), and survival of a host failure is provided by bucket replication (Section 20). Stating this boundary precisely is itself a requirement (N-1), because a production operator must know exactly where Cairn's guarantee ends and theirs begins.
+Cairn guarantees that after a crash during normal operation, on restart it converges to a state in which every metadata row that is visible references a present, complete, durable blob, and no orphaned blob remains, with no manual intervention. An interrupted explicit offline baseline remains stopped until the operator resumes that maintenance operation (Section 8.5.1). It guarantees that a write acknowledged to a client as successful is durable on the local storage as configured. It does not, by itself, guarantee survival of a drive failure; that is delegated to the storage layer the operator places underneath (Section 8.6), and survival of a host failure is provided by bucket replication (Section 20). Stating this boundary precisely is itself a requirement (N-1), because a production operator must know exactly where Cairn's guarantee ends and theirs begins.
 
 ### 8.2 The commit sequence
 
@@ -95,7 +95,10 @@ layouts and symlinks are preserved and reported. A missing directory-entry type 
 resolved with descriptor-relative, no-follow metadata lookup; lookup failure fails the scan rather
 than silently skipping a subtree.
 
-The full walk remains a mandatory pre-bind startup gate. Under exclusive node ownership, startup
+The full walk remains a mandatory pre-bind startup gate. An unfinished offline baseline holds
+legacy quota accounting and refuses ordinary startup or reclaiming maintenance before generation
+advance, reconciliation, accounting release or listener bind; the operator must explicitly resume
+`storage-baseline` (below). Otherwise, under exclusive node ownership, startup
 commits a new generation, invalidates old cleanup claims, probes prior intent files for outstanding
 I/O, resolves those intents and recovers multipart completion ownership. It then performs the full
 scan, releases only eligible legacy orphan accounting after that scan succeeds, and drains exact
@@ -110,8 +113,55 @@ authoritative rows preserved. Checkpoint/close and file/directory synchronizatio
 image self-contained. Publication verifies its derived fingerprint and recovery state, while the
 source snapshot and manifest remain unchanged (Section 31.4). A crash after rename therefore cannot
 expose the source process's generation as the target's current ownership.
+Restore preserves a copied legacy-accounting hold and clears its release authorization. Such an
+image can be published, but ordinary restore finalization remains blocked until an explicit
+baseline completes; restoring cannot forgive held quota.
 
 Operators of very large stores can run the explicit integrity command for additional out-of-band checks, but there is no startup opt-out. A lazy per-read integrity check remains an always-on safety net: a read whose blob is unexpectedly missing returns a clear error, emits a metric, and flags the row for repair. A repair mode of reconciliation can additionally drop rows whose blobs are missing, which is needed only for recovery from external damage or from a backup taken in the narrow window described in Section 31.4. It cannot bypass Object Lock: the writer preserves still-retained or legally-held rows even when their blobs are missing, reports them as unresolved protected damage, and makes the repair command fail rather than manufacturing a clean report by deleting WORM metadata.
+
+#### 8.5.1 Offline storage baseline
+
+`cairn storage-baseline <empty-backup-dir>` operates under the exclusive node lock. Its automatic
+safety snapshot uses the existing single-SQLite backup format and reference checks (Section 31.4),
+so the command refuses other metadata topologies. This additional snapshot does not replace the
+operator's verified pre-upgrade backup and fresh restore drill. It is not a payload-decryption or
+bit-rot audit. Every explicit start or resume requires a new empty snapshot destination.
+
+After snapshot validation and key preflight, the Writer establishes a fresh generation and
+baseline identity with incomplete coverage and a persistent legacy-accounting hold. Every physical
+database must be held before recovery can remove bytes. Native intents and exact cleanup retain
+their existing quiescence, claim and directory-sync requirements. Legacy reservations and coarse
+cleanup charges remain held throughout classification, cleanup and proof construction.
+
+The bounded first walk classifies every supported file as an authoritative reference, existing
+journal ownership or newly recorded exact cleanup debt. Classification writes metadata only; a
+partial directory walk cannot start deleting the artifacts it is classifying. Exact owner lookup
+spans metadata shards before an ownerless staging alias receives the retained internal routing
+bucket `cairn-storage-orphans`. Ownerless object paths retain their physical bucket name even when
+the bucket row no longer exists. No routing bucket is created as user-visible metadata.
+
+Every entry is physically validated, including live references and allowed infrastructure files.
+Descriptor-anchored traversal rejects descendant mounts, symlinks, hard links, special nodes,
+unknown names and lookup errors. The root allowlist contains only the retained data lock and, when
+the configured database is directly in the root, that exact database, its exact sidecars and its
+exact database lock. A lock-like suffix alone is not an exemption. Unsupported entries survive and
+prevent completion.
+
+After exact cleanup drains, completion requires unconditional absence of all intent, intent-path
+and exact-cleanup rows plus protocol-2 quota debt. A zero-length claim page is insufficient.
+A bounded reverse walk checks every authoritative object version and active multipart part;
+missing live files block proof. A second strict namespace walk synchronizes directories from
+children to root, including when all legacy artifacts were already absent. Only the resulting
+proof for this generation and baseline may authorize bounded legacy-accounting release. Each
+Writer page rechecks that authorization and absence predicates; the hold remains set until every
+legacy reservation and cleanup charge is gone. Active part charges remain intact.
+
+Completion records the coverage identity and timestamp and clears the hold. Failures, interrupted
+release, partial shard transitions, new generations and restored images cannot reuse old proof.
+An explicit resume starts a new baseline with a new snapshot and repeats classification. A complete
+marker records supported namespace coverage under exclusive ownership; unsupported external
+writes invalidate that assumption. Full startup scans remain mandatory even after completion:
+the Phase 3C performance evaluation did not qualify journal-only startup for activation.
 
 ### 8.6 Single-node durability guidance for operators
 

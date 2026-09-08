@@ -18,6 +18,7 @@ const DB_LOCK_SUFFIX: &str = ".cairn-db.lock";
 #[derive(Debug)]
 pub(crate) struct NodeLock {
     _files: Vec<File>,
+    paths: Vec<std::path::PathBuf>,
 }
 
 impl NodeLock {
@@ -88,8 +89,8 @@ impl NodeLock {
         paths.dedup();
 
         let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            let file = cairn_blob::open_lock_file_nofollow(&path).map_err(|error| {
+        for path in &paths {
+            let file = cairn_blob::open_lock_file_nofollow(path).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!(
@@ -120,7 +121,22 @@ impl NodeLock {
             files.push(file);
         }
 
-        Ok(Self { _files: files })
+        Ok(Self {
+            _files: files,
+            paths,
+        })
+    }
+
+    /// Only the actual retained locks directly in this root are baseline infrastructure.
+    /// A similarly suffixed file from another configuration is not an exemption.
+    pub(crate) fn root_artifact_names(&self, root: &Path) -> io::Result<Vec<OsString>> {
+        let root = std::fs::canonicalize(root)?;
+        Ok(self
+            .paths
+            .iter()
+            .filter(|path| path.parent() == Some(root.as_path()))
+            .filter_map(|path| path.file_name().map(OsString::from))
+            .collect())
     }
 }
 
@@ -173,6 +189,23 @@ pub(crate) fn is_lock_file_name(name: &str) -> bool {
 mod tests {
     use super::NodeLock;
     use std::io::ErrorKind;
+
+    #[test]
+    fn baseline_artifacts_include_only_retained_locks_in_the_configured_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("data");
+        let lock = NodeLock::acquire(&root, &root.join("custom.db")).unwrap();
+        let mut names = lock.root_artifact_names(&root).unwrap();
+        names.sort();
+        assert_eq!(names, vec![".cairn-data.lock", ".custom.db.cairn-db.lock"]);
+        assert!(!names.contains(&".unexpected.cairn-db.lock".into()));
+        drop(lock);
+        let outside = NodeLock::acquire(&root, &workspace.path().join("outside.db")).unwrap();
+        assert_eq!(
+            outside.root_artifact_names(&root).unwrap(),
+            vec![".cairn-data.lock"]
+        );
+    }
 
     #[test]
     fn second_node_is_rejected_and_lock_releases_on_drop() {

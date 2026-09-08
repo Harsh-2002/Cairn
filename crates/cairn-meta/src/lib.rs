@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+mod baseline;
 mod cache;
 mod model;
 mod range;

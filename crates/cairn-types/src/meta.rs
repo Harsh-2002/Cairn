@@ -80,6 +80,25 @@ pub struct CurrentVersionGuard {
 /// shared group-commit transaction, so one mutation's failure rolls back only itself.
 #[derive(Debug, Clone)]
 pub enum Mutation {
+    BeginStorageBaseline {
+        token: crate::storage_baseline::StorageBaselineToken,
+    },
+    ClassifyStorageBaseline {
+        bucket: BucketName,
+        token: crate::storage_baseline::StorageBaselineToken,
+        paths: Vec<StoragePath>,
+    },
+    AuthorizeStorageBaselineRelease {
+        proof: crate::blob::StorageBaselineProof,
+    },
+    FinalizeStorageBaselineLegacy {
+        token: crate::storage_baseline::StorageBaselineToken,
+        limit: u32,
+    },
+    CompleteStorageBaseline {
+        token: crate::storage_baseline::StorageBaselineToken,
+        completed_at: Timestamp,
+    },
     /// Advance every physical database under the exclusive node lock before serving requests.
     /// Callers must establish backend teardown before using a fresh generation as restart proof.
     BeginStorageGeneration {
@@ -821,6 +840,15 @@ pub enum Mutation {
 /// The typed result of applying a [`Mutation`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum MutationOutcome {
+    StorageBaselineUpdated(crate::storage_baseline::StorageBaselineTransition),
+    StorageBaselineClassified(Vec<crate::storage_baseline::StorageBaselineDisposition>),
+    StorageBaselineLegacyPage {
+        released: u32,
+        remaining: bool,
+    },
+    MultipartAccountingHeld {
+        baseline_id: crate::storage::StorageToken,
+    },
     /// A committed pre-stage admission. The acknowledgement itself is move-only.
     StorageAdmission(crate::storage::StorageAdmission),
     /// Joint completion claim and move-only storage admission.
@@ -831,13 +859,17 @@ pub enum MutationOutcome {
     /// Publication lost its exact intent, generation or cancellation fence.
     StoragePublicationNotApplied,
     /// Exact physical-ownership mutation applied or lost its owner/generation.
-    StorageUpdated { applied: bool },
+    StorageUpdated {
+        applied: bool,
+    },
     /// A bounded page of prior-generation plans requiring actual backend quiescence checks.
     StorageIntentBatch(Vec<crate::storage::StorageWritePlan>),
     /// Independently claimed physical debt, with retained routing and exact lease ownership.
     StorageCleanupBatch(Vec<crate::storage::StorageCleanup>),
     /// Whether a replication update still owned its exact attempt.
-    ReplicationClaimUpdated { applied: bool },
+    ReplicationClaimUpdated {
+        applied: bool,
+    },
     /// Durable remote-upload cleanup work, independent of originating outbox retention.
     ReplicationUploadBatch(crate::replication_upload::ReplicationUploadBatch),
     /// A put committed.

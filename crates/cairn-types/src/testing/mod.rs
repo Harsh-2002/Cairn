@@ -62,3 +62,9 @@ pub use replication_upload_contract::assert_replication_upload_journal;
 
 mod storage_contract;
 pub use storage_contract::{assert_prepare_storage_restore, assert_storage_journal};
+
+mod storage_baseline_contract;
+pub use storage_baseline_contract::{
+    assert_storage_baseline, assert_storage_baseline_authority,
+    assert_storage_baseline_native_aliases,
+};

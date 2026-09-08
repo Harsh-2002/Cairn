@@ -477,6 +477,11 @@ impl CachedMetadataStore {
             | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
             | Mutation::RenewReplicationClaim { .. }
+            | Mutation::BeginStorageBaseline { .. }
+            | Mutation::ClassifyStorageBaseline { .. }
+            | Mutation::AuthorizeStorageBaselineRelease { .. }
+            | Mutation::FinalizeStorageBaselineLegacy { .. }
+            | Mutation::CompleteStorageBaseline { .. }
             | Mutation::BeginStorageGeneration { .. }
             | Mutation::PrepareStorageRestore { .. }
             | Mutation::Storage { .. }
@@ -511,6 +516,30 @@ impl CachedMetadataStore {
 
 #[async_trait]
 impl MetadataStore for CachedMetadataStore {
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<cairn_types::storage_baseline::StorageBaselineState>, MetaError> {
+        self.inner.storage_baseline_states().await
+    }
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<cairn_types::storage_baseline::StorageBaselinePending, MetaError> {
+        self.inner.storage_baseline_pending().await
+    }
+    async fn storage_path_owners(
+        &self,
+        paths: &[StoragePath],
+    ) -> Result<Vec<cairn_types::storage_baseline::StoragePathOwnership>, MetaError> {
+        self.inner.storage_path_owners(paths).await
+    }
+    async fn enumerate_storage_authority(
+        &self,
+        cursor: Option<&cairn_types::storage_baseline::StorageAuthorityCursor>,
+        limit: u32,
+    ) -> Result<cairn_types::storage_baseline::StorageAuthorityPage, MetaError> {
+        self.inner.enumerate_storage_authority(cursor, limit).await
+    }
+
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         // Invalidate around the write so no reader can repopulate a stale entry from a snapshot
         // taken before the commit: drop before forwarding, and again after it lands. The auth

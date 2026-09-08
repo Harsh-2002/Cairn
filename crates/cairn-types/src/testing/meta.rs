@@ -865,6 +865,30 @@ fn page_rows(
 
 #[async_trait::async_trait]
 impl MetadataStore for InMemoryMetadataStore {
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<crate::storage_baseline::StorageBaselineState>, MetaError> {
+        Ok(vec![storage::baseline_state(&self.state.lock().unwrap())])
+    }
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<crate::storage_baseline::StorageBaselinePending, MetaError> {
+        Ok(storage::baseline_pending(&self.state.lock().unwrap()))
+    }
+    async fn storage_path_owners(
+        &self,
+        paths: &[StoragePath],
+    ) -> Result<Vec<crate::storage_baseline::StoragePathOwnership>, MetaError> {
+        storage::baseline_owners(&self.state.lock().unwrap(), paths)
+    }
+    async fn enumerate_storage_authority(
+        &self,
+        cursor: Option<&crate::storage_baseline::StorageAuthorityCursor>,
+        limit: u32,
+    ) -> Result<crate::storage_baseline::StorageAuthorityPage, MetaError> {
+        storage::baseline_authority(&self.state.lock().unwrap(), cursor, limit)
+    }
+
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         if matches!(
             &mutation,
@@ -2201,7 +2225,41 @@ impl State {
     }
 
     fn apply_inner(st: &mut Self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        if matches!(
+            &mutation,
+            Mutation::ReleaseMultipartReservation { .. }
+                | Mutation::ReleaseMultipartCleanup { .. }
+                | Mutation::ReleaseMultipartUploadCleanups { .. }
+                | Mutation::RecoverMultipartStagingAccounting { .. }
+        ) {
+            let baseline = storage::baseline_state(st);
+            if baseline.legacy_accounting_hold {
+                return Ok(MutationOutcome::MultipartAccountingHeld {
+                    baseline_id: baseline.baseline_id.ok_or_else(|| {
+                        MetaError::Engine("held baseline identity missing".into())
+                    })?,
+                });
+            }
+        }
+
         match mutation {
+            Mutation::BeginStorageBaseline { token } => storage::baseline_begin(st, token),
+            Mutation::ClassifyStorageBaseline {
+                bucket,
+                token,
+                paths,
+            } => storage::baseline_classify(st, bucket, token, paths),
+            Mutation::AuthorizeStorageBaselineRelease { proof } => {
+                storage::baseline_authorize(st, proof.token())
+            }
+            Mutation::FinalizeStorageBaselineLegacy { token, limit } => {
+                storage::baseline_finalize(st, token, limit)
+            }
+            Mutation::CompleteStorageBaseline {
+                token,
+                completed_at,
+            } => storage::baseline_complete(st, token, completed_at),
+
             Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
                 Err(MetaError::Engine("nested storage operation".into()))
             }
@@ -2469,6 +2527,12 @@ impl State {
                 max_parts_per_upload,
                 now,
             } => {
+                if storage::baseline_state(st).legacy_accounting_hold {
+                    return Err(MetaError::Engine(
+                        "storage baseline accounting is held".into(),
+                    ));
+                }
+
                 let session = st
                     .multipart
                     .get(upload_id.as_str())

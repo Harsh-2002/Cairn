@@ -155,12 +155,296 @@ impl ShardedMetadataStore {
     fn for_upload(&self, upload: &str) -> &Arc<dyn MetadataStore> {
         &self.shards[decode_upload_shard(upload, self.n())]
     }
+    async fn submit_baseline(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        use cairn_types::storage_baseline::StorageBaselineTransition as Transition;
+        let outcome = |status| Ok(MutationOutcome::StorageBaselineUpdated(status));
+        let states = self.storage_baseline_states().await?;
+        match &mutation {
+            Mutation::BeginStorageBaseline { token } => {
+                if states.iter().any(|state| {
+                    state.generation.as_ref() != Some(&token.generation)
+                        || (state.matches(token) && state.legacy_release_authorized)
+                }) {
+                    return outcome(Transition::Stale);
+                }
+            }
+            Mutation::ClassifyStorageBaseline {
+                bucket,
+                token,
+                paths,
+            } => {
+                if states
+                    .iter()
+                    .any(|state| !state.matches(token) || state.legacy_release_authorized)
+                {
+                    return outcome(Transition::Stale);
+                }
+                let owners = self.storage_path_owners(paths).await?;
+                if owners
+                    .iter()
+                    .any(|owner| owner.bucket.as_ref().is_some_and(|owner| owner != bucket))
+                {
+                    return Err(MetaError::Engine(
+                        "storage classification routing mismatch".into(),
+                    ));
+                }
+                return self.for_bucket(bucket.as_str()).submit(mutation).await;
+            }
+            Mutation::AuthorizeStorageBaselineRelease { proof } => {
+                if states.iter().any(|state| !state.matches(proof.token())) {
+                    return outcome(Transition::Stale);
+                }
+                if self.storage_baseline_pending().await?.native_pending() {
+                    return outcome(Transition::Blocked);
+                }
+            }
+            Mutation::FinalizeStorageBaselineLegacy { token, limit } => {
+                if states
+                    .iter()
+                    .any(|state| !state.matches(token) || !state.legacy_release_authorized)
+                {
+                    return outcome(Transition::Stale);
+                }
+                if self.storage_baseline_pending().await?.native_pending() {
+                    return outcome(Transition::Blocked);
+                }
+                let limit = (*limit).clamp(1, 1000);
+                let mut released = 0;
+                for shard in &self.shards {
+                    if released == limit {
+                        break;
+                    }
+                    match shard
+                        .submit(Mutation::FinalizeStorageBaselineLegacy {
+                            token: token.clone(),
+                            limit: limit - released,
+                        })
+                        .await?
+                    {
+                        MutationOutcome::StorageBaselineLegacyPage {
+                            released: count, ..
+                        } if count <= limit - released => released += count,
+                        MutationOutcome::StorageBaselineUpdated(status) => return outcome(status),
+                        _ => {
+                            return Err(MetaError::Engine(
+                                "unexpected baseline legacy release outcome".into(),
+                            ));
+                        }
+                    }
+                }
+                let pending = self.storage_baseline_pending().await?;
+                return Ok(MutationOutcome::StorageBaselineLegacyPage {
+                    released,
+                    remaining: pending.legacy_reservations || pending.legacy_quota_debt,
+                });
+            }
+            Mutation::CompleteStorageBaseline { token, .. } => {
+                if states.iter().any(|state| {
+                    !(state.matches(token) && state.legacy_release_authorized)
+                        && !(!state.legacy_accounting_hold
+                            && state.generation.as_ref() == Some(&token.generation)
+                            && state.coverage_identity.as_ref() == Some(&token.baseline_id))
+                }) {
+                    return outcome(Transition::Stale);
+                }
+                if self.storage_baseline_pending().await?.any() {
+                    return outcome(Transition::Blocked);
+                }
+            }
+            _ => return Err(MetaError::Engine("invalid baseline dispatch".into())),
+        }
+        let mut applied = false;
+        for shard in &self.shards {
+            match shard.submit(mutation.clone()).await? {
+                MutationOutcome::StorageBaselineUpdated(Transition::Applied) => applied = true,
+                MutationOutcome::StorageBaselineUpdated(Transition::AlreadyApplied) => {}
+                MutationOutcome::StorageBaselineUpdated(status) => return outcome(status),
+                _ => {
+                    return Err(MetaError::Engine(
+                        "unexpected baseline transition outcome".into(),
+                    ));
+                }
+            }
+        }
+        outcome(if applied {
+            Transition::Applied
+        } else {
+            Transition::AlreadyApplied
+        })
+    }
 }
 
 #[async_trait]
 impl MetadataStore for ShardedMetadataStore {
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<cairn_types::storage_baseline::StorageBaselineState>, MetaError> {
+        let mut states = Vec::with_capacity(self.n());
+        for shard in &self.shards {
+            let state = shard.storage_baseline_states().await?;
+            if state.len() != 1 {
+                return Err(MetaError::Engine(
+                    "invalid physical baseline state count".into(),
+                ));
+            }
+            states.extend(state);
+        }
+        Ok(states)
+    }
+
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<cairn_types::storage_baseline::StorageBaselinePending, MetaError> {
+        let mut pending = cairn_types::storage_baseline::StorageBaselinePending::default();
+        for shard in &self.shards {
+            pending.merge(&shard.storage_baseline_pending().await?);
+        }
+        Ok(pending)
+    }
+
+    async fn storage_path_owners(
+        &self,
+        paths: &[StoragePath],
+    ) -> Result<Vec<cairn_types::storage_baseline::StoragePathOwnership>, MetaError> {
+        use cairn_types::storage_baseline::{STORAGE_BASELINE_PAGE_LIMIT, StoragePathOwnership};
+        if paths.len() > STORAGE_BASELINE_PAGE_LIMIT {
+            return Err(MetaError::Engine(
+                "storage ownership page exceeds bound".into(),
+            ));
+        }
+        let mut owners: Vec<_> = paths
+            .iter()
+            .map(|path| StoragePathOwnership {
+                path: path.clone(),
+                bucket: None,
+                authoritative: false,
+                intent: false,
+                cleanup: false,
+                legacy_debt: false,
+            })
+            .collect();
+        for shard in &self.shards {
+            let page = shard.storage_path_owners(paths).await?;
+            if page.len() != paths.len() {
+                return Err(MetaError::Engine("unaligned storage ownership page".into()));
+            }
+            for (owner, next) in owners.iter_mut().zip(page) {
+                if owner.path != next.path
+                    || (owner.bucket.is_some()
+                        && next.bucket.is_some()
+                        && owner.bucket != next.bucket)
+                {
+                    return Err(MetaError::Engine(
+                        "conflicting storage ownership across shards".into(),
+                    ));
+                }
+                if next.bucket.is_some() {
+                    owner.bucket = next.bucket;
+                }
+                owner.authoritative |= next.authoritative;
+                owner.intent |= next.intent;
+                owner.cleanup |= next.cleanup;
+                owner.legacy_debt |= next.legacy_debt;
+            }
+        }
+        Ok(owners)
+    }
+
+    async fn enumerate_storage_authority(
+        &self,
+        cursor: Option<&cairn_types::storage_baseline::StorageAuthorityCursor>,
+        limit: u32,
+    ) -> Result<cairn_types::storage_baseline::StorageAuthorityPage, MetaError> {
+        use cairn_types::storage_baseline::{
+            STORAGE_BASELINE_PAGE_LIMIT, StorageAuthorityCursor, StorageAuthorityPage,
+        };
+        let mut cursor = cursor.cloned().unwrap_or_default();
+        if cursor.shard as usize >= self.n() {
+            return Err(MetaError::Engine(
+                "invalid storage authority shard cursor".into(),
+            ));
+        }
+        let limit = limit.clamp(1, STORAGE_BASELINE_PAGE_LIMIT as u32) as usize;
+        let mut items = Vec::with_capacity(limit);
+        loop {
+            let shard = cursor.shard;
+            cursor.shard = 0;
+            let page = self.shards[shard as usize]
+                .enumerate_storage_authority(Some(&cursor), (limit - items.len()) as u32)
+                .await?;
+            if page.items.len() > limit - items.len() {
+                return Err(MetaError::Engine(
+                    "storage authority page exceeds bound".into(),
+                ));
+            }
+            items.extend(page.items);
+            if let Some(mut next) = page.next {
+                next.shard = shard;
+                return Ok(StorageAuthorityPage {
+                    items,
+                    next: Some(next),
+                });
+            }
+            if shard as usize + 1 == self.n() {
+                return Ok(StorageAuthorityPage { items, next: None });
+            }
+            cursor = StorageAuthorityCursor {
+                shard: shard + 1,
+                ..Default::default()
+            };
+            if items.len() == limit {
+                return Ok(StorageAuthorityPage {
+                    items,
+                    next: Some(cursor),
+                });
+            }
+        }
+    }
+
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        // A partial baseline begin must block legacy release BEFORE the first physical dispatch.
+        if matches!(
+            &mutation,
+            Mutation::ReleaseMultipartReservation { .. }
+                | Mutation::ReleaseMultipartCleanup { .. }
+                | Mutation::ReleaseMultipartUploadCleanups { .. }
+                | Mutation::RecoverMultipartStagingAccounting { .. }
+        ) {
+            if let Some(state) = self
+                .storage_baseline_states()
+                .await?
+                .into_iter()
+                .find(|state| state.legacy_accounting_hold)
+            {
+                return Ok(MutationOutcome::MultipartAccountingHeld {
+                    baseline_id: state.baseline_id.ok_or_else(|| {
+                        MetaError::Engine("held baseline identity missing".into())
+                    })?,
+                });
+            }
+        }
+        if matches!(
+            &mutation,
+            Mutation::AdmitStorageWrite { .. }
+                | Mutation::ReserveMultipartPart { .. }
+                | Mutation::Storage {
+                    operation: cairn_types::storage::StorageMutation::Reserve { .. },
+                    ..
+                }
+        ) && self
+            .storage_baseline_states()
+            .await?
+            .iter()
+            .any(|state| state.legacy_accounting_hold)
+        {
+            return Err(MetaError::Engine(
+                "storage baseline accounting is held".into(),
+            ));
+        }
+
         match mutation {
+            mutation @ (Mutation::BeginStorageBaseline { .. } | Mutation::ClassifyStorageBaseline { .. } | Mutation::AuthorizeStorageBaselineRelease { .. } | Mutation::FinalizeStorageBaselineLegacy { .. } | Mutation::CompleteStorageBaseline { .. }) => self.submit_baseline(mutation).await,
+
             Mutation::BeginStorageGeneration { generation } => {
                 for shard in &self.shards {
                     match shard.submit(Mutation::BeginStorageGeneration { generation: generation.clone() }).await? {
@@ -1038,6 +1322,7 @@ impl MetadataStore for ShardedMetadataStore {
 /// Extract the target bucket name from a per-bucket mutation, for shard routing.
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
+        Mutation::ClassifyStorageBaseline { bucket, .. } => bucket.as_str(),
         Mutation::AdmitStorageWrite { plan, .. } | Mutation::PublishStorageWrite { plan, .. } => {
             plan.bucket.as_str()
         }
@@ -1101,6 +1386,10 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
+        | Mutation::BeginStorageBaseline { .. }
+        | Mutation::AuthorizeStorageBaselineRelease { .. }
+        | Mutation::FinalizeStorageBaselineLegacy { .. }
+        | Mutation::CompleteStorageBaseline { .. }
         | Mutation::BeginStorageGeneration { .. }
         | Mutation::PrepareStorageRestore { .. }
         | Mutation::ListStorageIntents { .. }

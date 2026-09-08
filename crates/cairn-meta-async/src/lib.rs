@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+mod baseline;
 mod driver;
 mod libsql_driver;
 mod model;

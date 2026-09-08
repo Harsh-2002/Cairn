@@ -22,6 +22,8 @@ mod crc64nvme;
 mod encode;
 pub mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
+#[cfg(unix)]
+mod baseline;
 mod raw_io;
 #[cfg(unix)]
 mod reconcile;
@@ -1348,6 +1350,27 @@ impl BlobStore for LocalBlobStore {
         // Sample time once; the bounded exclusive walker retains actual maintenance ownership.
         let now = system_now();
         reconcile_inner(&self.data_root, oracle, opts, now, lease).await
+    }
+
+    #[cfg(unix)]
+    async fn classify_storage_baseline(
+        &self,
+        meta: &dyn cairn_types::MetadataStore,
+        opts: &cairn_types::blob::StorageBaselineOptions,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<cairn_types::blob::StorageClassificationReport, BlobError> {
+        baseline::classify(&self.data_root, meta, opts, lease).await
+    }
+
+    #[cfg(unix)]
+    async fn verify_storage_baseline(
+        &self,
+        meta: &dyn cairn_types::MetadataStore,
+        opts: &cairn_types::blob::StorageBaselineOptions,
+        classification: &cairn_types::blob::StorageClassificationReport,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<cairn_types::blob::StorageBaselineProof, BlobError> {
+        baseline::verify(&self.data_root, meta, opts, classification, lease).await
     }
 }
 

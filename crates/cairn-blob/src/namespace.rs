@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// platforms fail closed rather than quietly reverting to a weaker path walk.
 pub(crate) fn open_beneath(
     parent: &File,
-    name: &str,
+    name: impl rustix::path::Arg,
     flags: OFlags,
     mode: Mode,
 ) -> std::io::Result<File> {
@@ -324,7 +324,7 @@ pub(crate) fn read_file(root: &Path, path: &StoragePath) -> std::io::Result<File
             } else {
                 OFlags::DIRECTORY
             };
-        let file = open_beneath(&directory, name, flags, Mode::empty())?;
+        let file = open_beneath(&directory, *name, flags, Mode::empty())?;
         let stat = fstat(&file)?;
         if stat.st_dev != device
             || (last && FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile)

@@ -66,7 +66,7 @@ jobs:
           cargo clippy --locked --manifest-path conformance/storage_lab/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --manifest-path conformance/storage_lab/Cargo.toml
           cargo build --locked --manifest-path conformance/storage_lab/Cargo.toml --bin cairn-fanout-lab
-          LAB_TEST_SERVER="$PWD/target/debug/cairn" LAB_TEST_FANOUT_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-fanout-lab" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
+          LAB_TEST_SERVER="$PWD/target/debug/cairn" LAB_TEST_RECOVERY_SERVER="$PWD/target/debug/cairn" LAB_TEST_FANOUT_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-fanout-lab" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
 
   # Runs before any package installer and encodes the release trust boundary: immutable actions,
   # tools and images; exact job permissions; checksum/provenance handoffs before publication.

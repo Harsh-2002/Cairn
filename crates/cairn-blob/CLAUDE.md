@@ -27,6 +27,13 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - `reconcile.rs` — bounded Linux flat/two-hex-leaf traversal; descriptor-relative no-follow cleanup,
   exact membership counts, conservative unknown-layout handling and parent-fsynced pruning.
   `DT_UNKNOWN` falls back to no-follow metadata lookup and lookup errors fail the scan.
+- `baseline.rs` — exclusive offline classification and reverse coverage proof. Classification
+  validates every file, including referenced files and exact root exemptions, and records bounded
+  Writer-owned debt without deleting names. After exact cleanup, verification probes all historical
+  object and active-part references beneath the same retained root, checks unconditional native
+  pending state, and strictly walks/syncs directories child-first through the root. Unknown names,
+  symlinks, mounts, hard links, special files and errors prevent proof. Receipts retain the exact
+  run, root identity, exemption list and actual maintenance lifetime; legacy accounting stays held.
 - `timing.rs` — bounded multipart permit/assembly/durability observations, mirrored by the server
   metrics tick; includes interrupted stages and reports sample eviction.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
@@ -153,6 +160,13 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   recursive deletion. Even an unprotected artifact younger than `staging_safety_margin_secs` is
   preserved; margin `0` removes only that age constraint. Bucket workers are bounded; staging is
   scanned inline. A failed/incomplete scan cannot authorize legacy orphan-accounting release.
+- **Baseline is separate from ordinary reconciliation.** Its existing `BlobStore` methods take
+  explicit metadata access for durable classification; `ReconcileOracle` remains read-only. Root
+  exemptions are exact operator-derived file names, including non-UTF-8 names, never lock-name
+  suffix patterns. Ownerless staging routes to `cairn-storage-orphans` only after all-shard owner
+  lookup; ownerless final paths retain their physical bucket. Reverse probes use `open_beneath`,
+  not the ordinary path-based `probe`. Physical sizes are checked where metadata records them;
+  coverage does not claim whole-payload checksum or decryption verification.
 - Blob transfers are bounded by **two SEPARATE permit pools** (both default `DEFAULT_BLOB_IO_CONCURRENCY
   = 64`; `with_read_pool_size` / `with_io_pool_size` to tune) — `read_permits` for GETs and `write_permits`
   for stage/stage_part/assemble (ARCH 7.4). The split is deliberate: a read permit is held for the whole
@@ -200,4 +214,5 @@ New writes remain flat. Linux reconciliation recognizes only the approved nested
 keeps bounded bucket/leaf pages and one leaf cursor per worker, and preserves/reports unknown paths and symlinks.
 Bucket enumeration is streamed too. File unlink batches sync their directory; pruning syncs the
 parent before reporting success. Full startup scans remain active; intent recovery and exact debt
-cleanup do not authorize scan-free startup or nested writes. Phase 3D remains unactivated.
+cleanup do not authorize scan-free startup or nested writes. An explicit offline baseline can
+establish coverage while full-scan recovery remains selected; journal-only startup is not activated.

@@ -942,6 +942,15 @@ CREATE INDEX idx_storage_intents_reservation ON storage_write_intents (reservati
     WHERE reservation_id IS NOT NULL;
 "#,
     },
+    Migration {
+        version: 38,
+        name: "offline_storage_baseline_accounting_hold",
+        sql: r#"
+ALTER TABLE storage_recovery_state ADD COLUMN baseline_id TEXT;
+ALTER TABLE storage_recovery_state ADD COLUMN legacy_accounting_hold INTEGER NOT NULL DEFAULT 0 CHECK (legacy_accounting_hold IN (0,1));
+ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER NOT NULL DEFAULT 0 CHECK (legacy_release_authorized IN (0,1));
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -998,7 +1007,7 @@ pub(crate) fn validate_compatibility(conn: &Connection) -> rusqlite::Result<i64>
             "unsupported storage journal for the applied schema",
         ));
     }
-    if applied >= 36 {
+    if (36..38).contains(&applied) {
         let state: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM storage_recovery_state WHERE singleton=1 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL)",
             [], |row| row.get(0),
@@ -1008,6 +1017,11 @@ pub(crate) fn validate_compatibility(conn: &Connection) -> rusqlite::Result<i64>
                 "unsupported or missing storage recovery state",
             ));
         }
+    }
+    if applied >= 38 {
+        crate::baseline::state(conn).map_err(|error| {
+            incompatible(format!("unsupported storage recovery state: {error}"))
+        })?;
     }
     if has_protocol {
         let state = conn.query_row(
@@ -1112,6 +1126,10 @@ mod tests {
             "DROP TABLE storage_cleanups",
             "DELETE FROM storage_recovery_state",
             "UPDATE storage_recovery_state SET coverage_state='complete'",
+            "UPDATE storage_recovery_state SET legacy_accounting_hold=1",
+            "UPDATE storage_recovery_state SET legacy_release_authorized=1",
+            "UPDATE storage_recovery_state SET baseline_id='11111111111111111111111111111111'",
+            "UPDATE storage_recovery_state SET generation='11111111111111111111111111111111',baseline_id='invalid',legacy_accounting_hold=1",
             "UPDATE storage_protocol SET write_layout='fanout-v1'",
             "UPDATE storage_protocol SET recovery_mode='journal'",
             "DELETE FROM storage_protocol",

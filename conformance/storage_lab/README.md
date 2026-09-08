@@ -140,7 +140,7 @@ do not establish performance evidence:
 
 ```sh
 shellcheck -s sh conformance/storage_lab/run.sh
-LAB_TEST_SERVER="$PWD/target/debug/cairn" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
+LAB_TEST_SERVER="$PWD/target/debug/cairn" LAB_TEST_RECOVERY_SERVER="$PWD/target/debug/cairn" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
 cargo fmt --manifest-path conformance/storage_lab/Cargo.toml --check
 cargo clippy --locked --manifest-path conformance/storage_lab/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path conformance/storage_lab/Cargo.toml
@@ -169,3 +169,13 @@ cannot be pooled with this variant as one unchanged trial.
 `fanout_report.py --root <campaign> --run <comparison-token>` charges reduction/export and
 produces Markdown plus the full provenance/measurement JSON inside the owned campaign.
 The September comparison retained flat placement after predeclared control-drift checks failed.
+
+## Offline baseline and recovery
+
+`run.sh recovery-cost` measures the predeclared 100/1,000-object offline screen in
+[`storage-recovery-2026-09.md`](../../docs/storage-recovery-2026-09.md). It uses an explicit prebuilt
+Cairn binary, the existing campaign's recovery allowance and GNU time. Source, ordinary/safety
+snapshots, restored data, metadata/WAL, command observations and cleanup share one reservation.
+Exact row/byte verification and cleanup success are diagnostic results; this descriptive screen
+cannot activate journal-only startup. Full scans remain mandatory.
+`LAB_TEST_RECOVERY_SERVER` enables its fixed eight-object correctness fixture.

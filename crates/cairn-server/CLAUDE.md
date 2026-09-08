@@ -7,7 +7,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 ## Layout (`src/`)
 - `main.rs` — entrypoint + the `Command` enum (clap). Node-local commands operate on the data dir
   from config: `serve` (default), `validate-config`, `bootstrap`, `integrity [--repair]`, `migrate`,
-  `backup <dir>`, `restore <dir>`. Remote-admin commands (`bucket`/`user`/`replication`/`object`/
+  `backup <dir>`, `restore <dir>`, `storage-baseline <empty-backup-dir>`. Remote-admin commands (`bucket`/`user`/`replication`/`object`/
   `share`/`overview`, ARCH 24.2) are a thin HTTP client — dispatched **before** `Config::load()`,
   they never touch the local data dir. **One exception**: `replication audit` is NODE-LOCAL (a
   dispatch guard lets it fall through to `Config::load()`), because it reads the durable version-row
@@ -29,6 +29,16 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   restore is no-replace: an existing immutable
   path is accepted only when byte-identical, and new paths publish by hard link with an
   `AlreadyExists` re-check. A non-zero reconciliation error count makes restore fail.
+- `baseline.rs` — explicit offline, single-SQLite coverage under the retained node lock. Every
+  start/resume creates and validates a fresh safety snapshot, closes its source Writer, then
+  checks key bindings before beginning a fresh generation/run and durable legacy-accounting hold.
+  Complete database-only classification precedes intent resolution and exact physical cleanup;
+  reverse-authority validation, unconditional journal absence and namespace sync precede legacy
+  release authorization. Bounded legacy release runs while held; only completion clears the hold.
+  Startup and reclaiming maintenance reject any shard's hold before generation/recovery; a held
+  restore publishes its prepared image but returns baseline-required without reconciliation.
+  The snapshot validates database/reference structure, not an actual restore drill or pre-upgrade
+  rollback image. Full startup scans remain mandatory even after completed coverage.
 - `integrity --repair` uses the ordinary writer deletion gate with a trusted timestamp and denied
   governance bypass. Missing-blob rows that are still retained or legally held remain as explicit
   `protected_unresolved` damage and make the command fail; the repair must never erase WORM

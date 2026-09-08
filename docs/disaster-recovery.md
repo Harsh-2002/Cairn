@@ -64,7 +64,10 @@ Suggested alerts: `cairn_replication_lag_seconds` above your RPO budget for N mi
 2. Restore the latest complete offline snapshot with `cairn restore`, following
    [`backup-restore.md`](./backup-restore.md). The supported format contains the database and its
    referenced committed blobs and multipart parts; a raw database-only copy is not this format.
-3. Confirm restore and its reconciliation pass succeed. Do not treat `integrity --repair` as an
+3. Confirm restore and its reconciliation pass succeed. If the snapshot carries an interrupted
+   storage-baseline hold, restore publishes a fresh held image and explicitly requires
+   `cairn storage-baseline <empty-backup-dir>` before startup. Complete that operation; do not
+   manually clear its accounting rows. Do not treat `integrity --repair` as an
    automatic recovery step: it removes unprotected rows with missing blobs, cannot recreate bytes,
    and refuses to erase retained or legally held metadata.
 4. Start the node, then verify historical version IDs, delete markers, object tags/ACLs/locks, and
@@ -101,7 +104,8 @@ endpoints, Object Lock defaults) on the destination — these are configured per
 ### 4.3 Whole node lost — restore from an off-box backup (no live replica)
 
 Restore the complete snapshot to a fresh node per `backup-restore.md`, confirm its built-in
-validation and reconciliation succeed, then start and verify. RPO is the age of the backup. This is the minimum
+validation and reconciliation succeed, then start and verify. An explicit held-baseline response
+requires the resume procedure in Section 4.1 before startup. RPO is the age of the backup. This is the minimum
 viable DR posture and is sufficient for a backup-target deployment.
 
 ### 4.4 Detected blob corruption (bit-rot)

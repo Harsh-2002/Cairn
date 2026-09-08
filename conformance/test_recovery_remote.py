@@ -9,9 +9,11 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from recovery_remote import FaultProxy
-from recovery_state import (recovered_artifacts_absent, recovered_database_rows,
+from recovery_state import (database_rows, durable_tables, rows,
+                            recovered_artifacts_absent, recovered_database_rows,
                             same_database_rows, same_live_files)
 
 
@@ -160,6 +162,29 @@ class RestoreStateTests(unittest.TestCase):
                 mutate(after)
                 with self.assertRaises(AssertionError):
                     recovered_database_rows(before, after)
+
+    def test_observation_connections_close_before_offline_maintenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "source.db"
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                connection.executescript("CREATE TABLE metadata (id); INSERT INTO metadata VALUES (1);")
+            connect, opened = sqlite3.connect, []
+
+            def observe(*args, **kwargs):
+                connection = connect(*args, **kwargs)
+                opened.append(connection)  # Retain references so garbage collection cannot close them.
+                return connection
+
+            with patch("recovery_state.sqlite3.connect", side_effect=observe):
+                self.assertEqual(durable_tables(database), ["metadata"])
+                self.assertEqual(rows(database, "metadata"), [{"id": 1}])
+                self.assertEqual(database_rows(database), {"metadata": [{"id": 1}]})
+                with self.assertRaises(sqlite3.OperationalError):
+                    rows(database, "missing")
+            self.assertEqual(len(opened), 4)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
 
     def test_snapshot_comparison_includes_empty_tables_and_all_columns(self):
         with tempfile.TemporaryDirectory() as directory:

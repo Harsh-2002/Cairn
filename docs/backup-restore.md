@@ -100,7 +100,10 @@ an existing target path is reused only when a no-follow, byte-for-byte compariso
 identical to the snapshot, while a different collision aborts restore without changing the old
 inode. A new path is staged and synced, then published with an atomic hard link; an
 `AlreadyExists` race is re-opened no-follow and subjected to the same identity rule rather than
-replaced. Reconciliation runs while the exclusive node lock remains held; target-side blobs not
+replaced. A snapshot with an unfinished baseline preserves its legacy-accounting hold. Restore
+publishes the prepared image with fresh ownership, then returns an explicit `storage-baseline`
+requirement without reconciling or releasing held quota. For an unheld snapshot, reconciliation
+runs while the exclusive node lock remains held; target-side blobs not
 referenced by restored metadata are reclaimed. Any non-zero reconciliation error count makes
 restore fail even when the reconciliation call itself returned a report, matching the pre-bind
 startup gate rather than declaring a partially checked generation ready.
@@ -120,7 +123,8 @@ only after kernel quiescence checks, release interrupted multipart completion an
 ownership through the canonical Writer, and run full reconciliation. Intents and cleanup claims
 protect their exact paths during the scan; cleanup retirement still requires durable namespace
 absence. Snapshot generation and cleanup leases are never reused as serving ownership. Coverage
-remains incomplete and full scans are mandatory. A restored active upload must retain its staged
+is invalidated by restore and full scans are mandatory. A held baseline remains held until an
+explicit baseline run completes. A restored active upload must retain its staged
 parts and captured tags/lock/encryption intent so the client can retry Complete. Replication work may
 be attempted again: generic S3 destinations can gain another version after an ambiguous prior
 success. Isolate an old primary before resuming a restored node to avoid two independent sources
@@ -150,6 +154,48 @@ source, then compares every durable row across offline backup and restore. It ch
 incident retention, known-ID cleanup, startup release of abandoned cleanup ownership, and exact
 native version identity after redelivery. This harness requires the schema-v33 streaming sender;
 all three fault arms passed against the final v33 sender implementation at `5a9a9b1`.
+
+## Offline baseline and interrupted-baseline recovery
+
+Before upgrading an existing installation to the new storage protocol, stop the old node, take a
+backup with its compatible binary, and perform a fresh restore drill in an isolated data directory
+with the original keys. Verify object reads and active multipart recovery. Keep that verified
+pre-upgrade snapshot as the rollback image; unsupported older writers must never open upgraded
+metadata. The baseline command's automatic snapshot is additional protection and does not replace
+this operational prerequisite.
+
+With the new binary and the server still stopped, choose a new empty backup directory outside
+the data root:
+
+```sh
+cairn storage-baseline /backup/cairn-baseline-2026-09-08
+```
+
+The command supports one local SQLite database, matching native backup/restore. It holds the same
+node lock for snapshot validation, classification, exact cleanup and completion. Before each start
+or resume it creates a fresh snapshot and verifies the database and referenced-file presence.
+Opening the source may apply migrations, so this snapshot is not necessarily a pre-upgrade rollback
+image. These automated checks do not run a restore drill or decrypt every payload.
+
+The baseline first marks coverage incomplete and holds legacy staging charges. It classifies the
+entire supported namespace through bounded Writer batches before deleting classified orphan files.
+Unknown names, symlinks, descendant mounts, hard links, missing live files and I/O errors block
+completion. Only the exact configured database/sidecars and retained node-lock filenames are
+exempt infrastructure entries; an arbitrary lock-like filename is not exempt. The detailed proof
+and quota-release sequence is in [ARCH 8.5.1](storage-durability.md#851-offline-storage-baseline).
+
+If the operation fails or is interrupted after establishing the hold, ordinary `serve` and
+reclaiming maintenance refuse to proceed. Preserve the reported files and snapshot, resolve the
+specific unsupported artifact or storage error, then rerun `storage-baseline` with another empty
+backup destination. Do not clear the hold or accounting rows manually. Each resume uses a new
+generation and baseline identity and repeats classification; an old release proof cannot be reused.
+
+A snapshot of held metadata remains restorable conservatively. Restore publishes a fresh-generation
+held image and reports that an explicit baseline is required; it does not release copied charges or
+start serving. Run the baseline against that target before starting Cairn. Completed baseline
+coverage preserves active encrypted parts, historical versions and Object Lock metadata, but is not
+a substitute for payload integrity verification. Full startup scans remain enabled after completion;
+the current performance evidence did not qualify journal-only startup.
 
 ## Database-path upgrade requirement
 
