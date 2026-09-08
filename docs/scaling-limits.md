@@ -39,9 +39,11 @@ regime — bounded by disk/network, not the writer.
 
 ## 2. Object and bucket limits
 
-- **Max object size:** configurable via `CAIRN_MAX_OBJECT_SIZE` (default 5 TiB). Large objects stream
-  to disk with bounded memory; the cost is disk bandwidth, not the writer. Multipart uploads assemble
-  parts during a single staging pass.
+- **Max object size:** configurable via `CAIRN_MAX_OBJECT_SIZE` (default 5 TiB). Raw objects stream
+  to disk; encoded objects additionally obey the CRNB index ceiling in
+  [Section 9.3](storage-durability.md#93-the-blob-file-format), about 455.11 GiB for encryption-only
+  blocks and 1.78 TiB at the default compression geometry. Their current index memory grows with
+  block count up to the format cap. Multipart uploads assemble parts during a single staging pass.
 - **Incomplete multipart uploads:** active sessions default to 1,000 per bucket and 1,000 per
   initiating principal; each upload defaults to at most 10,000 distinct part numbers. Tune
   `CAIRN_MULTIPART_MAX_ACTIVE_UPLOADS_PER_BUCKET`,

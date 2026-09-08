@@ -2774,6 +2774,50 @@ async fn abort_wins_before_complete_claim_and_no_object_is_committed() {
     assert_eq!(get_status, StatusCode::NOT_FOUND);
 }
 
+/// Encoded-size preflight uses the same SizeExceeded path as configured limits. A post-claim
+/// rejection must preserve the upload and parts and release exact ownership for a corrected retry.
+#[tokio::test]
+async fn assembly_size_rejection_preserves_parts_and_releases_completion_claim() {
+    let h = harness().await;
+    let (upload_id, etag) = start_upload_with_part(&h, "size-retry", "obj").await;
+    let limited = S3Service::new(
+        h.meta.clone(),
+        h.blob.clone(),
+        Arc::new(cairn_types::testing::AllowAll),
+        Arc::new(cairn_types::testing::TestClock::default()),
+        Arc::new(cairn_crypto::SystemCrypto::new(
+            rand::random::<[u8; 32]>().into(),
+        )),
+        "us-east-1".into(),
+        1,
+    );
+    let complete = || {
+        req(Method::POST, Some("size-retry"), Some("obj"),
+        &[("uploadId", upload_id.as_str())], &[],
+        format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>").into_bytes())
+    };
+    let (status, _, body) = drain(send(&limited, complete()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8(body).unwrap().contains("EntityTooLarge"));
+    let id = cairn_types::UploadId::from_string(upload_id.clone());
+    let parts = h.meta.list_parts(&id, 0, 100).await.unwrap();
+    assert_eq!(parts.items.len(), 1);
+    assert!(h.blob.probe(&parts.items[0].storage_path).await.is_ok());
+    assert!(
+        h.meta
+            .current_version(
+                &cairn_types::BucketName::parse("size-retry").unwrap(),
+                &cairn_types::ObjectKey::parse("obj").unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (status, _, _) = drain(send(&h.svc, complete()).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.meta.get_multipart(&id).await.unwrap().is_none());
+}
+
 /// A genuine post-claim assembly failure must surface its real error, release `completing` back to
 /// `active`, and permit a corrected retry. Delete the staged part bytes without removing the
 /// session row to inject that failure, then upload the replacement part and complete successfully.

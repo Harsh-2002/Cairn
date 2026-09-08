@@ -82,6 +82,12 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   (enough for a 5-GiB object at the minimum supported 1-KiB block size) and its block count must
   match the independently stored logical size and block geometry before allocation. A corrupt large
   file therefore cannot make pre-v3 or pre-MAC parsing allocate in proportion to its physical size.
+- **Writers obey the same index ceiling.** `BlockEncoder::feed` is fallible and rejects an excessive
+  logical size before buffering input; finalization also fails after a rejected feed. Known encoded
+  lengths fail before staging/preallocation, and multipart totals use checked addition. Effective
+  limits depend on block geometry (ARCH 9.3); raw files retain their configured ceiling. This does
+  not provide 5-TiB encrypted-object support or remove the still-resident index; see the tracked
+  `docs/storage-evolution-plan.md` for subsequent spool/paged-reader PRs.
 - **Block allocations obey trusted metadata on every CRNB version.** Trailer algorithm, block
   size and logical total must match metadata for v1/v2/v3. Every raw payload is exactly logical
   length and every compressed payload is nonempty and shorter, excluding the encrypted GCM tag.

@@ -32,6 +32,116 @@ fn opts(compression: Option<CompressionPolicy>, content_type: &str) -> StageOpti
     }
 }
 
+#[tokio::test]
+async fn encoded_preflight_rejects_before_staging_or_polling_body() {
+    use aes_gcm::KeyInit;
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    // Removing this owned empty staging tree also makes running the regression against the old
+    // implementation safe: file creation fails before any huge preallocation could be attempted.
+    tokio::fs::remove_dir_all(dir.path().join(".staging"))
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("preflight").unwrap();
+    let max_blocks = (64_u64 * 1024 * 1024) / 9;
+    for (encrypted, content_type, block_size) in [
+        (false, "text/plain", 256 * 1024),
+        (true, "application/zip", 64 * 1024),
+    ] {
+        let dek = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
+        let options = StageOptions {
+            compression: Some(CompressionPolicy::default()),
+            encryption: encrypted.then(|| SecretKey32::from_slice(&dek).unwrap()),
+            content_type: content_type.into(),
+            content_length: Some(max_blocks * block_size + 1),
+            size_ceiling: u64::MAX,
+            ..StageOptions::default()
+        };
+        let unread_body: BodyStream = Box::pin(futures_util::stream::poll_fn(|_| {
+            panic!("preflight must not poll the body")
+        }));
+        assert!(matches!(
+            store.stage(&bucket, unread_body, options).await,
+            Err(BlobError::SizeExceeded)
+        ));
+    }
+    // A precompressed plaintext object uses raw storage, so the CRNB limit must not reject it.
+    // The deliberately absent staging tree stops it before preallocation or body polling.
+    let raw_options = StageOptions {
+        compression: Some(CompressionPolicy::default()),
+        content_type: "application/zip".into(),
+        content_length: Some(max_blocks * 256 * 1024 + 1),
+        size_ceiling: u64::MAX,
+        ..StageOptions::default()
+    };
+    assert!(matches!(
+        store.stage(&bucket, body(Vec::new()), raw_options).await,
+        Err(BlobError::Io(_))
+    ));
+    assert!(!dir.path().join(bucket.as_str()).exists());
+}
+
+#[tokio::test]
+async fn assembly_format_limit_and_overflow_leave_parts_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let bucket = BucketName::parse("bounded-assembly").unwrap();
+    let upload = UploadId::generate();
+    let part = store
+        .stage_part(
+            &upload,
+            1,
+            "format-limit",
+            body(b"keep me".to_vec()),
+            ChecksumSet::none(),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+    let actual = PartRef {
+        part_number: 1,
+        storage_path: part.storage_path.clone(),
+        size: part.size,
+        cipher: BlobCipher::KnownPlaintext,
+    };
+    // No enormous file is needed: preflight must reject the trusted total before opening parts.
+    let over_format = PartRef {
+        size: (64_u64 * 1024 * 1024 / 9) * 256 * 1024 + 1,
+        ..actual.clone()
+    };
+    let overflow = PartRef {
+        size: u64::MAX,
+        ..actual.clone()
+    };
+    let options = StageOptions {
+        compression: Some(CompressionPolicy::default()),
+        size_ceiling: u64::MAX,
+        content_type: "text/plain".into(),
+        ..StageOptions::default()
+    };
+    for parts in [vec![over_format], vec![overflow, actual.clone()]] {
+        assert!(matches!(
+            store.assemble(&bucket, &parts, options.clone()).await,
+            Err(BlobError::SizeExceeded)
+        ));
+        assert!(store.probe(&part.storage_path).await.is_ok());
+        assert!(!dir.path().join(bucket.as_str()).exists());
+    }
+    let completed = store.assemble(&bucket, &[actual], options).await.unwrap();
+    assert_eq!(
+        read_all(
+            &store,
+            &completed.storage_path,
+            None,
+            &completed.compression,
+            completed.size_logical
+        )
+        .await,
+        b"keep me"
+    );
+}
+
 /// Stage options that compress *and* encrypt under the given DEK (SSE-S3 over the block format).
 fn opts_encrypted(
     compression: Option<CompressionPolicy>,
