@@ -1,6 +1,8 @@
 """Attribution failures preserve campaign accounting and never imply available stacks."""
 import argparse
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import tempfile
 import sys
@@ -9,11 +11,28 @@ import unittest
 from unittest.mock import patch
 
 from analyze import analyze
-from budget import Campaign
+from budget import Campaign, footprint
 from processes import Child
 
 
 class AttributionTests(unittest.TestCase):
+    def test_footprint_tolerates_staging_unlink_after_directory_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "finished.tmp"
+            staging.write_bytes(b"payload")
+            original = os.scandir
+
+            @contextmanager
+            def raced_scan(directory):
+                with original(directory) as entries:
+                    entries = list(entries)
+                staging.unlink()
+                yield iter(entries)
+
+            with patch("budget.os.scandir", raced_scan):
+                self.assertEqual(footprint(root), 0)
+
     def test_target_shutdown_allows_wrapper_to_flush_before_group_teardown(self):
         with tempfile.TemporaryDirectory() as temporary:
             campaign = Campaign(Path(temporary) / "campaign", create=True, require_ssd=False)

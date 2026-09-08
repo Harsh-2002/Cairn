@@ -82,14 +82,23 @@ def footprint(root):
     stack = [root]
     while stack:
         directory = stack.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                info = entry.stat(follow_symlinks=False)
-                if info.st_dev != device or stat.S_ISLNK(info.st_mode):
-                    raise Unavailable("unexpected mount or symbolic link in owned campaign")
-                total += max(info.st_size, info.st_blocks * 512)
-                if stat.S_ISDIR(info.st_mode):
-                    stack.append(Path(entry.path))
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        # A live workload may finish/unlink a staging file after readdir.
+                        # Admission reserves outstanding work; removed files consume no space.
+                        continue
+                    if info.st_dev != device or stat.S_ISLNK(info.st_mode):
+                        raise Unavailable("unexpected mount or symbolic link in owned campaign")
+                    total += max(info.st_size, info.st_blocks * 512)
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(Path(entry.path))
+        except FileNotFoundError:
+            if directory == root:
+                raise
     return total
 
 
