@@ -83,6 +83,25 @@ pub async fn begin(db: &DB<'_>, generation: &StorageToken) -> R<MutationOutcome>
     Ok(MutationOutcome::Ack)
 }
 
+pub async fn prepare_restore(db: &DB<'_>, generation: &StorageToken) -> R<MutationOutcome> {
+    if x(
+        db,
+        "UPDATE storage_recovery_state SET generation=?1,coverage_state='incomplete',coverage_identity=NULL,baseline_completed_at=NULL WHERE singleton=1 AND generation IS NOT ?1",
+        vec![text(generation.as_str())],
+    )
+    .await? != 1
+    {
+        return Err(invalid("storage restore requires a fresh generation and recovery state"));
+    }
+    x(
+        db,
+        "UPDATE storage_cleanups SET claim_token=NULL,claim_generation=NULL,lease_until=NULL",
+        vec![],
+    )
+    .await?;
+    Ok(MutationOutcome::Ack)
+}
+
 pub async fn apply(
     db: &DB<'_>,
     bucket: &BucketName,
@@ -714,6 +733,115 @@ mod tests {
     use cairn_types::storage::PlannedStorageWrite;
     use cairn_types::storage::io::StorageIoWatch;
     use std::sync::Arc;
+
+    async fn restore_invalidates_coverage_contract(db: &DB<'_>) {
+        crate::schema::run_migrations(db).await.unwrap();
+        let generation = StorageToken::generate();
+        let restored = StorageToken::generate();
+        let bucket = BucketName::parse("restore-coverage-contract").unwrap();
+        let path = StoragePath::from_string(".staging/11111111111111111111111111111111.tmp".into());
+        begin(db, &generation).await.unwrap();
+        enqueue_owned(db, &bucket, &path, None, None).await.unwrap();
+        let claims = claim(db, &generation, 100, Timestamp(0), 60).await.unwrap();
+        assert!(matches!(&claims, MutationOutcome::StorageCleanupBatch(batch) if batch.len() == 1));
+        // v37 startup still rejects complete coverage. Inject the future-shaped tuple only
+        // after opening this fixture to prove invalidation without widening that preflight.
+        x(db, "UPDATE storage_recovery_state SET coverage_state='complete',coverage_identity=?1,baseline_completed_at=42", vec![text(StorageToken::generate().as_str())]).await.unwrap();
+        let protocol = q(db, "SELECT * FROM storage_protocol", vec![])
+            .await
+            .unwrap();
+        let coverage = q(db, "SELECT * FROM storage_recovery_state", vec![])
+            .await
+            .unwrap();
+        let cleanup = q(db, "SELECT * FROM storage_cleanups", vec![])
+            .await
+            .unwrap();
+        assert!(prepare_restore(db, &generation).await.is_err());
+        assert_eq!(
+            q(db, "SELECT * FROM storage_recovery_state", vec![])
+                .await
+                .unwrap(),
+            coverage
+        );
+        assert_eq!(
+            q(db, "SELECT * FROM storage_cleanups", vec![])
+                .await
+                .unwrap(),
+            cleanup
+        );
+        assert_eq!(
+            prepare_restore(db, &restored).await.unwrap(),
+            MutationOutcome::Ack
+        );
+        assert_eq!(q(db, "SELECT generation,coverage_state,coverage_identity,baseline_completed_at FROM storage_recovery_state", vec![]).await.unwrap(),
+            vec![vec![text(restored.as_str()), text("incomplete"), Cell::Null, Cell::Null]]);
+        assert_eq!(
+            q(
+                db,
+                "SELECT claim_token,claim_generation,lease_until FROM storage_cleanups",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            vec![vec![Cell::Null, Cell::Null, Cell::Null]]
+        );
+        assert_eq!(
+            q(db, "SELECT * FROM storage_protocol", vec![])
+                .await
+                .unwrap(),
+            protocol
+        );
+        let MutationOutcome::StorageCleanupBatch(old) = claims else {
+            unreachable!()
+        };
+        let MutationOutcome::StorageCleanupBatch(new) =
+            claim(db, &restored, 100, Timestamp(1), 60).await.unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, old[0].id);
+        assert_eq!(new[0].path, old[0].path);
+        assert_ne!(new[0].claim_token, old[0].claim_token);
+        let cleanup = q(db, "SELECT * FROM storage_cleanups", vec![])
+            .await
+            .unwrap();
+        x(db, "DELETE FROM storage_recovery_state", vec![])
+            .await
+            .unwrap();
+        assert!(
+            prepare_restore(db, &StorageToken::generate())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            q(db, "SELECT * FROM storage_cleanups", vec![])
+                .await
+                .unwrap(),
+            cleanup
+        );
+    }
+
+    #[tokio::test]
+    async fn libsql_restore_invalidates_coverage_and_claims() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let driver = crate::libsql_driver::LibsqlDriver::new(db.connect().unwrap());
+        restore_invalidates_coverage_contract(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn turso_restore_invalidates_coverage_and_claims() {
+        let db = turso::Builder::new_local(":memory:")
+            .experimental_vacuum(true)
+            .build()
+            .await
+            .unwrap();
+        let driver = crate::turso_driver::TursoDriver::new(db.connect().unwrap());
+        restore_invalidates_coverage_contract(&driver).await;
+    }
 
     async fn matching_quota_preserves_claim(db: &DB<'_>) {
         crate::schema::run_migrations(db).await.unwrap();

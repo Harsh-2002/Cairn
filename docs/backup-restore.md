@@ -75,12 +75,27 @@ object and multipart-part file, and rejects symlinks, special nodes, and top-lev
 `blobs/`.
 
 The database is copied to a synced, target-owned sibling and checked against the manifest again.
+Before publication, restore applies the existing read-only master-key identity and retirement
+checks to that staged database. A conflicting recorded key binding, unsafe removal of an older
+key, or failed metadata read refuses restore without replacing the old target. Legacy images
+without recorded key bindings retain the existing startup policy; this check is not a full
+decryption audit.
+
+The staged database's canonical Writer then commits a fresh storage generation, clears copied
+coverage and cleanup claims, and preserves authoritative rows, unfinished intents, exact cleanup
+debt and quota. After checkpointing and closing every staged connection, restore synchronizes the
+main file, removes its exact sidecars and synchronizes the directory. A private receipt binds the
+prepared image's size, SHA-256 and expected recovery state; publication validates this receipt.
+The prepared bytes intentionally differ from the snapshot image. The original snapshot database
+and manifest remain unchanged. Finalized-image validation is immutable and read-only, so it does
+not recreate WAL/SHM sidecars after the Writer has closed.
+
 If the old target generation has an exact WAL, SHM, or rollback-journal sidecar, Cairn first opens
 that generation through its canonical Writer, checkpoints and closes every owned SQLite
 connection, syncs the old main file, removes the exact sidecars, and syncs the parent directory.
 Only then can the atomic rename publish the staged image. Therefore a crash immediately before the
 rename reopens a complete old generation, while a crash immediately after it reopens only the new
-generation. Immutable blobs are copied before the metadata rename with no-replace publication:
+generation with fresh storage ownership already durable. Immutable blobs are copied before the metadata rename with no-replace publication:
 an existing target path is reused only when a no-follow, byte-for-byte comparison proves it
 identical to the snapshot, while a different collision aborts restore without changing the old
 inode. A new path is staged and synced, then published with an atomic hard link; an
@@ -99,7 +114,8 @@ outbox work, and remote multipart journals. These are database state;
 there is no second manifest inventory that can replace them. Restoring the database does not restore
 the external master-key ring or recreate the outcome of an ambiguous remote request.
 
-Restore and startup commit a fresh storage generation under the node lock, resolve prior intents
+Restore prepares fresh ownership before database publication; startup commits another fresh
+storage generation under the node lock. Both resolve prior intents
 only after kernel quiescence checks, release interrupted multipart completion and replication
 ownership through the canonical Writer, and run full reconciliation. Intents and cleanup claims
 protect their exact paths during the scan; cleanup retirement still requires durable namespace

@@ -61,4 +61,4 @@ mod replication_upload_contract;
 pub use replication_upload_contract::assert_replication_upload_journal;
 
 mod storage_contract;
-pub use storage_contract::assert_storage_journal;
+pub use storage_contract::{assert_prepare_storage_restore, assert_storage_journal};

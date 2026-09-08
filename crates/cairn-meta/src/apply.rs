@@ -102,6 +102,9 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Err(MetaError::Engine("nested storage operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => crate::storage::begin(conn, &generation),
+        Mutation::PrepareStorageRestore { generation } => {
+            crate::storage::prepare_restore(conn, &generation)
+        }
         Mutation::Storage { bucket, operation } => crate::storage::apply(conn, &bucket, operation),
         Mutation::ListStorageIntents { generation, limit } => {
             crate::storage::recover(conn, &generation, limit)

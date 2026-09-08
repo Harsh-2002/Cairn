@@ -2206,6 +2206,9 @@ impl State {
                 Err(MetaError::Engine("nested storage operation".into()))
             }
             Mutation::BeginStorageGeneration { generation } => Ok(storage::begin(st, generation)),
+            Mutation::PrepareStorageRestore { generation } => {
+                storage::prepare_restore(st, generation)
+            }
             Mutation::Storage { bucket, operation } => storage::apply(st, &bucket, operation),
             Mutation::ListStorageIntents { generation, limit } => {
                 storage::recover(st, &generation, limit)

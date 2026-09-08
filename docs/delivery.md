@@ -37,10 +37,16 @@ the completion marker.
 
 Restore validates that manifest, rejects a forward schema, digest mismatch, snapshot
 WAL/SHM/rollback journal, symlink, special node, or invalid blob layout before target mutation, and
-revalidates a target-owned staged database immediately before publication. An old generation with
+checks the staged database's recorded master-key bindings and retirement state without updating
+them. Before publication, its canonical Writer commits a fresh storage generation, invalidates
+copied coverage and cleanup claims, and preserves all authoritative rows and debt. After checkpoint,
+close and synchronization, a private size/hash/recovery-state receipt binds the prepared image;
+immutable validation immediately before publication leaves it sidecar-free. The original snapshot
+and manifest remain unchanged. An old generation with
 sidecars is checkpointed through the canonical Writer and fully closed; its main file is synced and
 the exact sidecars are removed and parent-synced **before** atomic rename. Thus either side of the
-rename is independently reopenable after a crash. Reconciliation follows while still locked. A
+rename is independently reopenable after a crash, with fresh ownership already durable in the new
+image. Reconciliation follows while still locked. A
 database may be directly inside the data root or outside it on the same filesystem, never under a
 deeper data-root directory that reconciliation could interpret as a bucket. The master key remains
 deliberately excluded and must be backed up out of band. The operator procedure and nested-path

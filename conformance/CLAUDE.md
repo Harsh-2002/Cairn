@@ -88,7 +88,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   real interrupted replication claims, exact source-to-snapshot table/row fidelity, explicit
   fresh-generation restore transitions and independent quota/live-file/retired-alias checks,
   fail-closed missing-part /
-  wrong-key / live-lock / shard checks, and retryable multipart completion after restore. The
+  wrong-key / live-lock / shard checks, and retryable multipart completion after restore.
+  Wrong recorded key bindings refuse restore into both fresh and populated targets before
+  metadata publication; the target rows/bytes and original snapshot image/manifest stay unchanged. The
   failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
 - `recovery_remote.py` — real Cairn destination and bounded HTTP fault proxy: lose a successful
   initiation/part/abort response, SIGKILL source, compare every snapshot table exactly and validate only specified recovery transitions on restore,
