@@ -1,6 +1,8 @@
 //! Isolated completed-byte publication diagnostic; no production routing or adoption decision.
 #[path = "packing/gc.rs"]
 pub mod gc;
+#[path = "packing/measurement.rs"]
+mod measurement;
 #[path = "packing/model.rs"]
 pub mod model;
 #[path = "packing/node.rs"]
@@ -53,6 +55,8 @@ struct Config {
     concurrency: usize,
     seed: u64,
     known_length: bool,
+    #[serde(default)]
+    measurement: bool,
     deadline_seconds: u64,
 }
 
@@ -63,6 +67,8 @@ impl Config {
             || ![1, 4, 32, 128].contains(&self.concurrency)
             || !(1..=120).contains(&self.deadline_seconds)
             || !self.root.is_absolute()
+            || (self.measurement
+                && (!(4..=8192).contains(&self.objects) || !self.objects.is_multiple_of(4)))
         {
             return Err("invalid bounded packing configuration".into());
         }
@@ -174,6 +180,7 @@ impl Budget {
 /// No request allocates fixture bytes until it holds both admission permits.
 struct Request {
     index: usize,
+    replacement: bool,
     payload: Option<Vec<u8>>,
     admission: Admission,
     reply: oneshot::Sender<std::result::Result<(), String>>,
@@ -292,6 +299,26 @@ fn persist(store: &Store, config: &Config, batch: &[Request], deadline: Instant)
     } else {
         config.size as u64
     };
+    // Requests and their admission guards remain in this owned job through every lookup,
+    // physical operation and conditional Writer acknowledgement. Overwrites fence the exact
+    // current row and complete old location, never an unconditional key replacement.
+    let expected: Vec<_> = batch
+        .iter()
+        .map(|request| -> Result<ExpectedCurrent> {
+            if request.replacement {
+                check_deadline(deadline)?;
+                let previous = runtime
+                    .block_on(store.lookup(&key(request.index)))?
+                    .ok_or("overwrite source is absent")?;
+                Ok(ExpectedCurrent::Exact {
+                    row_id: previous.metadata.row_id,
+                    location: previous.location,
+                })
+            } else {
+                Ok(ExpectedCurrent::Absent)
+            }
+        })
+        .collect::<Result<_>>()?;
     let admission = runtime.block_on(store.plan(kind, length))?;
     if let Err(error) = check_deadline(deadline) {
         runtime.block_on(store.abort(record::abort(admission)))?;
@@ -307,7 +334,16 @@ fn persist(store: &Store, config: &Config, batch: &[Request], deadline: Instant)
         record::publish_file(
             &config.root,
             admission,
-            &mut Fixture::new(config.seed, batch[0].index, config.size),
+            &mut Fixture::new(
+                config.seed,
+                batch[0].index
+                    + if batch[0].replacement {
+                        config.objects
+                    } else {
+                        0
+                    },
+                config.size,
+            ),
         )
     };
     let artifact = match artifact {
@@ -322,7 +358,8 @@ fn persist(store: &Store, config: &Config, batch: &[Request], deadline: Instant)
     let records = batch
         .iter()
         .zip(artifact.spans())
-        .map(|(request, span)| {
+        .zip(expected)
+        .map(|((request, span), expected)| {
             let location = match kind {
                 ArtifactKind::File => Location::File {
                     artifact: identity.clone(),
@@ -347,7 +384,7 @@ fn persist(store: &Store, config: &Config, batch: &[Request], deadline: Instant)
                     locked: false,
                 },
                 location,
-                expected: ExpectedCurrent::Absent,
+                expected,
                 preserve_previous: false,
             }
         })
@@ -503,8 +540,15 @@ impl Latency {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PublicationStage {
+    Append,
+    Overwrite,
+}
+
 async fn worker(
     worker: usize,
+    stage: PublicationStage,
     config: Arc<Config>,
     budget: Arc<Budget>,
     sender: mpsc::Sender<Request>,
@@ -512,7 +556,18 @@ async fn worker(
     deadline: Instant,
 ) -> Result<Latency> {
     let mut latency = Latency::default();
-    for index in (worker..config.objects).step_by(config.concurrency) {
+    let replacement = matches!(stage, PublicationStage::Overwrite);
+    let objects = if replacement {
+        config.objects / 4
+    } else {
+        config.objects
+    };
+    for ordinal in (worker..objects).step_by(config.concurrency) {
+        let index = if config.measurement && !replacement {
+            measurement::initial_index(ordinal, config.objects)
+        } else {
+            ordinal
+        };
         check_deadline(deadline)?;
         let start = Instant::now();
         let admission = budget
@@ -520,7 +575,12 @@ async fn worker(
             .await?;
         let payload = if config.packed() {
             let mut bytes = vec![0; config.size];
-            Fixture::new(config.seed, index, config.size).read_exact(&mut bytes)?;
+            Fixture::new(
+                config.seed,
+                index + if replacement { config.objects } else { 0 },
+                config.size,
+            )
+            .read_exact(&mut bytes)?;
             Some(bytes)
         } else {
             None
@@ -528,6 +588,7 @@ async fn worker(
         let (reply, response) = oneshot::channel();
         let request = Request {
             index,
+            replacement,
             payload,
             admission,
             reply,
@@ -557,6 +618,57 @@ async fn worker(
     Ok(latency)
 }
 
+async fn publish_phase(
+    stage: PublicationStage,
+    store: Store,
+    config: Arc<Config>,
+    budget: Arc<Budget>,
+    deadline: Instant,
+) -> Result<(Latency, f64)> {
+    let start = Instant::now();
+    let (sender, receiver) = mpsc::channel(model::MAX_RECORDS);
+    let builder = tokio::spawn(build(
+        receiver,
+        store.clone(),
+        config.clone(),
+        budget.counters.clone(),
+        deadline,
+    ));
+    let mut workers = Vec::with_capacity(config.concurrency);
+    for index in 0..config.concurrency {
+        workers.push(tokio::spawn(worker(
+            index,
+            stage,
+            config.clone(),
+            budget.clone(),
+            sender.clone(),
+            store.clone(),
+            deadline,
+        )));
+    }
+    drop(sender);
+    let mut latency = Latency::default();
+    let mut error = None;
+    // Join every actual owner before closing SQLite; never abort live filesystem work.
+    for worker in workers {
+        match worker.await {
+            Ok(Ok(value)) => latency.merge(value),
+            Ok(Err(value)) => {
+                error.get_or_insert(value);
+            }
+            Err(value) => {
+                error.get_or_insert(value.into());
+            }
+        }
+    }
+    // Preserve the builder's typed cause ahead of peers that only observed its closed channel.
+    builder.await??;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok((latency, start.elapsed().as_secs_f64()))
+}
+
 fn create_root(path: &Path) -> Result<Arc<node::Node>> {
     node::Node::create(path)
 }
@@ -565,7 +677,12 @@ fn physical_budget(config: &Config) -> model::PhysicalBudget {
     // Reserve final bytes, worst-case one-frame segment overhead per object, and one complete
     // replacement segment. SQLite/WAL and observation headroom remain the coordinator's charge.
     model::PhysicalBudget {
-        limit_bytes: config.objects as u64 * (config.size as u64 + 120) + model::MAX_SEGMENT_LENGTH,
+        // The measurement retains originals, one-quarter overwrites and replacement segments
+        // until its explicit cleanup phase. Reserve those bytes before any physical admission.
+        limit_bytes: config.objects as u64
+            * (config.size as u64 + 120)
+            * if config.measurement { 2 } else { 1 }
+            + model::MAX_SEGMENT_LENGTH,
     }
 }
 
@@ -706,39 +823,24 @@ struct Report {
     pending_limit_records: usize,
     timing_scope: &'static str,
     collection_check: gc::CollectionReport,
+    #[serde(flatten)]
+    measurement: Option<measurement::Metrics>,
 }
 
 async fn run(config: Config) -> Result<Report> {
     config.validate()?;
+    if config.measurement {
+        return measurement::run(config).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
     let lifetime = create_root(&config.root)?;
     let store = Store::open(lifetime.clone(), physical_budget(&config))?;
     let budget = Arc::new(Budget::new(lifetime));
     let config = Arc::new(config);
     let result = async {
-        let publication_start = Instant::now();
-        let (sender, receiver) = mpsc::channel(model::MAX_RECORDS);
-        let builder = tokio::spawn(build(receiver, store.clone(), config.clone(), budget.counters.clone(), deadline));
-        let mut workers = Vec::with_capacity(config.concurrency);
-        for index in 0..config.concurrency {
-            workers.push(tokio::spawn(worker(index, config.clone(), budget.clone(), sender.clone(), store.clone(), deadline)));
-        }
-        drop(sender);
-        let mut latency = Latency::default();
-        let mut error = None;
-        // Join every actual owner before closing SQLite; never abort live filesystem work.
-        for worker in workers {
-            match worker.await {
-                Ok(Ok(value)) => latency.merge(value),
-                Ok(Err(value)) => { error.get_or_insert(value); }
-                Err(value) => { error.get_or_insert(value.into()); }
-            }
-        }
-        // The builder's typed cause takes precedence over workers that merely observed
-        // its channel close. Do not relabel an actual I/O failure because joins took time.
-        builder.await??;
-        if let Some(error) = error { return Err(error); }
-        let publication_seconds = publication_start.elapsed().as_secs_f64();
+        let (latency, publication_seconds) = publish_phase(
+            PublicationStage::Append, store.clone(), config.clone(), budget.clone(), deadline,
+        ).await?;
         let verified = verify(&store, &config, &budget, deadline).await?;
         cleanup(&store, &config.root, deadline).await?;
         // This append-only diagnostic has no dead records. Exercise bounded enumeration and
@@ -764,7 +866,7 @@ async fn run(config: Config) -> Result<Report> {
             packed_records: counters.packed.load(Ordering::SeqCst), dedicated_records: counters.dedicated.load(Ordering::SeqCst),
             peak_admitted_bytes: counters.peak_bytes.load(Ordering::SeqCst), peak_pending_records: counters.peak_pending.load(Ordering::SeqCst),
             publication_seconds, publication_latency: latency, admission_limit_bytes: ADMISSION_BYTES,
-            pending_limit_records: model::MAX_RECORDS, collection_check,
+            pending_limit_records: model::MAX_RECORDS, collection_check, measurement: None,
             timing_scope: "publication includes deterministic fixture generation, admission, filesystem durability/hash validation and SQLite acknowledgement; readback/cleanup excluded; no encoding or S3" })
     }.await;
     let closed = store.close().await;
@@ -830,6 +932,7 @@ mod tests {
             concurrency: 4,
             seed: 0x5eed,
             known_length: true,
+            measurement: false,
             deadline_seconds: 10,
         }
     }
@@ -846,6 +949,7 @@ mod tests {
         (
             Request {
                 index: 0,
+                replacement: false,
                 payload: Some(vec![0; size]),
                 admission,
                 reply,

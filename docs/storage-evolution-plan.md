@@ -89,7 +89,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   rename and directory sync precede SQLite location publication. Explicit file versus segment
   identity/generation/offset/length locations; existing raw/CRNB framing, hashes and encryption
   interpretation. No heap entry per stored object. Report blob-layer, not S3, rates.
-- [ ] **4B: collection/recovery/snapshot prototype**. Select sealed segments at least 50% dead;
+- [x] **4B: collection/recovery/snapshot prototype**. Select sealed segments at least 50% dead;
   reserve replacement space, copy live records, make replacement durable, and conditionally
   relocate exact old identities/locations. Preserve old segments until metadata references and
   reader pins are gone; durable cleanup debt precedes reclamation. Preserve concurrent overwrites
@@ -443,3 +443,19 @@ Phase 4A merged in PR #94 as `3b2edbd` after all 54 checks passed for `825d543`;
 and open branch code-scanning alerts were empty. Phase 4B locally passes the full gate, 66
 packing tests and all 70 live-enabled Python fixtures; its final-head CI is still required.
 No packing comparison or metadata capacity measurement has been charged yet.
+
+Phase 4B merged in PR #95 as `ea553fc` after all 54 checks passed for `706d700`; reviews,
+inline comments and open branch code-scanning alerts were empty. Phase 4C's complete raw-record
+comparison implementation passes the full local gate, 70 packing tests and 84 Python tests
+with every live fixture enabled. Its ninety-arm, five-pair comparison is predeclared; no packing
+measurement or threshold decision has run yet.
+
+2026-09-09: Phase 4C's bounded comparison completed with an **INCONCLUSIVE / KEEP files**
+decision. Eleven of ninety planned arms completed before the first 1-MiB packed arm's fixed
+120-second deadline. No repeated pairs or global streaming controls completed, and no threshold
+was selected. Raw outcomes, process observations and the failed deadline are archived in
+[the packing evaluation](storage-packing-measurement-2026-09.md). Comparison plus evidence export
+charged 326.493302 seconds; the campaign then stood at 918.639472 seconds and 1,778,102,272 peak
+bytes, with no active reservation or temporary dataset. Full local validation passed before the
+run; final-commit CI/integration remains required. This closes the bounded experiment with an
+explicit inconclusive decision, not a performance pass.

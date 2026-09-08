@@ -201,3 +201,12 @@ production backup or placement. Fixed Rust fixtures exercise encrypted protected
 relocation races, interrupted work and invalid snapshots. The diagnostic driver additionally
 checks that an entirely live dataset produces no collection candidate. See
 [`storage-collection-2026-09.md`](../../docs/storage-collection-2026-09.md).
+
+`run.sh packing-measure` runs the predeclared five-pair comparison across six known-length
+ladder sizes, two unknown-length controls and a 2-MiB dedicated-file control. Each arm includes
+conditional overwrite, permanent delete, actual collection/cleanup, survivor/range verification,
+offline snapshot, fresh restore and reopen. It charges all ninety arms and their cleanup to the
+same packing allowance; incomplete or drifting measurements cannot select a threshold. See
+[`storage-packing-measurement-2026-09.md`](../../docs/storage-packing-measurement-2026-09.md).
+The existing `LAB_TEST_PACKING_DRIVER` also enables its tiny complete-pipeline CI fixtures;
+those cannot qualify the predeclared performance matrix.
