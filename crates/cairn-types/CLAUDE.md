@@ -151,3 +151,9 @@ owner preserves its claim. Cancellation
 closes child-lease admission; only a drained ownership set creates a quiescence proof. Coverage
 remains incomplete and startup retains full scans; neither the traits nor test helpers enable
 Phase 3D recovery.
+
+`PrepareStorageRestore` is an exclusive staged-image Writer operation at schema v37. It requires
+a fresh generation, atomically clears coverage identity/completion and cleanup claims, and
+preserves old intent generations, authoritative references, cleanup debts and multipart charges.
+Fan it out to every physical shard. It neither marks coverage complete nor enables journal
+recovery; unsupported source coverage is still rejected by read-only startup preflight.

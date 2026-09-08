@@ -19,9 +19,14 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   no-follow semantics; database symlinks/hard links and database parents nested below the data root
   are rejected. The snapshot format supports only one SQLite shard; it refuses other topologies,
   uses `VACUUM INTO`, preserves `.staging/multipart`, and publishes a versioned size/SHA-256-bound
-  manifest last. Restore rejects snapshot sidecars/symlinks/forward schemas, revalidates its
-  target-owned staging inode, and checkpoints/closes/removes+syncs an old generation's exact
-  sidecars before atomic database publication. Blob restore is no-replace: an existing immutable
+  manifest last. Restore rejects snapshot sidecars/symlinks/forward schemas, validates the copied
+  key bindings without changing them, and uses the staged Writer to establish fresh storage
+  ownership and clear copied coverage/cleanup claims before publication. Intents, debt and live
+  references remain intact. A private receipt binds the prepared inode, bytes, schema and generation;
+  it is checked before and after rename while the original snapshot manifest remains unchanged.
+  Staged and old-generation SQLite connections close before their exact sidecars are removed and
+  synced. Immutable SQLite reads are limited to the closed, sidecar-free prepared image. Blob
+  restore is no-replace: an existing immutable
   path is accepted only when byte-identical, and new paths publish by hard link with an
   `AlreadyExists` re-check. A non-zero reconciliation error count makes restore fail.
 - `integrity --repair` uses the ordinary writer deletion gate with a trusted timestamp and denied

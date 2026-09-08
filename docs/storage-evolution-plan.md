@@ -345,3 +345,32 @@ supported. Every candidate's post-idle journal is empty. Full scans remain manda
 3D is unactivated. Raw experiment artifacts and processes are removed; cumulative costs and
 exact evidence are preserved in the report. Final documentation-head CI and PR #91 integration
 remain required before Phase 3D implementation starts.
+
+
+### Phase 3C integration and Phase 3D review boundaries
+
+PR #91 merged as `a72c98ebb719b6f68b9dc1ea8bc3cccb7f080319` after all 54 checks passed for
+final head `e3a296d08625db99a00eb4297430e1223d63a309`. The final documentation run's browser
+job initially timed out starting Chrome; its isolated retry passed without source or threshold
+changes. PR reviews/comments and branch CodeQL alerts were empty. Findings #88–#90 closed with
+the merge, and the merged branch/worktree were removed. The additional async-savepoint finding
+is fixed in that merge; permission to file its separate tracking issue is still pending.
+
+Phase 3D is split into two sequential review boundaries to keep integration smaller. The first
+prepares restored metadata ownership before publication: canonical staged Writer mutation,
+checkpoint/close, a derived image receipt, immutable validation and the existing read-only key
+binding preflight. It does not add schema, change snapshot format or enable journal startup.
+The second adds the offline baseline operation and legacy coverage/quota holds, with its own
+failure and performance evidence. Each starts from the preceding merged main and must pass
+final-head CI. The Phase 3C cost record remains INCONCLUSIVE; full startup scans remain mandatory.
+
+The restore-preparation implementation is complete on `codex/storage-03d-restore`, based on
+`a72c98e`. Thirteen focused metadata journal tests pass across all engines/doubles/shards;
+25 server snapshot/publication/key-gate tests pass, including interruption on both sides of the
+rename, changed staging files, failed reset and pinned WAL. Both owning all-target/all-feature
+Clippy checks pass. The focused real `recovery_state.py` drill passes encrypted history, Object
+Lock, active multipart recovery, exact row/quota transitions, unchanged snapshot fingerprints,
+and wrong-key refusal before changing either a fresh or existing target. Twelve Python recovery
+helper tests pass. Web lint/build, both npm audits, cargo audit and installer checks pass.
+The complete workspace gate and final-head CI remain required before this PR merges. No further
+local experiment has run; consumption remains 574.519391 seconds and recorded peak 571,154,432 bytes.

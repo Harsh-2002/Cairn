@@ -284,6 +284,47 @@ fn validate_key_gate_reads(
     Ok(states)
 }
 
+/// Validated key state awaiting startup's binding writes and counter initialization.
+#[derive(Debug)]
+pub(crate) struct KeyStatePreflight {
+    ring: Vec<(u16, String, bool)>,
+    sealed_count: u64,
+}
+
+/// Read the existing master-key identity and retirement gate without changing the database or
+/// priming the crypto counter. Restore uses this before publishing its staged database image.
+/// Missing legacy key-state rows remain accepted; this checks recorded bindings and retirement
+/// progress, not the decryptability of every stored ciphertext.
+pub(crate) async fn preflight_key_state(
+    store: &[&SqliteMetadataStore],
+    crypto: &SystemCrypto,
+    cfg: &Config,
+) -> Result<KeyStatePreflight, String> {
+    let ring = ring_for_state(cfg)?;
+    let env_ids: std::collections::HashSet<u16> = ring.iter().map(|(id, _, _)| *id).collect();
+    let active = crypto.active_key_id();
+    let mut sealed_count = 0;
+    for (i, s) in store.iter().enumerate() {
+        let states = validate_key_gate_reads(
+            i,
+            &ring,
+            &env_ids,
+            active,
+            s.key_ring_states().await,
+            s.rewrap_done_active_ids().await,
+        )?;
+        sealed_count = sealed_count.max(
+            states
+                .iter()
+                .filter(|row| row.id == active)
+                .map(|row| row.sealed_count)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+    Ok(KeyStatePreflight { ring, sealed_count })
+}
+
 /// Fail-closed master-key initialization for every SQLite shard.
 ///
 /// Phase 1 reads and validates every shard — durable id→full-hash identity, re-wrap progress, and
@@ -298,20 +339,10 @@ async fn initialize_key_state(
     crypto: &SystemCrypto,
     cfg: &Config,
 ) -> Result<(), String> {
-    let ring = ring_for_state(cfg)?;
-    let env_ids: std::collections::HashSet<u16> = ring.iter().map(|(id, _, _)| *id).collect();
+    let shards: Vec<_> = store.iter().map(Arc::as_ref).collect();
+    let KeyStatePreflight { ring, sealed_count } =
+        preflight_key_state(&shards, crypto, cfg).await?;
     let active = crypto.active_key_id();
-    let mut snapshots = Vec::with_capacity(store.len());
-    for (i, s) in store.iter().enumerate() {
-        snapshots.push(validate_key_gate_reads(
-            i,
-            &ring,
-            &env_ids,
-            active,
-            s.key_ring_states().await,
-            s.rewrap_done_active_ids().await,
-        )?);
-    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -322,18 +353,11 @@ async fn initialize_key_state(
             .map_err(|e| format!("master-key gate: bind configured ring on shard {i}: {e}"))?;
     }
 
-    let base = snapshots
-        .iter()
-        .flatten()
-        .filter(|row| row.id == active)
-        .map(|row| row.sealed_count)
-        .max()
-        .unwrap_or(0);
-    crypto.prime_seal_count(base);
+    crypto.prime_seal_count(sealed_count);
     if !store.is_empty() {
         tracing::info!(
             active_key_id = active,
-            primed_seal_count = base,
+            primed_seal_count = sealed_count,
             ring_keys = ring.len(),
             "master-key identity and retirement gate passed"
         );
@@ -1259,6 +1283,163 @@ mod retire_gate_tests {
             )
             .expect("both an already-upgraded shard and its matching legacy peer must preflight");
         }
+    }
+}
+
+#[cfg(test)]
+mod key_preflight_tests {
+    use super::{build_crypto, initialize_key_state, preflight_key_state, ring_for_state};
+    use crate::config::Config;
+    use rusqlite::{Connection, OpenFlags, types::Value};
+    use std::{path::Path, sync::Arc};
+
+    fn ring_config(keys: &[(u16, u8)]) -> Config {
+        Config {
+            master_key_ring: Some(
+                serde_json::to_string(
+                    &keys
+                        .iter()
+                        .map(|(id, byte)| {
+                            serde_json::json!({"id": id, "key": hex::encode([*byte; 32])})
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .into(),
+            ),
+            ..Config::default()
+        }
+    }
+
+    type TableRows = Vec<Vec<Value>>;
+
+    fn key_tables(path: &Path) -> [TableRows; 2] {
+        let connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        [
+            "SELECT * FROM key_ring_state ORDER BY id",
+            "SELECT * FROM rewrap_progress ORDER BY stream",
+        ]
+        .map(|sql| {
+            let mut statement = connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<TableRows>>()
+                .unwrap()
+        })
+    }
+
+    #[tokio::test]
+    async fn preflight_preserves_legacy_bindings_progress_and_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.db");
+        let cfg = ring_config(&[(1, 1), (2, 2)]);
+        let store = cairn_meta::open(&path, &Default::default()).unwrap();
+        let mut prior_ring = ring_for_state(&cfg).unwrap();
+        for (id, _, active) in &mut prior_ring {
+            *active = *id == 1;
+        }
+        store.key_ring_apply_config(prior_ring, 11).await.unwrap();
+        store.key_ring_sync_seal_count(2, 73).await.unwrap();
+        store
+            .rewrap_set_progress("users".into(), Some("cursor".into()), 5, 1, 31)
+            .await
+            .unwrap();
+        store.checkpoint_and_close().await.unwrap();
+        // Represent an existing legacy snapshot before opening its sole Writer.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE key_ring_state SET key_hash=substr(key_hash, 1, 8) WHERE id=1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = cairn_meta::open(&path, &Default::default()).unwrap();
+        let crypto = build_crypto(&cfg).unwrap();
+        let before = key_tables(&path);
+        preflight_key_state(&[&store], &crypto, &cfg).await.unwrap();
+        assert_eq!(key_tables(&path), before);
+        assert_eq!(
+            crypto.seal_count(),
+            0,
+            "preflight must not prime the counter"
+        );
+
+        let store = Arc::new(store);
+        initialize_key_state(std::slice::from_ref(&store), &crypto, &cfg)
+            .await
+            .unwrap();
+        let states = store.key_ring_states().await.unwrap();
+        assert_eq!(states[0].key_hash, ring_for_state(&cfg).unwrap()[0].1);
+        assert!(!states[0].is_active);
+        assert!(states[1].is_active);
+        assert_eq!(states[0].created_at, 11);
+        assert_eq!(states[1].created_at, 11);
+        assert_eq!(states[1].sealed_count, 73);
+        assert_eq!(crypto.seal_count(), 73);
+        assert_eq!(key_tables(&path)[1], before[1]);
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_absent_legacy_state_without_seeding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.db");
+        let store = cairn_meta::open(&path, &Default::default()).unwrap();
+        let cfg = ring_config(&[(1, 1)]);
+        let crypto = build_crypto(&cfg).unwrap();
+        let before = key_tables(&path);
+        preflight_key_state(&[&store], &crypto, &cfg).await.unwrap();
+        assert_eq!(key_tables(&path), before);
+        assert!(store.key_ring_states().await.unwrap().is_empty());
+        assert_eq!(crypto.seal_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_wrong_or_missing_required_keys_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.db");
+        let store = cairn_meta::open(&path, &Default::default()).unwrap();
+        store
+            .key_ring_apply_config(ring_for_state(&ring_config(&[(1, 1)])).unwrap(), 11)
+            .await
+            .unwrap();
+        store.key_ring_sync_seal_count(1, 73).await.unwrap();
+        let before = key_tables(&path);
+        for (cfg, expected) in [
+            (ring_config(&[(1, 2)]), "same-id replacement"),
+            (ring_config(&[(2, 2)]), "retire-gate"),
+            (Config::default(), "same-id replacement"),
+        ] {
+            let crypto = build_crypto(&cfg).unwrap();
+            let error = preflight_key_state(&[&store], &crypto, &cfg)
+                .await
+                .expect_err("a recorded key cannot be replaced or prematurely retired");
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(key_tables(&path), before);
+            assert_eq!(crypto.seal_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn later_shard_key_failure_prevents_earlier_shard_initialization() {
+        let first = Arc::new(cairn_meta::open_in_memory().unwrap());
+        let second = Arc::new(cairn_meta::open_in_memory().unwrap());
+        second
+            .key_ring_apply_config(ring_for_state(&ring_config(&[(1, 1)])).unwrap(), 11)
+            .await
+            .unwrap();
+        let cfg = ring_config(&[(1, 2)]);
+        let crypto = build_crypto(&cfg).unwrap();
+        let error = initialize_key_state(&[first.clone(), second], &crypto, &cfg)
+            .await
+            .expect_err("all shards must preflight before any binding write");
+        assert!(error.contains("shard 1"), "{error}");
+        assert!(first.key_ring_states().await.unwrap().is_empty());
+        assert_eq!(crypto.seal_count(), 0);
     }
 }
 

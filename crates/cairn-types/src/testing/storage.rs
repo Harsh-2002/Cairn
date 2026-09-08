@@ -42,6 +42,16 @@ pub(super) fn begin(st: &mut State, generation: StorageToken) -> MutationOutcome
     MutationOutcome::Ack
 }
 
+pub(super) fn prepare_restore(st: &mut State, generation: StorageToken) -> R<MutationOutcome> {
+    if st.storage.generation.as_ref() == Some(&generation) {
+        return Err(invalid(
+            "storage restore requires a fresh generation and recovery state",
+        ));
+    }
+    // The protocol-2 double only represents incomplete coverage, just like schema v37 startup.
+    Ok(begin(st, generation))
+}
+
 pub(super) fn apply(
     st: &mut State,
     bucket: &BucketName,

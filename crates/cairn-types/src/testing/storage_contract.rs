@@ -638,6 +638,154 @@ fn publish_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
     }
 }
 
+/// Restore preparation fences copied claims without forgiving physical work or quota charges.
+pub async fn assert_prepare_storage_restore(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-restore-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    meta.submit(Mutation::SetBucketQuota {
+        bucket: bucket.clone(),
+        quota_bytes: Some(40),
+    })
+    .await
+    .unwrap();
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let owner = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let object = plan(&bucket, &generation);
+    let row = object_row(object.plan(), owner);
+    admit_object(meta, object.plan()).await;
+    assert!(matches!(
+        meta.submit(Mutation::PublishStorageWrite {
+            plan: Box::new(object.plan().clone()),
+            operation: Box::new(put(row.clone())),
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::Put { .. }
+    ));
+    let upload = create_upload(meta, &bucket).await;
+    // One live object, one replaced part's cleanup debt, one live part and one pending
+    // replacement each retain ten bytes. All four must still count after restore preparation.
+    for _ in 0..2 {
+        let part = part_plan(&bucket, &generation, &upload);
+        assert!(matches!(
+            meta.submit(reserve_part(&part)).await.unwrap(),
+            MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+        ));
+        assert!(matches!(
+            meta.submit(publish_part(&part)).await.unwrap(),
+            MutationOutcome::PartRecorded { .. }
+        ));
+    }
+    let pending = part_plan(&bucket, &generation, &upload);
+    assert!(matches!(
+        meta.submit(reserve_part(&pending)).await.unwrap(),
+        MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+    ));
+    let session = meta.get_multipart(&upload).await.unwrap();
+    let parts = meta.list_parts(&upload, 0, 100).await.unwrap();
+    let reservations = meta
+        .enumerate_stale_multipart_reservations(Timestamp(1), 100)
+        .await
+        .unwrap();
+    let debts = meta.list_multipart_cleanups(100).await.unwrap();
+    // Protocol-2 ownership excludes these rows from legacy time-based cleanup enumerators.
+    assert!(reservations.is_empty());
+    assert!(debts.is_empty());
+    let old_claims = claim(meta, &generation, 100, 0).await;
+    assert_eq!(old_claims.len(), 5);
+    assert!(
+        old_claims
+            .iter()
+            .any(|cleanup| cleanup.quota_debt_id.is_some())
+    );
+    assert!(matches!(
+        meta.submit(reserve_part(&part_plan(&bucket, &generation, &upload)))
+            .await,
+        Err(crate::MetaError::QuotaExceeded)
+    ));
+    assert!(
+        meta.submit(Mutation::PrepareStorageRestore {
+            generation: generation.clone(),
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        claim(meta, &generation, 100, 1).await.is_empty(),
+        "rejected preparation must retain every existing lease"
+    );
+
+    let restored = StorageToken::generate();
+    assert_eq!(
+        meta.submit(Mutation::PrepareStorageRestore {
+            generation: restored.clone(),
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::Ack
+    );
+    assert_eq!(meta.get_multipart(&upload).await.unwrap(), session);
+    assert_eq!(meta.list_parts(&upload, 0, 100).await.unwrap(), parts);
+    assert_eq!(
+        meta.enumerate_stale_multipart_reservations(Timestamp(1), 100)
+            .await
+            .unwrap(),
+        reservations
+    );
+    assert_eq!(meta.list_multipart_cleanups(100).await.unwrap(), debts);
+    assert_eq!(
+        meta.get_version(&bucket, &row.key, &row.version_id)
+            .await
+            .unwrap(),
+        Some(row)
+    );
+    assert_eq!(
+        meta.submit(Mutation::ListStorageIntents {
+            generation: restored.clone(),
+            limit: 100,
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::StorageIntentBatch(vec![pending.clone()])
+    );
+    assert_eq!(
+        meta.submit(publish_part(&pending)).await.unwrap(),
+        MutationOutcome::StoragePublicationNotApplied
+    );
+    assert!(matches!(
+        meta.submit(reserve_part(&part_plan(&bucket, &restored, &upload)))
+            .await,
+        Err(crate::MetaError::QuotaExceeded)
+    ));
+    for cleanup in &old_claims {
+        update(
+            meta,
+            &bucket,
+            StorageMutation::FinishCleanup {
+                cleanup: cleanup.clone(),
+                now: Timestamp(1),
+            },
+            false,
+        )
+        .await;
+    }
+    let new_claims = claim(meta, &restored, 100, 1).await;
+    assert_eq!(new_claims.len(), old_claims.len());
+    for cleanup in &new_claims {
+        let old = old_claims.iter().find(|old| old.id == cleanup.id).unwrap();
+        assert_eq!(cleanup.path, old.path);
+        assert_eq!(cleanup.bucket, old.bucket);
+        assert_eq!(cleanup.quota_debt_id, old.quota_debt_id);
+        assert_ne!(cleanup.claim_token, old.claim_token);
+        assert_eq!(cleanup.generation, restored);
+    }
+}
+
 async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
     let bucket = BucketName::parse("storage-part-quota-contract").unwrap();
     create_bucket(meta, &bucket).await;
@@ -1031,6 +1179,11 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn in_memory_prepare_storage_restore_contract() {
+        super::assert_prepare_storage_restore(&crate::testing::InMemoryMetadataStore::new()).await;
+    }
+
     #[tokio::test]
     async fn storage_admission_ack_loss_preserves_joint_reservation_and_intent() {
         use super::*;

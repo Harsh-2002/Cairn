@@ -141,5 +141,11 @@ intents; settlement requires the exact id/path/bucket/token/generation/unexpired
 after durable physical absence. Per-bucket operations retain routing after bucket/session deletion;
 generation changes reach every shard and global claims remain bounded. SQLite, libSQL, Turso and
 the in-memory double preserve these savepoint and typed outcome semantics. Coverage remains
-incomplete and Phase 3C gates remain tracked in `docs/storage-evolution-plan.md`; Phase 3D is not
-active.
+incomplete and startup retains full scans; phase gates remain tracked in
+`docs/storage-evolution-plan.md`.
+
+`PrepareStorageRestore` is an exclusive staged-image Writer operation at schema v37. It requires
+a fresh generation, atomically clears coverage identity/completion and cleanup claims, and
+preserves old intent generations, authoritative references, cleanup debts and multipart charges.
+Fan it out to every physical shard. It neither marks coverage complete nor enables journal
+recovery; unsupported source coverage is still rejected by read-only startup preflight.

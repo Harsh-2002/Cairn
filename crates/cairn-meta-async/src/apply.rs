@@ -106,6 +106,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         Mutation::BeginStorageGeneration { generation } => {
             crate::storage::begin(driver, &generation).await
         }
+        Mutation::PrepareStorageRestore { generation } => {
+            crate::storage::prepare_restore(driver, &generation).await
+        }
         Mutation::Storage { bucket, operation } => {
             crate::storage::apply(driver, &bucket, operation).await
         }

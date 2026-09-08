@@ -170,6 +170,15 @@ impl MetadataStore for ShardedMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::PrepareStorageRestore { generation } => {
+                for shard in &self.shards {
+                    match shard.submit(Mutation::PrepareStorageRestore { generation: generation.clone() }).await? {
+                        MutationOutcome::Ack => {},
+                        _ => return Err(MetaError::Engine("unexpected storage restore preparation outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::ListStorageIntents { generation, limit } => {
                 let mut remaining = limit.clamp(1,1000);
                 let mut batch = Vec::new();
@@ -1093,6 +1102,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
         | Mutation::BeginStorageGeneration { .. }
+        | Mutation::PrepareStorageRestore { .. }
         | Mutation::ListStorageIntents { .. }
         | Mutation::ClaimStorageCleanup { .. }
         | Mutation::ClaimReplicationUploadCleanup { .. }

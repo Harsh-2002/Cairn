@@ -85,6 +85,13 @@ pub enum Mutation {
     BeginStorageGeneration {
         generation: crate::storage::StorageToken,
     },
+    /// Prepare a validated, target-owned restore image before its publication rename. Atomically
+    /// establish a fresh generation, invalidate copied coverage and cleanup claims, and preserve
+    /// every authoritative row, old intent, cleanup debt and multipart charge. Reusing the current
+    /// generation is an error. The caller owns the exclusive node lock and the staged database.
+    PrepareStorageRestore {
+        generation: crate::storage::StorageToken,
+    },
     /// Per-bucket physical admission, cancellation and cleanup. Routing survives bucket deletion.
     Storage {
         bucket: BucketName,

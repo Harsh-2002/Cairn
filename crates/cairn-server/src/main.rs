@@ -1087,7 +1087,7 @@ async fn snapshot_sqlite_database(
 }
 
 fn validate_snapshot_database(path: &std::path::Path) -> Result<(), String> {
-    use rusqlite::{OpenFlags, OptionalExtension};
+    use rusqlite::OpenFlags;
 
     ensure_regular_file_no_symlink(path, "snapshot database")?;
     let conn = rusqlite::Connection::open_with_flags(
@@ -1095,6 +1095,12 @@ fn validate_snapshot_database(path: &std::path::Path) -> Result<(), String> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| format!("failed to open snapshot database: {error}"))?;
+    validate_snapshot_connection(&conn)
+}
+
+fn validate_snapshot_connection(conn: &rusqlite::Connection) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+
     let mut statement = conn
         .prepare("PRAGMA integrity_check")
         .map_err(|error| format!("failed to start SQLite integrity_check: {error}"))?;
@@ -1707,6 +1713,14 @@ fn restore(cfg: Config, dir: &std::path::Path, node_lock: Arc<node_lock::NodeLoc
                 }
             };
 
+        let prepared = match prepare_staged_database(staged, &cfg).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("failed to prepare restored storage ownership: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
         // Make any old sidecar-owning generation self-contained before the publication name can
         // change. Crashing before rename then reopens old state; crashing after rename sees only
         // the new, independently validated image.
@@ -1724,15 +1738,8 @@ fn restore(cfg: Config, dir: &std::path::Path, node_lock: Arc<node_lock::NodeLoc
 
         // Revalidate the target-owned staging inode immediately before the one metadata
         // linearization point. Publication also refuses if an old sidecar has reappeared.
-        if let Err(error) = publish_staged_database(staged, &cfg.db_path, &snapshot.manifest).await
-        {
+        if let Err(error) = publish_staged_database(prepared, &cfg.db_path).await {
             eprintln!("failed to restore database: {error}");
-            return ExitCode::FAILURE;
-        }
-        if let Err(error) =
-            validate_database_against_manifest(&cfg.db_path, &snapshot.manifest).await
-        {
-            eprintln!("restored database validation failed: {error}");
             return ExitCode::FAILURE;
         }
 
@@ -1870,6 +1877,7 @@ async fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
 struct StagedDatabase {
     path: std::path::PathBuf,
     published: bool,
+    connections_closed: bool,
 }
 
 impl StagedDatabase {
@@ -1880,8 +1888,13 @@ impl StagedDatabase {
 
 impl Drop for StagedDatabase {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.published && self.connections_closed {
             let _ = std::fs::remove_file(&self.path);
+            if let Ok(sidecars) = present_sqlite_sidecars(&self.path) {
+                for sidecar in sidecars {
+                    let _ = std::fs::remove_file(sidecar);
+                }
+            }
         }
     }
 }
@@ -1959,9 +1972,181 @@ async fn stage_snapshot_database(
     let staged = StagedDatabase {
         path: staged,
         published: false,
+        connections_closed: true,
     };
     validate_database_against_manifest(staged.path(), manifest).await?;
     Ok(staged)
+}
+
+/// A validated snapshot becomes publishable only after its copied process ownership is fenced
+/// through its own Writer and every SQLite connection has closed. The source manifest continues
+/// to describe the untouched backup; this private receipt binds the transformed staging inode.
+#[derive(Debug)]
+struct PreparedDatabase {
+    staged: StagedDatabase,
+    receipt: PreparedDatabaseReceipt,
+}
+
+#[derive(Debug)]
+struct PreparedDatabaseReceipt {
+    file: std::fs::File,
+    size: u64,
+    sha256: String,
+    schema_version: i64,
+    generation: cairn_types::storage::StorageToken,
+}
+
+async fn prepare_staged_database(
+    mut staged: StagedDatabase,
+    cfg: &Config,
+) -> Result<PreparedDatabase, String> {
+    use cairn_types::MetadataStore;
+
+    let crypto = stack::build_crypto(cfg)?;
+    // If open or shutdown cannot prove that every owned connection stopped, preserve the exact
+    // staging files for diagnosis rather than unlinking beneath a possibly live SQLite owner.
+    staged.connections_closed = false;
+    let store = cairn_meta::open(
+        staged.path(),
+        &cairn_meta::OpenOptions {
+            synchronous_full: true,
+            read_pool_size: 1,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("failed to open staged metadata Writer: {error}"))?;
+    let generation = cairn_types::storage::StorageToken::generate();
+    let preparation = async {
+        stack::preflight_key_state(&[&store], &crypto, cfg).await?;
+        match store
+            .submit(cairn_types::Mutation::PrepareStorageRestore {
+                generation: generation.clone(),
+            })
+            .await
+            .map_err(|error| format!("failed to reset staged storage ownership: {error}"))?
+        {
+            cairn_types::MutationOutcome::Ack => Ok(()),
+            _ => Err("unexpected staged storage preparation acknowledgement".to_owned()),
+        }
+    }
+    .await;
+    let closed = close_staged_database(&mut staged, store).await;
+    preparation?;
+    closed?;
+    sync_closed_database(staged.path()).await?;
+    let conn = open_prepared_database(staged.path())?;
+    let schema_version = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| format!("failed to read prepared schema version: {error}"))?;
+    drop(conn);
+    let file = cairn_blob::open_readonly_nofollow(staged.path())
+        .map_err(|error| format!("failed to retain prepared database inode: {error}"))?;
+    let (size, sha256) = file_fingerprint(staged.path()).await?;
+    let receipt = PreparedDatabaseReceipt {
+        file,
+        size,
+        sha256,
+        schema_version,
+        generation,
+    };
+    validate_prepared_database(staged.path(), &receipt).await?;
+    Ok(PreparedDatabase { staged, receipt })
+}
+
+async fn close_staged_database(
+    staged: &mut StagedDatabase,
+    store: cairn_meta::SqliteMetadataStore,
+) -> Result<(), String> {
+    let stats = store
+        .checkpoint_and_close()
+        .await
+        .map_err(|error| format!("failed to checkpoint and close staged metadata: {error}"))?;
+    if stats.busy {
+        return Err("staged database WAL is busy; restored generation was not published".into());
+    }
+    staged.connections_closed = true;
+    Ok(())
+}
+
+/// Immutable mode is limited to this closed, sidecar-free, target-owned image. Ordinary live
+/// metadata reads must keep SQLite's WAL visibility and never use this connection helper.
+fn open_prepared_database(path: &std::path::Path) -> Result<rusqlite::Connection, String> {
+    use rusqlite::OpenFlags;
+    use std::fmt::Write;
+
+    ensure_regular_file_no_symlink(path, "prepared database")?;
+    if !present_sqlite_sidecars(path)?.is_empty() {
+        return Err("prepared database unexpectedly has a SQLite sidecar".into());
+    }
+    let absolute = std::fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve prepared database: {error}"))?;
+    let mut uri = "file:".to_owned();
+    for &byte in absolute.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            write!(&mut uri, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    uri.push_str("?immutable=1");
+    rusqlite::Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| format!("failed to open prepared database: {error}"))
+}
+
+fn validate_prepared_inode(
+    path: &std::path::Path,
+    receipt: &PreparedDatabaseReceipt,
+) -> Result<(), String> {
+    let current = cairn_blob::open_readonly_nofollow(path)
+        .and_then(|file| file.metadata())
+        .map_err(|error| format!("failed to inspect prepared database inode: {error}"))?;
+    let expected = receipt
+        .file
+        .metadata()
+        .map_err(|error| format!("failed to inspect retained database inode: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if current.is_file() && expected.dev() == current.dev() && expected.ino() == current.ino() {
+            return Ok(());
+        }
+        Err("prepared database inode changed".into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (current, expected);
+        Err("prepared database identity checks require a POSIX filesystem".into())
+    }
+}
+
+async fn validate_prepared_database(
+    path: &std::path::Path,
+    receipt: &PreparedDatabaseReceipt,
+) -> Result<(), String> {
+    validate_prepared_inode(path, receipt)?;
+    let (size, sha256) = file_fingerprint(path).await?;
+    if size != receipt.size || sha256 != receipt.sha256 {
+        return Err("prepared database digest mismatch".into());
+    }
+    let conn = open_prepared_database(path)?;
+    validate_snapshot_connection(&conn)?;
+    let prepared: bool = conn.query_row(
+        "SELECT (SELECT MAX(version) FROM schema_migrations)=?1 AND generation=?2 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM storage_cleanups WHERE claim_token IS NOT NULL OR claim_generation IS NOT NULL OR lease_until IS NOT NULL) FROM storage_recovery_state WHERE singleton=1",
+        rusqlite::params![receipt.schema_version, receipt.generation.as_str()],
+        |row| row.get(0),
+    ).map_err(|error| format!("failed to validate prepared storage ownership: {error}"))?;
+    if !prepared {
+        return Err("prepared database storage ownership mismatch".into());
+    }
+    drop(conn);
+    validate_prepared_inode(path, receipt)
 }
 
 async fn sync_regular_file_no_symlink(path: &std::path::Path) -> Result<(), String> {
@@ -2001,6 +2186,11 @@ async fn prepare_target_database_for_publish(destination: &std::path::Path) -> R
             stats.checkpointed_frames, stats.log_frames
         ));
     }
+    sync_closed_database(destination).await
+}
+
+/// All owned SQLite connections have closed before this helper removes exact sidecars.
+async fn sync_closed_database(destination: &std::path::Path) -> Result<(), String> {
     sync_regular_file_no_symlink(destination).await?;
     for sidecar in present_sqlite_sidecars(destination)? {
         remove_file_if_present(&sidecar).await.map_err(|error| {
@@ -2020,11 +2210,10 @@ async fn prepare_target_database_for_publish(destination: &std::path::Path) -> R
 }
 
 async fn publish_staged_database(
-    mut staged: StagedDatabase,
+    mut prepared: PreparedDatabase,
     destination: &std::path::Path,
-    manifest: &SnapshotManifest,
 ) -> Result<(), String> {
-    validate_database_against_manifest(staged.path(), manifest).await?;
+    validate_prepared_database(prepared.staged.path(), &prepared.receipt).await?;
     validate_target_database_entry(destination)?;
     let sidecars = present_sqlite_sidecars(destination)?;
     if !sidecars.is_empty() {
@@ -2033,17 +2222,18 @@ async fn publish_staged_database(
             sidecars[0].display()
         ));
     }
-    tokio::fs::rename(staged.path(), destination)
+    tokio::fs::rename(prepared.staged.path(), destination)
         .await
         .map_err(|error| format!("failed to atomically publish restored database: {error}"))?;
-    staged.published = true;
+    prepared.staged.published = true;
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     sync_directory(parent)
         .await
-        .map_err(|error| format!("failed to sync published database generation: {error}"))
+        .map_err(|error| format!("failed to sync published database generation: {error}"))?;
+    validate_prepared_database(destination, &prepared.receipt).await
 }
 
 fn invalid_filesystem_entry(message: impl Into<String>) -> std::io::Error {
@@ -2569,11 +2759,11 @@ mod tests {
     use super::{
         Cli, Config, SNAPSHOT_BLOB_DIRECTORY, SNAPSHOT_DATABASE_FILE, SNAPSHOT_MANIFEST_FILE,
         SnapshotManifest, build_snapshot_manifest, copy_blob_tree, database_artifact_names,
-        prepare_target_database_for_publish, publish_staged_copy_no_replace,
-        publish_staged_database, repair_dangling_rows, require_canonical_backup_topology,
-        schema_version, snapshot_sqlite_database, stage_snapshot_database,
-        validate_restore_reconcile_report, validate_snapshot, validate_snapshot_database,
-        verify_snapshot_blob_references, write_snapshot_manifest_last,
+        prepare_staged_database, prepare_target_database_for_publish,
+        publish_staged_copy_no_replace, publish_staged_database, repair_dangling_rows,
+        require_canonical_backup_topology, schema_version, snapshot_sqlite_database,
+        stage_snapshot_database, validate_restore_reconcile_report, validate_snapshot,
+        validate_snapshot_database, verify_snapshot_blob_references, write_snapshot_manifest_last,
     };
     use clap::Parser;
 
@@ -2591,6 +2781,91 @@ mod tests {
             .await
             .unwrap();
         (snapshot, manifest)
+    }
+
+    async fn create_restore_source(database: &std::path::Path, blobs: &std::path::Path) {
+        use cairn_types::testing::FixtureMetadataStore;
+        use cairn_types::{MetadataStore, Mutation, Timestamp};
+
+        let store = cairn_meta::open(database, &cairn_meta::OpenOptions::default()).unwrap();
+        let fixture = store.begin_fixture().await.unwrap();
+        let bucket = cairn_types::BucketName::parse("bucket").unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(cairn_types::Bucket {
+                name: bucket.clone(),
+                owner_id: cairn_types::UserId("admin".into()),
+                created_at: Timestamp(0),
+                versioning: cairn_types::VersioningState::Enabled,
+                ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".into(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
+        let mut row = dangling_row(&bucket, "object");
+        row.storage_path = Some(cairn_types::StoragePath::from_string(
+            "bucket/00000000000000000000000000000000".into(),
+        ));
+        row.size_logical = 6;
+        row.size_physical = 6;
+        store
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Default::default(),
+                    initial_state: Default::default(),
+                    replication: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let pending = fixture
+            .object_plan(&dangling_row(&bucket, "pending"))
+            .unwrap();
+        store
+            .submit(Mutation::Storage {
+                bucket,
+                operation: cairn_types::storage::StorageMutation::Reserve {
+                    plan: Box::new(pending),
+                    now: Timestamp(1),
+                },
+            })
+            .await
+            .unwrap();
+        store
+            .submit(Mutation::ClaimStorageCleanup {
+                generation: fixture.generation().clone(),
+                limit: 100,
+                now: Timestamp(1),
+                lease_secs: 60,
+            })
+            .await
+            .unwrap();
+        store.checkpoint_and_close().await.unwrap();
+        let conn = rusqlite::Connection::open(database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO multipart_uploads(id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+             VALUES ('11111111111111111111111111111111','bucket','multipart','application/octet-stream','active','admin','[]',1,1);
+             INSERT INTO multipart_parts(upload_id,part_number,size,etag,storage_path)
+             VALUES ('11111111111111111111111111111111',1,4,'part-etag','.staging/multipart/11111111111111111111111111111111/00001-22222222222222222222222222222222');
+             INSERT INTO multipart_staging_cleanups(id,upload_id,bucket_name,principal_id,bytes,storage_path,created_at,storage_protocol)
+             VALUES ('retained-charge','old-upload','bucket','admin',7,'.staging/multipart/33333333333333333333333333333333/00001-44444444444444444444444444444444',1,2);
+             INSERT INTO storage_cleanups(id,storage_path,bucket_name,quota_debt_id,claim_token,claim_generation,lease_until,quota_owner_path)
+             SELECT '55555555555555555555555555555555','.staging/multipart/33333333333333333333333333333333/00001-44444444444444444444444444444444','bucket','retained-charge','66666666666666666666666666666666',generation,60001,'.staging/multipart/33333333333333333333333333333333/00001-44444444444444444444444444444444' FROM storage_recovery_state WHERE singleton=1;
+             INSERT INTO multipart_bucket_stats VALUES ('bucket',1,11);
+             INSERT INTO multipart_principal_stats VALUES ('admin',1,11);"
+        ).unwrap();
+        drop(conn);
+        std::fs::create_dir_all(blobs.join("bucket")).unwrap();
+        std::fs::create_dir_all(blobs.join(".staging/multipart/11111111111111111111111111111111"))
+            .unwrap();
+        std::fs::write(
+            blobs.join("bucket/00000000000000000000000000000000"),
+            b"object",
+        )
+        .unwrap();
+        std::fs::write(blobs.join(".staging/multipart/11111111111111111111111111111111/00001-22222222222222222222222222222222"), b"part").unwrap();
     }
 
     fn dangling_row(bucket: &cairn_types::BucketName, key: &str) -> cairn_types::ObjectVersionRow {
@@ -3326,32 +3601,10 @@ mod tests {
         let restored_db = root.path().join("restored.db");
         let source_blobs = root.path().join("source-blobs");
         let snapshot_blobs = root.path().join("snapshot-blobs");
-        std::fs::create_dir_all(source_blobs.join("bucket")).unwrap();
-        std::fs::create_dir_all(source_blobs.join(".staging/multipart/upload")).unwrap();
-        std::fs::write(source_blobs.join("bucket/object"), b"object").unwrap();
-        std::fs::write(source_blobs.join(".staging/multipart/upload/part"), b"part").unwrap();
-
-        let conn = rusqlite::Connection::open(&source_db).unwrap();
-        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_migrations (
-                 version INTEGER PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 applied_at INTEGER NOT NULL
-             );
-             INSERT INTO schema_migrations VALUES (1, 'test', 1);
-             CREATE TABLE object_versions (storage_path TEXT);
-             CREATE TABLE multipart_parts (storage_path TEXT NOT NULL);
-             INSERT INTO object_versions VALUES ('bucket/object');
-             INSERT INTO multipart_parts VALUES ('.staging/multipart/upload/part');",
-        )
-        .unwrap();
-        conn.execute(
-            "VACUUM INTO ?1",
-            rusqlite::params![snapshot_db.to_str().unwrap()],
-        )
-        .unwrap();
-        drop(conn);
+        create_restore_source(&source_db, &source_blobs).await;
+        snapshot_sqlite_database(&source_db, &snapshot_db)
+            .await
+            .unwrap();
         copy_blob_tree(&source_blobs, &snapshot_blobs, &[])
             .await
             .unwrap();
@@ -3367,7 +3620,10 @@ mod tests {
         prepare_target_database_for_publish(&restored_db)
             .await
             .unwrap();
-        publish_staged_database(staged, &restored_db, &manifest)
+        let prepared = prepare_staged_database(staged, &Config::default())
+            .await
+            .unwrap();
+        publish_staged_database(prepared, &restored_db)
             .await
             .unwrap();
         assert!(!super::sqlite_sidecar_path(&restored_db, "-wal").exists());
@@ -3378,9 +3634,241 @@ mod tests {
             2
         );
 
-        std::fs::remove_file(snapshot_blobs.join("bucket/object")).unwrap();
+        std::fs::remove_file(snapshot_blobs.join("bucket/00000000000000000000000000000000"))
+            .unwrap();
         let error = verify_snapshot_blob_references(&restored_db, &snapshot_blobs).unwrap_err();
         assert!(error.contains("missing referenced blob"), "{error}");
+    }
+
+    fn restore_image_rows(
+        database: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let conn = super::open_prepared_database(database).unwrap();
+        let tables = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = conn
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                rows.sort_by_cached_key(|row| format!("{row:?}"));
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restore_preparation_preserves_every_row_except_copied_process_ownership() {
+        use rusqlite::types::Value;
+
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let source = root.path().join("source.db");
+        create_restore_source(&source, &snapshot.join("blobs")).await;
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        snapshot_sqlite_database(&source, &database).await.unwrap();
+        let manifest = build_snapshot_manifest(&database).await.unwrap();
+        write_snapshot_manifest_last(&snapshot, &manifest)
+            .await
+            .unwrap();
+        validate_snapshot(&snapshot).await.unwrap();
+        let original_database = std::fs::read(&database).unwrap();
+        let original_manifest = std::fs::read(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap();
+        let mut expected = restore_image_rows(&database);
+        for table in [
+            "object_versions",
+            "multipart_parts",
+            "multipart_staging_cleanups",
+            "storage_write_intents",
+            "storage_intent_paths",
+            "storage_cleanups",
+            "multipart_bucket_stats",
+            "multipart_principal_stats",
+        ] {
+            assert!(
+                !expected[table].is_empty(),
+                "vacuous restore coverage: {table}"
+            );
+        }
+        assert!(
+            expected["storage_cleanups"]
+                .iter()
+                .all(|row| row[4] != Value::Null)
+        );
+        let target = root.path().join("target ?#%.db");
+        std::fs::write(&target, b"old generation").unwrap();
+        let staged = stage_snapshot_database(&database, &target, &manifest)
+            .await
+            .unwrap();
+        let prepared = prepare_staged_database(staged, &Config::default())
+            .await
+            .unwrap();
+        let state = &mut expected.get_mut("storage_recovery_state").unwrap()[0];
+        assert_ne!(
+            state[1],
+            Value::Text(prepared.receipt.generation.as_str().into())
+        );
+        state[1] = Value::Text(prepared.receipt.generation.as_str().into());
+        state[2] = Value::Null;
+        state[3] = Value::Text("incomplete".into());
+        state[4] = Value::Null;
+        for row in expected.get_mut("storage_cleanups").unwrap() {
+            row[4..7].fill(Value::Null);
+        }
+        assert_eq!(restore_image_rows(prepared.staged.path()), expected);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old generation");
+        assert!(
+            super::present_sqlite_sidecars(prepared.staged.path())
+                .unwrap()
+                .is_empty()
+        );
+        publish_staged_database(prepared, &target).await.unwrap();
+        assert_eq!(restore_image_rows(&target), expected);
+        assert!(super::present_sqlite_sidecars(&target).unwrap().is_empty());
+        assert_eq!(std::fs::read(&database).unwrap(), original_database);
+        assert_eq!(
+            std::fs::read(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap(),
+            original_manifest
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_publication_rejects_changed_bytes_inode_ownership_and_old_sidecars() {
+        for failure in ["digest", "inode", "ownership", "sidecar"] {
+            let root = tempfile::tempdir().unwrap();
+            let (snapshot, manifest) = create_complete_empty_snapshot(root.path()).await;
+            let source = snapshot.join(SNAPSHOT_DATABASE_FILE);
+            let original = std::fs::read(&source).unwrap();
+            let target = root.path().join("target.db");
+            std::fs::write(&target, b"old generation").unwrap();
+            let staged = stage_snapshot_database(&source, &target, &manifest)
+                .await
+                .unwrap();
+            let mut prepared = prepare_staged_database(staged, &Config::default())
+                .await
+                .unwrap();
+            let staged_path = prepared.staged.path().to_owned();
+            match failure {
+                "digest" => {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&staged_path)
+                        .unwrap()
+                        .write_all(b"changed")
+                        .unwrap();
+                }
+                "inode" => {
+                    let replacement = root.path().join("replacement.db");
+                    std::fs::copy(&staged_path, &replacement).unwrap();
+                    std::fs::rename(replacement, &staged_path).unwrap();
+                }
+                "ownership" => {
+                    prepared.receipt.generation = cairn_types::storage::StorageToken::generate()
+                }
+                "sidecar" => {
+                    std::fs::write(super::sqlite_sidecar_path(&target, "-wal"), b"old WAL").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let error = publish_staged_database(prepared, &target)
+                .await
+                .unwrap_err();
+            assert!(error.contains(failure), "{failure}: {error}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"old generation");
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert!(!staged_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_preparation_failure_closes_writer_before_cleaning_exact_staging_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (snapshot, _) = create_complete_empty_snapshot(root.path()).await;
+        let source = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_restore_reset BEFORE UPDATE ON storage_recovery_state BEGIN SELECT RAISE(ABORT,'injected restore reset failure'); END;").unwrap();
+        drop(conn);
+        let manifest = build_snapshot_manifest(&source).await.unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let target = root.path().join("target.db");
+        std::fs::write(&target, b"old generation").unwrap();
+        let staged = stage_snapshot_database(&source, &target, &manifest)
+            .await
+            .unwrap();
+        let staged_path = staged.path().to_owned();
+        let unrelated = super::sqlite_sidecar_path(&staged_path, "-unrelated");
+        std::fs::write(&unrelated, b"preserve").unwrap();
+        let error = prepare_staged_database(staged, &Config::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("failed to reset staged storage ownership"),
+            "{error}"
+        );
+        assert!(error.contains("metadata uniqueness conflict"), "{error}");
+        assert!(!staged_path.exists());
+        assert!(
+            super::present_sqlite_sidecars(&staged_path)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old generation");
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn restore_preparation_refuses_a_pinned_staged_wal_without_unlinking_it() {
+        use cairn_types::MetadataStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let (snapshot, manifest) = create_complete_empty_snapshot(root.path()).await;
+        let target = root.path().join("target.db");
+        std::fs::write(&target, b"old generation").unwrap();
+        let mut staged =
+            stage_snapshot_database(&snapshot.join(SNAPSHOT_DATABASE_FILE), &target, &manifest)
+                .await
+                .unwrap();
+        let staged_path = staged.path().to_owned();
+        staged.connections_closed = false;
+        let store = cairn_meta::open(&staged_path, &cairn_meta::OpenOptions::default()).unwrap();
+        let reader = rusqlite::Connection::open(&staged_path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row(
+                "SELECT coverage_state FROM storage_recovery_state",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        store
+            .submit(cairn_types::Mutation::PrepareStorageRestore {
+                generation: cairn_types::storage::StorageToken::generate(),
+            })
+            .await
+            .unwrap();
+        let error = super::close_staged_database(&mut staged, store)
+            .await
+            .unwrap_err();
+        assert!(error.contains("WAL is busy"), "{error}");
+        drop(staged);
+        assert!(staged_path.exists());
+        assert!(super::sqlite_sidecar_path(&staged_path, "-wal").exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old generation");
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
@@ -3419,7 +3907,7 @@ mod tests {
         new_writer
             .execute_batch(
                 "CREATE TABLE generation (value TEXT NOT NULL);
-                 INSERT INTO generation VALUES ('new-main');",
+             INSERT INTO generation VALUES ('new-main');",
             )
             .unwrap();
         drop(new_writer);
@@ -3455,7 +3943,11 @@ mod tests {
         );
         drop(old_reopen);
 
-        publish_staged_database(staged, &old_database, &manifest)
+        let prepared = prepare_staged_database(staged, &Config::default())
+            .await
+            .unwrap();
+        let prepared_generation = prepared.receipt.generation.clone();
+        publish_staged_database(prepared, &old_database)
             .await
             .unwrap();
         // Crash immediately after rename: the publication name reopens as only the new generation.
@@ -3466,6 +3958,19 @@ mod tests {
                     .get::<_, String>(0))
                 .unwrap(),
             "new-main"
+        );
+        let restored: (String, String, Option<String>, Option<i64>) = new_reopen.query_row(
+            "SELECT generation,coverage_state,coverage_identity,baseline_completed_at FROM storage_recovery_state WHERE singleton=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            restored,
+            (
+                prepared_generation.as_str().into(),
+                "incomplete".into(),
+                None,
+                None
+            )
         );
     }
 

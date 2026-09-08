@@ -152,14 +152,16 @@ def recovered_artifacts_absent(root, state):
                 assert not os.path.lexists(root / row["storage_path"]), "retired physical artifact remains"
 
 
+def digest(path):
+    assert path.is_file() and not path.is_symlink(), "authoritative file missing or replaced by symlink"
+    result = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            result.update(block)
+    return result.digest()
+
+
 def same_live_files(snapshot_blobs, restored, state):
-    def digest(path):
-        assert path.is_file() and not path.is_symlink(), "authoritative file missing or replaced by symlink"
-        result = hashlib.sha256()
-        with path.open("rb") as file:
-            for block in iter(lambda: file.read(1024 * 1024), b""):
-                result.update(block)
-        return result.digest()
     for table in ("object_versions", "multipart_parts"):
         for row in state[table]:
             path = row.get("storage_path")
@@ -383,12 +385,30 @@ def main():
             refused_target = work / "refused-target"
             cli(refused_target, "restore", str(broken_snapshot), succeeds=False)
             assert not (refused_target / "cairn.db").exists()
+            # Recorded key identity must be checked before a restore can replace metadata.
+            original_manifest = (snapshot / "manifest.json").read_bytes()
+            original_database_hash = digest(source_db)
+            wrong_ring = secrets.token_hex(32)
+            wrong_target = work / "wrong-key-target"
+            wrong = cli(wrong_target, "restore", str(snapshot), succeeds=False,
+                        CAIRN_MASTER_KEY=wrong_ring)
+            assert "key" in (wrong.stdout + wrong.stderr).lower(), "restore failed for an unrelated reason"
+            assert not (wrong_target / "cairn.db").exists(), "wrong key published target metadata"
             cli(restored, "restore", str(snapshot))
             snapshot_state = database_rows(source_db)
             restored_state = database_rows(restored / "cairn.db")
             recovered_database_rows(snapshot_state, restored_state)
             same_live_files(snapshot / "blobs", restored, snapshot_state)
             recovered_artifacts_absent(restored, snapshot_state)
+            target_database_hash = digest(restored / "cairn.db")
+            wrong = cli(restored, "restore", str(snapshot), succeeds=False,
+                        CAIRN_MASTER_KEY=wrong_ring)
+            assert "key" in (wrong.stdout + wrong.stderr).lower(), "restore failed for an unrelated reason"
+            assert database_rows(restored / "cairn.db") == restored_state, "wrong key changed target rows"
+            assert digest(restored / "cairn.db") == target_database_hash, "wrong key changed the target image"
+            same_live_files(snapshot / "blobs", restored, snapshot_state)
+            assert digest(source_db) == original_database_hash, "restore preparation changed the source image"
+            assert (snapshot / "manifest.json").read_bytes() == original_manifest, "restore changed the source manifest"
             # An assembled file without committed metadata is not authoritative snapshot data.
             assert len(list((restored / "recovery").iterdir())) == 2
             start(restored)

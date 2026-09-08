@@ -104,6 +104,13 @@ because a scan completed. An oracle error, filesystem walk/barrier failure or un
 aborts stack construction. Full scans remain active; the journal does not authorize scan-free
 startup or nested placement.
 
+Restore prepares the copied database through its canonical Writer before the publication rename:
+fresh generation, incomplete coverage and invalidated cleanup claims, with intents, debt and
+authoritative rows preserved. Checkpoint/close and file/directory synchronization make that prepared
+image self-contained. Publication verifies its derived fingerprint and recovery state, while the
+source snapshot and manifest remain unchanged (Section 31.4). A crash after rename therefore cannot
+expose the source process's generation as the target's current ownership.
+
 Operators of very large stores can run the explicit integrity command for additional out-of-band checks, but there is no startup opt-out. A lazy per-read integrity check remains an always-on safety net: a read whose blob is unexpectedly missing returns a clear error, emits a metric, and flags the row for repair. A repair mode of reconciliation can additionally drop rows whose blobs are missing, which is needed only for recovery from external damage or from a backup taken in the narrow window described in Section 31.4. It cannot bypass Object Lock: the writer preserves still-retained or legally-held rows even when their blobs are missing, reports them as unresolved protected damage, and makes the repair command fail rather than manufacturing a clean report by deleting WORM metadata.
 
 ### 8.6 Single-node durability guidance for operators

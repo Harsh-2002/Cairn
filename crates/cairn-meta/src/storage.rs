@@ -79,6 +79,25 @@ pub fn begin(db: &DB, generation: &StorageToken) -> R<MutationOutcome> {
     Ok(MutationOutcome::Ack)
 }
 
+pub fn prepare_restore(db: &DB, generation: &StorageToken) -> R<MutationOutcome> {
+    if x(
+        db,
+        "UPDATE storage_recovery_state SET generation=?1,coverage_state='incomplete',coverage_identity=NULL,baseline_completed_at=NULL WHERE singleton=1 AND generation IS NOT ?1",
+        vec![text(generation.as_str())],
+    )? != 1
+    {
+        return Err(invalid(
+            "storage restore requires a fresh generation and recovery state",
+        ));
+    }
+    x(
+        db,
+        "UPDATE storage_cleanups SET claim_token=NULL,claim_generation=NULL,lease_until=NULL",
+        vec![],
+    )?;
+    Ok(MutationOutcome::Ack)
+}
+
 pub fn apply(db: &DB, bucket: &BucketName, operation: StorageMutation) -> R<MutationOutcome> {
     let applied = match operation {
         StorageMutation::Reserve { plan, now } => {
@@ -756,6 +775,76 @@ mod tests {
     use cairn_types::storage::PlannedStorageWrite;
     use cairn_types::storage::io::StorageIoWatch;
     use std::sync::Arc;
+
+    fn restore_invalidates_coverage_contract(db: &DB) {
+        crate::schema::run_migrations(db).unwrap();
+        let generation = StorageToken::generate();
+        let restored = StorageToken::generate();
+        let bucket = BucketName::parse("restore-coverage-contract").unwrap();
+        let path = StoragePath::from_string(".staging/11111111111111111111111111111111.tmp".into());
+        begin(db, &generation).unwrap();
+        enqueue_owned(db, &bucket, &path, None, None).unwrap();
+        let claims = claim(db, &generation, 100, Timestamp(0), 60).unwrap();
+        assert!(matches!(&claims, MutationOutcome::StorageCleanupBatch(batch) if batch.len() == 1));
+        // v37 startup still rejects complete coverage. Inject the future-shaped tuple only
+        // after opening this fixture to prove invalidation without widening that preflight.
+        x(db, "UPDATE storage_recovery_state SET coverage_state='complete',coverage_identity=?1,baseline_completed_at=42", vec![text(StorageToken::generate().as_str())]).unwrap();
+        let protocol = q(db, "SELECT * FROM storage_protocol", vec![]).unwrap();
+        let coverage = q(db, "SELECT * FROM storage_recovery_state", vec![]).unwrap();
+        let cleanup = q(db, "SELECT * FROM storage_cleanups", vec![]).unwrap();
+        assert!(prepare_restore(db, &generation).is_err());
+        assert_eq!(
+            q(db, "SELECT * FROM storage_recovery_state", vec![]).unwrap(),
+            coverage
+        );
+        assert_eq!(
+            q(db, "SELECT * FROM storage_cleanups", vec![]).unwrap(),
+            cleanup
+        );
+        assert_eq!(
+            prepare_restore(db, &restored).unwrap(),
+            MutationOutcome::Ack
+        );
+        assert_eq!(q(db, "SELECT generation,coverage_state,coverage_identity,baseline_completed_at FROM storage_recovery_state", vec![]).unwrap(),
+            vec![vec![text(restored.as_str()), text("incomplete"), Cell::Null, Cell::Null]]);
+        assert_eq!(
+            q(
+                db,
+                "SELECT claim_token,claim_generation,lease_until FROM storage_cleanups",
+                vec![]
+            )
+            .unwrap(),
+            vec![vec![Cell::Null, Cell::Null, Cell::Null]]
+        );
+        assert_eq!(
+            q(db, "SELECT * FROM storage_protocol", vec![]).unwrap(),
+            protocol
+        );
+        let MutationOutcome::StorageCleanupBatch(old) = claims else {
+            unreachable!()
+        };
+        let MutationOutcome::StorageCleanupBatch(new) =
+            claim(db, &restored, 100, Timestamp(1), 60).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, old[0].id);
+        assert_eq!(new[0].path, old[0].path);
+        assert_ne!(new[0].claim_token, old[0].claim_token);
+        let cleanup = q(db, "SELECT * FROM storage_cleanups", vec![]).unwrap();
+        x(db, "DELETE FROM storage_recovery_state", vec![]).unwrap();
+        assert!(prepare_restore(db, &StorageToken::generate()).is_err());
+        assert_eq!(
+            q(db, "SELECT * FROM storage_cleanups", vec![]).unwrap(),
+            cleanup
+        );
+    }
+
+    #[test]
+    fn sqlite_restore_invalidates_coverage_and_claims() {
+        restore_invalidates_coverage_contract(&DB::open_in_memory().unwrap());
+    }
 
     fn matching_quota_preserves_claim(db: &DB) {
         crate::schema::run_migrations(db).unwrap();
