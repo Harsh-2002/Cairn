@@ -164,3 +164,11 @@ reopen, runs in CI alongside mutation-family and coordinator regressions. Capaci
 require a separately admitted 100,000-row hot/distributed comparison with complete Writer stage
 and resource evidence; neither the tiny fixture nor raw KV throughput qualifies an engine. See
 [the predeclared metadata capacity evaluation](storage-metadata-capacity-2026-09.md).
+
+A qualifying canonical hot-bucket result permits the isolated transactional Fjall comparison.
+Both engines use the same trace/runner with a persisted seed recipe, fresh-process arms, exact
+quota checks and checked close. The ordinary CI suite includes failed-member rollback, native
+journal I/O failure, commit-boundary SIGKILL and wrong-resume-identity fixtures. The adapter is
+outside the production workspace and refuses unsupported operations. See
+[the conditional comparison contract](storage-metadata-alternative-2026-09.md); no tiny fixture,
+process-kill test or isolated gain establishes production migration/backup/power-loss parity.

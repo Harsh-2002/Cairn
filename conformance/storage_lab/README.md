@@ -224,3 +224,13 @@ Build with `cargo build --locked --release --manifest-path conformance/storage_l
 fixture in CI. That fixture verifies the driver and fresh reopen; it is not a capacity result.
 The engine capability comparison is in
 [`storage-metadata-capabilities-2026-09.md`](../../docs/storage-metadata-capabilities-2026-09.md).
+
+`run.sh metadata-alternative` revalidates a supplied qualifying capacity result and runs the
+predeclared five-pair hot-bucket comparison with `cairn-metadata-comparison-lab`. Both engines
+share the same workload/runner, and each arm reopens its existing seed in a fresh process.
+The explicit `--allow-seconds` cannot exceed the remaining cumulative 600-second metadata
+allowance. See [the exact comparison contract](../../docs/storage-metadata-alternative-2026-09.md).
+`LAB_TEST_METADATA_COMPARISON_DRIVER` enables the fixed 100-row fresh-process and wrong-identity
+CI fixture. Native journal EFBIG and commit-boundary SIGKILL fixtures are ordinary Rust tests;
+the ignored child helper is invoked by its bounded parent test. None is performance evidence
+or a production engine registration.

@@ -2,8 +2,8 @@
 
 Phase 5A uses the production `SqliteMetadataStore`, one actual Writer and its WAL read pool.
 This is a populated metadata workload, not raw SQL/KV insertion or an empty overwrite ring.
-Implementation and fixed-fixture validation are in progress; no capacity measurement has run.
-The following matrix and criteria are declared before admission, with the actual source and
+The full measurement completed; the hot-bucket population qualifies for the conditional
+alternative experiment. SQLite remains the production engine. The matrix and criteria below were declared before admission, with the actual source and
 prebuilt binary identities recorded by the coordinator.
 
 ## Dataset and boundaries
@@ -78,6 +78,46 @@ a qualifying semantics-equivalent alternative result. The capability comparison 
 SQLite, libSQL/Turso, redb, Fjall and RocksDB; transactional Fjall is the first conditional
 experiment, and RocksDB remains research-only. Production replacement always needs complete
 semantic/migration/restore parity and the human architectural decision.
+
+## Recorded result
+
+[Machine-readable evidence](storage-metadata-capacity-2026-09.json) and the
+[bounded raw archive](storage-metadata-capacity-2026-09.raw.tar.gz) retain the actual source
+`86f03ccf4c8df479d789ddab03eda7bf0ad1fefe`, binary, toolchain, SQLite runtime/source ID,
+configuration, family histograms, Writer stages and process observations. Both complete 100,000-row
+populations, auxiliary parts, quota checks, checkpoints and fresh reopens passed.
+After integrating merged Phase 4 documentation, commit `e965e12` retains byte-identical
+production and laboratory sources from that measured revision; only Phase 4 documentation and
+its archived evidence differ. The conditional comparison subsequently extracts the shared runner
+and adds the separate candidate; its own source/binary identity must be recorded independently.
+
+| Population | C4 | First C32 | C128 | Repeat C32 | Repeat C4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| One hot bucket, bundles/s | 157.80 | 266.13 | 293.12 | 265.55 | 155.25 |
+| Sixteen buckets, bundles/s | — | 264.98 | 285.90 | 264.29 | — |
+
+The hot population meets all declared Writer-limit criteria: 95.22% serialized occupancy,
+81.87% nonempty queue samples and only 10.26% throughput gain from C32 to C128. C32/C4 control
+drift is 0.22%/1.64%. The distributed population has 95.03% occupancy and 8.04% C128 gain, but
+its 79.77% queue fraction narrowly misses the required 80%; its 0.26% control drift does not
+waive that threshold. Only the hot population triggers
+[the preregistered Fjall comparison](storage-metadata-alternative-2026-09.md).
+
+Actual Writer CPU at C128 is 6.29/6.27 seconds for hot/distributed arms, against 11.36/11.35
+seconds of complete measured wall time. The 95% occupancy includes fsync and scheduling; it
+does not prove that SQLite computation consumed 95% of a CPU. Whole-process RSS peaks were
+305,996/327,120 KiB, including generator/histogram memory. Both had 24 observed descriptors.
+Database sizes after checkpoint were 65,822,720/65,773,568 bytes, with 34,398,208/34,361,344
+index bytes. Hot-workload WAL reached 124,156,232 bytes and returned to zero after checkpoint.
+No per-family phase reached 10,000 observations, so no family p99 is claimed. No Writer stage
+samples were dropped.
+
+Measurement plus evidence export/owned cleanup charged **292.003397 seconds** to metadata.
+The campaign then stood at **1,210.642869 seconds**, with **1,778,102,272 bytes** peak combined
+footprint; its active reservation was empty. Original measurement data/processes/raw artifacts
+were removed after the checked archive was written. The resulting decision is **KEEP SQLite**
+while evaluating the explicitly qualified hot-bucket alternative; no production backend change
+or universal S3 bottleneck claim follows from this metadata-only trace.
 
 ## Fixed-fixture validation
 

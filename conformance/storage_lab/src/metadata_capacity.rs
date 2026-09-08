@@ -1,11 +1,9 @@
 //! Populated canonical-Writer capacity laboratory. No physical object I/O is performed.
-#[path = "metadata_capacity/metrics.rs"]
-mod metrics;
-#[path = "metadata_capacity/workload.rs"]
-mod workload;
+use cairn_storage_lab::{metadata_metrics as metrics, metadata_workload as workload};
 
 use cairn_meta::{OpenOptions, SqliteMetadataStore};
-use metrics::{Histogram, WriterCpu, WriterObservation};
+use cairn_storage_lab::metadata_run::load;
+use metrics::{WriterCpu, WriterObservation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -93,59 +91,6 @@ async fn periodic_checkpoint(
     Ok(())
 }
 
-#[derive(Default)]
-struct FamilyStats {
-    successful: Histogram,
-    rejected: Histogram,
-}
-
-#[derive(Default)]
-struct WorkerStats {
-    operations: u64,
-    families: BTreeMap<&'static str, FamilyStats>,
-}
-
-impl WorkerStats {
-    fn observe(&mut self, result: workload::OperationResult) {
-        self.operations += 1;
-        for item in result.observations {
-            let family = self.families.entry(item.family.as_str()).or_default();
-            let histogram = if item.rejected {
-                &mut family.rejected
-            } else {
-                &mut family.successful
-            };
-            histogram.observe(Duration::from_nanos(item.elapsed_ns));
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.operations += other.operations;
-        for (name, family) in other.families {
-            let target = self.families.entry(name).or_default();
-            target.successful.merge(&family.successful);
-            target.rejected.merge(&family.rejected);
-        }
-    }
-
-    fn report(&self) -> Value {
-        let empty = FamilyStats::default();
-        workload::Family::ALL
-            .iter()
-            .map(|kind| {
-                let name = kind.as_str();
-                let family = self.families.get(name).unwrap_or(&empty);
-                (
-                    name.to_owned(),
-                    json!({"successful":family.successful.report(),
-                "expected_rejected":family.rejected.report()}),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>()
-            .into()
-    }
-}
-
 /// Observe while the actual operation remains owned. A deadline fails the run; it does not
 /// turn an unfinished mutation into a completed latency sample or an acknowledged outcome.
 async fn observed<F, T>(
@@ -196,48 +141,6 @@ where
         output.map_err(|error| -> Error { error.into() })?,
         observation,
     ))
-}
-
-async fn load(
-    fixture: Arc<workload::Fixture>,
-    concurrency: usize,
-    stop: Instant,
-    deadline: Instant,
-) -> Result<WorkerStats, String> {
-    let mut jobs = tokio::task::JoinSet::new();
-    for worker in 0..concurrency {
-        let fixture = fixture.clone();
-        jobs.spawn(async move {
-            let mut stats = WorkerStats::default();
-            let mut sequence = 0;
-            // Finish the admitted five-bundle mix cycle; measured wall includes its tail.
-            while Instant::now() < stop || sequence % 5 != 0 {
-                stats.observe(fixture.operation(worker, sequence, deadline).await?);
-                sequence += 1;
-                if sequence > 1_000_000 {
-                    return Err("worker operation ceiling exceeded".to_owned());
-                }
-            }
-            Ok::<_, String>(stats)
-        });
-    }
-    let mut total = WorkerStats::default();
-    let mut failure = None;
-    while let Some(result) = jobs.join_next().await {
-        match result
-            .map_err(|error| error.to_string())
-            .and_then(|result| result)
-        {
-            Ok(stats) => total.merge(stats),
-            Err(error) => {
-                failure.get_or_insert(error);
-            }
-        }
-    }
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    Ok(total)
 }
 
 fn database_sizes(path: &Path) -> Result<Value, Error> {

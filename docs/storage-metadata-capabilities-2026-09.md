@@ -3,9 +3,10 @@
 Research date: 2026-09-09. This is the Phase 5B capability comparison, not an engine benchmark,
 production replacement proposal, or evidence of a SQLite bottleneck. The workload and attribution
 requirements remain in [the capacity evaluation](storage-metadata-capacity-2026-09.md) and
-[Phase 5A–5C](storage-evolution-plan.md). At preparation of this comparison, no qualifying capacity
-result had been supplied. The conditional transactional Fjall experiment therefore remains
-untriggered. RocksDB is research-only.
+[Phase 5A–5C](storage-evolution-plan.md). The completed capacity result now qualifies the one-hot-bucket
+trace for [the bounded transactional Fjall experiment](storage-metadata-alternative-2026-09.md).
+Its isolated standalone-workspace dependency and adapter do not change the production backend.
+RocksDB remains research-only.
 
 Claims below distinguish upstream primitives from Cairn adapter work. A documented transaction
 or fsync primitive does not establish this application's error handling, physical-write ordering,
@@ -21,7 +22,7 @@ for this comparison.
 | libSQL | Cairn locks `0.10.0-pre.4`, `default-features=false`, `core`; upstream [version listing](https://docs.rs/crate/libsql/0.10.0-pre.4) also distinguishes this prerelease from stable `0.9.30`. | Existing optional embedded backend. libSQL is the SQLite fork, not the Rust rewrite. |
 | Turso Database | Cairn locks `turso`/`turso_core 0.6.1`; current stable Rust API examined is [0.7.2](https://docs.rs/turso/0.7.2/turso/), with `0.8.0-pre.7` also listed [upstream](https://docs.rs/crate/turso/0.7.2). | Existing optional beta backend. Current documentation is not retrospective proof of every 0.6.1 guarantee. Cloud Turso/remote replicas are outside this comparison. |
 | redb | [4.2.0 manifest](https://raw.githubusercontent.com/cberner/redb/v4.2.0/Cargo.toml). | Research only; no Cairn adapter or on-disk migration exists. |
-| Fjall | **Exact conditional candidate: `fjall = "=3.1.10"`**, using `SingleWriterTxDatabase`; [versioned API](https://docs.rs/fjall/3.1.10/fjall/struct.SingleWriterTxDatabase.html) and [manifest](https://raw.githubusercontent.com/fjall-rs/fjall/3.1.10/Cargo.toml). | First alternative experiment only after the Phase 5A attribution predicate passes. This records a candidate, not a dependency change. |
+| Fjall | **Exact conditional candidate: `fjall = "=3.1.10"`**, using `SingleWriterTxDatabase`; [versioned API](https://docs.rs/fjall/3.1.10/fjall/struct.SingleWriterTxDatabase.html) and [manifest](https://raw.githubusercontent.com/fjall-rs/fjall/3.1.10/Cargo.toml). | The Phase 5A hot-bucket predicate passed. The isolated adapter and pinned dependency live only in the standalone laboratory workspace. |
 | RocksDB | [RocksDB 11.8.1](https://github.com/facebook/rocksdb/releases/tag/v11.8.1); [Rust wrapper 0.25.0](https://raw.githubusercontent.com/rust-rocksdb/rust-rocksdb/v0.25.0/Cargo.toml) binds [librocksdb-sys 0.19.0+11.8.1](https://raw.githubusercontent.com/rust-rocksdb/rust-rocksdb/v0.25.0/librocksdb-sys/Cargo.toml). | Research only, including its transactional APIs. |
 
 Local versions and features come from [Cargo.lock](../Cargo.lock),

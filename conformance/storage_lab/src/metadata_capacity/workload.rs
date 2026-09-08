@@ -1,5 +1,4 @@
 //! Bounded canonical-Writer workload. Payload names are metadata-only fixtures: no object I/O.
-use cairn_meta::SqliteMetadataStore;
 use cairn_types::meta::MultipartLimits;
 use cairn_types::storage::{
     PlannedStorageWrite, StorageAdmission, StorageMutation, StorageToken, StorageWritePlan,
@@ -8,7 +7,7 @@ use cairn_types::storage::{
 use cairn_types::testing::PublicationFixture;
 use cairn_types::*;
 use futures_util::{StreamExt, stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -119,7 +118,7 @@ pub struct ExpectedState {
 }
 #[derive(Clone)]
 pub struct Fixture {
-    store: Arc<SqliteMetadataStore>,
+    store: Arc<dyn MetadataStore>,
     publication: PublicationFixture,
     buckets: Vec<BucketName>,
     seed_rows: u64,
@@ -133,8 +132,17 @@ pub struct DetachedFixture {
     seed: u64,
     cleanup_claims_lost: Arc<AtomicU64>,
 }
+/// Resume only an existing verified seed; this descriptor never initializes or repairs data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureIdentity {
+    pub generation: StorageToken,
+    pub bucket_count: usize,
+    pub seed_rows: u64,
+    pub seed: u64,
+}
 impl DetachedFixture {
-    pub fn attach(self, store: Arc<SqliteMetadataStore>) -> Fixture {
+    pub fn attach(self, store: Arc<dyn MetadataStore>) -> Fixture {
         Fixture {
             store,
             publication: self.publication,
@@ -248,7 +256,7 @@ where
 }
 
 pub async fn prepare(
-    store: Arc<SqliteMetadataStore>,
+    store: Arc<dyn MetadataStore>,
     bucket_count: usize,
     seed_rows: u64,
     seed: u64,
@@ -362,6 +370,36 @@ pub async fn prepare(
 }
 
 impl Fixture {
+    pub fn identity(&self) -> FixtureIdentity {
+        FixtureIdentity {
+            generation: self.publication.generation().clone(),
+            bucket_count: self.buckets.len(),
+            seed_rows: self.seed_rows,
+            seed: self.seed,
+        }
+    }
+    pub fn resume(
+        store: Arc<dyn MetadataStore>,
+        identity: FixtureIdentity,
+    ) -> Result<Self, String> {
+        require(
+            matches!(identity.bucket_count, 1 | 16)
+                && (10..=100_000).contains(&identity.seed_rows)
+                && identity.seed_rows.is_multiple_of(10),
+            "invalid persisted fixture identity",
+        )?;
+        let buckets = (0..identity.bucket_count)
+            .map(|i| BucketName::parse(&format!("capacity-{i:02}")).map_err(err))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            store,
+            publication: PublicationFixture::from_generation(identity.generation),
+            buckets,
+            seed_rows: identity.seed_rows,
+            seed: identity.seed,
+            cleanup_claims_lost: Arc::new(AtomicU64::new(0)),
+        })
+    }
     pub fn detach(self) -> DetachedFixture {
         DetachedFixture {
             publication: self.publication,

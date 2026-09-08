@@ -22,4 +22,8 @@ if [ "${1-}" = metadata-capacity ]; then
     shift
     exec python3 "$LAB_SCRIPT_DIR/metadata_capacity.py" "$@"
 fi
+if [ "${1-}" = metadata-alternative ]; then
+    shift
+    exec python3 "$LAB_SCRIPT_DIR/metadata_alternative.py" "$@"
+fi
 exec python3 "$LAB_SCRIPT_DIR/lab.py" "$@"
