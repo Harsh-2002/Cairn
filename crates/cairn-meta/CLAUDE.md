@@ -110,3 +110,10 @@ Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat pl
 full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
 sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
 without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.
+
+Schema v36 adds exact storage intents/paths/cleanup and a process-generation/coverage singleton,
+raises reader/writer protocol floors to 2, and preserves flat placement/full startup scans. The
+`storage.rs` Writer module is mirrored in both SQL backends and the in-memory double. Cancellation
+never proves I/O quiescence; cleanup claims exclude every live object/part and outstanding intent.
+Legacy multipart cleanup charges remain protocol 1 until explicit conversion; they are not forgiven
+by adding the tables. Phase 3C integration remains tracked in `docs/storage-evolution-plan.md`.

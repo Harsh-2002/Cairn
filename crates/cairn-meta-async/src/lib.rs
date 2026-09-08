@@ -20,6 +20,7 @@ mod model;
 mod range;
 mod replication_upload;
 mod schema;
+mod storage;
 mod store;
 mod turso_driver;
 mod writer;

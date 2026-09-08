@@ -80,6 +80,29 @@ pub struct CurrentVersionGuard {
 /// shared group-commit transaction, so one mutation's failure rolls back only itself.
 #[derive(Debug, Clone)]
 pub enum Mutation {
+    /// Advance every physical database under the exclusive node lock before serving requests.
+    /// Callers must establish backend teardown before using a fresh generation as restart proof.
+    BeginStorageGeneration {
+        generation: crate::storage::StorageToken,
+    },
+    /// Per-bucket physical admission, cancellation and cleanup. Routing survives bucket deletion.
+    Storage {
+        bucket: BucketName,
+        operation: crate::storage::StorageMutation,
+    },
+    /// Resolve a bounded page of prior-generation intents during exclusive startup. Full scans
+    /// still follow; this mutation alone cannot establish legacy coverage or readiness.
+    RecoverStorageIntents {
+        generation: crate::storage::StorageToken,
+        limit: u32,
+    },
+    /// Claim a bounded page of exact debt only after checking live references and intent ownership.
+    ClaimStorageCleanup {
+        generation: crate::storage::StorageToken,
+        limit: u32,
+        now: Timestamp,
+        lease_secs: i64,
+    },
     /// Upsert an object version (the put commit point). Returns any superseded blob path.
     PutObjectVersion {
         /// The new version row.
@@ -776,8 +799,16 @@ pub enum Mutation {
 }
 
 /// The typed result of applying a [`Mutation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MutationOutcome {
+    /// A committed pre-stage admission. The acknowledgement itself is move-only.
+    StorageAdmission(crate::storage::StorageAdmission),
+    /// Exact physical-ownership mutation applied or lost its owner/generation.
+    StorageUpdated { applied: bool },
+    /// Prior-generation intents resolved by a bounded startup page.
+    StorageRecovered(u32),
+    /// Independently claimed physical debt, with retained routing and exact lease ownership.
+    StorageCleanupBatch(Vec<crate::storage::StorageCleanup>),
     /// Whether a replication update still owned its exact attempt.
     ReplicationClaimUpdated { applied: bool },
     /// Durable remote-upload cleanup work, independent of originating outbox retention.

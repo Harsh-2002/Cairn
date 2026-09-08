@@ -2780,7 +2780,7 @@ mod tests {
         let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
-            .execute("UPDATE storage_protocol SET minimum_writer=2", [])
+            .execute("UPDATE storage_protocol SET minimum_writer=3", [])
             .unwrap();
         drop(connection);
         // Rebind the deliberately incompatible bytes: rejection must come from the protocol

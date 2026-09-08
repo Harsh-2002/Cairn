@@ -28,6 +28,17 @@ type MultipartInitialColumns = (String, Option<String>, Option<i64>, Option<i64>
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::BeginStorageGeneration { generation } => crate::storage::begin(conn, &generation),
+        Mutation::Storage { bucket, operation } => crate::storage::apply(conn, &bucket, operation),
+        Mutation::RecoverStorageIntents { generation, limit } => {
+            crate::storage::recover(conn, &generation, limit)
+        }
+        Mutation::ClaimStorageCleanup {
+            generation,
+            limit,
+            now,
+            lease_secs,
+        } => crate::storage::claim(conn, &generation, limit, now, lease_secs),
         Mutation::ReplicationUpload { bucket, operation } => {
             crate::replication_upload::apply(conn, &bucket, operation)
         }

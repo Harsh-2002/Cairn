@@ -277,3 +277,10 @@ The operator approved the exact `storage-lifecycle-proposal.md` protocol-2 propo
 cleanup debt and backend-I/O quiescence, while retaining full startup scans. Phase 3D activation
 remains gated by the approved coverage, crash/restore and performance checks. CONTRACT.md is
 unchanged.
+
+Phase 3C foundation: v36 journal schema, strict protocol-2 preflight, typed admission/cleanup
+transactions, retained I/O ownership types and backend/shard parity are implemented. Fifteen focused
+migration, ownership and journal tests pass across SQLite, libSQL, Turso, doubles and shards;
+owning all-feature Clippy passes. Blob I/O, strict publication, v26 quota retirement and recovery
+consumer integration are still required before this phase or its PR can be considered complete.
+No new performance experiment has run; the cumulative campaign remains 390.191882 seconds.

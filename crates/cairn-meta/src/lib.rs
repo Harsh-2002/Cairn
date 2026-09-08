@@ -11,6 +11,7 @@ mod range;
 mod replication_upload;
 mod schema;
 mod shard;
+mod storage;
 mod store;
 mod writer;
 

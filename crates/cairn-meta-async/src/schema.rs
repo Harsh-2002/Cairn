@@ -804,6 +804,57 @@ CREATE TABLE storage_protocol (
 INSERT INTO storage_protocol VALUES (1, 1, 1, 'flat', 'full-scan');
 "#,
     },
+    Migration {
+        version: 36,
+        name: "exact physical storage ownership",
+        sql: r#"
+-- These rows deliberately have no bucket/session foreign keys: deleting application ownership
+-- must never erase evidence of unfinished physical writes or bytes awaiting durable reclamation.
+CREATE TABLE storage_recovery_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+    generation TEXT,
+    coverage_identity TEXT,
+    coverage_state TEXT NOT NULL CHECK (coverage_state IN ('incomplete','complete')),
+    baseline_completed_at INTEGER
+);
+INSERT INTO storage_recovery_state VALUES (1, NULL, NULL, 'incomplete', NULL);
+CREATE TABLE storage_write_intents (
+    attempt_id TEXT PRIMARY KEY,
+    generation TEXT NOT NULL,
+    bucket_name TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    cancelled INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0,1)),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_storage_intents_generation ON storage_write_intents (generation, attempt_id);
+CREATE INDEX idx_storage_intents_bucket ON storage_write_intents (bucket_name, attempt_id);
+CREATE TABLE storage_intent_paths (
+    attempt_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('temporary','final','index_spool')),
+    storage_path TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (attempt_id, role),
+    FOREIGN KEY (attempt_id) REFERENCES storage_write_intents (attempt_id) ON DELETE CASCADE
+);
+CREATE TABLE storage_cleanups (
+    id TEXT PRIMARY KEY,
+    storage_path TEXT NOT NULL UNIQUE,
+    bucket_name TEXT NOT NULL,
+    quota_debt_id TEXT,
+    claim_token TEXT,
+    claim_generation TEXT,
+    lease_until INTEGER,
+    CHECK ((claim_token IS NULL AND claim_generation IS NULL AND lease_until IS NULL)
+        OR (claim_token IS NOT NULL AND claim_generation IS NOT NULL AND lease_until IS NOT NULL))
+);
+CREATE INDEX idx_storage_cleanup_pending ON storage_cleanups (lease_until, id);
+CREATE INDEX idx_storage_cleanup_bucket ON storage_cleanups (bucket_name, id);
+CREATE INDEX idx_storage_cleanup_quota ON storage_cleanups (quota_debt_id);
+-- v26 remains the sole owner of staged-byte charges. Its older coarse rows require a complete
+-- exclusive baseline; ordinary accounting recovery must not forgive protocol-2 physical debt.
+ALTER TABLE multipart_staging_cleanups ADD COLUMN storage_protocol INTEGER NOT NULL DEFAULT 1;
+UPDATE storage_protocol SET minimum_reader=2, minimum_writer=2;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -839,13 +890,37 @@ pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Resul
             "storage protocol state does not match the applied schema".into(),
         ));
     }
+    let tables = driver.query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('storage_recovery_state','storage_write_intents','storage_intent_paths','storage_cleanups')", vec![]
+    ).await?;
+    if !tables
+        .first()
+        .is_some_and(|row| row.value(0) == &Value::Int(if applied >= 36 { 4 } else { 0 }))
+    {
+        return Err(MetaError::Engine(
+            "unsupported storage journal for the applied schema".into(),
+        ));
+    }
+    if applied >= 36 {
+        let state = driver.query(
+            "SELECT EXISTS(SELECT 1 FROM storage_recovery_state WHERE singleton=1 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL)", vec![]
+        ).await?;
+        if !state
+            .first()
+            .is_some_and(|row| row.value(0) == &Value::Int(1))
+        {
+            return Err(MetaError::Engine(
+                "unsupported or missing storage recovery state".into(),
+            ));
+        }
+    }
     if has_protocol {
         let rows = driver.query(
             "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol WHERE singleton=1", vec![]
         ).await?;
         if !rows.first().is_some_and(|row| {
-            matches!(row.value(0), Value::Int(1))
-                && matches!(row.value(1), Value::Int(1))
+            row.value(0) == &Value::Int(if applied >= 36 { 2 } else { 1 })
+                && row.value(1) == row.value(0)
                 && row.value(2).as_str() == Some("flat")
                 && row.value(3).as_str() == Some("full-scan")
         }) {
@@ -995,8 +1070,13 @@ mod tests {
     async fn assert_startup_compatibility(turso: bool) {
         for change in [
             "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
-            "UPDATE storage_protocol SET minimum_reader=2",
-            "UPDATE storage_protocol SET minimum_writer=2",
+            "UPDATE storage_protocol SET minimum_reader=3",
+            "UPDATE storage_protocol SET minimum_writer=3",
+            "UPDATE storage_protocol SET minimum_reader=1,minimum_writer=1",
+            "DROP TABLE storage_intent_paths",
+            "DROP TABLE storage_cleanups",
+            "DELETE FROM storage_recovery_state",
+            "UPDATE storage_recovery_state SET coverage_state='complete'",
             "UPDATE storage_protocol SET write_layout='fanout-v1'",
             "UPDATE storage_protocol SET recovery_mode='journal'",
             "DELETE FROM storage_protocol",
@@ -1008,7 +1088,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 35);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 36);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")

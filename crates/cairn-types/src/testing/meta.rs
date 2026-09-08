@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "replication_upload.rs"]
 mod replication_upload;
+#[path = "storage.rs"]
+mod storage;
 
 type VKey = (String, String, String); // (bucket, key, version_id)
 
@@ -76,6 +78,7 @@ struct State {
     multipart_cleanups: BTreeMap<String, MultipartCleanup>,
     outbox: Vec<OutboxEntry>,
     replication_uploads: BTreeMap<String, crate::replication_upload::RemoteMultipartUpload>,
+    storage: storage::Journal,
     webhook_outbox: Vec<WebhookEntry>,
     users: BTreeMap<String, UserRecord>,
     session_creds: BTreeMap<String, SessionCredentialRecord>,
@@ -976,6 +979,19 @@ impl MetadataStore for InMemoryMetadataStore {
         };
         let mut st = self.state.lock().unwrap();
         match mutation {
+            Mutation::BeginStorageGeneration { generation } => {
+                Ok(storage::begin(&mut st, generation))
+            }
+            Mutation::Storage { bucket, operation } => storage::apply(&mut st, &bucket, operation),
+            Mutation::RecoverStorageIntents { generation, limit } => {
+                storage::recover(&mut st, &generation, limit)
+            }
+            Mutation::ClaimStorageCleanup {
+                generation,
+                limit,
+                now,
+                lease_secs,
+            } => storage::claim(&mut st, &generation, limit, now, lease_secs),
             Mutation::ReplicationUpload { bucket, operation } => {
                 replication_upload::apply(&mut st, &bucket, operation)
             }

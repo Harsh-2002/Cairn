@@ -163,10 +163,24 @@ migration. It records compatibility, not journal coverage or an operator-selecta
 | Field | Type | Constraints and notes |
 |---|---|---|
 | singleton | integer | Primary key, exactly 1. |
-| minimum_reader | integer | At least 1; this binary supports exactly protocol 1. |
-| minimum_writer | integer | At least 1; this binary supports exactly protocol 1. |
+| minimum_reader | integer | At least 1; 1 for schema v35; 2 from v36 onward. |
+| minimum_writer | integer | At least 1; 1 for schema v35; 2 from v36 onward. |
 | write_layout | text | Not null; only `flat` is accepted. |
 | recovery_mode | text | Not null; only `full-scan` is accepted. |
+
+**Physical storage ownership (v36).** All identifiers/paths are text. No table below references
+buckets or multipart sessions with a cascading foreign key.
+
+| Table | Fields and constraints |
+|---|---|
+| storage_recovery_state | Singleton 1; nullable generation and coverage identity; coverage state `incomplete`/`complete`; nullable baseline completion timestamp. Phase 3C accepts only incomplete coverage. |
+| storage_write_intents | Attempt primary key, generation, routing bucket, validated plan JSON, cancellation boolean, creation timestamp. Indexed by generation/attempt and bucket/attempt. |
+| storage_intent_paths | Attempt/role primary key; role limited to temporary/final/index_spool; unique exact relative path. Only this bounded child table cascades from its intent. |
+| storage_cleanups | Cleanup primary key, unique exact path, retained bucket, optional quota-debt id; claim token/generation/lease are either all absent or all present. Pending, bucket and quota indexes support bounded work. |
+
+The migration marks existing `multipart_staging_cleanups.storage_protocol=1` without changing
+charged bytes. Protocol 2 physical rows link to that existing accounting; they do not charge bytes
+again. Compatibility floors become 2, with flat writes and mandatory full startup scans retained.
 
 **Users.**
 

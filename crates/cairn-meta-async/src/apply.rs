@@ -29,6 +29,21 @@ type R<T> = Result<T, MetaError>;
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::BeginStorageGeneration { generation } => {
+            crate::storage::begin(driver, &generation).await
+        }
+        Mutation::Storage { bucket, operation } => {
+            crate::storage::apply(driver, &bucket, operation).await
+        }
+        Mutation::RecoverStorageIntents { generation, limit } => {
+            crate::storage::recover(driver, &generation, limit).await
+        }
+        Mutation::ClaimStorageCleanup {
+            generation,
+            limit,
+            now,
+            lease_secs,
+        } => crate::storage::claim(driver, &generation, limit, now, lease_secs).await,
         Mutation::ReplicationUpload { bucket, operation } => {
             crate::replication_upload::apply(driver, &bucket, operation).await
         }

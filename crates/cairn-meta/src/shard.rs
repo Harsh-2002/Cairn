@@ -93,6 +93,7 @@ pub struct ShardedMetadataStore {
     replication_claim_cursor: AtomicUsize,
     /// Independent cleanup cursor: alternating cleanup/delivery claims must not pin even shards.
     replication_upload_claim_cursor: AtomicUsize,
+    storage_cleanup_claim_cursor: AtomicUsize,
     /// The same, for the webhook claim fan-out. A separate cursor from replication on purpose: a
     /// single shared cursor degenerates when the two callers alternate against an even shard count.
     webhook_claim_cursor: AtomicUsize,
@@ -121,6 +122,7 @@ impl ShardedMetadataStore {
             shards,
             replication_claim_cursor: AtomicUsize::new(0),
             replication_upload_claim_cursor: AtomicUsize::new(0),
+            storage_cleanup_claim_cursor: AtomicUsize::new(0),
             webhook_claim_cursor: AtomicUsize::new(0),
         }
     }
@@ -159,6 +161,46 @@ impl ShardedMetadataStore {
 impl MetadataStore for ShardedMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         match mutation {
+            Mutation::BeginStorageGeneration { generation } => {
+                for shard in &self.shards {
+                    match shard.submit(Mutation::BeginStorageGeneration { generation: generation.clone() }).await? {
+                        MutationOutcome::Ack => {},
+                        _ => return Err(MetaError::Engine("unexpected storage generation outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RecoverStorageIntents { generation, limit } => {
+                let mut remaining = limit.clamp(1,1000);
+                let mut recovered = 0;
+                for shard in &self.shards {
+                    if remaining == 0 { break; }
+                    match shard.submit(Mutation::RecoverStorageIntents { generation: generation.clone(), limit: remaining }).await? {
+                        MutationOutcome::StorageRecovered(count) if count <= remaining => {
+                            recovered += count;
+                            remaining -= count;
+                        },
+                        _ => return Err(MetaError::Engine("unexpected storage recovery outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::StorageRecovered(recovered))
+            }
+            Mutation::ClaimStorageCleanup { generation, limit, now, lease_secs } => {
+                let mut remaining = limit.clamp(1,1000);
+                let mut batch = Vec::new();
+                let start = self.rotate_start(&self.storage_cleanup_claim_cursor);
+                for offset in 0..self.n() {
+                    if remaining == 0 { break; }
+                    match self.shards[(start+offset)%self.n()].submit(Mutation::ClaimStorageCleanup { generation: generation.clone(), limit: remaining, now, lease_secs }).await? {
+                        MutationOutcome::StorageCleanupBatch(part) if part.len() <= remaining as usize => {
+                            remaining -= part.len() as u32;
+                            batch.extend(part);
+                        },
+                        _ => return Err(MetaError::Engine("unexpected storage cleanup outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::StorageCleanupBatch(batch))
+            }
             // DeleteBucket is per-bucket, but its apply also purges ACCOUNT-GLOBAL request_metrics
             // and object_shares on shard 0. For a nonzero bucket, clean shard 0 FIRST: this is
             // deliberately conservative because a crash between two database commits may leave the
@@ -211,6 +253,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetObjectRetention { .. }
             | Mutation::SetObjectLegalHold { .. }
             | Mutation::EnqueueReplication(_)
+            | Mutation::Storage { .. }
             | Mutation::ReplicationUpload { .. }
             // Both of its statements are keyed on `bucket_name`, and every outbox row and version
             // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
@@ -984,7 +1027,9 @@ impl MetadataStore for ShardedMetadataStore {
 /// Extract the target bucket name from a per-bucket mutation, for shard routing.
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
-        Mutation::ReplicationUpload { bucket, .. } => bucket.as_str(),
+        Mutation::Storage { bucket, .. } | Mutation::ReplicationUpload { bucket, .. } => {
+            bucket.as_str()
+        }
         Mutation::PutObjectVersion { row, .. } => row.bucket.as_str(),
         Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
@@ -1042,6 +1087,9 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
+        | Mutation::BeginStorageGeneration { .. }
+        | Mutation::RecoverStorageIntents { .. }
+        | Mutation::ClaimStorageCleanup { .. }
         | Mutation::ClaimReplicationUploadCleanup { .. }
         | Mutation::RecoverClaimedReplication
         | Mutation::EnqueueWebhooks(_)

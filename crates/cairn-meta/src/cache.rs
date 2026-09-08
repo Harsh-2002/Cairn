@@ -477,6 +477,10 @@ impl CachedMetadataStore {
             | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
             | Mutation::RenewReplicationClaim { .. }
+            | Mutation::BeginStorageGeneration { .. }
+            | Mutation::Storage { .. }
+            | Mutation::RecoverStorageIntents { .. }
+            | Mutation::ClaimStorageCleanup { .. }
             | Mutation::ReplicationUpload { .. }
             | Mutation::ClaimReplicationUploadCleanup { .. }
             | Mutation::RecoverClaimedReplication

@@ -14,12 +14,12 @@ The store opens one write connection, owned by the single group-committing write
 
 Before changing connection PRAGMAs or performing application mutations, startup validates the
 highest applied schema and storage-protocol state. Migrations beyond this binary's ceiling are
-rejected; schema v35 adds a singleton requiring reader/writer protocol 1, `write_layout='flat'`
-and `recovery_mode='full-scan'`. Inconsistent, missing or unsupported state fails closed. Both async
+rejected. Schema v35 introduced reader/writer protocol 1; v36 raises both floors to 2 while
+retaining `write_layout='flat'` and `recovery_mode='full-scan'`. Inconsistent, missing or unsupported state fails closed. Both async
 backends mirror this preflight, including direct migration calls. Sharded SQLite checks all
 existing database files before migrating any shard. The snapshot validator uses the same read-only
-SQLite guard before target staging. No shared mutation/read trait is added: this is startup
-compatibility state, initialized only by the append-only migration. Released binaries without the
+SQLite guard before target staging. Compatibility floors change only through append-only
+migrations. Released binaries without the
 check remain unsafe downgrade targets; see `upgrade-rollback.md` for verified snapshot rollback.
 
 The writer measures channel admission, admitted queue residence, transaction stages, and checkpoint execution using bounded per-stage sample rings (Section 26.2). Queue depth counts only admitted mutations not yet collected into a batch; cancellation while waiting for admission cannot inflate it. Checkpoint busy-wait prevention and batching policy remain unchanged.
@@ -27,6 +27,17 @@ The writer measures channel admission, admitted queue residence, transaction sta
 ### 11.3 Entities
 
 The schema is specified field by field in Appendix 34.1; this section describes the entities and the design intent behind them.
+
+**Physical storage ownership (v36, Phase 3C implementation).** A singleton records the current
+process generation and incomplete legacy coverage. Unfinished write intents retain their routing
+bucket, exact publication target and at most three canonical paths. Exact physical cleanup rows
+retain independent claim tokens/generations/leases and optional links to v26 quota debts. These
+rows survive bucket/session deletion; no permanent journal entry is added per live object.
+Admission, generation advancement, cancellation, quiescence resolution and bounded cleanup claims
+run through the canonical Writer in both SQL backends, the double and shard routing. An active
+intent blocks cleanup regardless of its age or cancellation flag. The full protocol and remaining
+integration gates are specified in `storage-lifecycle-proposal.md`; table availability alone does
+not establish coverage or authorize journal startup.
 
 **Users** hold an identity, a display name, a role that is administrator or member, an active flag, the Bearer access-key identifier and a hash of its secret, and optionally a SigV4 access-key identifier and its secret stored as ciphertext plus a nonce under envelope encryption (Section 27). The two credential schemes coexist per user.
 

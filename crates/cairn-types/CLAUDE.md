@@ -131,3 +131,8 @@ must override it and clone the lease into that work until actual completion, inc
 metadata. Replication uses it before admission; every double/wrapper must report or delegate its
 own actual read behavior. Prepared blocking-task results must retain their lease while owning
 buffers, even if the awaiting caller has already been cancelled.
+
+`storage.rs` carries protocol-2 file-free plans, move-only creation permits/admission outcomes and
+exact cleanup claims. `storage/io.rs` retains each actual backend operation plus the node-lock
+lifetime; cancellation closes child-lease admission, while only a drained ownership set can create
+a quiescence proof. Plan DTOs are copyable metadata inputs, not permission to create another file.
