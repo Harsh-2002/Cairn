@@ -32,7 +32,7 @@ additional server-configuration flags.
 | Public base URL | `CAIRN_PUBLIC_BASE_URL` | unset | External **S3 data-origin** base URL used for presigned and persistent-share URLs behind ingress. It must be a distinct browser origin from the console/management endpoint. |
 | Virtual-host base domain | `CAIRN_S3_DOMAIN` | unset | The base domain for virtual-host-style addressing (`<bucket>.<domain>`); unset serves path-style only. |
 | Metadata cache budget | `CAIRN_META_CACHE_BYTES` | 64 MiB | Byte budget for the metadata and configuration cache; zero disables it. |
-| Maximum object size | `CAIRN_MAX_OBJECT_SIZE` | a large ceiling | Hard per-object size limit. |
+| Maximum object size | `CAIRN_MAX_OBJECT_SIZE` | 5 TiB | Hard per-object size limit. Encoded objects also obey the block-dependent CRNB index ceiling in [Section 9.3](storage-durability.md#93-the-blob-file-format). |
 | Write-ahead-log checkpoint interval | `CAIRN_WAL_CHECKPOINT_INTERVAL_SECS` | on the order of a minute | Cadence of the truncating checkpoint. |
 | Write-ahead-log checkpoint size threshold | `CAIRN_WAL_CHECKPOINT_SIZE_BYTES` | 64 MiB | Trigger a truncating checkpoint between interval ticks once the log grows past this; zero leaves only the interval. |
 | Multipart session lifetime and sweep interval | `CAIRN_MULTIPART_UPLOAD_LIFETIME_SECS` / `CAIRN_MULTIPART_SWEEP_INTERVAL_SECS` | a day and an hour | When idle uploads become stale and how often the sweeper runs. |

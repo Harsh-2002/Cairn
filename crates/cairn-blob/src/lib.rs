@@ -387,6 +387,34 @@ async fn ensure_bucket_dir(data_root: &Path, bucket_dir: &Path) -> Result<(), Bl
     Ok(())
 }
 
+/// Select the actual on-disk transform once for both preflight and streaming. A precompressed
+/// content type bypasses compression, but must never bypass required encryption.
+fn encoding_policies(
+    opts: &StageOptions,
+) -> (Option<CompressionPolicy>, Option<CompressionPolicy>) {
+    let compress = match opts.compression {
+        Some(pol) if !is_precompressed(&opts.content_type) => Some(pol),
+        _ => None,
+    };
+    let block_pol = compress.or_else(|| {
+        opts.encryption.as_ref().map(|_| CompressionPolicy {
+            algorithm: CompressionAlgorithm::None,
+            block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
+        })
+    });
+    (compress, block_pol)
+}
+
+fn validate_stage_len(opts: &StageOptions, logical_len: Option<u64>) -> Result<(), BlobError> {
+    if logical_len.is_some_and(|len| len > opts.size_ceiling) {
+        return Err(BlobError::SizeExceeded);
+    }
+    if let Some(policy) = encoding_policies(opts).1 {
+        compress::validate_encoded_len(logical_len.unwrap_or(0), policy.block_size)?;
+    }
+    Ok(())
+}
+
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
@@ -405,10 +433,8 @@ async fn write_staged(
     ),
     BlobError,
 > {
-    let compress = match opts.compression {
-        Some(pol) if !is_precompressed(&opts.content_type) => Some(pol),
-        _ => None,
-    };
+    let (compress, block_pol) = encoding_policies(opts);
+    validate_stage_len(opts, opts.content_length)?;
     let mut hashers = Hashers::new(&opts.extra_checksums);
     let mut logical: u64 = 0;
     let mut physical: u64 = 0;
@@ -418,13 +444,6 @@ async fn write_staged(
     // flows through the block encoder with `CompressionAlgorithm::None`. The MD5/ETag is computed
     // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
     // without compression/encryption (ARCH 21.1, 27).
-    let block_pol = compress.or_else(|| {
-        opts.encryption.as_ref().map(|_| CompressionPolicy {
-            algorithm: CompressionAlgorithm::None,
-            block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
-        })
-    });
-
     if let Some(pol) = block_pol {
         let mut enc = match opts.encryption.clone() {
             Some(dek) => BlockEncoder::new_encrypted(pol.algorithm, pol.block_size, dek),
@@ -432,12 +451,14 @@ async fn write_staged(
         };
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            logical += chunk.len() as u64;
+            logical = logical
+                .checked_add(chunk.len() as u64)
+                .ok_or(BlobError::SizeExceeded)?;
             if logical > opts.size_ceiling {
                 return Err(BlobError::SizeExceeded);
             }
             hashers.update(&chunk);
-            let phys = enc.feed(&chunk);
+            let phys = enc.feed(&chunk)?;
             file.write_all(&phys).await?;
             physical += phys.len() as u64;
         }
@@ -459,7 +480,9 @@ async fn write_staged(
     } else {
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            logical += chunk.len() as u64;
+            logical = logical
+                .checked_add(chunk.len() as u64)
+                .ok_or(BlobError::SizeExceeded)?;
             if logical > opts.size_ceiling {
                 return Err(BlobError::SizeExceeded);
             }
@@ -627,7 +650,9 @@ async fn feed_assembled_chunk(
     physical: &mut u64,
     size_ceiling: u64,
 ) -> Result<(), BlobError> {
-    *logical += chunk.len() as u64;
+    *logical = logical
+        .checked_add(chunk.len() as u64)
+        .ok_or(BlobError::SizeExceeded)?;
     // Enforce the ceiling on the actual bytes read, so a part whose on-disk size exceeds its recorded
     // size can't inflate the object past the limit (audit 2026-07).
     if *logical > size_ceiling {
@@ -636,7 +661,7 @@ async fn feed_assembled_chunk(
     hashers.update(chunk);
     match enc {
         Some(e) => {
-            let phys = e.feed(chunk);
+            let phys = e.feed(chunk)?;
             sink.write_all(&phys).await?;
             *physical += phys.len() as u64;
         }
@@ -926,6 +951,7 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
+        validate_stage_len(&opts, opts.content_length)?;
         // Bound concurrent blob *copy* I/O (ARCH 7.4). Held through the data copy and the per-file
         // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
         // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
@@ -1151,31 +1177,18 @@ impl BlobStore for LocalBlobStore {
         // synchronous Drop guard armed across part reads, rename, and the directory-fsync barrier.
         let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
 
-        let compress = match opts.compression {
-            Some(pol) if !is_precompressed(&opts.content_type) => Some(pol),
-            _ => None,
-        };
-        // As in `write_staged`, the CRNB block container is used when we compress OR encrypt; an
-        // encrypted-but-uncompressed assembly uses `CompressionAlgorithm::None` with a default block
-        // size. The multipart ETag is computed from the part MD5s by the caller, not from `hasher`,
-        // but the plaintext MD5 here is still computed before any transform.
-        let block_pol = compress.or_else(|| {
-            opts.encryption.as_ref().map(|_| CompressionPolicy {
-                algorithm: CompressionAlgorithm::None,
-                block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
-            })
-        });
+        let (compress, block_pol) = encoding_policies(&opts);
         // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
         // preallocate the staging file to place it contiguously (ARCH 7.5).
-        let assembled_len: u64 = parts.iter().map(|p| p.size).sum();
+        let assembled_len = parts.iter().try_fold(0_u64, |total, p| {
+            total.checked_add(p.size).ok_or(BlobError::SizeExceeded)
+        })?;
         // Enforce the object-size ceiling on the multipart total, exactly as the single-PUT path does
         // on its streamed bytes (write_staged). Without this a multipart upload of up to ~10000 parts
         // each near the per-part cap bypasses CAIRN_MAX_OBJECT_SIZE — a limit-bypass / disk+memory DoS
         // (audit 2026-07). Checked up front on the recorded sizes; assemble_into also enforces on the
         // running sum in case a part's on-disk size disagrees with its record.
-        if assembled_len > opts.size_ceiling {
-            return Err(BlobError::SizeExceeded);
-        }
+        validate_stage_len(&opts, Some(assembled_len))?;
         let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
         // Hash the assembled plaintext once, computing the MD5/ETag basis plus any supplementary
         // checksums the caller requested via `opts.extra_checksums` (a whole-object FULL_OBJECT

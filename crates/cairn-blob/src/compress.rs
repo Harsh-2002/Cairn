@@ -52,14 +52,32 @@ const METADATA_MAC_DOMAIN: &[u8] = b"cairn/crnb/v3/metadata";
 /// far above that yet bounds the per-block `read_range`/decompression allocation a corrupt or
 /// bit-rotted trailer could otherwise demand (the read path works one block at a time).
 const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
-/// Maximum index bytes accepted before authentication. At the S3 5-GiB object ceiling this still
-/// permits the smallest supported 1-KiB compression blocks with ample headroom, while preventing
-/// a corrupt large backing file from driving an allocation proportional to its physical length.
+/// Maximum index bytes emitted or accepted before authentication. This limits encoded logical
+/// size according to block geometry; the raw-file object ceiling is independent.
 const MAX_INDEX_LEN: usize = 64 * 1024 * 1024;
+
 /// The AES-GCM nonce length (96 bits — the recommended GCM nonce size).
 const GCM_NONCE_LEN: usize = 12;
 /// AES-256-GCM appends a 16-byte authentication tag to every encrypted block.
 const GCM_TAG_LEN: u64 = 16;
+
+fn index_len_for_blocks(blocks: usize, limit: usize) -> Option<usize> {
+    blocks.checked_mul(INDEX_ENTRY_LEN).filter(|&n| n <= limit)
+}
+
+fn check_encoded_len(logical_len: u64, block_size: u64, limit: usize) -> Result<(), BlobError> {
+    if block_size == 0 || block_size > MAX_BLOCK_SIZE {
+        return Err(BlobError::SizeExceeded);
+    }
+    let blocks =
+        usize::try_from(logical_len.div_ceil(block_size)).map_err(|_| BlobError::SizeExceeded)?;
+    index_len_for_blocks(blocks, limit).ok_or(BlobError::SizeExceeded)?;
+    Ok(())
+}
+
+pub(crate) fn validate_encoded_len(logical_len: u64, block_size: u32) -> Result<(), BlobError> {
+    check_encoded_len(logical_len, u64::from(block_size), MAX_INDEX_LEN)
+}
 
 /// Derive a block's deterministic 96-bit GCM nonce from `(dek, block_index)` as the first 12
 /// bytes of `HMAC-SHA256(dek, block_index_le_u64)`. Distinct blocks get distinct nonces, and the
@@ -211,8 +229,8 @@ fn decompress_block(
 }
 
 /// Streaming block encoder. Feed logical bytes; it emits physical bytes for completed blocks
-/// and, on finish, the last block plus the index and trailer. Bounded memory: at most one
-/// block plus its compressed form is buffered. When constructed with a DEK
+/// and, on finish, the last block plus the index and trailer. The index remains in memory up to
+/// the shared format ceiling; payload output is proportional to the supplied chunk. With a DEK
 /// ([`new_encrypted`](BlockEncoder::new_encrypted)), each block is AES-256-GCM-encrypted after
 /// compression and the trailer records [`VERSION_ENCRYPTED`].
 pub struct BlockEncoder {
@@ -220,6 +238,7 @@ pub struct BlockEncoder {
     block_size: usize,
     buf: Vec<u8>,
     index: Vec<IndexEntry>,
+    index_limit: usize,
     logical_len: u64,
     phys_len: u64,
     /// The raw 32-byte DEK when this is an SSE-S3 (encrypted) encoder; `None` stores plaintext.
@@ -246,9 +265,10 @@ impl BlockEncoder {
     fn with_dek(algo: CompressionAlgorithm, block_size: u32, dek: Option<SecretKey32>) -> Self {
         Self {
             algo,
-            block_size: block_size.max(1) as usize,
+            block_size: block_size as usize,
             buf: Vec::new(),
             index: Vec::new(),
+            index_limit: MAX_INDEX_LEN,
             logical_len: 0,
             phys_len: 0,
             dek,
@@ -258,15 +278,26 @@ impl BlockEncoder {
     }
 
     /// Feed plaintext; returns physical bytes to append for any blocks completed.
-    pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        self.logical_len += data.len() as u64;
+    ///
+    /// # Errors
+    /// Returns [`BlobError::SizeExceeded`] before copying input whose index cannot be read.
+    /// A rejected feed also makes finalization fail, so a caller cannot publish a prefix.
+    pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, BlobError> {
+        let next = self.logical_len.checked_add(data.len() as u64);
+        if next.is_none_or(|len| {
+            check_encoded_len(len, self.block_size as u64, self.index_limit).is_err()
+        }) {
+            self.error = Some(BlobError::SizeExceeded);
+            return Err(BlobError::SizeExceeded);
+        }
+        self.logical_len = next.ok_or(BlobError::SizeExceeded)?;
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         while self.buf.len() >= self.block_size {
             let block: Vec<u8> = self.buf.drain(..self.block_size).collect();
             self.emit_block(&block, &mut out);
         }
-        out
+        Ok(out)
     }
 
     fn emit_block(&mut self, logical: &[u8], out: &mut Vec<u8>) {
@@ -274,9 +305,8 @@ impl BlockEncoder {
         if let Some(dek) = self.dek.as_ref() {
             match encrypt_block(dek.expose_secret(), self.block_index, &phys) {
                 Ok(ciphertext) => phys = ciphertext,
-                // Record the first failure; `finish` turns it into an `Err`. We cannot return an
-                // error from `feed` without changing the streaming signature, and an encryption
-                // failure here is effectively unreachable (AES-GCM only fails on absurd sizes).
+                // Record the first failure; `finish` turns it into an `Err`. An encryption failure
+                // here is effectively unreachable (AES-GCM only fails on absurd sizes).
                 Err(e) => {
                     self.error.get_or_insert(e);
                 }
@@ -296,9 +326,13 @@ impl BlockEncoder {
     /// error if any block failed to encrypt.
     ///
     /// # Errors
-    /// Returns [`BlobError::Corruption`] if a block's AES-256-GCM encryption failed (practically
-    /// unreachable; GCM only rejects inputs larger than the format ever produces).
+    /// Returns [`BlobError::SizeExceeded`] for an unrepresentable index, or
+    /// [`BlobError::Corruption`] if a block's AES-256-GCM encryption failed.
     pub fn finish(mut self) -> Result<Vec<u8>, BlobError> {
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
+        check_encoded_len(self.logical_len, self.block_size as u64, self.index_limit)?;
         let mut out = Vec::new();
         if !self.buf.is_empty() {
             let block = std::mem::take(&mut self.buf);
@@ -308,7 +342,11 @@ impl BlockEncoder {
             return Err(e);
         }
         let index_offset = self.phys_len;
-        let mut index_bytes = Vec::with_capacity(self.index.len() * INDEX_ENTRY_LEN);
+        let index_len = index_len_for_blocks(self.index.len(), self.index_limit)
+            .ok_or(BlobError::SizeExceeded)?;
+        let block_count = u32::try_from(self.index.len()).map_err(|_| BlobError::SizeExceeded)?;
+        let index_len_u32 = u32::try_from(index_len).map_err(|_| BlobError::SizeExceeded)?;
+        let mut index_bytes = Vec::with_capacity(index_len);
         for e in &self.index {
             index_bytes.extend_from_slice(&e.phys_len.to_le_bytes());
             index_bytes.extend_from_slice(&e.logical_len.to_le_bytes());
@@ -325,9 +363,9 @@ impl BlockEncoder {
         trailer.push(algo_code(self.algo));
         trailer.extend_from_slice(&(self.block_size as u32).to_le_bytes());
         trailer.extend_from_slice(&self.logical_len.to_le_bytes());
-        trailer.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
+        trailer.extend_from_slice(&block_count.to_le_bytes());
         trailer.extend_from_slice(&index_offset.to_le_bytes());
-        trailer.extend_from_slice(&(index_bytes.len() as u32).to_le_bytes());
+        trailer.extend_from_slice(&index_len_u32.to_le_bytes());
 
         out.extend_from_slice(&index_bytes);
         if let Some(dek) = self.dek.as_ref() {
@@ -449,9 +487,8 @@ impl<R: Read + Seek> CompressedReader<R> {
         // overflow, and bounding the index against the actual file size stops a trailer claiming a
         // gigabyte index on a tiny file from forcing a multi-GB `vec![0u8; index_len]` allocation
         // (an out-of-memory DoS the `read_exact` below would only catch after the allocation).
-        let expected_index_len = block_count
-            .checked_mul(INDEX_ENTRY_LEN)
-            .ok_or_else(|| BlobError::Corruption("block count overflows index length".into()))?;
+        let expected_index_len = index_len_for_blocks(block_count, MAX_INDEX_LEN)
+            .ok_or_else(|| BlobError::Corruption("index length exceeds the maximum".into()))?;
         if index_len != expected_index_len {
             return Err(BlobError::Corruption("index length mismatch".into()));
         }
@@ -745,7 +782,7 @@ mod tests {
 
     fn encode(algo: CompressionAlgorithm, block_size: u32, data: &[u8]) -> Vec<u8> {
         let mut enc = BlockEncoder::new(algo, block_size);
-        let mut out = enc.feed(data);
+        let mut out = enc.feed(data).unwrap();
         out.extend_from_slice(&enc.finish().unwrap());
         out
     }
@@ -757,7 +794,7 @@ mod tests {
         data: &[u8],
     ) -> Vec<u8> {
         let mut enc = BlockEncoder::new_encrypted(algo, block_size, dek.into());
-        let mut out = enc.feed(data);
+        let mut out = enc.feed(data).unwrap();
         out.extend_from_slice(&enc.finish().unwrap());
         out
     }
@@ -1473,5 +1510,94 @@ mod tests {
         assert_ne!(block_nonce(&dek, 0), block_nonce(&dek, 1));
         // A different key yields a different nonce for the same block index.
         assert_ne!(block_nonce(&dek, 0), block_nonce(&[6u8; 32], 0));
+    }
+
+    #[test]
+    fn encoded_length_boundaries_use_reader_geometry_without_allocating_payload() {
+        for block in [1024_u32, 64 * 1024, 256 * 1024] {
+            let limit = (MAX_INDEX_LEN / INDEX_ENTRY_LEN) as u64 * u64::from(block);
+            assert!(validate_encoded_len(limit, block).is_ok());
+            assert!(validate_encoded_len(limit - 1, block).is_ok());
+            assert!(matches!(
+                validate_encoded_len(limit + 1, block),
+                Err(BlobError::SizeExceeded)
+            ));
+        }
+        assert!(validate_encoded_len(0, 1024).is_ok());
+        for (len, block) in [(0, 0), (1, u32::MAX), (u64::MAX, 1024)] {
+            assert!(matches!(
+                validate_encoded_len(len, block),
+                Err(BlobError::SizeExceeded)
+            ));
+        }
+        assert!(index_len_for_blocks(usize::MAX, MAX_INDEX_LEN).is_none());
+    }
+
+    #[test]
+    fn encoder_rejects_extra_block_before_copy_and_cannot_finalize_a_prefix() {
+        for chunk_size in [1, 1023, 1024, 3072] {
+            let mut enc = BlockEncoder::new(CompressionAlgorithm::Zstd, 1024);
+            enc.index_limit = 3 * INDEX_ENTRY_LEN;
+            let mut out = Vec::new();
+            let data = vec![42; 3072];
+            for chunk in data.chunks(chunk_size) {
+                out.extend(enc.feed(chunk).unwrap());
+            }
+            assert_eq!(enc.logical_len, 3072);
+            assert_eq!(enc.index.len(), 3);
+            assert!(enc.buf.is_empty());
+            assert!(matches!(enc.feed(&[42]), Err(BlobError::SizeExceeded)));
+            assert_eq!(enc.logical_len, 3072);
+            assert_eq!(enc.index.len(), 3);
+            assert!(enc.buf.is_empty());
+            assert!(matches!(enc.finish(), Err(BlobError::SizeExceeded)));
+        }
+    }
+
+    #[test]
+    fn bounded_encoder_boundary_and_partial_final_block_roundtrip() {
+        for len in [2049, 3072] {
+            for encrypted in [false, true] {
+                let dek = Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
+                let cipher = if encrypted {
+                    BlobCipher::AuthenticatedV3(SecretKey32::from_slice(&dek).unwrap())
+                } else {
+                    BlobCipher::KnownPlaintext
+                };
+                let mut enc = match cipher.dek() {
+                    Some(key) => BlockEncoder::new_encrypted(CompressionAlgorithm::Zstd, 1024, key),
+                    None => BlockEncoder::new(CompressionAlgorithm::Zstd, 1024),
+                };
+                enc.index_limit = 3 * INDEX_ENTRY_LEN;
+                let data = vec![42; len];
+                let mut out = enc.feed(&data).unwrap();
+                out.extend(enc.finish().unwrap());
+                let mut reader = CompressedReader::open_with_dek(
+                    std::io::Cursor::new(out),
+                    cipher,
+                    &CompressionDescriptor::Compressed {
+                        algorithm: CompressionAlgorithm::Zstd,
+                        block_size: 1024,
+                    },
+                    len as u64,
+                )
+                .unwrap();
+                assert_eq!(reader.read_range(0, len as u64).unwrap(), data);
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_checks_length_addition_and_finish_geometry() {
+        let mut enc = BlockEncoder::new(CompressionAlgorithm::Zstd, 1024);
+        enc.logical_len = u64::MAX;
+        assert!(matches!(enc.feed(&[1]), Err(BlobError::SizeExceeded)));
+        assert!(enc.buf.is_empty());
+        assert!(enc.index.is_empty());
+        assert!(matches!(enc.finish(), Err(BlobError::SizeExceeded)));
+        assert!(matches!(
+            BlockEncoder::new(CompressionAlgorithm::Zstd, 0).finish(),
+            Err(BlobError::SizeExceeded)
+        ));
     }
 }

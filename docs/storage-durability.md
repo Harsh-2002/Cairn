@@ -51,6 +51,21 @@ The data filesystem holds a staging area for in-progress single-part writes, a m
 
 ### 9.3 The blob file format
 
+CRNB v1–v3 writers and readers share a 64-MiB index ceiling with nine bytes per block entry.
+The effective encoded-object limit is `floor(64 MiB / 9) × logical_block_size`, also bounded by
+`CAIRN_MAX_OBJECT_SIZE`: 488,671,805,440 bytes (about 455.11 GiB) for encryption-only 64-KiB blocks,
+or 1,954,687,221,760 bytes (about 1.78 TiB) for default 256-KiB compression blocks. Smaller configured
+blocks have proportionately smaller limits. Known encoded lengths are rejected before staging;
+unknown-length streams fail before encoding an excess block. Multipart checks the recorded total
+with overflow-safe addition before assembly and still checks streamed bytes. Rejection uses
+`EntityTooLarge` and preserves retryable parts. Raw plaintext files have no CRNB index limit.
+
+This prevents new writers from publishing a container the reader refuses for index size. It does
+not repair an existing oversized container or promise 5-TiB encoded-object support. The current
+encoder/reader still hold index state proportional to block count up to that cap; bounded index
+spooling and paged reader bookkeeping are tracked in the
+[storage evolution plan](storage-evolution-plan.md).
+
 An uncompressed object is stored as exactly its bytes, with no header and no framing, so the simplicity and the byte-for-byte promise are preserved for the default case and an operator can read a blob directly if they ever need to. A compressed object is stored in a self-describing format: a sequence of independently-compressed logical blocks followed by an index that records, for each block, its size and offset, followed by a fixed trailer that records the index's location, the block size, the compression algorithm, the logical (plaintext) length, a magic marker, and a format-version byte. The same self-describing container also holds objects that are encrypted at rest: the version byte then marks the blob encrypted, each block carries its own AES-GCM authentication tag, and current format v3 carries an additional authentication tag over the index and trailer semantics (Section 10.7). This makes such a blob self-contained for layout and range reads, but the file is not allowed to choose its own compatibility parser: the object row's SSE descriptor (or a multipart part's sealed-DEK marker) independently declares legacy v2 or authenticated v3, and the reader requires an exact match before returning bytes. Reconciliation and backup treat the whole file as one artifact; there is no sidecar to keep in sync. Whether a blob is compressed, which algorithm it uses, and its logical block size are also recorded in the metadata row and threaded into the reader. For legacy encrypted v2, whose trailer is not authenticated, the reader requires the trailer algorithm and block geometry to equal that trusted descriptor before it may drive decompression or range mapping. Section 10 specifies the compression scheme in full.
 
 Legacy v2 additionally receives the trusted object row's `size_logical` or multipart
