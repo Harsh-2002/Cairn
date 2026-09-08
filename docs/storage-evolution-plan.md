@@ -263,4 +263,9 @@ measurements and adoption gates are in `storage-fanout-2026-09.md`. The driver e
 BlobStore reads, deletion and reconciliation, with exact generated liveness and survivor checks.
 The raw namespace publisher preserves file/rename/directory durability and compiles the production
 directory-sync coordinator. It does not measure complete S3 PUT or the future lifecycle protocol.
-Measurements and the decision are pending; production remains flat.
+All 30 measured arms passed exact operation/survivor checks. The comparison is INCONCLUSIVE
+because controls drifted beyond the predeclared 20% span; KEEP flat. No default placement changes
+or promotion PR follow. The shared campaign, including reduction and cleanup, has consumed
+390.191882 seconds (6m30s), with 542,654,464 bytes peak and no active process/data reservation.
+Raw owned run artifacts are removed; compact evidence is in `storage-fanout-2026-09.json`.
+Phase 3B final-commit CI and merge remain pending.

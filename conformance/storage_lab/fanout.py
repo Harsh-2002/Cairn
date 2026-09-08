@@ -245,7 +245,9 @@ def run_comparison(args, campaign, cases=CASES):
                     cpu_end = resource.getrusage(resource.RUSAGE_SELF)
                     observer_cpu = cpu_end.ru_utime + cpu_end.ru_stime - cpu_start.ru_utime - cpu_start.ru_stime
                     if driver.exited() != 0:
-                        raise RuntimeError(f"{label}: driver operation failed")
+                        driver.stop(min(deadline - 2, time.monotonic() + 4))
+                        diagnostic = driver.paths[1].read_text(errors="replace")[-2048:]
+                        raise RuntimeError(f"{label}: driver operation failed: {diagnostic}")
                     driver.stop(min(deadline - 2, time.monotonic() + 4))
                     records = [json.loads(line) for line in driver.paths[0].read_text().splitlines() if line.startswith("{")]
                     arm = {"case": case, "pair": pair, "layout": layout, "status": "PASS", "measurements": reduce_records(records, parameters),
@@ -291,6 +293,7 @@ def run_comparison(args, campaign, cases=CASES):
         atomic_json(campaign.root / f"{token}.result.json", report)
         campaign.finish(max(charged, time.monotonic() - start), status, clean=clean)
     print(json.dumps({"status": status, "decision": report["decision"], "result": str(campaign.root / f"{token}.result.json"),
+                      "reasons": reasons,
                       "spent_seconds": campaign.ledger["spent_seconds"], "peak_bytes": campaign.ledger["peak_bytes"]}), flush=True)
     return RESULTS[status]
 

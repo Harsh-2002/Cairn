@@ -144,3 +144,7 @@ Single-case or single-pair runs cannot qualify for adoption. Raw-file publicatio
 namespace durability; GET/delete/reconciliation use LocalBlobStore. This is not S3 throughput.
 `LAB_TEST_FANOUT_DRIVER` supplies the debug binary to tiny deterministic Python fixtures;
 `cargo test` also checks cancellation/failure cleanup and directory synchronization.
+
+`fanout_report.py --root <campaign> --run <comparison-token>` charges reduction/export and
+produces Markdown plus the full provenance/measurement JSON inside the owned campaign.
+The September comparison retained flat placement after predeclared control-drift checks failed.

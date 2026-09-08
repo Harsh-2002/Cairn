@@ -9,6 +9,7 @@ import unittest
 
 from budget import Campaign, Unavailable
 from fanout import CASES, assess, reduce_records, reserve_bytes, run_comparison
+from fanout_report import render
 
 
 def arm(case, pair, layout, ratio=1.0):
@@ -76,6 +77,17 @@ class FanoutTests(unittest.TestCase):
         with self.assertRaises(Unavailable):
             reduce_records([], {"objects": 16})
 
+    def test_export_preserves_incomplete_decision_without_fabricating_measurements(self):
+        report = {"kind": "fanout", "id": "fixture", "status": "INCONCLUSIVE", "decision": "KEEP flat",
+                  "reasons": ["incomplete measurements"], "cases": CASES, "arms": [],
+                  "charged_seconds": 1, "cleaned_data_and_processes": True}
+        markdown = render(report)
+        self.assertIn("INCONCLUSIVE — KEEP flat", markdown)
+        self.assertIn("incomplete measurements", markdown)
+        self.assertNotIn("| hot-4k |", markdown)
+        with self.assertRaises(ValueError):
+            render({"kind": "baseline"})
+
     @unittest.skipUnless(os.environ.get("LAB_TEST_FANOUT_DRIVER"), "explicit correctness-test binary not supplied")
     def test_real_tiny_paired_fixture_cleans_processes_data_and_accounts_time(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -85,8 +97,9 @@ class FanoutTests(unittest.TestCase):
                                       pairs=1, seed=0x5eed, allow_seconds=60, device="fixture-unavailable-device")
             cases = {"tiny": {"objects": 16, "buckets": 2, "size": 1024, "concurrency": 4}}
             try:
-                self.assertEqual(run_comparison(args, campaign, cases), 2)
+                code = run_comparison(args, campaign, cases)
                 result = json.loads(next(campaign.root.glob("*.result.json")).read_text())
+                self.assertEqual(code, 2, result["reasons"])
                 self.assertEqual(result["status"], "INCONCLUSIVE")
                 self.assertEqual(result["decision"], "KEEP flat")
                 self.assertEqual(len(result["arms"]), 2)
