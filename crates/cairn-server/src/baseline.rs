@@ -11,8 +11,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub(crate) fn run(cfg: Config, backup: &Path, node: Arc<NodeLock>) -> ExitCode {
-    if let Err(error) = crate::require_canonical_backup_topology(&cfg) {
-        eprintln!("storage baseline refused: {error}");
+    if crate::require_canonical_backup_topology(&cfg).is_err() {
+        eprintln!(
+            "storage baseline refused: requires CAIRN_META_BACKEND=sqlite and CAIRN_META_SHARDS=1"
+        );
         return ExitCode::from(2);
     }
     let runtime = match crate::runtime(&cfg) {

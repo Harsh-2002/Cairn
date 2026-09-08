@@ -735,6 +735,7 @@ async fn verify_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::KeyInit;
     use cairn_types::storage::{StorageMutation, StorageToken, io::StorageIoWatch};
     use cairn_types::storage_baseline::{StorageBaselineToken, StorageBaselineTransition};
     use cairn_types::testing::{
@@ -960,7 +961,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let dek = cairn_types::SecretKey32::new([7; 32]);
+        let dek = cairn_types::SecretKey32::new(
+            aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng).into(),
+        );
         let part = PartRecord {
             part_number: 1,
             size: 4,

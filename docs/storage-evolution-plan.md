@@ -414,3 +414,10 @@ and limits are in `storage-recovery-2026-09.md` and its JSON. The screen plus ex
 17.626779 seconds; cumulative consumption is **592.146171 seconds / 571,154,432 bytes recorded
 peak**, with no active process/data reservation or raw measurement artifacts. Final-head CI and
 merge remain pending.
+
+PR #93's first review head passed 53 checks; CodeQL flagged a fixed encryption key in a
+baseline fixture and a topology-refusal diagnostic that interpolated a configuration-derived
+error. The fixture now generates a fresh key and the refusal prints a constant actionable
+message. The topology gate is unchanged. The complete Rust gate passed again: 1,466 default and 1,492 all-feature tests,
+both Clippy configurations, doctests and standalone lab checks. Corrected-head CI remains pending. The measured implementation remains `cc542fd`; these diagnostic/test-only fixes do
+not rewrite that historical source identity or create another campaign measurement.
