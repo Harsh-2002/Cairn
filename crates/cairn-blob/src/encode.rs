@@ -189,6 +189,45 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    /// Dropping the request cannot stop a queued filesystem create. Force that ordering with
+    /// one occupied blocking thread, then let creation finish after the spool owner is gone.
+    #[test]
+    fn cancelled_spool_creation_cleans_up_after_detached_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                // A failed assertion must not strand the runtime's blocking worker.
+                let _ = wait.recv();
+            });
+            started.await.unwrap();
+            {
+                let mut spool = IndexSpool::new(dir.path());
+                let data = vec![1; BATCH_BYTES + 1];
+                let append = spool.append(&data);
+                futures_util::pin_mut!(append);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(append.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            // Queued behind the create on the sole worker: its completion establishes quiescence.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        });
+    }
+
     #[tokio::test]
     async fn spool_create_and_read_errors_propagate_before_commit() {
         let dir = tempfile::tempdir().unwrap();
