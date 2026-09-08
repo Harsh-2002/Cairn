@@ -222,7 +222,10 @@ impl Publisher {
                 .root
                 .join(".staging")
                 .join(format!("fanout-{id}.tmp")),
-            final_path: self.config.root.join(self.config.location(index).as_str()),
+            final_path: self
+                .config
+                .root
+                .join(self.config.location_for(index, &id).as_str()),
             armed: true,
         };
         let mut owner = tokio::task::spawn_blocking(move || -> Result<Unpublished, Error> {
@@ -385,7 +388,7 @@ async fn phase(
                     Phase::Delete => store.delete(&config.location(index)).await?,
                     Phase::Verify => {
                         if group % 4 == 1 {
-                            verify_read(&store, &config, index, &data, true).await?;
+                            verify_read(&store, &config, index, &data, false).await?;
                         } else if !matches!(
                             store.probe(&config.location(index)).await,
                             Err(BlobError::NotFound)
@@ -555,6 +558,29 @@ mod tests {
         for layout in [Layout::Flat, Layout::Fanout] {
             let root = tempfile::tempdir().unwrap();
             run(config(root.path().join("data"), layout)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn final_survivor_verification_checks_bytes_outside_the_measured_range() {
+        for layout in [Layout::Flat, Layout::Fanout] {
+            let root = tempfile::tempdir().unwrap();
+            let mut cfg = config(root.path().join("data"), layout);
+            cfg.objects = 4;
+            cfg.buckets = 1;
+            let cfg = Arc::new(cfg);
+            let store = Arc::new(LocalBlobStore::open(&cfg.root).await.unwrap());
+            let publisher = Arc::new(Publisher::new(cfg.clone()));
+            let data = Bytes::from(vec![1; cfg.size]);
+            publisher.publish(1, data.clone(), None).await.unwrap();
+            let mut corrupted = data.to_vec();
+            corrupted[0] = 2;
+            std::fs::write(cfg.root.join(cfg.location(1).as_str()), corrupted).unwrap();
+            assert!(
+                phase(cfg, store, publisher, data, Phase::Verify)
+                    .await
+                    .is_err()
+            );
         }
     }
 
