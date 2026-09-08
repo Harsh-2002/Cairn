@@ -1,12 +1,14 @@
 //! Isolated namespace comparison. No production routing or placement configuration changes.
 mod common;
-// Compile the exact production coordinator into the laboratory; its fsync seam below adds
-// measurements. This does not export a new production API or copy a competing algorithm.
+// Compile the exact production descriptor/lease coordinator into the laboratory. Its internal
+// syscall timings are unavailable here; do not substitute request waits for actual fsync counts.
 #[path = "../../../crates/cairn-blob/src/commit.rs"]
 mod commit;
 
 use bytes::Bytes;
-use cairn_blob::LocalBlobStore;
+use cairn_blob::{LocalBlobStore, open_readonly_nofollow};
+use cairn_types::storage::io::StorageIoLease;
+use cairn_types::testing::{fixture_storage_cleanup, fixture_storage_io};
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use cairn_types::*;
 use common::{distribution, emit, payload};
@@ -15,27 +17,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::OnceCell;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
-static DIRECTORY_SYNCS: AtomicU64 = AtomicU64::new(0);
-static DIRECTORY_SYNC_NANOS: AtomicU64 = AtomicU64::new(0);
+const PUBLICATION_VARIANT: &str = "raw_namespace_descriptor_coalescer_exact_cleanup_fixture_v3";
 
-async fn fsync_dir(path: &Path) -> Result<(), BlobError> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let start = Instant::now();
-        let result = File::open(path).and_then(|file| file.sync_all());
-        DIRECTORY_SYNCS.fetch_add(1, Ordering::Relaxed);
-        DIRECTORY_SYNC_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        result.map_err(|e| BlobError::Io(e.to_string()))
-    })
-    .await
-    .map_err(|e| BlobError::Io(e.to_string()))?
+fn io_err(error: std::io::Error) -> BlobError {
+    BlobError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod owned_file {
+    pub(crate) use cairn_types::testing::fixture_storage_io as test_lease;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -126,7 +123,9 @@ async fn create_durable_directory(
     path: PathBuf,
     metrics: Arc<CreationMetrics>,
 ) -> Result<PathBuf, Error> {
+    let lease = fixture_storage_io();
     tokio::task::spawn_blocking(move || {
+        let _lease = lease;
         let start = Instant::now();
         std::fs::create_dir(&path)?;
         File::open(parent)?.sync_all()?;
@@ -143,6 +142,7 @@ struct Unpublished {
     temporary: PathBuf,
     final_path: PathBuf,
     armed: bool,
+    lease: StorageIoLease,
 }
 impl Drop for Unpublished {
     fn drop(&mut self) {
@@ -227,6 +227,7 @@ impl Publisher {
                 .root
                 .join(self.config.location_for(index, &id).as_str()),
             armed: true,
+            lease: fixture_storage_io(),
         };
         let mut owner = tokio::task::spawn_blocking(move || -> Result<Unpublished, Error> {
             let file = std::fs::OpenOptions::new()
@@ -245,7 +246,9 @@ impl Publisher {
             Ok(owner)
         })
         .await??;
-        self.coalescer.sync_dir(&directory).await?;
+        self.coalescer
+            .sync_file(Arc::new(open_readonly_nofollow(&directory)?), &owner.lease)
+            .await?;
         inject(fault, Fault::DirectorySync)?;
         owner.armed = false;
         Ok(())
@@ -385,7 +388,13 @@ async fn phase(
                 match phase {
                     Phase::Publish => publisher.publish(index, data.clone(), None).await?,
                     Phase::Read => verify_read(&store, &config, index, &data, ranged).await?,
-                    Phase::Delete => store.delete(&config.location(index)).await?,
+                    Phase::Delete => {
+                        let (cleanup, lease) = fixture_storage_cleanup(
+                            BucketName::parse(&config.bucket(index))?,
+                            config.location(index),
+                        );
+                        store.cleanup_storage(&cleanup, lease).await?;
+                    }
                     Phase::Verify => {
                         if group % 4 == 1 {
                             verify_read(&store, &config, index, &data, false).await?;
@@ -442,6 +451,7 @@ async fn reconcile(
                 parallelism: 4,
                 staging_safety_margin_secs: 0,
             },
+            fixture_storage_io(),
         )
         .await?;
     let seconds = start.elapsed().as_secs_f64();
@@ -464,13 +474,14 @@ async fn reconcile(
 
 async fn run(config: Config) -> Result<(), Error> {
     config.validate()?;
-    emit(json!({"kind": "start", "workload": config}));
+    emit(
+        json!({"kind": "start", "workload": config, "publication_variant": PUBLICATION_VARIANT,
+        "metadata_admission": false, "scope": "isolated_raw_namespace_fixture_not_journal_adoption"}),
+    );
     let config = Arc::new(config);
-    let store = Arc::new(LocalBlobStore::open(&config.root).await?);
+    let store = Arc::new(LocalBlobStore::open(&config.root, fixture_storage_io()).await?);
     let publisher = Arc::new(Publisher::new(config.clone()));
     let data = Bytes::from(payload(config.size, config.seed));
-    let calls = DIRECTORY_SYNCS.load(Ordering::Relaxed);
-    let nanos = DIRECTORY_SYNC_NANOS.load(Ordering::Relaxed);
     phase(
         config.clone(),
         store.clone(),
@@ -479,10 +490,10 @@ async fn run(config: Config) -> Result<(), Error> {
         Phase::Publish,
     )
     .await?;
-    let sync_calls = DIRECTORY_SYNCS.load(Ordering::Relaxed) - calls;
-    let sync_seconds = (DIRECTORY_SYNC_NANOS.load(Ordering::Relaxed) - nanos) as f64 / 1e9;
-    let durability = json!({"kind": "durability", "directory_sync_requests": config.objects, "coalesced_directory_sync_calls": sync_calls,
-        "coalesced_directory_sync_cumulative_seconds": sync_seconds, "created_directories": publisher.creation.directories.load(Ordering::Relaxed),
+    let durability = json!({"kind": "durability", "directory_sync_requests": config.objects, "coalesced_directory_sync_calls": null,
+        "coalesced_directory_sync_cumulative_seconds": null, "created_directories": publisher.creation.directories.load(Ordering::Relaxed),
+        "publication_variant": PUBLICATION_VARIANT,
+        "unavailable": "production_descriptor_coalescer_has_no_syscall_measurement_hook",
         "directory_creation_parent_sync_cumulative_seconds": publisher.creation.nanos.load(Ordering::Relaxed) as f64 / 1e9});
     emit(durability);
     phase(
@@ -569,7 +580,11 @@ mod tests {
             cfg.objects = 4;
             cfg.buckets = 1;
             let cfg = Arc::new(cfg);
-            let store = Arc::new(LocalBlobStore::open(&cfg.root).await.unwrap());
+            let store = Arc::new(
+                LocalBlobStore::open(&cfg.root, fixture_storage_io())
+                    .await
+                    .unwrap(),
+            );
             let publisher = Arc::new(Publisher::new(cfg.clone()));
             let data = Bytes::from(vec![1; cfg.size]);
             publisher.publish(1, data.clone(), None).await.unwrap();
@@ -595,7 +610,9 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let cfg = Arc::new(config(root.path().join("data"), Layout::Fanout));
-            let _store = LocalBlobStore::open(&cfg.root).await.unwrap();
+            let _store = LocalBlobStore::open(&cfg.root, fixture_storage_io())
+                .await
+                .unwrap();
             let publisher = Publisher::new(cfg.clone());
             assert!(
                 publisher

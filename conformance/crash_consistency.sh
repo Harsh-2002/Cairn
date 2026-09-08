@@ -4,8 +4,8 @@
 # The durability ordering (fsync file -> rename -> fsync dir -> *then* metadata commit) means a
 # failure in the window between blob durability and the metadata commit creates an unreferenced
 # durable path. A task panic leaves the server alive, so retained exact-path cancellation recovery
-# may unlink it immediately; otherwise it remains an orphan for reconciliation. This script makes
-# both safe outcomes real instead of merely asserted:
+# may resolve its ownership and exact cleanup may reclaim it; otherwise integrity must do so.
+# This script makes both safe outcomes real instead of merely asserted:
 #
 #   1. build the `cairn` binary with --features failpoints (arms the cairn-blob `fail` seams);
 #   2. bootstrap a fresh temp store;
@@ -172,13 +172,28 @@ if [ "$ARMED" -eq 1 ]; then
   fi
 
   note "running 'cairn integrity' (reconcile)"
-  REPORT="$("$BIN" integrity)" || fail "integrity command failed: $REPORT"
+  REPORT="$(PYTHONPATH="$ROOT/conformance" "${PY:-python3}" - "$BIN" "$CAIRN_DB_PATH" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+from recovery_state import database_rows, recovered_artifacts_absent, recovered_database_rows
+
+before = database_rows(Path(sys.argv[2]))
+result = subprocess.run([sys.argv[1], "integrity"], capture_output=True, text=True, timeout=60)
+if result.returncode:
+    print(result.stderr, file=sys.stderr)
+    sys.exit(result.returncode)
+recovered_database_rows(before, database_rows(Path(sys.argv[2])))
+recovered_artifacts_absent(Path(sys.argv[2]).parent, before)
+print(result.stdout, end="")
+PY
+)" || fail "integrity or exact ownership/accounting validation failed: $REPORT"
   note "$REPORT"
   reclaimed="$(echo "$REPORT" | sed -n 's/.*orphans_reclaimed=\([0-9]*\).*/\1/p')"
   [ -n "$reclaimed" ] || fail "could not parse orphans_reclaimed from: $REPORT"
-  [ "$reclaimed" -eq "$orphan_count" ] \
-    || fail "expected reconciliation to reclaim exactly $orphan_count orphan(s), reclaimed $reclaimed"
-  note "reconciliation reclaimed $reclaimed orphan(s); exact-path recovery handled the remainder"
+  [ "$reclaimed" -le "$orphan_count" ] \
+    || fail "scan reclaimed more than the observed $orphan_count orphan(s): $reclaimed"
+  note "scan reclaimed $reclaimed orphan(s); exact cleanup retired the remaining owned paths"
 
   remaining="$(count_blobs)"
   [ "$remaining" -eq "$blobs_before" ] \

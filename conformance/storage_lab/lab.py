@@ -11,6 +11,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import sys
 import time
 
@@ -107,6 +108,74 @@ def metrics_sample(port):
         # Profiling can delay this auxiliary endpoint. Preserve the telemetry gap,
         # but allow the workload and profiler to finish so their evidence survives.
         return {"metrics_unavailable": f"{type(error).__name__}: {error}"}
+
+
+def observe_storage_cleanup(database, work_deadline, server_alive):
+    """Observe committed journal debt without consuming the reserved teardown time."""
+    start = time.monotonic()
+    deadline = min(start + 5, work_deadline)
+    result = {"status": "unavailable", "protocol": None, "samples": [],
+              "wait_budget_seconds": max(0, deadline - start),
+              "boundary": "after_final_idle_before_server_stop", "access": "sqlite_mode_ro"}
+    connection = None
+    try:
+        if start >= deadline:
+            result["reason"] = "no observation time remains before reserved teardown"
+            return result
+        if not server_alive():
+            result["reason"] = "server exited before observation"
+            return result
+        # mode=ro includes the live WAL; immutable=1 would silently miss its writes.
+        connection = sqlite3.connect(Path(database).resolve().as_uri() + "?mode=ro",
+                                     timeout=min(.05, deadline - start), isolation_level=None)
+        connection.execute("PRAGMA query_only=ON")
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        exists = connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_protocol')").fetchone()[0]
+        if not exists:
+            result.update(status="unsupported", reason="database has no storage protocol journal")
+            return result
+        protocol = connection.execute(
+            "SELECT minimum_reader,minimum_writer FROM storage_protocol WHERE singleton=1").fetchone()
+        if protocol is None:
+            result["reason"] = "storage protocol singleton is missing"
+            return result
+        result["protocol"] = {"minimum_reader": protocol[0], "minimum_writer": protocol[1]}
+        if protocol == (1, 1):
+            result.update(status="unsupported", reason="protocol 1 has no lifecycle journal")
+            return result
+        if protocol != (2, 2):
+            result["reason"] = "observation supports only protocol 2 journals"
+            return result
+        while time.monotonic() < deadline:
+            if not server_alive():
+                result["reason"] = "server exited during observation"
+                return result
+            # One statement gives both counts from the same committed read snapshot;
+            # autocommit releases it before waiting for the production cleanup worker.
+            intents, cleanups = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM storage_write_intents),"
+                "(SELECT COUNT(*) FROM storage_cleanups)").fetchone()
+            if not server_alive() or time.monotonic() >= deadline:
+                result["reason"] = "live observation did not finish within its allowance"
+                return result
+            result["samples"].append({"elapsed_seconds": time.monotonic() - start,
+                                      "write_intents": intents, "cleanups": cleanups})
+            if intents == cleanups == 0:
+                result["status"] = "drained"
+                return result
+            time.sleep(min(.2, max(0, deadline - time.monotonic())))
+        if result["samples"]:
+            result.update(status="residual", reason="journal debt remained at the observation deadline")
+        else:
+            result["reason"] = "observation deadline reached before a journal snapshot"
+    except (OSError, sqlite3.Error) as error:
+        result["reason"] = f"{type(error).__name__}: {error}"
+    finally:
+        if connection is not None:
+            connection.close()
+        result["elapsed_seconds"] = time.monotonic() - start
+    return result
 
 
 def recover(campaign):
@@ -300,6 +369,9 @@ def run_case(args, campaign):
         report["cycles"] = cycles
         if len(cycles) != 3 or not any(record.get("kind") == "complete" for record in records):
             raise Unavailable("insufficient completed load/idle cycles")
+        if server:
+            report["post_load_storage_cleanup"] = observe_storage_cleanup(
+                server_env["CAIRN_DB_PATH"], work_deadline, lambda: server.exited() is None)
         if any(cycle["operation_cap_reached"] or cycle["successful_transactions"] == 0 for cycle in cycles):
             raise Unavailable("operation cap or insufficient samples prevented equal load cycles")
         if any(len(cycle.get("bucket_transactions", [])) != args.buckets or not all(cycle["bucket_transactions"]) for cycle in cycles):

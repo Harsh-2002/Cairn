@@ -9,18 +9,21 @@ orphan, never a half-committed object" contract is verified for each write PATH:
                           durable, before metadata commit
 
 Each seam runs TWICE: plaintext, and again under CAIRN_ENCRYPT_AT_REST=true. A task-level panic leaves
-the server alive, so the retained object-write recovery worker may reclaim the exact staged path
-before shutdown. If the worker has not won that race, the durable encrypted orphan must be a CRNB
-container carrying no plaintext, and startup reconciliation must reclaim it DEK-FREE (using the
-row-less `probe`, never a data key), exactly the Stage-3 reader seam.
+the server alive, so retained recovery may resolve the intent and exact cleanup may reclaim its
+paths before shutdown. Any remaining durable encrypted artifact must be a CRNB container carrying
+no plaintext. Exclusive integrity recovery resolves journal ownership and durably reclaims exact
+paths without a data key; full-scan counters account only for unjournaled orphan reclamation.
 
 For each: arm the seam, run the op (the in-flight task panics; tokio isolates it so the process
 survives), stop, run `cairn integrity`, and assert either eager recovery already removed the blob or
-reconciliation reclaimed it, with the object absent in both cases.
+exclusive recovery reclaimed it, with no intent/debt or visible object remaining in either case.
 
 Requires a binary built with --features failpoints. Config via env: BIN, DATA, PORT.
 """
 import datetime, hashlib, hmac, http.client, os, signal, subprocess, sys, time, urllib.parse
+from pathlib import Path
+
+from recovery_state import database_rows, recovered_artifacts_absent, recovered_database_rows
 
 BIN = os.environ.get("BIN", "target/debug/cairn")
 ROOT = os.environ["DATA"]
@@ -138,7 +141,7 @@ def integrity():
     for tok in txt.split():
         if tok.startswith("orphans_reclaimed="):
             reclaimed = int(tok.split("=")[1])
-    return reclaimed, txt.strip()
+    return out.returncode, reclaimed, txt.strip()
 
 # ---------- the operations that crash mid-commit ----------
 def op_put(ak, sk, bucket, key):
@@ -178,9 +181,8 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
     check(f"[{tag}] the in-flight op did NOT cleanly commit (the seam fired)", status != 200, f"status={status}")
     check(f"[{tag}] the server process survived the task panic", PROC and PROC.poll() is None)
     stop()
-    # A task panic is cancellation, not a process crash. The retained recovery worker may therefore
-    # resolve and unlink the exact staged path before shutdown. If it has not, inspect the orphan
-    # before startup reconciliation reclaims it.
+    # A task panic is cancellation, not a process crash. Retained recovery may resolve ownership
+    # and a cleanup pass may reclaim it. Inspect remaining bytes before exclusive recovery.
     ob = orphan_blob_bytes(BUCKET)
     eagerly_reclaimed = ob is None
     note(f"[{tag}] durable final blob was "
@@ -192,20 +194,23 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
               marker not in ob)
     elif encrypt:
         note(f"[{tag}] exact-path recovery removed the encrypted blob before it could be inspected")
-    reclaimed, report = integrity()
+    database = Path(ROOT) / "data" / "cairn.db"
+    before_recovery = database_rows(database)
+    exit_code, reclaimed, report = integrity()
     note(f"integrity: {report}")
-    recovery_ok = (
-        reclaimed is not None
-        and ((eagerly_reclaimed and reclaimed == 0) or (not eagerly_reclaimed and reclaimed >= 1))
-    )
-    check(f"[{tag}] exact-path recovery or reconcile reclaimed the durable blob"
-          f"{' (encrypted reconcile is DEK-free via probe)' if encrypt else ''}",
-          recovery_ok, f"eagerly_reclaimed={eagerly_reclaimed} orphans_reclaimed={reclaimed}")
+    check(f"[{tag}] exclusive recovery completed successfully", exit_code == 0, f"exit={exit_code}")
+    # Exact journal cleanup is intentionally separate from the scan's orphans_reclaimed counter.
+    # Require a valid report AND complete ownership/accounting recovery, without weakening byte
+    # absence or metadata fidelity to accommodate that separate accounting path.
+    check(f"[{tag}] full scan returned a valid orphan count", reclaimed is not None and reclaimed >= 0)
+    recovered_database_rows(before_recovery, database_rows(database))
+    recovered_artifacts_absent(Path(ROOT) / "data", before_recovery)
+    check(f"[{tag}] fresh recovery preserved authoritative rows and retired all exact debt", True)
     check(f"[{tag}] no unreferenced final blob remains after recovery",
           orphan_blob_bytes(BUCKET) is None)
     if serve(tag=f"{tag}_check"):
         st, _, _ = s3("GET", f"/{BUCKET}/{key}", headers={"x-amz-content-sha256": _sha(b"")}, ak=ak, sk=sk)
-        check(f"[{tag}] the half-committed object is ABSENT after reconcile (no torn object)", st != 200, f"GET status={st}")
+        check(f"[{tag}] the half-committed object is ABSENT after reconcile (no torn object)", st == 404, f"GET status={st}")
     stop()
 
 print(f"\n== RESULT: {len(PASS)} passed, {len(FAIL)} failed ==", flush=True)

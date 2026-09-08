@@ -3,16 +3,281 @@
 
 use bytes::Bytes;
 use cairn_protocol::{
-    MultipartClaimRecovery, MultipartPartWriteRecovery, ObjectWriteRecovery, S3Body, S3Request,
-    S3Response, S3Service,
+    S3Body, S3Request, S3Response, S3Service, StorageRecoveryPermit, StorageWriteRecovery,
+    StorageWriteRuntime,
 };
 use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use cairn_types::storage::io::StorageIoWatch;
+use cairn_types::storage::{
+    StorageCreationPermit, StorageMutation, StorageToken, StorageWriteTarget,
+};
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 use http::{Method, StatusCode};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Real Writer admission and a bounded retained recovery consumer, like the server runtime.
+async fn storage_runtime(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
+    recover: Option<Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>>,
+) -> StorageWriteRuntime {
+    let generation = StorageToken::generate();
+    meta.submit(cairn_types::Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    runtime_in_generation(meta, blob, generation, recover)
+}
+
+async fn storage_runtime_with_slots(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
+) -> (StorageWriteRuntime, Arc<tokio::sync::Semaphore>) {
+    let generation = StorageToken::generate();
+    meta.submit(cairn_types::Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
+    let runtime = runtime_with_slots(meta, blob, generation, None, slots.clone());
+    (runtime, slots)
+}
+
+fn runtime_in_generation(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
+    generation: StorageToken,
+    recover: Option<Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>>,
+) -> StorageWriteRuntime {
+    runtime_with_slots(
+        meta,
+        blob,
+        generation,
+        recover,
+        Arc::new(tokio::sync::Semaphore::new(64)),
+    )
+}
+
+fn runtime_with_slots(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
+    generation: StorageToken,
+    recover: Option<Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>>,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> StorageWriteRuntime {
+    let admission = Arc::new(move || {
+        let slots = slots.clone();
+        Box::pin(async move {
+            slots
+                .acquire_owned()
+                .await
+                .ok()
+                .map(StorageRecoveryPermit::new)
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<StorageRecoveryPermit>> + Send>,
+            >
+    });
+    let recover = recover.unwrap_or_else(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(record) = rx.recv().await {
+                resolve_storage(&*meta, &*blob, &record).await;
+            }
+        });
+        Arc::new(move |record| tx.send(record).is_ok())
+    });
+    StorageWriteRuntime::new(generation, Arc::new(()), admission, recover)
+}
+
+async fn resolve_storage(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    record: &StorageWriteRecovery,
+) -> cairn_types::MutationOutcome {
+    use cairn_types::{Mutation, MutationOutcome};
+    meta.submit(Mutation::Storage {
+        bucket: record.plan.bucket.clone(),
+        operation: StorageMutation::Cancel {
+            attempt: record.plan.attempt.clone(),
+            generation: record.plan.generation.clone(),
+        },
+    })
+    .await
+    .unwrap();
+    let mut io = record.io.clone();
+    let proof = io.quiescent().await;
+    let (_, lease) = StorageIoWatch::new(
+        record.plan.attempt.clone(),
+        record.plan.generation.clone(),
+        Arc::new(record.lifetime.clone()),
+    );
+    blob.confirm_storage_quiescence(&record.plan, lease)
+        .await
+        .unwrap();
+    if let StorageWriteTarget::Completion {
+        upload_id,
+        claim_token,
+        ..
+    } = &record.plan.target
+    {
+        meta.submit(Mutation::ReleaseMultipartClaim {
+            upload_id: upload_id.clone(),
+            claim_token: cairn_types::MultipartClaimToken::from_string(claim_token.clone()),
+        })
+        .await
+        .unwrap();
+    }
+    let outcome = meta
+        .submit(Mutation::Storage {
+            bucket: record.plan.bucket.clone(),
+            operation: StorageMutation::Resolve { quiescence: proof },
+        })
+        .await
+        .unwrap();
+    loop {
+        let MutationOutcome::StorageCleanupBatch(batch) = meta
+            .submit(Mutation::ClaimStorageCleanup {
+                generation: record.plan.generation.clone(),
+                limit: 64,
+                now: cairn_types::Timestamp(1),
+                lease_secs: 60,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("cleanup batch expected")
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for cleanup in batch {
+            let (_, lease) = StorageIoWatch::new(
+                cleanup.id.clone(),
+                cleanup.generation.clone(),
+                Arc::new(record.lifetime.clone()),
+            );
+            blob.cleanup_storage(&cleanup, lease).await.unwrap();
+            assert!(matches!(
+                meta.submit(Mutation::Storage {
+                    bucket: cleanup.bucket.clone(),
+                    operation: StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: cairn_types::Timestamp(1)
+                    },
+                })
+                .await
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            ));
+        }
+    }
+    outcome
+}
+
+fn recovery_upload_id(record: &StorageWriteRecovery) -> UploadId {
+    match &record.plan.target {
+        StorageWriteTarget::Part { upload_id, .. }
+        | StorageWriteTarget::Completion { upload_id, .. } => upload_id.clone(),
+        StorageWriteTarget::Object { .. } => panic!("multipart recovery expected"),
+    }
+}
+
+fn recovery_key(record: &StorageWriteRecovery) -> ObjectKey {
+    match &record.plan.target {
+        StorageWriteTarget::Object { key, .. } | StorageWriteTarget::Completion { key, .. } => {
+            key.clone()
+        }
+        StorageWriteTarget::Part { .. } => panic!("object recovery expected"),
+    }
+}
+
+fn recovery_row_id(record: &StorageWriteRecovery) -> String {
+    match &record.plan.target {
+        StorageWriteTarget::Object { row_id, .. }
+        | StorageWriteTarget::Completion { row_id, .. } => row_id.clone(),
+        StorageWriteTarget::Part { .. } => panic!("object recovery expected"),
+    }
+}
+
+async fn seed_plaintext_part(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    generation: &StorageToken,
+    upload: &UploadId,
+    part_number: u16,
+    body: Vec<u8>,
+) -> cairn_types::blob::StagedPart {
+    use cairn_types::{Mutation, MutationOutcome};
+    let session = meta.get_multipart(upload).await.unwrap().unwrap();
+    let attempt_id = StorageToken::generate().as_str().to_owned();
+    let planned = blob
+        .plan_write(
+            session.bucket,
+            generation.clone(),
+            StorageWriteTarget::Part {
+                upload_id: upload.clone(),
+                part_number,
+                reservation_id: attempt_id.clone(),
+            },
+        )
+        .unwrap();
+    let plan = planned.plan().clone();
+    let MutationOutcome::StorageAdmission(receipt) = meta
+        .submit(Mutation::AdmitStorageWrite {
+            plan: Box::new(plan.clone()),
+            operation: Box::new(Mutation::ReserveMultipartPart {
+                upload_id: upload.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                reserved_bytes: body.len() as u64,
+                max_parts_per_upload: 10_000,
+                now: cairn_types::Timestamp(1),
+            }),
+            now: cairn_types::Timestamp(1),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("part admission expected")
+    };
+    let (_, lease) =
+        StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), Arc::new(()));
+    let permit = planned.admit(receipt, lease).unwrap();
+    let staged = blob
+        .stage_part(
+            permit,
+            once_body(body),
+            cairn_types::ChecksumSet::none(),
+            1 << 30,
+            None,
+        )
+        .await
+        .unwrap();
+    meta.submit(Mutation::PublishStorageWrite {
+        plan: Box::new(plan),
+        operation: Box::new(Mutation::RecordPart {
+            upload_id: upload.clone(),
+            attempt_id,
+            part: cairn_types::PartRecord {
+                part_number,
+                size: staged.size,
+                etag: staged.md5_hex.clone(),
+                storage_path: staged.storage_path.clone(),
+                checksum: None,
+                part_dek: None,
+            },
+        }),
+    })
+    .await
+    .unwrap();
+    staged
+}
 
 fn admin() -> Principal {
     Principal {
@@ -49,9 +314,24 @@ fn member_with_policy(user: &str, policy: &str) -> Principal {
 
 struct Harness {
     svc: S3Service,
+    runtime: StorageWriteRuntime,
+    recovery_slots: Arc<tokio::sync::Semaphore>,
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStore>,
     _dir: tempfile::TempDir,
+}
+
+impl Harness {
+    async fn settle_recovery(&self) {
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.recovery_slots.clone().acquire_many_owned(64),
+        )
+        .await
+        .expect("retained storage recovery must drain")
+        .unwrap();
+        drop(idle);
+    }
 }
 
 async fn harness() -> Harness {
@@ -61,11 +341,15 @@ async fn harness() -> Harness {
 async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEngine>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -74,9 +358,12 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
         crypto,
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
-    );
+    )
+    .with_storage_runtime(runtime.clone());
     Harness {
         svc,
+        runtime,
+        recovery_slots,
         meta,
         blob,
         _dir: dir,
@@ -88,6 +375,88 @@ async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMeta
     (harness, meta)
 }
 
+/// Admission can hit a full metadata filesystem before staging ever observes blob ENOSPC.
+/// Preserve the storage-capacity response and leave the body/files untouched until a later retry.
+#[tokio::test]
+async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
+    let (h, meta) = in_memory_harness().await;
+    let bucket = "full-admission";
+    assert_eq!(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![])
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    meta.reject_next_storage_admission_out_of_space();
+    let staging_entries = || {
+        let mut names = std::fs::read_dir(h._dir.path().join(".staging"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = staging_entries();
+    let (request, _) = req(Method::PUT, Some(bucket), Some("object"), &[], &[], vec![]);
+    let polled = Arc::new(AtomicBool::new(false));
+    let observed = polled.clone();
+    let body = Box::pin(futures_util::stream::once(async move {
+        observed.store(true, Ordering::Release);
+        Ok(Bytes::from_static(b"must not stage"))
+    }));
+    let (status, _, response) = drain(h.svc.handle(request, body).await).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("InsufficientStorage")
+    );
+    assert!(!polled.load(Ordering::Acquire));
+    h.settle_recovery().await;
+    assert!(!h._dir.path().join(bucket).exists());
+    assert_eq!(staging_entries(), before);
+    assert!(
+        meta.current_version(
+            &BucketName::parse(bucket).unwrap(),
+            &ObjectKey::parse("object").unwrap()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let expected = b"capacity restored".to_vec();
+    assert_eq!(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some("object"),
+                &[],
+                &[],
+                expected.clone()
+            )
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let (status, _, bytes) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some(bucket), Some("object"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, expected);
+}
+
 async fn in_memory_harness_with_clock() -> (
     Harness,
     Arc<cairn_types::testing::InMemoryMetadataStore>,
@@ -96,11 +465,15 @@ async fn in_memory_harness_with_clock() -> (
     let dir = tempfile::tempdir().unwrap();
     let concrete = Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
     let meta: Arc<dyn MetadataStore> = concrete.clone();
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -109,10 +482,13 @@ async fn in_memory_harness_with_clock() -> (
         crypto,
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
-    );
+    )
+    .with_storage_runtime(runtime.clone());
     (
         Harness {
             svc,
+            runtime,
+            recovery_slots,
             meta,
             blob,
             _dir: dir,
@@ -164,11 +540,11 @@ impl BlobStore for AbortAfterStagePartBlob {
 
     async fn stage(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
-        self.inner.stage(bucket, body, opts).await
+        self.inner.stage(permit, body, opts).await
     }
 
     async fn open_raw(
@@ -212,31 +588,40 @@ impl BlobStore for AbortAfterStagePartBlob {
         self.inner.probe(path).await
     }
 
-    async fn delete(&self, path: &StoragePath) -> Result<(), cairn_types::error::BlobError> {
-        self.inner.delete(path).await
+    async fn confirm_storage_quiescence(
+        &self,
+        plan: &cairn_types::storage::StorageWritePlan,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), cairn_types::BlobError> {
+        self.inner.confirm_storage_quiescence(plan, lease).await
+    }
+
+    async fn cleanup_storage(
+        &self,
+        cleanup: &cairn_types::storage::StorageCleanup,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), cairn_types::BlobError> {
+        self.inner.cleanup_storage(cleanup, lease).await
     }
 
     async fn stage_part(
         &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         checksums: cairn_types::object::ChecksumSet,
         size_ceiling: u64,
         encryption: Option<cairn_types::SecretKey32>,
     ) -> Result<cairn_types::blob::StagedPart, cairn_types::error::BlobError> {
+        let StorageWriteTarget::Part {
+            upload_id: upload, ..
+        } = &permit.plan().target
+        else {
+            panic!("part permit expected")
+        };
+        let upload = upload.clone();
         let staged = self
             .inner
-            .stage_part(
-                upload,
-                part_number,
-                attempt_id,
-                body,
-                checksums,
-                size_ceiling,
-                encryption,
-            )
+            .stage_part(permit, body, checksums, size_ceiling, encryption)
             .await?;
         *self.last_staged.lock().unwrap() = Some(staged.storage_path.clone());
         self.meta
@@ -250,46 +635,36 @@ impl BlobStore for AbortAfterStagePartBlob {
         Ok(staged)
     }
 
-    async fn delete_part_attempt(
-        &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
-    ) -> Result<(), cairn_types::error::BlobError> {
-        self.inner
-            .delete_part_attempt(upload, part_number, attempt_id)
-            .await
-    }
-
     async fn assemble(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         parts: &[cairn_types::blob::PartRef],
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
-        self.inner.assemble(bucket, parts, opts).await
-    }
-
-    async fn delete_session(&self, upload: &UploadId) -> Result<(), cairn_types::error::BlobError> {
-        self.inner.delete_session(upload).await
+        self.inner.assemble(permit, parts, opts).await
     }
 
     async fn reconcile(
         &self,
         oracle: &dyn cairn_types::traits::ReconcileOracle,
         opts: cairn_types::blob::ReconcileOpts,
+        lease: cairn_types::storage::io::StorageIoLease,
     ) -> Result<cairn_types::blob::ReconcileReport, cairn_types::error::BlobError> {
-        self.inner.reconcile(oracle, opts).await
+        self.inner.reconcile(oracle, opts, lease).await
     }
 }
 
 async fn harness_abort_after_stage_part() -> (Harness, Arc<AbortAfterStagePartBlob>) {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let inner: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let inner: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let fault = Arc::new(AbortAfterStagePartBlob::new(inner, meta.clone()));
     let blob: Arc<dyn BlobStore> = fault.clone();
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -298,10 +673,13 @@ async fn harness_abort_after_stage_part() -> (Harness, Arc<AbortAfterStagePartBl
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into())),
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
-    );
+    )
+    .with_storage_runtime(runtime.clone());
     (
         Harness {
             svc,
+            runtime,
+            recovery_slots,
             meta,
             blob,
             _dir: dir,
@@ -324,7 +702,7 @@ struct AssembleGateBlob {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlobGatePoint {
     BeforeAssemble,
-    BeforeDelete,
+    AfterAssemble,
 }
 
 impl AssembleGateBlob {
@@ -332,8 +710,8 @@ impl AssembleGateBlob {
         Self::new_at(inner, BlobGatePoint::BeforeAssemble)
     }
 
-    fn new_before_delete(inner: Arc<dyn BlobStore>) -> Self {
-        Self::new_at(inner, BlobGatePoint::BeforeDelete)
+    fn new_after_assemble(inner: Arc<dyn BlobStore>) -> Self {
+        Self::new_at(inner, BlobGatePoint::AfterAssemble)
     }
 
     fn new_at(inner: Arc<dyn BlobStore>, pause_at: BlobGatePoint) -> Self {
@@ -369,11 +747,11 @@ impl BlobStore for AssembleGateBlob {
 
     async fn stage(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
-        self.inner.stage(bucket, body, opts).await
+        self.inner.stage(permit, body, opts).await
     }
 
     async fn open_raw(
@@ -417,53 +795,38 @@ impl BlobStore for AssembleGateBlob {
         self.inner.probe(path).await
     }
 
-    async fn delete(&self, path: &StoragePath) -> Result<(), cairn_types::error::BlobError> {
-        if self.pause_at == BlobGatePoint::BeforeDelete
-            && self.pause_next.swap(false, Ordering::AcqRel)
-        {
-            self.entered.notify_one();
-            self.release.notified().await;
-        }
-        self.inner.delete(path).await
+    async fn confirm_storage_quiescence(
+        &self,
+        plan: &cairn_types::storage::StorageWritePlan,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), cairn_types::BlobError> {
+        self.inner.confirm_storage_quiescence(plan, lease).await
+    }
+
+    async fn cleanup_storage(
+        &self,
+        cleanup: &cairn_types::storage::StorageCleanup,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), cairn_types::BlobError> {
+        self.inner.cleanup_storage(cleanup, lease).await
     }
 
     async fn stage_part(
         &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         checksums: cairn_types::object::ChecksumSet,
         size_ceiling: u64,
         encryption: Option<cairn_types::SecretKey32>,
     ) -> Result<cairn_types::blob::StagedPart, cairn_types::error::BlobError> {
         self.inner
-            .stage_part(
-                upload,
-                part_number,
-                attempt_id,
-                body,
-                checksums,
-                size_ceiling,
-                encryption,
-            )
-            .await
-    }
-
-    async fn delete_part_attempt(
-        &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
-    ) -> Result<(), cairn_types::error::BlobError> {
-        self.inner
-            .delete_part_attempt(upload, part_number, attempt_id)
+            .stage_part(permit, body, checksums, size_ceiling, encryption)
             .await
     }
 
     async fn assemble(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         parts: &[cairn_types::blob::PartRef],
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -473,19 +836,23 @@ impl BlobStore for AssembleGateBlob {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        self.inner.assemble(bucket, parts, opts).await
-    }
-
-    async fn delete_session(&self, upload: &UploadId) -> Result<(), cairn_types::error::BlobError> {
-        self.inner.delete_session(upload).await
+        let staged = self.inner.assemble(permit, parts, opts).await?;
+        if self.pause_at == BlobGatePoint::AfterAssemble
+            && self.pause_next.swap(false, Ordering::AcqRel)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(staged)
     }
 
     async fn reconcile(
         &self,
         oracle: &dyn cairn_types::traits::ReconcileOracle,
         opts: cairn_types::blob::ReconcileOpts,
+        lease: cairn_types::storage::io::StorageIoLease,
     ) -> Result<cairn_types::blob::ReconcileReport, cairn_types::error::BlobError> {
-        self.inner.reconcile(oracle, opts).await
+        self.inner.reconcile(oracle, opts, lease).await
     }
 }
 
@@ -494,30 +861,34 @@ async fn harness_with_assemble_gate() -> (Harness, Arc<AssembleGateBlob>) {
 }
 
 async fn harness_with_assemble_gate_and_recovery(
-    recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    recovery: Option<Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>>,
 ) -> (Harness, Arc<AssembleGateBlob>) {
     harness_with_blob_gate_and_recovery(BlobGatePoint::BeforeAssemble, recovery).await
 }
 
-async fn harness_with_delete_gate_and_recovery(
-    recovery: Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>,
+async fn harness_with_post_assemble_gate_and_recovery(
+    recovery: Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>,
 ) -> (Harness, Arc<AssembleGateBlob>) {
-    harness_with_blob_gate_and_recovery(BlobGatePoint::BeforeDelete, Some(recovery)).await
+    harness_with_blob_gate_and_recovery(BlobGatePoint::AfterAssemble, Some(recovery)).await
 }
 
 async fn harness_with_blob_gate_and_recovery(
     gate_point: BlobGatePoint,
-    recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    recovery: Option<Arc<dyn Fn(StorageWriteRecovery) -> bool + Send + Sync>>,
 ) -> (Harness, Arc<AssembleGateBlob>) {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let inner: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let inner: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let gate = Arc::new(match gate_point {
         BlobGatePoint::BeforeAssemble => AssembleGateBlob::new(inner),
-        BlobGatePoint::BeforeDelete => AssembleGateBlob::new_before_delete(inner),
+        BlobGatePoint::AfterAssemble => AssembleGateBlob::new_after_assemble(inner),
     });
     let blob: Arc<dyn BlobStore> = gate.clone();
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -526,14 +897,18 @@ async fn harness_with_blob_gate_and_recovery(
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into())),
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
-    );
+    )
+    .with_storage_runtime(runtime.clone());
     let svc = match recovery {
-        Some(recover) => svc.with_multipart_claim_recovery(recover),
+        Some(recover) => svc
+            .with_storage_runtime(storage_runtime(meta.clone(), blob.clone(), Some(recover)).await),
         None => svc,
     };
     (
         Harness {
             svc,
+            runtime,
+            recovery_slots,
             meta,
             blob,
             _dir: dir,
@@ -550,11 +925,15 @@ async fn harness_sharded(shards: usize) -> Harness {
         .map(|_| Arc::new(cairn_meta::open_in_memory().unwrap()) as Arc<dyn MetadataStore>)
         .collect();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::ShardedMetadataStore::new(inner));
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -563,9 +942,12 @@ async fn harness_sharded(shards: usize) -> Harness {
         crypto,
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
-    );
+    )
+    .with_storage_runtime(runtime.clone());
     Harness {
         svc,
+        runtime,
+        recovery_slots,
         meta,
         blob,
         _dir: dir,
@@ -577,11 +959,15 @@ async fn harness_sharded(shards: usize) -> Harness {
 async fn harness_encrypt_at_rest() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let (runtime, recovery_slots) = storage_runtime_with_slots(meta.clone(), blob.clone()).await;
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -591,9 +977,12 @@ async fn harness_encrypt_at_rest() -> Harness {
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     )
+    .with_storage_runtime(runtime.clone())
     .with_encrypt_at_rest(true);
     Harness {
         svc,
+        runtime,
+        recovery_slots,
         meta,
         blob,
         _dir: dir,
@@ -1900,6 +2289,76 @@ async fn crc64nvme_checksum_is_computed_and_echoed() {
     );
 }
 
+/// A physical write must have both explicit process ownership and bounded recovery admission
+/// before the request body or filesystem can be touched.
+#[tokio::test]
+async fn put_without_storage_runtime_or_recovery_admission_never_reads_body() {
+    for install_runtime in [false, true] {
+        let h = harness().await;
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some("no-admission"), None, &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut svc = S3Service::new(
+            h.meta.clone(),
+            h.blob.clone(),
+            Arc::new(cairn_types::testing::AllowAll),
+            Arc::new(cairn_types::testing::TestClock::default()),
+            Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into())),
+            "us-east-1".into(),
+            1024,
+        );
+        if install_runtime {
+            let generation = StorageToken::generate();
+            h.meta
+                .submit(cairn_types::Mutation::BeginStorageGeneration {
+                    generation: generation.clone(),
+                })
+                .await
+                .unwrap();
+            svc = svc.with_storage_runtime(StorageWriteRuntime::new(
+                generation,
+                Arc::new(()),
+                Arc::new(|| Box::pin(async { None })),
+                Arc::new(|_| panic!("rejected recovery admission has no plan to recover")),
+            ));
+        }
+        let read = Arc::new(AtomicBool::new(false));
+        let observed = read.clone();
+        let body = Box::pin(futures_util::stream::once(async move {
+            observed.store(true, Ordering::Release);
+            Ok(Bytes::from_static(b"must not read"))
+        }));
+        let (request, _) = req(
+            Method::PUT,
+            Some("no-admission"),
+            Some("object"),
+            &[],
+            &[("content-length", "13")],
+            vec![],
+        );
+        let (status, _, _) = drain(svc.handle(request, body).await).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!read.load(Ordering::Acquire));
+        assert_eq!(blob_file_count(h._dir.path()), 0);
+        assert!(
+            h.meta
+                .current_version(
+                    &BucketName::parse("no-admission").unwrap(),
+                    &ObjectKey::parse("object").unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 // Count regular files under the blob-store root, skipping the `.staging` area. Metadata is
 // in-memory in these tests, so every remaining file is an object blob — used to prove a rejected
 // PUT leaves no orphan.
@@ -2419,15 +2878,10 @@ async fn cancelled_complete_queues_claim_recovery_and_is_retryable() {
         .await
         .expect("claim recovery must be queued synchronously on future drop")
         .expect("recovery queue remains open");
-    assert_eq!(queued.upload_id.as_str(), upload_id);
-    assert!(
-        queued.assembled_blob.is_none(),
-        "cancellation before the real assembler starts has no committed blob"
-    );
-    assert!(!queued.delete_blob_on_not_owner);
+    assert_eq!(recovery_upload_id(&queued).as_str(), upload_id);
     assert_eq!(
         h.meta
-            .get_multipart(&queued.upload_id)
+            .get_multipart(&recovery_upload_id(&queued))
             .await
             .unwrap()
             .expect("claimed session survives cancellation")
@@ -2439,20 +2893,12 @@ async fn cancelled_complete_queues_claim_recovery_and_is_retryable() {
     // completion. A missing drop guard leaves this receive empty; a missing worker transition
     // leaves the retry at NoSuchUpload.
     assert!(matches!(
-        h.meta
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: queued.upload_id.clone(),
-                claim_token: queued.claim_token,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::Released
-        )
+        resolve_storage(&*h.meta, &*h.blob, &queued).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
     assert_eq!(
         h.meta
-            .get_multipart(&queued.upload_id)
+            .get_multipart(&recovery_upload_id(&queued))
             .await
             .unwrap()
             .expect("released session survives")
@@ -2500,7 +2946,10 @@ async fn cancelled_during_claim_ack_queues_exact_token_recovery() {
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
     let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
     let (mut h, concrete) = in_memory_harness().await;
-    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     let (upload_id, etag) = start_upload_with_part(&h, "claim-ack-loss", "obj").await;
     let typed_id = UploadId::from_string(upload_id.clone());
     concrete.hang_next_multipart_claim_ack();
@@ -2550,23 +2999,14 @@ async fn cancelled_during_claim_ack_queues_exact_token_recovery() {
         .await
         .expect("claim-ack cancellation must enqueue recovery")
         .expect("recovery queue remains open");
-    assert_eq!(recovery.upload_id, typed_id);
-    assert!(recovery.assembled_blob.is_none());
+    assert_eq!(recovery_upload_id(&recovery), typed_id);
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: recovery.upload_id.clone(),
-                claim_token: recovery.claim_token,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::Released
-        )
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
     assert_eq!(
         concrete
-            .get_multipart(&recovery.upload_id)
+            .get_multipart(&recovery_upload_id(&recovery))
             .await
             .unwrap()
             .expect("claim recovery preserves the upload")
@@ -2583,7 +3023,10 @@ async fn complete_ack_error_preserves_the_committed_object_blob() {
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
     let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
     let (mut h, concrete) = in_memory_harness().await;
-    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     let (upload_id, etag) = start_upload_with_part(&h, "complete-ack-loss", "obj").await;
     concrete.fail_next_multipart_complete_ack();
 
@@ -2611,11 +3054,7 @@ async fn complete_ack_error_preserves_the_committed_object_blob() {
         .await
         .expect("ambiguous completion must enqueue exact-token recovery")
         .expect("recovery queue remains open");
-    assert!(!recovery.delete_blob_on_not_owner);
-    let assembled_path = recovery
-        .assembled_blob
-        .clone()
-        .expect("the recovery record carries the assembled path");
+    let assembled_path = recovery.plan.final_path().unwrap().clone();
     let bucket = BucketName::parse("complete-ack-loss").unwrap();
     let key = ObjectKey::parse("obj").unwrap();
     let committed = concrete
@@ -2626,16 +3065,8 @@ async fn complete_ack_error_preserves_the_committed_object_blob() {
     assert_eq!(committed.storage_path.as_ref(), Some(&assembled_path));
     assert!(h.blob.probe(&assembled_path).await.is_ok());
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: recovery.upload_id,
-                claim_token: recovery.claim_token,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::NotOwner
-        )
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
 
     let (get_status, _, body) = drain(
@@ -2658,14 +3089,14 @@ async fn complete_ack_error_preserves_the_committed_object_blob() {
     assert!(h.blob.probe(&assembled_path).await.is_ok());
 }
 
-/// Once real assembly has returned, cancellation at a later cleanup await must carry the durable
-/// assembled path to recovery. Releasing `completing` proves that blob was never installed, after
-/// which the retained worker can reclaim it instead of leaking one orphan per timed-out request.
+/// Once real assembly is durable, cancellation before the wrapper returns still carries its
+/// pre-admitted final path to recovery. Quiescence, exact claim release and Writer resolution
+/// produce durable cleanup debt without losing ownership at that handoff.
 #[tokio::test]
 async fn cancelled_complete_after_real_assembly_recovers_claim_and_blob_path() {
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
     let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
-    let (h, delete_gate) = harness_with_delete_gate_and_recovery(recover).await;
+    let (h, delete_gate) = harness_with_post_assemble_gate_and_recovery(recover).await;
     let upload_id = init_mpu(&h, "cancel-after-assembly", "obj").await;
     let (status, headers, _) = drain(
         send(
@@ -2710,8 +3141,8 @@ async fn cancelled_complete_after_real_assembly_recovers_claim_and_blob_path() {
         .await
     });
 
-    // The wrong whole-object checksum reaches `blob.delete` only after LocalBlobStore returned a
-    // durable assembled blob and the request guard tracked its path. Drop at that exact await.
+    // Pause after real durable assembly and before publication. The pre-admitted plan already
+    // owns the final path even though the wrapper has not returned its result to the request.
     delete_gate.wait_until_entered().await;
     complete_task.abort();
     assert!(complete_task.await.unwrap_err().is_cancelled());
@@ -2719,39 +3150,24 @@ async fn cancelled_complete_after_real_assembly_recovers_claim_and_blob_path() {
         .await
         .expect("post-assembly cancellation must enqueue recovery")
         .expect("recovery queue remains open");
-    assert_eq!(recovery.upload_id.as_str(), upload_id);
-    let assembled_path = recovery
-        .assembled_blob
-        .expect("post-assembly cancellation carries the uncommitted blob path");
-    assert!(
-        recovery.delete_blob_on_not_owner,
-        "BadDigest proves this request's assembled path was never installed"
-    );
+    assert_eq!(recovery_upload_id(&recovery).as_str(), upload_id);
+    let assembled_path = recovery.plan.final_path().unwrap().clone();
     assert!(
         h.blob.probe(&assembled_path).await.is_ok(),
-        "the injected cancellation happened before the direct cleanup"
+        "the injected cancellation happened before retained cleanup"
     );
 
     assert!(matches!(
-        h.meta
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: recovery.upload_id.clone(),
-                claim_token: recovery.claim_token,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::Released
-        )
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
-    h.blob.delete(&assembled_path).await.unwrap();
     assert!(matches!(
         h.blob.probe(&assembled_path).await,
         Err(cairn_types::error::BlobError::NotFound)
     ));
     assert_eq!(
         h.meta
-            .get_multipart(&recovery.upload_id)
+            .get_multipart(&recovery_upload_id(&recovery))
             .await
             .unwrap()
             .expect("released upload remains retryable")
@@ -2852,7 +3268,8 @@ async fn assembly_size_rejection_preserves_parts_and_releases_completion_claim()
         )),
         "us-east-1".into(),
         1,
-    );
+    )
+    .with_storage_runtime(h.runtime.clone());
     let complete = || {
         req(Method::POST, Some("size-retry"), Some("obj"),
         &[("uploadId", upload_id.as_str())], &[],
@@ -2875,6 +3292,7 @@ async fn assembly_size_rejection_preserves_parts_and_releases_completion_claim()
             .unwrap()
             .is_none()
     );
+    h.settle_recovery().await;
     let (status, _, _) = drain(send(&h.svc, complete()).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.meta.get_multipart(&id).await.unwrap().is_none());
@@ -2889,10 +3307,14 @@ async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_uplo
     let (upload_id, etag) = start_upload_with_part(&h, "mpbucket", "obj").await;
     // Pull the staged part artifacts out from under the soon-to-run assemble WITHOUT touching the
     // session row — this is a real assembly I/O failure, not an abort.
-    h.blob
-        .delete_session(&cairn_types::UploadId::from_string(upload_id.clone()))
+    let parts = h
+        .meta
+        .list_parts(&UploadId::from_string(upload_id.clone()), 0, 100)
         .await
         .unwrap();
+    assert_eq!(parts.items.len(), 1);
+    // Fault injection: remove the authoritative part's file without changing its metadata.
+    std::fs::remove_file(h._dir.path().join(parts.items[0].storage_path.as_str())).unwrap();
     let body = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
     );
@@ -2919,6 +3341,7 @@ async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_uplo
          got {st} {xml}"
     );
 
+    h.settle_recovery().await;
     // The post-claim failure released the session to active. Replace the missing part and retry;
     // without ReleaseMultipartClaim the second Complete sees `AlreadyClaimed` and returns 404.
     let (st, headers, _) = drain(
@@ -2966,10 +3389,16 @@ async fn explicit_complete_failure_queues_exactly_one_release_without_aba() {
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
     let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
     let mut h = harness().await;
-    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     let (upload_id, etag) = start_upload_with_part(&h, "claim-aba", "obj").await;
     let typed_id = UploadId::from_string(upload_id.clone());
-    h.blob.delete_session(&typed_id).await.unwrap();
+    let parts = h.meta.list_parts(&typed_id, 0, 100).await.unwrap();
+    assert_eq!(parts.items.len(), 1);
+    // Fault injection: exact file loss forces assembly failure while the session remains active.
+    std::fs::remove_file(h._dir.path().join(parts.items[0].storage_path.as_str())).unwrap();
 
     let body = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
@@ -3009,23 +3438,10 @@ async fn explicit_complete_failure_queues_exactly_one_release_without_aba() {
         .await
         .expect("explicit failure queues recovery")
         .expect("recovery queue remains open");
-    assert_eq!(queued.upload_id, typed_id);
-    assert!(
-        queued.assembled_blob.is_none(),
-        "the injected assembly failure never returned a committed blob"
-    );
-    assert!(!queued.delete_blob_on_not_owner);
+    assert_eq!(recovery_upload_id(&queued), typed_id);
     assert!(matches!(
-        h.meta
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: queued.upload_id.clone(),
-                claim_token: queued.claim_token.clone(),
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::Released
-        )
+        resolve_storage(&*h.meta, &*h.blob, &queued).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
 
     // A retry now owns `completing`. There is no delayed second command from the failed request
@@ -3055,16 +3471,8 @@ async fn explicit_complete_failure_queues_exactly_one_release_without_aba() {
         cairn_types::MultipartStatus::Completing
     );
     assert!(matches!(
-        h.meta
-            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
-                upload_id: typed_id.clone(),
-                claim_token: queued.claim_token,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartClaimRelease(
-            cairn_types::meta::ClaimReleaseOutcome::NotOwner
-        )
+        resolve_storage(&*h.meta, &*h.blob, &queued).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
 
     // Leave the fixture retryable for normal test teardown.
@@ -3410,6 +3818,7 @@ async fn start_upload(h: &Harness, bucket: &str, key: &str) -> String {
 }
 
 async fn assert_no_multipart_accounting(h: &Harness, upload_id: &str) {
+    h.settle_recovery().await;
     let upload_id = UploadId::from_string(upload_id.to_owned());
     assert!(
         h.meta
@@ -3567,14 +3976,13 @@ async fn upload_part_declared_length_mismatch_reclaims_attempt_and_reservation()
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_no_multipart_accounting(&h, &upload_id).await;
 
-    let mut entries =
-        tokio::fs::read_dir(h._dir.path().join(".staging/multipart").join(&upload_id))
-            .await
-            .unwrap();
-    assert!(
-        entries.next_entry().await.unwrap().is_none(),
-        "failed attempt bytes must be removed immediately"
-    );
+    match tokio::fs::read_dir(h._dir.path().join(".staging/multipart").join(&upload_id)).await {
+        Ok(mut entries) => assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "failed attempt bytes must be removed after retained recovery drains"
+        ),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    }
 }
 
 /// AUD-007: bucket byte quota is reserved transactionally before `stage_part`, so a request that
@@ -3632,6 +4040,7 @@ async fn upload_part_quota_failure_happens_before_staging() {
 }
 
 async fn assert_failed_part_was_reclaimed(h: &Harness, fault: &AbortAfterStagePartBlob) {
+    h.settle_recovery().await;
     let staged = fault.last_staged();
     assert!(
         matches!(
@@ -3753,9 +4162,16 @@ async fn upload_part_ack_loss_preserves_committed_attempt() {
     .await;
     let upload_id = start_upload(&h, "part-ack-loss", "object").await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
-        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
-    ));
+    h.svc = h.svc.clone().with_storage_runtime(
+        storage_runtime(
+            h.meta.clone(),
+            h.blob.clone(),
+            Some(Arc::new(move |recovery: StorageWriteRecovery| {
+                tx.send(recovery).is_ok()
+            })),
+        )
+        .await,
+    );
     concrete.fail_next_part_record_ack();
 
     let (status, _, _) = drain(
@@ -3776,19 +4192,17 @@ async fn upload_part_ack_loss_preserves_committed_attempt() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let recovery = rx.recv().await.expect("ambiguous part must queue recovery");
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
-                upload_id: recovery.upload_id.clone(),
-                part_number: recovery.part_number,
-                storage_path: recovery.storage_path.clone(),
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
-    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
+            .await
+            .is_ok()
+    );
     let part = concrete
-        .list_parts(&recovery.upload_id, 0, 10)
+        .list_parts(&recovery_upload_id(&recovery), 0, 10)
         .await
         .unwrap()
         .items
@@ -3836,9 +4250,16 @@ async fn upload_part_copy_ack_loss_preserves_committed_attempt() {
     .await;
     let upload_id = start_upload(&h, "copy-ack-loss", "object").await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
-        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
-    ));
+    h.svc = h.svc.clone().with_storage_runtime(
+        storage_runtime(
+            h.meta.clone(),
+            h.blob.clone(),
+            Some(Arc::new(move |recovery: StorageWriteRecovery| {
+                tx.send(recovery).is_ok()
+            })),
+        )
+        .await,
+    );
     concrete.fail_next_part_record_ack();
 
     let (status, _, _) = drain(
@@ -3862,19 +4283,17 @@ async fn upload_part_copy_ack_loss_preserves_committed_attempt() {
         .await
         .expect("ambiguous copy-part must queue recovery");
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
-                upload_id: recovery.upload_id.clone(),
-                part_number: recovery.part_number,
-                storage_path: recovery.storage_path.clone(),
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
-    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
+            .await
+            .is_ok()
+    );
     let part = concrete
-        .list_parts(&recovery.upload_id, 0, 10)
+        .list_parts(&recovery_upload_id(&recovery), 0, 10)
         .await
         .unwrap()
         .items
@@ -3907,9 +4326,16 @@ async fn cancelled_upload_part_ack_queues_exact_committed_attempt() {
     .await;
     let upload_id = start_upload(&h, "part-cancel", "object").await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
-        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
-    ));
+    h.svc = h.svc.clone().with_storage_runtime(
+        storage_runtime(
+            h.meta.clone(),
+            h.blob.clone(),
+            Some(Arc::new(move |recovery: StorageWriteRecovery| {
+                tx.send(recovery).is_ok()
+            })),
+        )
+        .await,
+    );
     concrete.hang_next_part_record_ack();
 
     let svc = h.svc.clone();
@@ -3942,15 +4368,8 @@ async fn cancelled_upload_part_ack_queues_exact_committed_attempt() {
         .await
         .expect("request Drop must enqueue exact part");
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
-                upload_id: recovery.upload_id,
-                part_number: recovery.part_number,
-                storage_path: recovery.storage_path,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
 }
 
@@ -3991,9 +4410,16 @@ async fn cancelled_upload_part_copy_ack_queues_exact_committed_attempt() {
     .await;
     let upload_id = start_upload(&h, "copy-part-cancel", "object").await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
-        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
-    ));
+    h.svc = h.svc.clone().with_storage_runtime(
+        storage_runtime(
+            h.meta.clone(),
+            h.blob.clone(),
+            Some(Arc::new(move |recovery: StorageWriteRecovery| {
+                tx.send(recovery).is_ok()
+            })),
+        )
+        .await,
+    );
     concrete.hang_next_part_record_ack();
 
     let svc = h.svc.clone();
@@ -4026,15 +4452,8 @@ async fn cancelled_upload_part_copy_ack_queues_exact_committed_attempt() {
         .await
         .expect("copy request Drop must enqueue exact part");
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
-                upload_id: recovery.upload_id,
-                part_number: recovery.part_number,
-                storage_path: recovery.storage_path,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
 }
 
@@ -7215,8 +7634,12 @@ async fn cancelled_put_before_metadata_submission_queues_exact_object_recovery()
     let (mut h, concrete) = in_memory_harness().await;
     versioned_bucket(&h, "cancel-put").await;
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
-    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
-    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    let recover =
+        Arc::new(move |recovery: StorageWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     concrete.hang_next_replication_config_read();
 
     let svc = h.svc.clone();
@@ -7242,32 +7665,32 @@ async fn cancelled_put_before_metadata_submission_queues_exact_object_recovery()
         .await
         .expect("PUT cancellation must synchronously enqueue recovery")
         .expect("recovery receiver remains open");
-    assert_eq!(recovery.bucket.as_str(), "cancel-put");
-    assert_eq!(recovery.key.as_str(), "object");
-    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert_eq!(recovery.plan.bucket.as_str(), "cancel-put");
+    assert_eq!(recovery_key(&recovery).as_str(), "object");
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
+            .await
+            .is_ok()
+    );
     assert!(
         concrete
-            .current_version(&recovery.bucket, &recovery.key)
+            .current_version(&recovery.plan.bucket, &recovery_key(&recovery))
             .await
             .unwrap()
             .is_none(),
         "cancellation occurred before metadata submission"
     );
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveObjectWrite {
-                bucket: recovery.bucket,
-                key: recovery.key,
-                version_id: recovery.version_id,
-                row_id: recovery.row_id,
-                storage_path: recovery.storage_path.clone(),
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
-    h.blob.delete(&recovery.storage_path).await.unwrap();
-    assert!(h.blob.probe(&recovery.storage_path).await.is_err());
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
+            .await
+            .is_err()
+    );
 }
 
 /// CopyObject has the same post-stage cancellation window as PUT. Its destination blob must carry
@@ -7300,8 +7723,12 @@ async fn cancelled_copy_before_metadata_submission_queues_exact_object_recovery(
     .await;
     versioned_bucket(&h, "copy-destination").await;
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
-    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
-    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    let recover =
+        Arc::new(move |recovery: StorageWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     concrete.hang_next_replication_config_read();
 
     let svc = h.svc.clone();
@@ -7326,24 +7753,24 @@ async fn cancelled_copy_before_metadata_submission_queues_exact_object_recovery(
         .await
         .expect("Copy cancellation must synchronously enqueue recovery")
         .expect("recovery receiver remains open");
-    assert_eq!(recovery.bucket.as_str(), "copy-destination");
-    assert_eq!(recovery.key.as_str(), "copied");
-    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
-    assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveObjectWrite {
-                bucket: recovery.bucket,
-                key: recovery.key,
-                version_id: recovery.version_id,
-                row_id: recovery.row_id,
-                storage_path: recovery.storage_path.clone(),
-            })
+    assert_eq!(recovery.plan.bucket.as_str(), "copy-destination");
+    assert_eq!(recovery_key(&recovery).as_str(), "copied");
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
             .await
-            .unwrap(),
-        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+            .is_ok()
+    );
+    assert!(matches!(
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
-    h.blob.delete(&recovery.storage_path).await.unwrap();
-    assert!(h.blob.probe(&recovery.storage_path).await.is_err());
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
+            .await
+            .is_err()
+    );
 }
 
 /// A PUT transaction can commit while its acknowledgement is lost. The error response must queue
@@ -7361,8 +7788,12 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     )
     .await;
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
-    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
-    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    let recover =
+        Arc::new(move |recovery: StorageWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h
+        .svc
+        .clone()
+        .with_storage_runtime(storage_runtime(h.meta.clone(), h.blob.clone(), Some(recover)).await);
     concrete.fail_next_object_put_ack();
 
     let (status, _, _) = drain(
@@ -7386,28 +7817,24 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
         .expect("ambiguous PUT must enqueue exact recovery")
         .expect("recovery receiver remains open");
     let committed = concrete
-        .current_version(&recovery.bucket, &recovery.key)
+        .current_version(&recovery.plan.bucket, &recovery_key(&recovery))
         .await
         .unwrap()
         .expect("PUT transaction committed before acknowledgement loss");
-    assert_eq!(committed.id, recovery.row_id);
+    assert_eq!(committed.id, recovery_row_id(&recovery));
     assert_eq!(
         committed.storage_path.as_ref(),
-        Some(&recovery.storage_path)
+        Some(recovery.plan.final_path().unwrap())
     );
-    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
-    assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveObjectWrite {
-                bucket: recovery.bucket.clone(),
-                key: recovery.key.clone(),
-                version_id: recovery.version_id.clone(),
-                row_id: recovery.row_id.clone(),
-                storage_path: recovery.storage_path.clone(),
-            })
+    assert!(
+        h.blob
+            .probe(recovery.plan.final_path().unwrap())
             .await
-            .unwrap(),
-        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: true }
+            .is_ok()
+    );
+    assert!(matches!(
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
 
     // A later null-version overwrite replaces the row. Delayed recovery now proves only the old
@@ -7429,24 +7856,18 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     .await;
     assert_eq!(status, StatusCode::OK);
     let current = concrete
-        .current_version(&recovery.bucket, &recovery.key)
+        .current_version(&recovery.plan.bucket, &recovery_key(&recovery))
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(current.id, recovery.row_id);
-    assert_ne!(current.storage_path.as_ref(), Some(&recovery.storage_path));
+    assert_ne!(current.id, recovery_row_id(&recovery));
+    assert_ne!(
+        current.storage_path.as_ref(),
+        Some(recovery.plan.final_path().unwrap())
+    );
     assert!(matches!(
-        concrete
-            .submit(cairn_types::Mutation::ResolveObjectWrite {
-                bucket: recovery.bucket,
-                key: recovery.key,
-                version_id: recovery.version_id,
-                row_id: recovery.row_id,
-                storage_path: recovery.storage_path,
-            })
-            .await
-            .unwrap(),
-        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+        resolve_storage(&*h.meta, &*h.blob, &recovery).await,
+        cairn_types::MutationOutcome::StorageUpdated { applied: false }
     ));
     let (status, _, body) = drain(
         send(
@@ -8971,11 +9392,15 @@ async fn sse_kms_key_id_without_algorithm_is_invalid_argument() {
 async fn sse_kms_key_id_allow_list_is_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let runtime = storage_runtime(meta.clone(), blob.clone(), None).await;
     let svc = S3Service::new(
         meta.clone(),
         blob,
@@ -8985,6 +9410,7 @@ async fn sse_kms_key_id_allow_list_is_enforced() {
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     )
+    .with_storage_runtime(runtime.clone())
     .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
         crypto,
         Some(vec!["alias/allowed".to_owned()]),
@@ -9118,15 +9544,83 @@ async fn sse_kms_tampered_descriptor_fails_closed() {
     // Confirm we kept the `kms` mode (still a Kms descriptor, just tampered).
     assert_eq!(desc["mode"], serde_json::json!("kms"));
     row.sse_descriptor = Some(desc.to_string());
+    let generation = StorageToken::generate();
     h.meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: Vec::new(),
+        .submit(Mutation::BeginStorageGeneration {
+            generation: generation.clone(),
         })
         .await
         .unwrap();
+    row.id = StorageToken::generate().as_str().to_owned();
+    let planned = h
+        .blob
+        .plan_write(
+            bucket.clone(),
+            generation,
+            StorageWriteTarget::Object {
+                key: key.clone(),
+                version_id: row.version_id.clone(),
+                row_id: row.id.clone(),
+            },
+        )
+        .unwrap();
+    let plan = planned.plan().clone();
+    let cairn_types::MutationOutcome::StorageAdmission(receipt) = h
+        .meta
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: StorageMutation::Reserve {
+                plan: Box::new(plan.clone()),
+                now: cairn_types::Timestamp(1),
+            },
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("object admission expected")
+    };
+    let (_, lease) =
+        StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), Arc::new(()));
+    let permit = planned.admit(receipt, lease).unwrap();
+    let path = plan.final_path().unwrap().clone();
+    let source = h
+        ._dir
+        .path()
+        .join(row.storage_path.as_ref().unwrap().as_str());
+    let destination = h._dir.path().join(path.as_str());
+    let temporary = h._dir.path().join(
+        plan.paths
+            .iter()
+            .find(|path| path.role == cairn_types::storage::StoragePathRole::Temporary)
+            .unwrap()
+            .path
+            .as_str(),
+    );
+    std::fs::copy(&source, &temporary).unwrap();
+    std::fs::File::open(&temporary).unwrap().sync_all().unwrap();
+    std::fs::rename(temporary, &destination).unwrap();
+    std::fs::File::open(destination.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(source).unwrap(),
+        std::fs::read(&destination).unwrap()
+    );
+    row.storage_path = Some(path);
+    h.meta
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan),
+            operation: Box::new(Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: Vec::new(),
+            }),
+        })
+        .await
+        .unwrap();
+    drop(permit);
 
     let (st, _, body) = drain(
         send(
@@ -12351,6 +12845,7 @@ async fn object_lock_retention_starts_at_commit_and_expired_explicit_intent_clea
             .unwrap()
             .is_none()
     );
+    h.settle_recovery().await;
     assert_eq!(
         blob_file_count(h._dir.path()),
         before_files,
@@ -14629,8 +15124,9 @@ async fn upload_part_wrong_checksum_is_bad_digest_and_no_orphan() {
         StatusCode::BAD_REQUEST,
         "wrong part checksum must be BadDigest"
     );
-    // The staged part blob must have been deleted before returning — the session's staging dir holds
-    // no leftover part file (an orphan reconcile would otherwise have to reclaim).
+    // The retained consumer drains exact debt after the request returns; no part bytes remain
+    // once backend quiescence and physical cleanup have completed.
+    h.settle_recovery().await;
     let session_dir = h
         ._dir
         .path()
@@ -14707,6 +15203,7 @@ async fn upload_part_verifies_signed_content_sha256() {
         StatusCode::BAD_REQUEST,
         "a part not matching the signed sha256 is BadDigest"
     );
+    h.settle_recovery().await;
     let session_dir = h
         ._dir
         .path()
@@ -15364,9 +15861,13 @@ async fn at_rest_off_stores_plaintext() {
 async fn encrypted_object_unopenable_dek_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let runtime = storage_runtime(meta.clone(), blob.clone(), None).await;
     let mk = |key: [u8; 32], at_rest: bool| {
         S3Service::new(
             meta.clone(),
@@ -15378,6 +15879,7 @@ async fn encrypted_object_unopenable_dek_fails_closed() {
             "us-east-1".to_owned(),
             5 * 1024 * 1024 * 1024,
         )
+        .with_storage_runtime(runtime.clone())
         .with_encrypt_at_rest(at_rest)
     };
     let writer = mk([1u8; 32], true);
@@ -15634,7 +16136,12 @@ fn is_version_encrypted(path: &std::path::Path) -> bool {
         )
 }
 
-fn build_svc(meta: Arc<dyn MetadataStore>, blob: Arc<dyn BlobStore>, key: [u8; 32]) -> S3Service {
+fn build_svc(
+    meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
+    key: [u8; 32],
+    runtime: StorageWriteRuntime,
+) -> S3Service {
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new(key.into()));
@@ -15647,6 +16154,7 @@ fn build_svc(meta: Arc<dyn MetadataStore>, blob: Arc<dyn BlobStore>, key: [u8; 3
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     )
+    .with_storage_runtime(runtime)
 }
 
 /// Initiate a multipart upload with the given initiate headers and return the upload id.
@@ -16120,10 +16628,14 @@ async fn tampered_part_fails_complete() {
 async fn wrong_master_key_fails_complete() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
-    let svc1 = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
-    let svc2 = build_svc(meta.clone(), blob.clone(), [8u8; 32]);
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
+    let runtime = storage_runtime(meta.clone(), blob.clone(), None).await;
+    let svc1 = build_svc(meta.clone(), blob.clone(), [7u8; 32], runtime.clone());
+    let svc2 = build_svc(meta.clone(), blob.clone(), [8u8; 32], runtime);
 
     drain(send(&svc1, req(Method::PUT, Some("wmk"), None, &[], &[], vec![])).await).await;
     let uid = initiate(
@@ -16177,9 +16689,19 @@ async fn wrong_master_key_fails_complete() {
 async fn pre_v21_session_completes_legacy() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
-    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
+    let generation = StorageToken::generate();
+    meta.submit(cairn_types::Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let runtime = runtime_in_generation(meta.clone(), blob.clone(), generation.clone(), None);
+    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32], runtime);
     drain(send(&svc, req(Method::PUT, Some("leg"), None, &[], &[], vec![])).await).await;
 
     // Fabricate a legacy session: sse_requested but NO part encryption, and plaintext parts.
@@ -16218,45 +16740,8 @@ async fn pre_v21_session_completes_legacy() {
     let part2 = b"legacy-tail".to_vec();
     let mut etags = Vec::new();
     for (n, body) in [(1u16, part1.clone()), (2u16, part2.clone())] {
-        let attempt_id = format!("legacy-{n}");
-        meta.submit(cairn_types::meta::Mutation::ReserveMultipartPart {
-            upload_id: upload.clone(),
-            part_number: n,
-            attempt_id: attempt_id.clone(),
-            reserved_bytes: body.len() as u64,
-            max_parts_per_upload: 10_000,
-            now: cairn_types::time::Timestamp(1),
-        })
-        .await
-        .unwrap();
-        let staged = blob
-            .stage_part(
-                &upload,
-                n,
-                &attempt_id,
-                once_body(body),
-                cairn_types::object::ChecksumSet::none(),
-                1 << 30,
-                None,
-            )
-            .await
-            .unwrap();
-        let part = cairn_types::meta::PartRecord {
-            part_number: n,
-            size: staged.size,
-            etag: staged.md5_hex.clone(),
-            storage_path: staged.storage_path.clone(),
-            checksum: None,
-            part_dek: None,
-        };
-        etags.push((n, staged.md5_hex.clone()));
-        meta.submit(cairn_types::meta::Mutation::RecordPart {
-            upload_id: upload.clone(),
-            attempt_id,
-            part,
-        })
-        .await
-        .unwrap();
+        let staged = seed_plaintext_part(&*meta, &*blob, &generation, &upload, n, body).await;
+        etags.push((n, staged.md5_hex));
     }
 
     let refs: Vec<(u16, &str)> = etags.iter().map(|(n, e)| (*n, e.as_str())).collect();
@@ -16541,11 +17026,15 @@ async fn multipart_kms_survives_and_is_not_downgraded() {
 async fn multipart_kms_unknown_key_id_rejected_at_initiate() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let runtime = storage_runtime(meta.clone(), blob.clone(), None).await;
     let svc = S3Service::new(
         meta.clone(),
         blob,
@@ -16555,6 +17044,7 @@ async fn multipart_kms_unknown_key_id_rejected_at_initiate() {
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     )
+    .with_storage_runtime(runtime.clone())
     .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
         crypto,
         Some(vec!["alias/allowed".to_owned()]),
@@ -16807,9 +17297,19 @@ async fn multipart_checksum_is_over_plaintext_with_encryption() {
 async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
-    let blob: Arc<dyn BlobStore> =
-        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
-    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        cairn_blob::LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
+    let generation = StorageToken::generate();
+    meta.submit(cairn_types::Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let runtime = runtime_in_generation(meta.clone(), blob.clone(), generation.clone(), None);
+    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32], runtime);
     drain(send(&svc, req(Method::PUT, Some("fcb"), None, &[], &[], vec![])).await).await;
 
     // Fabricate a corrupt session: encrypt_parts=true, but its parts are staged PLAINTEXT (part_dek NULL).
@@ -16848,45 +17348,8 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
     let part2 = b"tail".to_vec();
     let mut etags = Vec::new();
     for (n, bytes) in [(1u16, part1.clone()), (2u16, part2.clone())] {
-        let attempt_id = format!("plaintext-{n}");
-        meta.submit(cairn_types::meta::Mutation::ReserveMultipartPart {
-            upload_id: upload.clone(),
-            part_number: n,
-            attempt_id: attempt_id.clone(),
-            reserved_bytes: bytes.len() as u64,
-            max_parts_per_upload: 10_000,
-            now: cairn_types::time::Timestamp(1),
-        })
-        .await
-        .unwrap();
-        let staged = blob
-            .stage_part(
-                &upload,
-                n,
-                &attempt_id,
-                once_body(bytes),
-                cairn_types::object::ChecksumSet::none(),
-                1 << 30,
-                None,
-            )
-            .await
-            .unwrap();
-        let part = cairn_types::meta::PartRecord {
-            part_number: n,
-            size: staged.size,
-            etag: staged.md5_hex.clone(),
-            storage_path: staged.storage_path.clone(),
-            checksum: None,
-            part_dek: None,
-        };
-        etags.push((n, staged.md5_hex.clone()));
-        meta.submit(cairn_types::meta::Mutation::RecordPart {
-            upload_id: upload.clone(),
-            attempt_id,
-            part,
-        })
-        .await
-        .unwrap();
+        let staged = seed_plaintext_part(&*meta, &*blob, &generation, &upload, n, bytes).await;
+        etags.push((n, staged.md5_hex));
     }
 
     let refs: Vec<(u16, &str)> = etags.iter().map(|(n, e)| (*n, e.as_str())).collect();
@@ -17173,6 +17636,7 @@ async fn replication_intent_errors_prevent_commits_and_preserve_multipart_retry(
                     .unwrap()
                     .is_none()
             );
+            h.settle_recovery().await;
             assert_eq!(
                 blob_file_count(h._dir.path()),
                 files_before,
@@ -17189,6 +17653,7 @@ async fn replication_intent_errors_prevent_commits_and_preserve_multipart_retry(
                 .unwrap()
                 .is_none()
         );
+        h.settle_recovery().await;
         let session = h
             .meta
             .get_multipart(&cairn_types::UploadId::from_string(upload.clone()))

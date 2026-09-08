@@ -96,6 +96,9 @@ pub struct AppStack {
     /// `S3Service`; its single receiver is retained and shutdown-drained by the background
     /// supervisor.
     pub multipart_claim_recovery: Arc<crate::multipart_claim_recovery::MultipartClaimRecoveryQueue>,
+    /// The committed serving generation and actual exclusive node guard retained by every I/O job.
+    pub storage_generation: cairn_types::storage::StorageToken,
+    pub storage_lifetime: Arc<dyn Send + Sync>,
     /// Short-lived, single-use tickets for the SSE live-update stream (`hash -> (expiry_ms,
     /// minting principal)`). EventSource cannot send an Authorization header, so the browser mints
     /// a ticket with its Bearer token then opens the stream with `?ticket=`. In-process and
@@ -497,7 +500,10 @@ pub(crate) async fn open_meta_store(
 ///
 /// # Errors
 /// Returns a message if any store cannot be opened or the master key is invalid.
-pub async fn build(cfg: &Config) -> Result<AppStack, String> {
+pub async fn build(
+    cfg: &Config,
+    node_lock: Arc<crate::node_lock::NodeLock>,
+) -> Result<AppStack, String> {
     if cfg.replication_allow_plaintext_sse_over_http {
         // Loud, operator-visible warning: replication ships the DECRYPTED body, so this permits
         // data the client asked us to encrypt to cross an unauthenticated, unencrypted link.
@@ -531,12 +537,17 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // pass-through. The typed `meta_cache` handle is kept so the metrics loop can scrape `stats()`.
     let meta_cache = Arc::new(CachedMetadataStore::new(inner_meta, cfg.meta_cache_bytes));
     let meta: Arc<dyn MetadataStore> = meta_cache.clone();
+    let storage_lifetime: Arc<dyn Send + Sync> = node_lock;
+    let storage_generation = begin_storage_generation(&*meta).await?;
 
-    let blob_impl = LocalBlobStore::open(cfg.data_dir.clone())
-        .await
-        .map_err(|e| format!("open blob store: {e}"))?
-        .with_io_pool_size(cfg.blob_io_pool_size)
-        .with_read_io_pool_size(cfg.blob_io_read_pool_size);
+    let blob_impl = LocalBlobStore::open(
+        cfg.data_dir.clone(),
+        maintenance_lease(&storage_generation, storage_lifetime.clone()),
+    )
+    .await
+    .map_err(|e| format!("open blob store: {e}"))?
+    .with_io_pool_size(cfg.blob_io_pool_size)
+    .with_read_io_pool_size(cfg.blob_io_read_pool_size);
 
     // Fail fast if the data root and staging are on different filesystems: the commit protocol's
     // atomic rename would fail with EXDEV on every write (ARCH 2.4, 9.2, GAP medium #10).
@@ -602,10 +613,12 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())
     })
-    .with_multipart_claim_recovery(multipart_claim_recovery.callback())
-    .with_object_write_recovery(multipart_claim_recovery.object_callback())
-    .with_multipart_part_write_recovery(multipart_claim_recovery.part_callback())
-    .with_storage_recovery_admission(multipart_claim_recovery.admission_callback());
+    .with_storage_runtime(cairn_protocol::StorageWriteRuntime::new(
+        storage_generation.clone(),
+        storage_lifetime.clone(),
+        multipart_claim_recovery.admission_callback(),
+        multipart_claim_recovery.callback(),
+    ));
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));
@@ -654,6 +667,14 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         );
     }
 
+    recover_storage_intents(
+        &*meta,
+        &*blob,
+        &storage_generation,
+        storage_lifetime.clone(),
+    )
+    .await?;
+
     // Completion ownership is process-local: no request survives a restart. Restore every
     // transient `completing` claim before reconciliation or listener bind so the durable session
     // and its parts remain retryable instead of being stranded forever. This global mutation fans
@@ -672,6 +693,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
                 staging_safety_margin_secs: 0,
                 ..ReconcileOpts::default()
             },
+            maintenance_lease(&storage_generation, storage_lifetime.clone()),
         )
         .await,
     )?;
@@ -681,6 +703,13 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         "startup reconciliation complete"
     );
     recover_multipart_staging_accounting(&*meta).await?;
+    drain_exclusive_storage_cleanup(
+        &*meta,
+        &*blob,
+        &storage_generation,
+        storage_lifetime.clone(),
+    )
+    .await?;
 
     // Replication crash-recovery: release any `claimed` outbox entries left leased by a worker that
     // crashed mid-ship. A freshly-started process has no live workers, so every claimed row is an
@@ -703,6 +732,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         replication_notify,
         import_notify,
         multipart_claim_recovery,
+        storage_generation,
+        storage_lifetime,
         sse_tickets: crate::sse::SseTicketStore::default(),
         blob,
         blob_local,
@@ -718,6 +749,137 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
             cfg.request_metrics_bucket_secs,
         )),
     })
+}
+
+pub(crate) async fn begin_storage_generation(
+    meta: &dyn MetadataStore,
+) -> Result<cairn_types::storage::StorageToken, String> {
+    let generation = cairn_types::storage::StorageToken::generate();
+    match meta
+        .submit(cairn_types::Mutation::BeginStorageGeneration {
+            generation: generation.clone(),
+        })
+        .await
+        .map_err(|error| format!("begin storage generation: {error}"))?
+    {
+        cairn_types::MutationOutcome::Ack => Ok(generation),
+        _ => Err("unexpected storage generation acknowledgement".into()),
+    }
+}
+
+/// Offline commands and startup share the same generation, kernel-quiescence and claim recovery.
+/// The caller retains its actual exclusive node guard through every dependent maintenance job.
+pub(crate) async fn recover_exclusive_storage(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<cairn_types::storage::StorageToken, String> {
+    let generation = begin_storage_generation(meta).await?;
+    recover_storage_intents(meta, blob, &generation, lifetime).await?;
+    recover_orphaned_multipart_claims(meta).await?;
+    Ok(generation)
+}
+
+pub(crate) async fn finish_exclusive_storage_scan(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    generation: &cairn_types::storage::StorageToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    recover_multipart_staging_accounting(meta).await?;
+    drain_exclusive_storage_cleanup(meta, blob, generation, lifetime).await
+}
+
+pub(crate) async fn drain_exclusive_storage_cleanup(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    generation: &cairn_types::storage::StorageToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    loop {
+        let batch = crate::multipart_claim_recovery::drain_storage_cleanup(
+            meta,
+            blob,
+            generation,
+            lifetime.clone(),
+            128,
+        )
+        .await?;
+        if batch.claimed != batch.retired {
+            return Err(
+                "exclusive storage cleanup did not durably retire every claimed path".into(),
+            );
+        }
+        if batch.claimed == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// A maintenance operation uses the same physical ownership primitive while exclusive node
+/// ownership excludes serving requests. The generation is already committed by the caller.
+pub(crate) fn maintenance_lease(
+    generation: &cairn_types::storage::StorageToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> cairn_types::storage::io::StorageIoLease {
+    cairn_types::storage::io::StorageIoWatch::new(
+        cairn_types::storage::StorageToken::generate(),
+        generation.clone(),
+        lifetime,
+    )
+    .1
+}
+
+async fn recover_storage_intents(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    generation: &cairn_types::storage::StorageToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    use cairn_types::storage::StorageMutation;
+    use cairn_types::storage::io::StorageIoWatch;
+    loop {
+        let cairn_types::MutationOutcome::StorageIntentBatch(plans) = meta
+            .submit(cairn_types::Mutation::ListStorageIntents {
+                generation: generation.clone(),
+                limit: 128,
+            })
+            .await
+            .map_err(|error| format!("list prior storage ownership: {error}"))?
+        else {
+            return Err("unexpected prior storage ownership page".into());
+        };
+        if plans.is_empty() {
+            return Ok(());
+        }
+        for plan in plans {
+            // The exclusive node guard excludes old namespace threads. A separate probe of each
+            // exact data-file lock also excludes kernel work which can outlive its process.
+            let (mut watch, lease) = StorageIoWatch::new(
+                plan.attempt.clone(),
+                plan.generation.clone(),
+                lifetime.clone(),
+            );
+            blob.confirm_storage_quiescence(&plan, lease)
+                .await
+                .map_err(|error| format!("prior storage I/O is not quiescent: {error}"))?;
+            let quiescence = watch.quiescent().await;
+            match meta
+                .submit(cairn_types::Mutation::Storage {
+                    bucket: plan.bucket,
+                    operation: StorageMutation::ResolveRecovered {
+                        current_generation: generation.clone(),
+                        quiescence,
+                    },
+                })
+                .await
+                .map_err(|error| format!("resolve prior storage ownership: {error}"))?
+            {
+                cairn_types::MutationOutcome::StorageUpdated { applied: true } => {}
+                _ => return Err("prior storage ownership lost its recovery generation".into()),
+            }
+        }
+    }
 }
 
 async fn recover_orphaned_multipart_claims(meta: &dyn MetadataStore) -> Result<(), String> {

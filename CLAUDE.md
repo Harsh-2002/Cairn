@@ -129,7 +129,8 @@ above remain the source of truth.
   multipart initial tags/Object Lock intent (including the legacy-intent proof marker) and
   orphan-lock cleanup, v28 lifecycle row identity in the current-listing covering index, v29
   exact-token multipart completion ownership, v30 replication claim fencing, v31 authenticated
-  multipart replica intent, v32 internal plaintext SHA-256 integrity baselines, v33 durable remote multipart cleanup).
+  multipart replica intent, v32 internal plaintext SHA-256 integrity baselines, v33 durable remote multipart cleanup, v34 current-visible roll-ups, v35 storage compatibility,
+  v36 exact storage intent/cleanup journals, v37 multipart scratch-alias ownership).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is
@@ -172,3 +173,9 @@ Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat pl
 full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
 sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
 without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.
+
+Storage protocol 2 requires durable Writer admission before any new physical write. Use the
+move-only BlobStore creation permit and retain its I/O/node lifetime through actual jobs. Publish
+with the exact plan; all authoritative removals atomically record cleanup debt. Reclaim only under
+exact Writer claims after I/O quiescence and retire only after namespace sync. Full scans remain
+mandatory. The data namespace requires Linux 5.6+ `openat2` and refuses descendant mounts/symlinks.

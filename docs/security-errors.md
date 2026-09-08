@@ -52,7 +52,7 @@ The principal mappings are as follows.
 | Multipart session not found or not active | 404 | NoSuchUpload |
 | Conditional precondition failed | 412 | PreconditionFailed |
 | Object exceeds configured maximum size | 400 | EntityTooLarge |
-| Out of space on the data filesystem | 507 | InsufficientStorage |
+| Data filesystem or metadata engine capacity exhausted | 507 | InsufficientStorage |
 | Supplied checksum or content-MD5 mismatch | 400 | BadDigest / InvalidDigest |
 | Malformed request, XML, or policy document | 400 | MalformedXML / MalformedPolicy / InvalidArgument |
 | Invalid Object Lock enablement/versioning transition | 409 | InvalidBucketState |
@@ -68,6 +68,11 @@ The principal mappings are as follows.
 | Unexpected internal failure | 500 | InternalError |
 
 The request identifier appears in the error body, as a response header, and in the request's trace span, so that a client report can be tied to the exact server-side trace.
+
+Metadata capacity exhaustion uses the engine's typed full-database condition, including at
+pre-stage admission and commit, and remains typed through Writer batch responses. It does not
+establish whether an ambiguous transaction published: storage ownership and recovery remain armed
+until their usual exact outcome checks complete. Generic engine failures remain opaque 500 errors.
 
 ---
 

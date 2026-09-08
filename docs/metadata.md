@@ -14,12 +14,12 @@ The store opens one write connection, owned by the single group-committing write
 
 Before changing connection PRAGMAs or performing application mutations, startup validates the
 highest applied schema and storage-protocol state. Migrations beyond this binary's ceiling are
-rejected; schema v35 adds a singleton requiring reader/writer protocol 1, `write_layout='flat'`
-and `recovery_mode='full-scan'`. Inconsistent, missing or unsupported state fails closed. Both async
+rejected. Schema v35 introduced reader/writer protocol 1; v36 raises both floors to 2 while
+retaining `write_layout='flat'` and `recovery_mode='full-scan'`. Inconsistent, missing or unsupported state fails closed. Both async
 backends mirror this preflight, including direct migration calls. Sharded SQLite checks all
 existing database files before migrating any shard. The snapshot validator uses the same read-only
-SQLite guard before target staging. No shared mutation/read trait is added: this is startup
-compatibility state, initialized only by the append-only migration. Released binaries without the
+SQLite guard before target staging. Compatibility floors change only through append-only
+migrations. Released binaries without the
 check remain unsafe downgrade targets; see `upgrade-rollback.md` for verified snapshot rollback.
 
 The writer measures channel admission, admitted queue residence, transaction stages, and checkpoint execution using bounded per-stage sample rings (Section 26.2). Queue depth counts only admitted mutations not yet collected into a batch; cancellation while waiting for admission cannot inflate it. Checkpoint busy-wait prevention and batching policy remain unchanged.
@@ -27,6 +27,21 @@ The writer measures channel admission, admitted queue residence, transaction sta
 ### 11.3 Entities
 
 The schema is specified field by field in Appendix 34.1; this section describes the entities and the design intent behind them.
+
+**Physical storage ownership (v36; multipart alias ownership v37).** A singleton records the
+current process generation and incomplete legacy coverage. Unfinished write intents retain their
+routing bucket, exact publication target and at most three canonical paths. The normalized path
+index and multipart upload/reservation identity must agree with the stored plan. Exact cleanup
+rows retain independent claim tokens, generations and leases, plus optional links to v26 quota
+debts and the final part path that owns an unfinished temporary alias. These rows survive
+bucket/session deletion; published live objects need no permanent journal entry.
+
+Admission, exact publication, cancellation, quiescence resolution and bounded cleanup claims run
+through the canonical Writer in SQLite, libSQL, Turso, the in-memory double and shard routing
+(Section 11.6). An outstanding intent blocks cleanup regardless of its age or cancellation flag.
+Storage remains flat and startup recovery remains `full-scan`; coverage remains `incomplete`.
+The journal does not authorize a shorter startup scan. Remaining Phase 3C gates and the separate
+Phase 3D coverage work remain tracked in `storage-evolution-plan.md`.
 
 **Users** hold an identity, a display name, a role that is administrator or member, an active flag, the Bearer access-key identifier and a hash of its secret, and optionally a SigV4 access-key identifier and its secret stored as ciphertext plus a nonce under envelope encryption (Section 27). The two credential schemes coexist per user.
 
@@ -95,15 +110,64 @@ A concurrent, sharded, size-bounded cache fronts the store for hot reads of buck
 
 ### 11.6 Transactions, group commit, and conditional logic
 
-Multipart part recording uses the same writer as an ordering barrier. After cancellation or an
-ambiguous acknowledgement, `ResolveMultipartPartWrite` matches only the current row for the exact
-`(upload_id, part_number, storage_path)`. FIFO ordering preserves a part whose `RecordPart`
-committed before its acknowledgement was lost; only an exact miss authorizes deleting that attempt
-and releasing its reservation. Because the path embeds a fresh attempt id, a delayed resolver for
-an old attempt cannot match or delete a retry that superseded the same part number. Sharding routes
-the probe by the upload id's encoded bucket.
+Every commit-point operation uses one Writer savepoint. Group commit batches these operations
+into one physical transaction (Section 7.2); a precondition, constraint, tag, lock or outbox failure
+rolls back that operation while its batch-mates may commit. Conditional writes read and check the
+current version in the same savepoint as their upsert. Lifecycle guards likewise require the
+listed immutable row identity, timestamp and any current-version or sole-marker predicate before
+changing rows, counters or outboxes. A lost predicate returns `DeleteNotApplied`. Object Lock
+parsing, replacement/deletion protection, retention rules, versioning transitions and exact initial
+tag/lock installation remain Writer-authoritative.
 
-Every operation that constitutes a commit point, namely putting an object version, completing a multipart upload, creating a delete marker, deleting a version, and the configuration mutations, is a single transaction. Under group commit these single transactions are batched into one physical transaction with a savepoint per operation (Section 7.2), so a conditional write whose precondition fails, or a mutation that violates a uniqueness or foreign-key constraint, rolls back only its own savepoint and returns its own typed error while its batch-mates commit. The precondition for a conditional write is evaluated by reading the current state and deciding within the same savepoint that performs the upsert, so the decision and the change are atomic with respect to every other writer, which is the property conditional writes exist to provide. Lifecycle freshness predicates use that same rule: a marker creation may require an exact version and timestamp still to be the current non-marker; every permanent expiration requires the immutable row identifier and timestamp captured by listing; and an expired-marker deletion may additionally require its target still to be the sole/latest delete marker. The row identifier is authoritative for replacement identity because a sentinel overwrite can reuse its version identifier and timestamp. A failed predicate returns `DeleteNotApplied` before version, tag, lock, counter, or outbox changes. The writer is likewise the final Object Lock authority: it strictly parses the persisted bucket and version state, checks replacement/deletion protection, enforces retention non-weakening and versioning transitions, and then commits the object row, exact tag and lock side rows, and outbox together. A late tag, lock, or outbox error rolls the whole savepoint back and cannot expose an unlocked version or return a superseded blob for reclamation. Ordinary PUT/Copy cancellation recovery also uses the writer as its ordering barrier: after staging, the request owns an intended `(bucket, key, version_id, immutable row_id, storage_path)` record; if its future is dropped or its acknowledgement is ambiguous, a later `ResolveObjectWrite` mutation reports referenced only for that exact row/path. Writer FIFO places the probe after an original put that reached the queue, while the immutable id and unique path make delayed recovery safe across an unversioned sentinel overwrite. Only an exact miss permits blob deletion; an error preserves the path for startup reconciliation. The sharded store routes this probe by bucket. Multipart terminal ownership is evaluated the same way: claim, active-only abort, conditional claim release, and the completion ownership check are writer mutations with typed won/lost outcomes; the final ownership check, Object Lock resolution, object upsert, and session retirement share one savepoint. Each completion attempt mints a fresh opaque token. Claim persists it with `active -> completing`, and release and final completion require the exact `(upload_id, token)` pair. The request guard is armed before awaiting Claim, so a commit whose acknowledgement is lost is still recoverable; a release that raced before an uncommitted/losing Claim is a harmless `NotOwner`. Delayed or duplicate recovery from an older token cannot release or complete a newer owner. When cancellation has already produced a durable assembled blob, recovery carries its path and deletes it only after a `Released` outcome proves completion did not commit; `NotOwner` preserves it because an object row may now reference it, unless the request observed a typed non-commit result that proves the path unreferenced. Startup additionally submits an idempotent global recovery mutation before listener bind, clearing both transient status and tokens, and then performs full blob reconciliation, safely resolving a process death or live recovery ambiguity before any request can race. A sharded store routes a live per-upload release to the owning shard and broadcasts global startup recovery to every physical shard.
+Protocol 2 requires a file-free plan before physical creation. Ordinary PUT/Copy admission reserves
+the exact attempt, generation, target and canonical temporary/final/index paths. Multipart
+`AdmitStorageWrite` combines that reservation with the original quota reservation or exact-token
+completion claim in one savepoint. A losing reserve/claim grants no creation authority. Only an
+acknowledged matching admission and a live I/O lease can produce the move-only creation permit
+consumed by the blob layer (Section 12.1).
+
+`PublishStorageWrite` validates the original mutation against that plan, then checks the current
+generation, exact persisted intent and normalized ownership index, and the cancellation flag.
+An absent, stale or cancelled owner returns `StoragePublicationNotApplied`. Direct physical
+`PutObjectVersion`, `RecordPart` and `CompleteMultipart` mutations are rejected. The accepted
+publication preserves the original preconditions, tags, Object Lock and outbox behavior; its
+savepoint commits those effects, consumes the intent and records cleanup for unreferenced planned
+paths. Replacement and deletion record cleanup debt in the same savepoint as removing a live
+reference. Returned superseded paths are descriptive outcomes, not authority for direct unlink.
+A late failure rolls back publication, intent consumption and cleanup changes together.
+
+Cancellation closes further I/O lease admission and marks the intent, but cannot prove that a
+blocking task, queued backend operation or prepared result has stopped. After the actual ownership
+set drains, `Resolve` carries its unforgeable quiescence proof through the Writer FIFO. Resolution
+checks exact live object/part references, retains referenced paths and converts unreferenced paths
+to durable cleanup before retiring the intent. The legacy exact `ResolveObjectWrite` and
+`ResolveMultipartPartWrite` probes remain ordering/identity checks; their misses alone do not
+authorize physical deletion or quota release. Immutable row identity and attempt-derived part
+paths prevent delayed recovery from confusing a replacement with its predecessor.
+
+Multipart completion still claims `active -> completing` under a fresh persisted token, Abort
+removes only `active`, and release/final completion require the exact token. The final claim check,
+Object Lock resolution, object upsert, session retirement and staging accounting share the
+publication savepoint. Abort or claim release cannot remove storage ownership while its backend
+I/O remains live. Terminal and superseded part bytes retain their v26 charge until every linked
+protocol-2 cleanup path is durably absent. Migration v37's `quota_owner_path` transfers unfinished
+temporary aliases to the same charge when the final part reference disappears; aliases do not
+charge those bytes twice. Legacy cleanup release mutations cannot retire protocol-2 debt.
+
+`ClaimStorageCleanup` is bounded and excludes every path referenced by an object, part or
+outstanding intent. A worker deletes only its exact claimed path and establishes the directory
+absence barrier before `FinishCleanup`. Settlement verifies the cleanup id, bucket, path, current
+generation, claim token, unexpired exact lease and quota-debt identity inside the Writer. The last
+linked cleanup may retire its sole quota charge only when no outstanding intent protects the
+charged path. A stale claim or failed deletion preserves retryable debt.
+
+Startup advances the process generation only under exclusive node ownership after prior backend
+I/O has drained, invalidating old cleanup claims. Prior-generation intents are enumerated in
+bounded batches and resolved through the recovered-quiescence path; full reconciliation remains
+mandatory before serving requests. Sharding routes admission, publication and settlement by the
+retained bucket, broadcasts generation changes to every physical shard, and bounds global intent
+and cleanup batches across shards. SQLite, libSQL, Turso and the in-memory double preserve the
+same savepoint and typed applied/not-applied outcomes.
 
 The SQLite re-wrap worker's compare-and-swap updates and key-ring binding transaction also execute
 on that same writer connection through its serialized control seam. It never opens an ad-hoc source
@@ -119,7 +183,13 @@ Cairn's protocol and control layers are written against a small set of internal 
 
 ### 12.1 The blob store interface
 
-The blob store owns object bytes on some medium and knows nothing of S3, identity, or metadata. It exposes the ability to stage a single object by consuming a byte stream, during which it computes the plaintext MD5 that becomes the ETag and any additional checksum algorithms the caller requests, applies the bucket's compression policy producing the self-describing blob format when compression is selected, enforces a hard size ceiling by aborting and cleaning up if exceeded, and performs the durable commit prefix of fsyncing the file and its directory before returning; on return it guarantees the blob is durable and reports the storage path, the logical and physical sizes, and the computed hashes, but it writes no metadata and does not itself verify against client-supplied checksums, which the caller does with the returned hashes. It exposes opening a committed blob through `open_raw(path, range, cipher, compression, expected_logical_len)`, whose `cipher` selector is `BlobCipher::KnownPlaintext`, `BlobCipher::LegacyV2(DEK)`, or `BlobCipher::AuthenticatedV3(DEK)`; it returns a handle that serves the whole object or a byte range, transparently decompressing each block and — for an encrypted declaration — decrypting each AES-256-GCM block. Cipher, compression, container generation, and full logical length come from authoritative metadata. A declared raw plaintext file must equal that trusted length; compressed layout is bound to its trusted block geometry; and the reader requires an encrypted on-disk version to match its declaration exactly, so body bytes cannot select their own parser. A DEK-free `probe(path)` inspects a blob's physical form without decrypting it. There is no DEK-less open. It exposes idempotent deletion of a committed blob, treating absence as success. It exposes staging a multipart part, reporting the part's plaintext size and MD5 and storage path, and assembling ordered parts into a single committed blob through the same durable sequence with compression applied during assembly, and idempotent deletion of all of a session's parts. Finally it exposes reconciliation, which must be bounded in memory and which is given batched membership oracles for live blobs and live upload sessions so it can stream the filesystem and reclaim orphans without materialising the keyspace. The default implementation is the local filesystem engine of Sections 7 through 10; an in-memory implementation backs unit tests; future implementations behind the same interface include an io_uring engine and a remote-S3-backed cold tier used by lifecycle transition.
+The blob store owns object bytes on some medium and knows nothing of S3, identity, or metadata. It exposes the ability to stage a single object by consuming a byte stream, during which it computes the plaintext MD5 that becomes the ETag and any additional checksum algorithms the caller requests, applies the bucket's compression policy producing the self-describing blob format when compression is selected, enforces a hard size ceiling by aborting if exceeded, and performs the durable commit prefix of fsyncing the file and its directory before returning; on return it guarantees the blob is durable and reports the storage path, the logical and physical sizes, and the computed hashes, but it writes no metadata and does not itself verify against client-supplied checksums, which the caller does with the returned hashes. It exposes opening a committed blob through `open_raw(path, range, cipher, compression, expected_logical_len)`, whose `cipher` selector is `BlobCipher::KnownPlaintext`, `BlobCipher::LegacyV2(DEK)`, or `BlobCipher::AuthenticatedV3(DEK)`; it returns a handle that serves the whole object or a byte range, transparently decompressing each block and — for an encrypted declaration — decrypting each AES-256-GCM block. Cipher, compression, container generation, and full logical length come from authoritative metadata. A declared raw plaintext file must equal that trusted length; compressed layout is bound to its trusted block geometry; and the reader requires an encrypted on-disk version to match its declaration exactly, so body bytes cannot select their own parser. A DEK-free `probe(path)` inspects a blob's physical form without decrypting it. There is no DEK-less open. It exposes idempotent deletion of an exact path, including the durable absence barrier when the path is already missing; callers must hold the Writer cleanup claim described in Section 11.6. It exposes staging a multipart part, reporting the part's plaintext size and MD5 and storage path, and assembling ordered parts into a single committed blob through the same durable sequence with compression applied during assembly, and legacy session cleanup for exclusive full-scan recovery. Online protocol-2 reclamation uses exact claimed paths. Finally it exposes reconciliation, which must be bounded in memory and which is given batched membership oracles for live blobs and live upload sessions so it can stream the filesystem and reclaim orphans without materialising the keyspace. The default implementation is the local filesystem engine of Sections 7 through 10; an in-memory implementation backs unit tests; future implementations behind the same interface include an io_uring engine and a remote-S3-backed cold tier used by lifecycle transition.
+
+`stage`, `stage_part` and `assemble` consume a move-only `StorageCreationPermit` produced from a
+matching Writer admission. File-free plans and cloned plan DTOs cannot create files. Each actual
+backend operation, including blocking work and prepared results, retains the storage I/O lease
+and node-lock lifetime until completion. Errors and cancellation leave physical cleanup to exact
+Writer claims; they do not make the request future's lifetime a reclamation barrier.
 
 `BlobStore::read_memory_bound(compression, encrypted, logical_len)` reports the backend's
 conservative allocation and maximum-frame bounds without opening a file or resolving a key.
@@ -130,10 +200,13 @@ range as one frame and must not borrow the filesystem decoder's assumptions.
 
 ### 12.2 The metadata store interface
 
-The metadata store is the source-of-truth interface and exposes operations grouped by entity, all of whose enumerations are paged and bounded. It also exposes a constant-cost read probe that must exercise a real backend read connection without enumerating application rows or caching the result. For buckets it exposes ordinary creation, atomic Object-Lock-enabled creation, lookup, listing overall and by owner, deletion, and the get and set of each configuration aspect: versioning state, ownership mode, policy, ACL, CORS, lifecycle, replication rules, stored replication targets, default-encryption setting, tag set, and public-access-block settings, plus the account-wide public-access-block singleton. Object Lock default retention uses a dedicated update mutation because its enablement cannot be changed through the generic configuration seam. For object versions it exposes getting the current version of a key, getting a specific version, putting a new version together with its initial tags and explicit Object Lock intent as a commit point that returns any superseded blob's storage path for reclamation and that enforces a supplied precondition atomically, creating a delete marker optionally guarded by the exact enumerated current version, permanently deleting a specific version with distinct deleted, not-applied, and protected outcomes and optional immutable-row, timestamp, and sole-marker guards, paged listing of current objects under a prefix with optional delimiter grouping — where an empty-but-present delimiter is treated as absent, i.e. no grouping, matching S3 and clients such as minio-go that send the parameter unconditionally — paged listing of all versions, and paged enumeration of storage paths for reconciliation and empty-bucket. Listing summaries carry their internal row identity in process but omit it from serde output. For object tags it exposes get, set, and delete; for Object Lock it exposes strict state reads plus serialized retention and legal-hold mutations. For multipart it exposes creating a session with pinned initial tags and explicit lock intent, querying its status, recording a part, listing parts, atomically claiming a session under a fresh completion token so a double completion is impossible, releasing only that exact failed claim, globally recovering process-orphaned completion claims, completing as a commit point that re-verifies both status and token while upserting the object version and removing the session in one transaction with a precondition, active-only abort with a typed winner result, and paged enumeration of stale and of all sessions for the sweeper. For replication it exposes enqueuing an outbox entry as part of a write, claiming a batch of due entries for a worker, marking entries done or failed with backoff, and querying an object's replication status. For users it exposes lookup by Bearer key returning the stored hash, lookup by SigV4 key returning the decrypted secret in a zeroizing container, counting, and the create, list, update, and deactivate operations the management API needs. For audit it exposes recording an action and listing recent actions. For metrics it exposes the aggregate counts. The guarantees are that commit-point operations are single transactions, that preconditions, lifecycle guards, and Object Lock policy are evaluated within them, and that no operation returns an unbounded result set. The default implementation is the SQLite store of Section 11; an in-memory implementation backs unit tests.
+The metadata store is the source-of-truth interface and exposes operations grouped by entity, all of whose enumerations are paged and bounded. It also exposes a constant-cost read probe that must exercise a real backend read connection without enumerating application rows or caching the result. For buckets it exposes ordinary creation, atomic Object-Lock-enabled creation, lookup, listing overall and by owner, deletion, and the get and set of each configuration aspect: versioning state, ownership mode, policy, ACL, CORS, lifecycle, replication rules, stored replication targets, default-encryption setting, tag set, and public-access-block settings, plus the account-wide public-access-block singleton. Object Lock default retention uses a dedicated update mutation because its enablement cannot be changed through the generic configuration seam. For object versions it exposes getting the current version of a key, getting a specific version, putting a new version together with its initial tags and explicit Object Lock intent through exact admitted publication that records any superseded blob's cleanup debt and enforces a supplied precondition atomically, creating a delete marker optionally guarded by the exact enumerated current version, permanently deleting a specific version with distinct deleted, not-applied, and protected outcomes and optional immutable-row, timestamp, and sole-marker guards, paged listing of current objects under a prefix with optional delimiter grouping — where an empty-but-present delimiter is treated as absent, i.e. no grouping, matching S3 and clients such as minio-go that send the parameter unconditionally — paged listing of all versions, and paged enumeration of storage paths for reconciliation and empty-bucket. Listing summaries carry their internal row identity in process but omit it from serde output. For object tags it exposes get, set, and delete; for Object Lock it exposes strict state reads plus serialized retention and legal-hold mutations. For multipart it exposes creating a session with pinned initial tags and explicit lock intent, querying its status, recording a part, listing parts, atomically claiming a session under a fresh completion token so a double completion is impossible, releasing only that exact failed claim, globally recovering process-orphaned completion claims, completing as a commit point that re-verifies both status and token while upserting the object version and removing the session in one transaction with a precondition, active-only abort with a typed winner result, and paged enumeration of stale and of all sessions for the sweeper. For replication it exposes enqueuing an outbox entry as part of a write, claiming a batch of due entries for a worker, marking entries done or failed with backoff, and querying an object's replication status. For users it exposes lookup by Bearer key returning the stored hash, lookup by SigV4 key returning the decrypted secret in a zeroizing container, counting, and the create, list, update, and deactivate operations the management API needs. For audit it exposes recording an action and listing recent actions. For metrics it exposes the aggregate counts. The guarantees are that commit-point operations are single transactions, that preconditions, lifecycle guards, and Object Lock policy are evaluated within them, and that no operation returns an unbounded result set. The default implementation is the SQLite store of Section 11; an in-memory implementation backs unit tests.
 
-Part recording's metadata surface includes the exact writer-serialized ownership resolver described
-in Section 11.6; it is a recovery barrier, not an eventually consistent read.
+The physical-ownership surface additionally exposes generation advancement, exact admission and
+publication, cancellation, quiescence resolution, bounded prior-generation intent enumeration,
+and leased exact cleanup claims/settlement (Section 11.6). All use the Writer; an ordinary read or
+an ownership-probe miss cannot authorize reclamation. Test fixtures initialize one generation
+explicitly and admit physical publications through the same production mutations.
 
 ### 12.3 The authenticator interface
 

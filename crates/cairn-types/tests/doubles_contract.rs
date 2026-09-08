@@ -3,8 +3,23 @@
 //! atomicity, versioning/delete-marker bookkeeping, and bounded reconciliation.
 
 use bytes::Bytes;
+use cairn_types::testing::{FixtureBlobStore, FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, TestClock};
 use cairn_types::*;
+
+async fn create_bucket_fixture(meta: &InMemoryMetadataStore, bucket: &BucketName) {
+    meta.submit(Mutation::CreateBucket(Box::new(Bucket {
+        name: bucket.clone(),
+        owner_id: UserId::generate(),
+        created_at: Timestamp::EPOCH,
+        versioning: VersioningState::Unversioned,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".into(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+}
 
 fn body(data: &'static [u8]) -> BodyStream {
     Box::pin(futures_util::stream::once(async move {
@@ -139,15 +154,17 @@ async fn read_all(handle: BlobReadHandle) -> Vec<u8> {
 async fn put_get_list_delete_roundtrip() {
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let clock = TestClock::default();
     let bucket = BucketName::parse("test-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let owner = UserId::generate();
 
     // Stage + commit two objects.
     for (k, data) in [("a/1.txt", &b"hello"[..]), ("a/2.txt", &b"world!!"[..])] {
         let key = ObjectKey::parse(k).unwrap();
         let staged = blob
-            .stage(
+            .stage_fixture(
                 &bucket,
                 Box::pin(futures_util::stream::once({
                     let d = data.to_vec();
@@ -173,12 +190,15 @@ async fn put_get_list_delete_roundtrip() {
             clock.now(),
         );
         let outcome = meta
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(row),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState::default(),
-                replication: Vec::new(),
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: Vec::new(),
+                },
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -250,11 +270,16 @@ async fn put_get_list_delete_roundtrip() {
 async fn conditional_write_if_none_match_is_atomic() {
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("cond-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("k").unwrap();
     let owner = UserId::generate();
 
-    let staged = blob.stage(&bucket, body(b"v1"), opts()).await.unwrap();
+    let staged = blob
+        .stage_fixture(&bucket, body(b"v1"), opts())
+        .await
+        .unwrap();
     let row = row_from(
         &staged,
         &bucket,
@@ -263,26 +288,35 @@ async fn conditional_write_if_none_match_is_atomic() {
         &owner,
         Timestamp::EPOCH,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row.clone()),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(row.clone()),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
 
-    // If-None-Match: * must now fail because the object exists.
+    // A fresh admitted attempt must still fail If-None-Match because the object exists.
+    let mut row = row;
+    row.id = uuid::Uuid::new_v4().simple().to_string();
+    row.storage_path = Some(StoragePath::generate(&bucket));
     let err = meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition {
-                if_match: None,
-                if_none_match: Some(IfNoneMatch::Any),
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition {
+                    if_match: None,
+                    if_none_match: Some(IfNoneMatch::Any),
+                },
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
             },
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::PreconditionFailed));
@@ -292,14 +326,16 @@ async fn conditional_write_if_none_match_is_atomic() {
 async fn versioning_keeps_history_and_promotes_latest() {
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("ver-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("doc").unwrap();
     let owner = UserId::generate();
 
     let mut versions = Vec::new();
     for data in [&b"one"[..], &b"two"[..], &b"three"[..]] {
         let staged = blob
-            .stage(
+            .stage_fixture(
                 &bucket,
                 Box::pin(futures_util::stream::once({
                     let d = data.to_vec();
@@ -313,12 +349,15 @@ async fn versioning_keeps_history_and_promotes_latest() {
         versions.push(v.clone());
         let mut row = row_from(&staged, &bucket, &key, v, &owner, Timestamp::EPOCH);
         row.is_latest = true;
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        meta.submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
         // version ids are time-sortable; give each a distinct timestamp
@@ -406,12 +445,17 @@ async fn versioning_keeps_history_and_promotes_latest() {
 async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("row-guard").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("object").unwrap();
     let owner = UserId::generate();
     let timestamp = Timestamp(100);
 
-    let first_blob = blob.stage(&bucket, body(b"old"), opts()).await.unwrap();
+    let first_blob = blob
+        .stage_fixture(&bucket, body(b"old"), opts())
+        .await
+        .unwrap();
     let first = row_from(
         &first_blob,
         &bucket,
@@ -420,12 +464,15 @@ async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
         &owner,
         timestamp,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(first),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(first),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
     let observed = meta
@@ -443,7 +490,10 @@ async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
         .next()
         .unwrap();
 
-    let replacement_blob = blob.stage(&bucket, body(b"new"), opts()).await.unwrap();
+    let replacement_blob = blob
+        .stage_fixture(&bucket, body(b"new"), opts())
+        .await
+        .unwrap();
     let replacement = row_from(
         &replacement_blob,
         &bucket,
@@ -454,12 +504,15 @@ async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
     );
     let replacement_id = replacement.id.clone();
     assert_ne!(replacement_id, observed.row_id);
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(replacement),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(replacement),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
 
@@ -491,12 +544,17 @@ async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
 async fn reconcile_reclaims_orphan_blobs() {
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("recon-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("kept").unwrap();
     let owner = UserId::generate();
 
     // One referenced blob...
-    let kept = blob.stage(&bucket, body(b"keep"), opts()).await.unwrap();
+    let kept = blob
+        .stage_fixture(&bucket, body(b"keep"), opts())
+        .await
+        .unwrap();
     let row = row_from(
         &kept,
         &bucket,
@@ -505,21 +563,27 @@ async fn reconcile_reclaims_orphan_blobs() {
         &owner,
         Timestamp::EPOCH,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
     // ...and one orphan blob with no metadata row (a crash between durability and commit).
-    let _orphan = blob.stage(&bucket, body(b"orphan"), opts()).await.unwrap();
+    let _orphan = blob
+        .stage_fixture(&bucket, body(b"orphan"), opts())
+        .await
+        .unwrap();
     assert_eq!(blob.blob_count(), 2);
 
     let oracle = meta.oracle();
     let report = blob
-        .reconcile(&oracle, ReconcileOpts::default())
+        .reconcile_fixture(&oracle, ReconcileOpts::default())
         .await
         .unwrap();
     assert_eq!(report.orphans_reclaimed, 1);
@@ -540,12 +604,13 @@ fn opts() -> StageOptions {
 /// Plant one replication-outbox entry by committing a version that carries it, returning its id.
 async fn plant_outbox_entry(
     meta: &InMemoryMetadataStore,
+    fixture: &PublicationFixture,
     bucket: &BucketName,
     key: &ObjectKey,
     version: &VersionId,
     id: &str,
 ) {
-    plant_outbox_entry_at(meta, bucket, key, version, id, Timestamp::EPOCH).await;
+    plant_outbox_entry_at(meta, fixture, bucket, key, version, id, Timestamp::EPOCH).await;
 }
 
 /// As [`plant_outbox_entry`], but with an explicit `enqueued_at` — the clock
@@ -553,6 +618,7 @@ async fn plant_outbox_entry(
 /// reclaims and which survive.
 async fn plant_outbox_entry_at(
     meta: &InMemoryMetadataStore,
+    fixture: &PublicationFixture,
     bucket: &BucketName,
     key: &ObjectKey,
     version: &VersionId,
@@ -592,11 +658,7 @@ async fn plant_outbox_entry_at(
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(StoragePath::from_string(format!(
-            "{}/{}",
-            bucket.as_str(),
-            version.as_str()
-        ))),
+        storage_path: Some(StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -611,12 +673,15 @@ async fn plant_outbox_entry_at(
         created_at: Timestamp::EPOCH,
         updated_at: Timestamp::EPOCH,
     };
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit_fixture(
+        fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: vec![entry],
+        },
+    )
     .await
     .unwrap();
 }
@@ -625,14 +690,16 @@ async fn plant_outbox_entry_at(
 async fn list_failed_replication_returns_only_terminal_entries() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("k").unwrap();
     let v1 = VersionId::from_string("00000001".to_owned());
     let v2 = VersionId::from_string("00000002".to_owned());
 
     // Two outbox entries: one we will leave pending, one we will mark terminally failed.
-    plant_outbox_entry(&meta, &bucket, &key, &v1, "pending-1").await;
-    plant_outbox_entry(&meta, &bucket, &key, &v2, "doomed-1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &key, &v1, "pending-1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &key, &v2, "doomed-1").await;
 
     // Nothing has failed yet.
     assert!(meta.list_failed_replication(100).await.unwrap().is_empty());
@@ -720,11 +787,16 @@ async fn set_object_acl_replaces_the_version_acl() {
 
     let blob = InMemoryBlobStore::new();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("acl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let key = ObjectKey::parse("obj").unwrap();
     let owner = UserId::generate();
 
-    let staged = blob.stage(&bucket, body(b"data"), opts()).await.unwrap();
+    let staged = blob
+        .stage_fixture(&bucket, body(b"data"), opts())
+        .await
+        .unwrap();
     let version = VersionId::null();
     let row = row_from(
         &staged,
@@ -734,12 +806,15 @@ async fn set_object_acl_replaces_the_version_acl() {
         &owner,
         Timestamp::EPOCH,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
 
@@ -808,7 +883,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
     let bucket = BucketName::parse("sse-bucket").unwrap();
     let dek = [9u8; 32];
     let staged = blob
-        .stage(
+        .stage_fixture(
             &bucket,
             body(b"top secret"),
             StageOptions {
@@ -876,7 +951,7 @@ async fn probe_reports_presence_without_a_dek() {
 
     // A plaintext blob: present, and its physical length is the byte length.
     let plain = blob
-        .stage(&bucket, body(b"twelve bytes"), opts())
+        .stage_fixture(&bucket, body(b"twelve bytes"), opts())
         .await
         .unwrap();
     let p = blob.probe(&plain.storage_path).await.unwrap();
@@ -884,7 +959,7 @@ async fn probe_reports_presence_without_a_dek() {
 
     // A well-formed ENCRYPTED blob probes present WITHOUT any DEK — presence is not decryptability.
     let enc = blob
-        .stage(
+        .stage_fixture(
             &bucket,
             body(b"top secret"),
             StageOptions {
@@ -914,14 +989,24 @@ async fn probe_reports_presence_without_a_dek() {
 async fn requeue_replication_versions_double_matches_the_engines() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let enc_key = ObjectKey::parse("enc").unwrap();
     let plain_key = ObjectKey::parse("plain").unwrap();
     let v1 = VersionId::from_string("00000001".to_owned());
     let v2 = VersionId::from_string("00000002".to_owned());
 
-    plant_outbox_entry(&meta, &bucket, &enc_key, &v1, "backfill:r1:enc:1").await;
-    plant_outbox_entry(&meta, &bucket, &plain_key, &v2, "backfill:r1:plain:2").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &enc_key, &v1, "backfill:r1:enc:1").await;
+    plant_outbox_entry(
+        &meta,
+        &fixture,
+        &bucket,
+        &plain_key,
+        &v2,
+        "backfill:r1:plain:2",
+    )
+    .await;
     // Mark the first version encrypted by re-committing the row with a descriptor.
     let mut enc = meta
         .get_version(&bucket, &enc_key, &v1)
@@ -930,12 +1015,17 @@ async fn requeue_replication_versions_double_matches_the_engines() {
         .unwrap();
     enc.sse_descriptor =
         Some(r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#.to_owned());
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(enc),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    enc.id = uuid::Uuid::new_v4().simple().to_string();
+    enc.storage_path = Some(StoragePath::generate(&bucket));
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
 
@@ -1005,7 +1095,9 @@ async fn requeue_replication_versions_double_matches_the_engines() {
 async fn requeue_replication_versions_double_is_key_scoped() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let k = ObjectKey::parse("k").unwrap();
     let p = ObjectKey::parse("p").unwrap();
     let v1 = VersionId::from_string("00000001".to_owned());
@@ -1013,18 +1105,23 @@ async fn requeue_replication_versions_double_is_key_scoped() {
     let v3 = VersionId::from_string("00000003".to_owned());
 
     // key `k`: an encrypted v1 and a later PLAINTEXT v2. key `p`: plaintext only.
-    plant_outbox_entry(&meta, &bucket, &k, &v1, "k-1").await;
-    plant_outbox_entry(&meta, &bucket, &k, &v2, "k-2").await;
-    plant_outbox_entry(&meta, &bucket, &p, &v3, "p-3").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &k, &v1, "k-1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &k, &v2, "k-2").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &p, &v3, "p-3").await;
     let mut enc = meta.get_version(&bucket, &k, &v1).await.unwrap().unwrap();
     enc.sse_descriptor =
         Some(r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#.to_owned());
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(enc),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    enc.id = uuid::Uuid::new_v4().simple().to_string();
+    enc.storage_path = Some(StoragePath::generate(&bucket));
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
 
@@ -1085,11 +1182,13 @@ async fn requeue_replication_versions_double_is_key_scoped() {
 async fn requeue_replication_versions_double_pages_by_key_and_threads_the_cursor() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     for i in 1..=5u32 {
         let key = ObjectKey::parse(&format!("k{i}")).unwrap();
         let v = VersionId::from_string(format!("0000000{i}"));
-        plant_outbox_entry(&meta, &bucket, &key, &v, &format!("e{i}")).await;
+        plant_outbox_entry(&meta, &fixture, &bucket, &key, &v, &format!("e{i}")).await;
     }
     replication_claims
         .claim(&meta, 10, Timestamp::from_secs(1))
@@ -1150,7 +1249,9 @@ async fn requeue_replication_versions_double_pages_by_key_and_threads_the_cursor
 async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let a = ObjectKey::parse("a").unwrap();
     let k = ObjectKey::parse("k").unwrap();
     let v1 = VersionId::from_string("00000001".to_owned());
@@ -1158,19 +1259,24 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
 
     // Insertion order deliberately puts k's NEWER version in the outbox before its older one — the
     // shape a row-ordered `.take(limit)` gets wrong.
-    plant_outbox_entry(&meta, &bucket, &k, &v2, "k:2").await;
-    plant_outbox_entry(&meta, &bucket, &a, &v1, "a:1").await;
-    plant_outbox_entry(&meta, &bucket, &k, &v1, "k:1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &k, &v2, "k:2").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &a, &v1, "a:1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &k, &v1, "k:1").await;
     for (key, v) in [(&a, &v1), (&k, &v1)] {
         let mut enc = meta.get_version(&bucket, key, v).await.unwrap().unwrap();
         enc.sse_descriptor =
             Some(r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#.to_owned());
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        enc.id = uuid::Uuid::new_v4().simple().to_string();
+        enc.storage_path = Some(StoragePath::generate(&bucket));
+        meta.submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     }
@@ -1261,10 +1367,12 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
 async fn mark_replication_done_double_stamps_replicated_at() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let k = ObjectKey::parse("k").unwrap();
     let v = VersionId::from_string("00000001".to_owned());
-    plant_outbox_entry(&meta, &bucket, &k, &v, "e1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &k, &v, "e1").await;
     assert_eq!(
         meta.get_version(&bucket, &k, &v)
             .await
@@ -1321,15 +1429,20 @@ async fn mark_replication_done_double_stamps_replicated_at() {
     // An inbound replica is never stamped as shipped from here.
     let rk = ObjectKey::parse("r").unwrap();
     let rv = VersionId::from_string("00000002".to_owned());
-    plant_outbox_entry(&meta, &bucket, &rk, &rv, "r1").await;
+    plant_outbox_entry(&meta, &fixture, &bucket, &rk, &rv, "r1").await;
     let mut inbound = meta.get_version(&bucket, &rk, &rv).await.unwrap().unwrap();
     inbound.replication_status = Some(cairn_types::meta::ReplicationStatus::Replica);
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(inbound),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: Vec::new(),
-    })
+    inbound.id = uuid::Uuid::new_v4().simple().to_string();
+    inbound.storage_path = Some(StoragePath::generate(&bucket));
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(inbound),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
     .await
     .unwrap();
     meta.submit(Mutation::MarkReplicationDone {
@@ -1364,7 +1477,9 @@ async fn mark_replication_done_double_stamps_replicated_at() {
 async fn requeue_replication_versions_double_skips_unshippable_non_current_versions() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("repl-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
     let v1 = VersionId::from_string("00000001".to_owned());
     let v2 = VersionId::from_string("00000002".to_owned());
 
@@ -1377,20 +1492,35 @@ async fn requeue_replication_versions_double_skips_unshippable_non_current_versi
         } else {
             Timestamp(1_000)
         };
-        plant_outbox_entry_at(&meta, &bucket, &key, &v1, &format!("{name}:1"), enqueued).await;
+        plant_outbox_entry_at(
+            &meta,
+            &fixture,
+            &bucket,
+            &key,
+            &v1,
+            &format!("{name}:1"),
+            enqueued,
+        )
+        .await;
         let mut enc = meta.get_version(&bucket, &key, &v1).await.unwrap().unwrap();
         enc.sse_descriptor =
             Some(r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#.to_owned());
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        enc.id = uuid::Uuid::new_v4().simple().to_string();
+        enc.storage_path = Some(StoragePath::generate(&bucket));
+        meta.submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
         plant_outbox_entry_at(
             &meta,
+            &fixture,
             &bucket,
             &key,
             &v2,

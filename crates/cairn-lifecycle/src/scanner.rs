@@ -22,7 +22,7 @@ use cairn_types::{BlobStore, MetaError};
 use cairn_types::{
     Bucket, BucketName, Clock, CurrentVersionGuard, GovernanceBypass, ListQuery, MetadataStore,
     MultipartSession, MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectKey,
-    ObjectSummary, StoragePath, Timestamp, VersionId, VersioningState,
+    ObjectSummary, Timestamp, VersionId, VersioningState,
 };
 
 /// The page size used for every bounded enumeration the scanner issues. Memory stays flat
@@ -431,7 +431,7 @@ impl LifecycleScanner {
     async fn abort_incomplete_uploads<M, B>(
         &self,
         meta: &M,
-        blob: &B,
+        _blob: &B,
         bucket: &Bucket,
         rules: &[&LifecycleRule],
         now: Timestamp,
@@ -469,21 +469,9 @@ impl LifecycleScanner {
                     .await
                 {
                     Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
-                        // Only the terminal winner owns these bytes. A concurrent Complete that
-                        // moved the session to `completing` returns NotOwner below and keeps parts.
-                        if blob.delete_session(&session.upload_id).await.is_ok() {
-                            match meta
-                                .submit(Mutation::ReleaseMultipartUploadCleanups {
-                                    upload_id: session.upload_id.clone(),
-                                })
-                                .await
-                            {
-                                Ok(MutationOutcome::Ack) => report.uploads_aborted += 1,
-                                Ok(_) | Err(_) => report.errors += 1,
-                            }
-                        } else {
-                            report.errors += 1;
-                        }
+                        // The Writer atomically records exact debt and fences active attempts.
+                        // The shared cleanup worker waits for quiescence before releasing bytes.
+                        report.uploads_aborted += 1;
                     }
                     Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
                         // Expected race: completion owns the session. It reclaims its own parts.
@@ -753,7 +741,7 @@ impl LifecycleScanner {
     pub(crate) async fn delete_version<M, B>(
         &self,
         meta: &M,
-        blob: &B,
+        _blob: &B,
         bucket: &BucketName,
         obj: &ObjectSummary,
         now: Timestamp,
@@ -778,29 +766,12 @@ impl LifecycleScanner {
             })
             .await?;
         match outcome {
-            MutationOutcome::Deleted {
-                freed: Some(path), ..
-            } => {
-                self.reclaim(blob, &path).await;
-                Ok(true)
-            }
-            MutationOutcome::Deleted { freed: None, .. } => Ok(true),
+            MutationOutcome::Deleted { .. } => Ok(true),
             MutationOutcome::DeleteNotApplied => Ok(false),
             MutationOutcome::DeleteProtected => Ok(false),
             _ => Err(MetaError::Engine(
                 "unexpected lifecycle delete outcome".to_owned(),
             )),
-        }
-    }
-
-    /// Best-effort blob reclamation; a delete failure is logged, not propagated, because the
-    /// metadata row is already gone and a later reconciliation pass will catch the orphan.
-    async fn reclaim<B>(&self, blob: &B, path: &StoragePath)
-    where
-        B: BlobStore + ?Sized,
-    {
-        if let Err(e) = blob.delete(path).await {
-            tracing::warn!(path = %path, error = %e, "lifecycle: blob reclaim failed");
         }
     }
 }

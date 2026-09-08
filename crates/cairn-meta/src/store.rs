@@ -1355,8 +1355,8 @@ impl MetadataStore for SqliteMetadataStore {
         self.with_read(move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT * FROM multipart_part_reservations
-                     WHERE created_at < ?1
+                    "SELECT * FROM multipart_part_reservations AS r
+                     WHERE created_at < ?1 AND NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)
                      ORDER BY created_at, attempt_id LIMIT ?2",
                 )
                 .map_err(engine_err)?;
@@ -1379,7 +1379,7 @@ impl MetadataStore for SqliteMetadataStore {
         self.with_read(move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT * FROM multipart_staging_cleanups
+                    "SELECT * FROM multipart_staging_cleanups WHERE storage_protocol=1
                      ORDER BY storage_path IS NULL, created_at, id LIMIT ?1",
                 )
                 .map_err(engine_err)?;

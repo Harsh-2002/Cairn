@@ -61,7 +61,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   parent-directory durability coverage. Full startup reconciliation remains active. Existing
   older binaries cannot retroactively be made to reject newer state: rollback uses a verified
   snapshot, and unsupported old writers/external restore invalidate journal-coverage assumptions.
-- [ ] **3B: fanout comparison**. Compare flat paths with lazy
+- [x] **3B: fanout comparison** — merged in PR #87 (`bf17dfe`). Compare flat paths with lazy
   `bucket/<first-two-UUID-hex-digits>/<uuid>` in the laboratory, with identical counts and mixes.
   Measure directory creation, PUT/GET/delete, reconciliation and directory-fsync coalescing.
   It reduces neither inode count nor total scan work. Failure/inconclusive means no default
@@ -268,4 +268,80 @@ because controls drifted beyond the predeclared 20% span; KEEP flat. No default 
 or promotion PR follow. The shared campaign, including reduction and cleanup, has consumed
 390.191882 seconds (6m30s), with 542,654,464 bytes peak and no active process/data reservation.
 Raw owned run artifacts are removed; compact evidence is in `storage-fanout-2026-09.json`.
-Phase 3B final-commit CI and merge remain pending.
+Phase 3B final head `6f87421a3312cda7976f522fc1da0b4a506504bc` passed all 54 checks, with no
+posted review findings or open branch scanning alerts. PR #87 merged as `bf17dfe`; its branch
+and worktree are removed.
+
+The operator approved the exact `storage-lifecycle-proposal.md` protocol-2 proposal on
+2026-09-08. Phase 3C implementation is authorized: durable pre-stage Writer admission, exact
+cleanup debt and backend-I/O quiescence, while retaining full startup scans. Phase 3D activation
+remains gated by the approved coverage, crash/restore and performance checks. CONTRACT.md is
+unchanged.
+
+Phase 3C foundation: v36 journal schema, strict protocol-2 preflight, typed admission/cleanup
+transactions, retained I/O ownership types and backend/shard parity are implemented. Fifteen focused
+migration, ownership and journal tests pass across SQLite, libSQL, Turso, doubles and shards;
+owning all-feature Clippy passes. Blob I/O, strict publication, v26 quota retirement and recovery
+consumer integration are still required before this phase or its PR can be considered complete.
+No new performance experiment has run; the cumulative campaign remains 390.191882 seconds.
+
+Phase 3C integration: all ordinary/import/replica PUT and Copy paths, multipart part/completion
+admission and publication, and deletion/lifecycle/control paths now use exact durable ownership.
+v37 additionally retains multipart scratch-alias ownership so quota cannot retire before all
+aliases are durably absent. Constructor, staging, blocking work, io_uring, reconciliation and
+cleanup retain node/I/O lifetime; Linux descriptor-anchored traversal rejects descendant mounts
+and symlinks. Focused protocol/blob/backend and five real-filesystem startup integration tests
+pass, including across all four metadata configurations. The actual io_uring SIGKILL fixture
+passes with the limits stated in `storage-journal-2026-09.md`. Review identified an import recovery
+shutdown-sentinel race; its fix and deterministic producer-order regression pass. Exact cleanup
+now runs promptly in the existing sweeper independently of the configured stale-upload interval;
+three regressions cover multi-page progress, shutdown and locked-file debt retention. The final
+local gate passes 1,388 default-feature and 1,413 all-feature tests, both Clippy configurations,
+formatting and two doctests. Web, npm audits, cargo audits and installer checks pass. Final-head CI,
+the admission-cost comparison, final review and merge remain pending.
+Phase 3C is not complete and Phase 3D is not activated. Campaign consumption is unchanged.
+
+PR #91 opened at `537c2b3`. Initial CI passed 52 checks and exposed two integration gaps: metadata
+admission on a full filesystem returned 500 instead of 507, and cleanup could prune an empty bucket
+directory held by pending multipart assembly. Typed capacity propagation and directory lifetime
+fences now have focused regressions; the mixed-feature harness is being updated to verify exact
+deferred cleanup within a deadline. The async Writer review additionally found ignored savepoint
+failures; whole-batch abort tests accompany its fix, and the additional issue candidate is pending
+operator approval. No comparison ran on the rejected candidate; the ledger remains unchanged.
+
+The CI follow-up revision passes the complete Rust gate: 1,403 default-feature and 1,429
+all-feature tests (four/seven skipped), two doctests, formatting and both Clippy configurations.
+The directory-lock review also corrected completed coalescer/io_uring descriptor release before
+acknowledgement; deterministic response-boundary regressions and the rebuilt privileged
+pending-kernel-write SIGKILL fixture pass. Fifteen terminal-cleanup verifier tests pass.
+The prior web/audit/installer results apply to their unchanged source and dependency inputs.
+New-head CI and the predeclared cost comparison remain pending; no additional experiment ran.
+
+At `0de5b69`, all 54 CI checks completed: 52 passed and two failed. The full-filesystem test
+now passes. The standalone laboratory compile exposed crate-specific test helper imports in the
+source-included coalescer regression; using standard file-lock methods fixes the test without
+adding a dependency. Its local gate passes eight fanout/coalescer tests, two layer-driver fixtures
+and 50 Python tests (two optional live fixtures skipped).
+
+The mixed-feature soak had zero operation errors, byte mismatches or leak-shape violations, but
+its unchanged 30-second cleanup deadline caught a quota-attachment race: a newly attached quota
+owner invalidated the old receipt while leaving its 60-second claim lease in place. Ownership
+changes now invalidate that entire claim tuple atomically for immediate retry, while unchanged
+ownership preserves valid claims. Shared regressions require retries before lease expiry after
+both supersession and terminal abort, preserving the charge until every alias is durably absent.
+The focused nine-case backend/topology and unchanged-claim contracts pass, together with all
+322 owning tests and both complete workspace Clippy configurations. Full workspace tests and
+new-head CI remain pending. Neither rejected candidate was measured; the campaign is unchanged.
+
+
+The final Phase 3C implementation at `9c3539fd41687bdd194eb00418d6dcf301a3e917` passes all
+54 CI checks, including CodeQL, all metadata backends and the original mixed-feature soak
+cleanup deadline (584/584 terminal sessions). The complete local gate passes 1,407 default and
+1,433 all-feature tests, two doctests, formatting and both Clippy configurations. The paired
+cost evidence is now in `storage-journal-2026-09.md` and its JSON: all twelve diagnostic arms
+pass, but performance qualification remains INCONCLUSIVE. At 4 KiB, paired PUT p50 increases
+75.9%, DELETE p50 increases 45.8%, and transaction throughput declines 36.9%; no p99 claim is
+supported. Every candidate's post-idle journal is empty. Full scans remain mandatory and Phase
+3D is unactivated. Raw experiment artifacts and processes are removed; cumulative costs and
+exact evidence are preserved in the report. Final documentation-head CI and PR #91 integration
+remain required before Phase 3D implementation starts.

@@ -42,8 +42,9 @@ blobs/              committed buckets plus .staging/multipart
 Manifest format version 1 records `complete: true`, creation time and Cairn version, the
 `sqlite`/one-shard topology, applied schema version, database filename/size/SHA-256, and blob-layout
 version. A directory without that final manifest is an incomplete snapshot, even if some files are
-present. The manifest does not list multipart reservations or cleanup debt: those v26 bookkeeping
-rows intentionally may precede or outlive a file; `multipart_parts.storage_path` remains the
+present. The manifest does not list multipart reservations or cleanup debt: those bookkeeping
+rows, including protocol-2 storage intents and exact cleanup debt, intentionally may precede or
+outlive a file; `multipart_parts.storage_path` remains the
 authoritative required-present staging reference.
 
 The destination must be empty so files from an older generation cannot masquerade as part of the
@@ -93,12 +94,17 @@ startup gate rather than declaring a partially checked generation ready.
 
 The SQLite image preserves complete metadata rows, including historical versions and delete
 markers, tags, ACLs, Object Lock retention/legal hold, sealed object and multipart-part data keys,
-and multipart reservations, cleanup records, replication outbox work, and remote multipart journals. These are database state;
+and multipart reservations, storage generations/intents/path ownership/cleanup records, replication
+outbox work, and remote multipart journals. These are database state;
 there is no second manifest inventory that can replace them. Restoring the database does not restore
 the external master-key ring or recreate the outcome of an ambiguous remote request.
 
-Before serving, startup releases interrupted multipart completion ownership and replication claims
-through the canonical Writer, then reconciles files. A restored active upload must retain its staged
+Restore and startup commit a fresh storage generation under the node lock, resolve prior intents
+only after kernel quiescence checks, release interrupted multipart completion and replication
+ownership through the canonical Writer, and run full reconciliation. Intents and cleanup claims
+protect their exact paths during the scan; cleanup retirement still requires durable namespace
+absence. Snapshot generation and cleanup leases are never reused as serving ownership. Coverage
+remains incomplete and full scans are mandatory. A restored active upload must retain its staged
 parts and captured tags/lock/encryption intent so the client can retry Complete. Replication work may
 be attempted again: generic S3 destinations can gain another version after an ambiguous prior
 success. Isolate an old primary before resuming a restored node to avoid two independent sources

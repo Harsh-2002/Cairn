@@ -29,6 +29,95 @@ type R<T> = Result<T, MetaError>;
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::AdmitStorageWrite {
+            plan,
+            operation,
+            now,
+        } => {
+            plan.validate_admission(&operation)?;
+            let admission =
+                crate::storage::reserve(driver, &plan.bucket, (*plan).clone(), now).await?;
+            if matches!(
+                admission,
+                cairn_types::storage::StorageAdmission::NotApplied
+            ) {
+                return Ok(MutationOutcome::StorageAdmission(admission));
+            }
+            match apply_inner(driver, *operation).await? {
+                MutationOutcome::MultipartReserved => {
+                    Ok(MutationOutcome::StorageAdmission(admission))
+                }
+                MutationOutcome::MultipartClaim(claim) => {
+                    let admission = if let cairn_types::meta::ClaimOutcome::Claimed(session) =
+                        &claim
+                    {
+                        if session.bucket != plan.bucket
+                            || !matches!(
+                                &plan.target, cairn_types::storage::StorageWriteTarget::Completion { key, .. }
+                                    if key == &session.key
+                            )
+                        {
+                            return Err(MetaError::Engine(
+                                "storage completion routing mismatch".into(),
+                            ));
+                        }
+                        admission
+                    } else {
+                        crate::storage::discard_unacknowledged(driver, &plan).await?;
+                        cairn_types::storage::StorageAdmission::NotApplied
+                    };
+                    Ok(MutationOutcome::StorageMultipartClaim { admission, claim })
+                }
+                _ => Err(MetaError::Engine(
+                    "invalid joint storage admission outcome".into(),
+                )),
+            }
+        }
+        Mutation::PublishStorageWrite { plan, operation } => {
+            plan.validate_publication(&operation)?;
+            if !crate::storage::owns_publication(driver, &plan).await? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = apply_inner(driver, *operation).await?;
+            if matches!(
+                &outcome,
+                MutationOutcome::Put { .. }
+                    | MutationOutcome::PartRecorded { .. }
+                    | MutationOutcome::MultipartTerminal(
+                        MultipartTerminalOutcome::Completed { .. }
+                    )
+            ) {
+                crate::storage::consume_published(driver, &plan).await?;
+            }
+            Ok(outcome)
+        }
+        other => {
+            cairn_types::storage::validate_unadmitted_mutation(&other)?;
+            apply_inner(driver, other).await
+        }
+    }
+}
+
+async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
+    match m {
+        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+            Err(MetaError::Engine("nested storage operation".into()))
+        }
+        Mutation::BeginStorageGeneration { generation } => {
+            crate::storage::begin(driver, &generation).await
+        }
+        Mutation::Storage { bucket, operation } => {
+            crate::storage::apply(driver, &bucket, operation).await
+        }
+        Mutation::ListStorageIntents { generation, limit } => {
+            crate::storage::recover(driver, &generation, limit).await
+        }
+        Mutation::ClaimStorageCleanup {
+            generation,
+            limit,
+            now,
+            lease_secs,
+        } => crate::storage::claim(driver, &generation, limit, now, lease_secs).await,
         Mutation::ReplicationUpload { bucket, operation } => {
             crate::replication_upload::apply(driver, &bucket, operation).await
         }
@@ -573,6 +662,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             if non_empty {
                 return Err(MetaError::NotEmpty);
             }
+            crate::storage::cancel_bucket(driver, &name).await?;
             driver
                 .execute(
                     "DELETE FROM bucket_config WHERE bucket_name=?1",
@@ -2203,6 +2293,9 @@ async fn upsert_version(
     let before = current_visibility(driver, &bucket, &key).await?;
     let result = upsert_version_inner(driver, row).await?;
     update_visibility(driver, &bucket, &key, before).await?;
+    if let Some(path) = &result {
+        crate::storage::enqueue(driver, &bucket, path, None).await?;
+    }
     Ok(result)
 }
 
@@ -2446,6 +2539,9 @@ async fn delete_version_inner(
         return Ok(MutationOutcome::DeleteProtected);
     }
     let freed = existing.get_opt_text(0).map(StoragePath::from_string);
+    if let Some(path) = &freed {
+        crate::storage::enqueue(driver, bucket, path, None).await?;
+    }
     let was_latest = existing.get_i64(1) != 0;
     let removed = (
         existing.get_text(2),
@@ -2583,7 +2679,7 @@ async fn multipart_stat(
     .map_or(0, |row| row.get_i64(0)))
 }
 
-async fn adjust_multipart_stats(
+pub(crate) async fn adjust_multipart_stats(
     driver: &dyn AsyncSqlDriver,
     bucket: &str,
     principal: &str,
@@ -2712,7 +2808,7 @@ async fn release_multipart_reservation(
         "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
          FROM multipart_part_reservations r
          JOIN multipart_uploads u ON u.id=r.upload_id
-         WHERE r.attempt_id=?1 AND r.upload_id=?2",
+         WHERE r.attempt_id=?1 AND r.upload_id=?2 AND NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)",
         vec![
             Value::Text(attempt_id.to_owned()),
             Value::Text(upload_id.as_str().to_owned()),
@@ -2789,8 +2885,8 @@ async fn record_part(
         driver
             .execute(
                 "INSERT INTO multipart_staging_cleanups
-                 (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                 (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at, storage_protocol)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,2)",
                 vec![
                     Value::Text(debt.id.clone()),
                     Value::Text(debt.upload_id.as_str().to_owned()),
@@ -2806,6 +2902,11 @@ async fn record_part(
                 ],
             )
             .await?;
+        let path = debt
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| MetaError::Engine("missing superseded part path".into()))?;
+        crate::storage::link_quota(driver, &debt.bucket, path, &debt.id).await?;
         driver
             .execute(
                 "UPDATE multipart_parts
@@ -2861,7 +2962,7 @@ async fn release_multipart_cleanup(driver: &dyn AsyncSqlDriver, cleanup_id: &str
     let row = query_one(
         driver,
         "SELECT bucket_name, principal_id, bytes
-         FROM multipart_staging_cleanups WHERE id=?1",
+         FROM multipart_staging_cleanups WHERE id=?1 AND storage_protocol=1",
         vec![Value::Text(cleanup_id.to_owned())],
     )
     .await?;
@@ -2873,7 +2974,7 @@ async fn release_multipart_cleanup(driver: &dyn AsyncSqlDriver, cleanup_id: &str
     let bytes = row.get_i64(2);
     driver
         .execute(
-            "DELETE FROM multipart_staging_cleanups WHERE id=?1",
+            "DELETE FROM multipart_staging_cleanups WHERE id=?1 AND storage_protocol=1",
             vec![Value::Text(cleanup_id.to_owned())],
         )
         .await?;
@@ -2887,7 +2988,7 @@ async fn release_multipart_upload_cleanups(
     let row = query_one(
         driver,
         "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
-         FROM multipart_staging_cleanups WHERE upload_id=?1
+         FROM multipart_staging_cleanups WHERE upload_id=?1 AND storage_protocol=1
          GROUP BY bucket_name, principal_id",
         vec![Value::Text(upload_id.as_str().to_owned())],
     )
@@ -2900,7 +3001,7 @@ async fn release_multipart_upload_cleanups(
     let bytes = row.get_i64(2);
     driver
         .execute(
-            "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1",
+            "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1 AND storage_protocol=1",
             vec![Value::Text(upload_id.as_str().to_owned())],
         )
         .await?;
@@ -2912,39 +3013,16 @@ async fn retire_multipart_session(
     upload_id: &cairn_types::UploadId,
 ) -> R<()> {
     let context = multipart_context(driver, upload_id).await?;
-    let part_bytes = query_one(
+    let bucket = BucketName::parse(&context.bucket)
+        .map_err(|_| MetaError::Engine("invalid multipart bucket".into()))?;
+    crate::storage::retire_multipart(
         driver,
-        "SELECT COALESCE(SUM(size),0) FROM multipart_parts WHERE upload_id=?1",
-        vec![Value::Text(upload_id.as_str().to_owned())],
+        upload_id.as_str(),
+        &bucket,
+        &context.principal,
+        context.updated_at,
     )
-    .await?
-    .map_or(0, |row| row.get_i64(0));
-    let reservation_bytes = query_one(
-        driver,
-        "SELECT COALESCE(SUM(reserved_bytes),0)
-         FROM multipart_part_reservations WHERE upload_id=?1",
-        vec![Value::Text(upload_id.as_str().to_owned())],
-    )
-    .await?
-    .map_or(0, |row| row.get_i64(0));
-    let current_bytes = part_bytes + reservation_bytes;
-    // A zero-length part still creates a session artifact. Preserve a retry token even when its
-    // byte charge is zero so a failed directory deletion cannot be forgotten.
-    driver
-        .execute(
-            "INSERT INTO multipart_staging_cleanups
-             (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
-             VALUES (?1,?2,?3,?4,?5,NULL,?6)",
-            vec![
-                Value::Text(format!("session:{}", upload_id.as_str())),
-                Value::Text(upload_id.as_str().to_owned()),
-                Value::Text(context.bucket.clone()),
-                Value::Text(context.principal.clone()),
-                Value::Int(current_bytes),
-                Value::Int(context.updated_at),
-            ],
-        )
-        .await?;
+    .await?;
     driver
         .execute(
             "DELETE FROM multipart_uploads WHERE id=?1",
@@ -2961,7 +3039,8 @@ async fn recover_multipart_staging_accounting(
     let limit = i64::from(limit.clamp(1, 1_000));
     let reservations = driver
         .query(
-            "SELECT attempt_id, upload_id FROM multipart_part_reservations
+            "SELECT attempt_id, upload_id FROM multipart_part_reservations AS r
+             WHERE NOT EXISTS (SELECT 1 FROM storage_write_intents WHERE reservation_id=r.attempt_id)
              ORDER BY created_at, attempt_id LIMIT ?1",
             vec![Value::Int(limit)],
         )
@@ -2980,7 +3059,7 @@ async fn recover_multipart_staging_accounting(
     if remaining > 0 {
         let cleanups = driver
             .query(
-                "SELECT id FROM multipart_staging_cleanups
+                "SELECT id FROM multipart_staging_cleanups WHERE storage_protocol=1
                  ORDER BY created_at, id LIMIT ?1",
                 vec![Value::Int(remaining)],
             )

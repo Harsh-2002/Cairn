@@ -11,6 +11,7 @@ mod range;
 mod replication_upload;
 mod schema;
 mod shard;
+mod storage;
 mod store;
 mod writer;
 
@@ -113,7 +114,7 @@ fn apply_common_pragmas(conn: &Connection, opts: &OpenOptions) -> rusqlite::Resu
 /// # Errors
 /// Returns a [`MetaError`] if the database cannot be opened, configured, or migrated.
 pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, MetaError> {
-    let map = |e: rusqlite::Error| MetaError::Engine(e.to_string());
+    let map = model::engine_err;
 
     // The single write connection, owned by the writer thread.
     //
@@ -180,7 +181,7 @@ pub fn open_in_memory() -> Result<SqliteMetadataStore, MetaError> {
         "file:cairn-mem-{}?mode=memory&cache=shared",
         uuid::Uuid::new_v4().simple()
     );
-    let map = |e: rusqlite::Error| MetaError::Engine(e.to_string());
+    let map = model::engine_err;
     let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_URI;
 
     let write_conn = Connection::open_with_flags(&name, flags).map_err(map)?;
@@ -236,7 +237,7 @@ impl ReconcileOracle for SqliteReconcileOracle {
             let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 )
                 .map_err(|e| MetaError::Engine(e.to_string()))?;
             paths
@@ -279,7 +280,7 @@ impl ReconcileOracle for SqliteReconcileOracle {
             let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_intent_paths WHERE storage_path=?1) OR EXISTS(SELECT 1 FROM storage_cleanups WHERE storage_path=?1)",
                 )
                 .map_err(|e| MetaError::Engine(e.to_string()))?;
             paths

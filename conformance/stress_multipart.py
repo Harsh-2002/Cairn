@@ -58,6 +58,7 @@ import hashlib
 import http.client
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -66,6 +67,8 @@ import urllib.parse
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from recovery_state import database_rows, multipart_accounting
 
 AK, SK, EP, DATA_DIR = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 KEY_ID = sys.argv[5] if len(sys.argv) > 5 else "alias/cairn-stress"
@@ -176,7 +179,36 @@ def staging_dir(upload_id):
 
 def staged_parts(upload_id):
     d = staging_dir(upload_id)
-    return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return []  # Exact cleanup can prune the empty directory between successive polls.
+    return [os.path.join(d, name) for name in sorted(names)]
+
+
+def await_session_cleanup(upload_id, timeout=30):
+    """Wait for exact disk and quota-debt retirement, preserving the terminal cleanup gate."""
+    tables = ("multipart_uploads", "multipart_parts", "multipart_part_reservations",
+              "multipart_staging_cleanups", "multipart_bucket_stats", "multipart_principal_stats",
+              "storage_write_intents", "storage_cleanups")
+    prefix = f".staging/multipart/{upload_id}/"
+    deadline = time.monotonic() + timeout
+    while True:
+        state = database_rows(Path(os.environ.get("CAIRN_DB_PATH", str(Path(DATA_DIR) / "cairn.db"))), tables)
+        pending = (any(row["id"] == upload_id for row in state["multipart_uploads"])
+                   or any(row["upload_id"] == upload_id for table in (
+                       "multipart_parts", "multipart_part_reservations", "multipart_staging_cleanups",
+                       "storage_write_intents") for row in state[table])
+                   or any((row["storage_path"].startswith(prefix)
+                           or (row["quota_owner_path"] or "").startswith(prefix))
+                          for row in state["storage_cleanups"]))
+        if not pending and not staged_parts(upload_id):
+            # Read in one transaction: concurrent cleanup cannot manufacture a mixed-time total.
+            multipart_accounting(state)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def trailer_encrypted(blob):
@@ -574,10 +606,10 @@ def scenario_3_race():
         except ClientError as e:
             if e.response["Error"].get("Code") != "NoSuchUpload":
                 unresolved.append(f"round {r}: ListParts -> {err_of(e)}")
-        left = staged_parts(sess["upload_id"])
-        if left:
-            orphans.append(f"round {r}: {len(left)} staged file(s) left in "
-                           f"{staging_dir(sess['upload_id'])}")
+        if not await_session_cleanup(sess["upload_id"]):
+            left = staged_parts(sess["upload_id"])
+            orphans.append(f"round {r}: exact cleanup/charged debt did not retire; "
+                           f"{len(left)} staged file(s) left in {staging_dir(sess['upload_id'])}")
 
     print(f"    outcomes: complete won {tally['complete']}, abort won {tally['abort']}, "
           f"both succeeded {tally['both']}, neither {tally['neither']}", flush=True)

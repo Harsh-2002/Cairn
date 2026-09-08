@@ -804,6 +804,80 @@ CREATE TABLE storage_protocol (
 INSERT INTO storage_protocol VALUES (1, 1, 1, 'flat', 'full-scan');
 "#,
     },
+    Migration {
+        version: 36,
+        name: "exact physical storage ownership",
+        sql: r#"
+-- These rows deliberately have no bucket/session foreign keys: deleting application ownership
+-- must never erase evidence of unfinished physical writes or bytes awaiting durable reclamation.
+CREATE TABLE storage_recovery_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+    generation TEXT,
+    coverage_identity TEXT,
+    coverage_state TEXT NOT NULL CHECK (coverage_state IN ('incomplete','complete')),
+    baseline_completed_at INTEGER
+);
+INSERT INTO storage_recovery_state VALUES (1, NULL, NULL, 'incomplete', NULL);
+CREATE TABLE storage_write_intents (
+    attempt_id TEXT PRIMARY KEY,
+    generation TEXT NOT NULL,
+    bucket_name TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    cancelled INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0,1)),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_storage_intents_generation ON storage_write_intents (generation, attempt_id);
+CREATE INDEX idx_storage_intents_bucket ON storage_write_intents (bucket_name, attempt_id);
+CREATE TABLE storage_intent_paths (
+    attempt_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('temporary','final','index_spool')),
+    storage_path TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (attempt_id, role),
+    FOREIGN KEY (attempt_id) REFERENCES storage_write_intents (attempt_id) ON DELETE CASCADE
+);
+CREATE TABLE storage_cleanups (
+    id TEXT PRIMARY KEY,
+    storage_path TEXT NOT NULL UNIQUE,
+    bucket_name TEXT NOT NULL,
+    quota_debt_id TEXT,
+    claim_token TEXT,
+    claim_generation TEXT,
+    lease_until INTEGER,
+    CHECK ((claim_token IS NULL AND claim_generation IS NULL AND lease_until IS NULL)
+        OR (claim_token IS NOT NULL AND claim_generation IS NOT NULL AND lease_until IS NOT NULL))
+);
+CREATE INDEX idx_storage_cleanup_pending ON storage_cleanups (lease_until, id);
+CREATE INDEX idx_storage_cleanup_bucket ON storage_cleanups (bucket_name, id);
+CREATE INDEX idx_storage_cleanup_quota ON storage_cleanups (quota_debt_id);
+-- v26 remains the sole owner of staged-byte charges. Its older coarse rows require a complete
+-- exclusive baseline; ordinary accounting recovery must not forgive protocol-2 physical debt.
+ALTER TABLE multipart_staging_cleanups ADD COLUMN storage_protocol INTEGER NOT NULL DEFAULT 1;
+UPDATE storage_protocol SET minimum_reader=2, minimum_writer=2;
+"#,
+    },
+    Migration {
+        version: 37,
+        name: "storage_multipart_alias_ownership",
+        sql: r#"
+-- An unfinished spool alias follows its part's sole v26 charge even after publication.
+ALTER TABLE storage_cleanups ADD COLUMN quota_owner_path TEXT;
+CREATE INDEX idx_storage_cleanup_quota_owner ON storage_cleanups (quota_owner_path)
+    WHERE quota_owner_path IS NOT NULL;
+CREATE INDEX idx_multipart_cleanups_path ON multipart_staging_cleanups (storage_path)
+    WHERE storage_path IS NOT NULL;
+-- Exact multipart ownership must be seekable without scanning unrelated object intents.
+ALTER TABLE storage_write_intents ADD COLUMN upload_id TEXT;
+ALTER TABLE storage_write_intents ADD COLUMN reservation_id TEXT;
+UPDATE storage_write_intents SET
+    upload_id=COALESCE(json_extract(plan, '$.target.Part.upload_id'),
+                       json_extract(plan, '$.target.Completion.upload_id')),
+    reservation_id=json_extract(plan, '$.target.Part.reservation_id');
+CREATE INDEX idx_storage_intents_upload ON storage_write_intents (upload_id, attempt_id)
+    WHERE upload_id IS NOT NULL;
+CREATE INDEX idx_storage_intents_reservation ON storage_write_intents (reservation_id, attempt_id)
+    WHERE reservation_id IS NOT NULL;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -839,13 +913,37 @@ pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Resul
             "storage protocol state does not match the applied schema".into(),
         ));
     }
+    let tables = driver.query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('storage_recovery_state','storage_write_intents','storage_intent_paths','storage_cleanups')", vec![]
+    ).await?;
+    if !tables
+        .first()
+        .is_some_and(|row| row.value(0) == &Value::Int(if applied >= 36 { 4 } else { 0 }))
+    {
+        return Err(MetaError::Engine(
+            "unsupported storage journal for the applied schema".into(),
+        ));
+    }
+    if applied >= 36 {
+        let state = driver.query(
+            "SELECT EXISTS(SELECT 1 FROM storage_recovery_state WHERE singleton=1 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL)", vec![]
+        ).await?;
+        if !state
+            .first()
+            .is_some_and(|row| row.value(0) == &Value::Int(1))
+        {
+            return Err(MetaError::Engine(
+                "unsupported or missing storage recovery state".into(),
+            ));
+        }
+    }
     if has_protocol {
         let rows = driver.query(
             "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol WHERE singleton=1", vec![]
         ).await?;
         if !rows.first().is_some_and(|row| {
-            matches!(row.value(0), Value::Int(1))
-                && matches!(row.value(1), Value::Int(1))
+            row.value(0) == &Value::Int(if applied >= 36 { 2 } else { 1 })
+                && row.value(1) == row.value(0)
                 && row.value(2).as_str() == Some("flat")
                 && row.value(3).as_str() == Some("full-scan")
         }) {
@@ -995,8 +1093,13 @@ mod tests {
     async fn assert_startup_compatibility(turso: bool) {
         for change in [
             "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
-            "UPDATE storage_protocol SET minimum_reader=2",
-            "UPDATE storage_protocol SET minimum_writer=2",
+            "UPDATE storage_protocol SET minimum_reader=3",
+            "UPDATE storage_protocol SET minimum_writer=3",
+            "UPDATE storage_protocol SET minimum_reader=1,minimum_writer=1",
+            "DROP TABLE storage_intent_paths",
+            "DROP TABLE storage_cleanups",
+            "DELETE FROM storage_recovery_state",
+            "UPDATE storage_recovery_state SET coverage_state='complete'",
             "UPDATE storage_protocol SET write_layout='fanout-v1'",
             "UPDATE storage_protocol SET recovery_mode='journal'",
             "DELETE FROM storage_protocol",
@@ -1008,7 +1111,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 35);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 37);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
@@ -1203,59 +1306,48 @@ mod tests {
         assert_eq!(matches.first().unwrap().get_i64(0), 0);
     }
 
-    async fn assert_v27_discards_only_legacy_orphan_lock_rows(driver: &dyn AsyncSqlDriver) {
+    /// Materialize the real historical schema so later migrations can extend every table.
+    async fn migrate_fixture_through(driver: &dyn AsyncSqlDriver, version: i64) {
         driver
             .execute_batch(
-                "PRAGMA foreign_keys=ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE object_versions (
-                     id TEXT PRIMARY KEY,
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL DEFAULT 1,
-                     is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                     etag TEXT NOT NULL DEFAULT '',
-                     size_logical INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
-                     storage_class TEXT NOT NULL DEFAULT 'Standard',
-                     owner_id TEXT NOT NULL DEFAULT '',
-                     UNIQUE (bucket_name, key, version_id)
-                 );
-                 INSERT INTO object_versions (id, bucket_name, key, version_id)
-                     VALUES ('row-live','b','live','v');
-                 CREATE INDEX idx_ov_latest_cover ON object_versions
-                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
-                      updated_at, storage_class, owner_id)
-                     WHERE is_latest = 1;
-                 CREATE TABLE object_locks (
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     lock_mode TEXT,
-                     retain_until INTEGER,
-                     legal_hold INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (bucket_name, key, version_id)
-                 );
-                 INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
-                 INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );
-                 INSERT INTO multipart_uploads VALUES ('legacy-upload','active');",
+                "PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
             )
             .await
             .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            driver.execute_batch(migration.sql).await.unwrap();
+            driver
+                .execute(
+                    "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                    vec![
+                        Value::Int(migration.version),
+                        Value::Text(migration.name.to_owned()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn assert_v27_discards_only_legacy_orphan_lock_rows(driver: &dyn AsyncSqlDriver) {
+        migrate_fixture_through(driver, 26).await;
+        driver.execute_batch(
+            "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region)
+                 VALUES ('b','owner',0,'enabled','BucketOwnerEnforced','us-east-1');
+             INSERT INTO object_versions
+                 (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+                  etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,created_at,updated_at)
+                 VALUES ('row-live','b','live','v',1,0,0,0,'','text/plain','{}','STANDARD','owner','[]','[]',0,0);
+             INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
+             INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
+             INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('legacy-upload','b','assembled','text/plain','active','owner','[]',0,0);",
+        ).await.unwrap();
 
         run_migrations(driver).await.unwrap();
         let locks = driver
@@ -1280,43 +1372,7 @@ mod tests {
     }
 
     async fn assert_v28_adds_row_identity_to_current_listing_cover(driver: &dyn AsyncSqlDriver) {
-        driver
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE object_versions (
-                     id TEXT PRIMARY KEY,
-                     bucket_name TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     version_id TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL,
-                     is_delete_marker INTEGER NOT NULL,
-                     etag TEXT NOT NULL,
-                     size_logical INTEGER NOT NULL,
-                     updated_at INTEGER NOT NULL,
-                     storage_class TEXT NOT NULL,
-                     owner_id TEXT NOT NULL
-                 );
-                 CREATE INDEX idx_ov_latest_cover ON object_versions
-                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
-                      updated_at, storage_class, owner_id)
-                     WHERE is_latest = 1;
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );",
-            )
-            .await
-            .unwrap();
-
+        migrate_fixture_through(driver, 27).await;
         run_migrations(driver).await.unwrap();
         let columns = driver
             .query(
@@ -1346,29 +1402,13 @@ mod tests {
     }
 
     async fn assert_v29_resets_unowned_legacy_completion_claims(driver: &dyn AsyncSqlDriver) {
-        driver
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     applied_at INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
-                 CREATE TABLE object_versions (id TEXT PRIMARY KEY, bucket_name TEXT NOT NULL,
-                     is_latest INTEGER NOT NULL DEFAULT 1, is_delete_marker INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
-                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
-                     physical_bytes INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-                 CREATE TABLE multipart_uploads (
-                     id TEXT PRIMARY KEY,
-                     status TEXT NOT NULL
-                 );
-                 INSERT INTO multipart_uploads VALUES ('active-upload','active');
-                 INSERT INTO multipart_uploads VALUES ('orphaned-completer','completing');",
-            )
-            .await
-            .unwrap();
+        migrate_fixture_through(driver, 28).await;
+        driver.execute_batch(
+            "INSERT INTO multipart_uploads
+                 (id,bucket_name,key,content_type,status,owner_id,user_metadata,created_at,updated_at)
+                 VALUES ('active-upload','b','assembled','text/plain','active','owner','[]',0,0),
+                        ('orphaned-completer','b','assembled','text/plain','completing','owner','[]',0,0);",
+        ).await.unwrap();
 
         run_migrations(driver).await.unwrap();
         let rows = driver

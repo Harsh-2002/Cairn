@@ -85,11 +85,13 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
   layout and parses each synchronous CLI's stdout counts. Also runs stdlib `recovery_state.py`:
   encrypted history/delete markers, ACL/tags/retention/legal hold, active encrypted multipart parts,
-  real interrupted replication claims, complete-row snapshot comparisons, fail-closed missing-part /
+  real interrupted replication claims, exact source-to-snapshot table/row fidelity, explicit
+  fresh-generation restore transitions and independent quota/live-file/retired-alias checks,
+  fail-closed missing-part /
   wrong-key / live-lock / shard checks, and retryable multipart completion after restore. The
   failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
 - `recovery_remote.py` — real Cairn destination and bounded HTTP fault proxy: lose a successful
-  initiation/part/abort response, SIGKILL source, compare every durable table across snapshot/restore,
+  initiation/part/abort response, SIGKILL source, compare every snapshot table exactly and validate only specified recovery transitions on restore,
   verify unknown upload-ID incidents versus known-ID cleanup and exact native version redelivery.
   `--cleanup-lease` includes abandoned abort ownership. Requires the v33 streaming sender and runs
   in the backup/restore CI gate; no failpoints build or MinIO download is needed.
@@ -268,7 +270,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   and — every `SOAK_HEAVY_EVERY` ticks — `.staging` bytes and the `session_credentials` row count.
   **GATED, correctness:** zero operation errors, every sampled read byte-exact, WORM unbroken for the
   whole soak, the lifecycle control prefix never touched (and expirations actually observed), a
-  tampered session token refused on **every** mint, aborted uploads leaving no staging, `/healthz`
+  tampered session token refused on **every** mint, every completed/aborted upload retiring its
+  staging directory and exact cleanup/quota debt within 30 seconds of its response, `/healthz`
   never *stopping* (60 s per-probe **wedge** timeout — latency is load, not signal), server alive, and
   a 5xx counter EQUAL to the declared budget, which for this mix is exactly **zero** (every
   deliberate rejection here is a 4xx). **GATED, leak shape** (middle-third vs last-third, the
@@ -286,7 +289,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `SOAK_SECS` > ~930). The `session_credentials` row count is sampled and **reported, never gated**,
   for the same reason: on a sub-900 s soak a rising row count is *correct*. Everything rate-shaped —
   ops/s, Complete wall times, CPU-s/GiB, expirations observed — is advisory (CI drives the debug
-  artifact); `SOAK_OUT=` writes it all as JSON.
+  artifact); `SOAK_OUT=` writes it all as JSON. The independent cleanup observer retains at most
+  1024 pending session IDs, probes 64 at a time, and fails on overflow, overdue debt, unsupported
+  schema, or inconsistent bucket/principal quota totals. It never idles a load worker. Its final
+  drain preserves original deadlines and is excluded from the leak samples by a workload-stop
+  marker. `test_soak_cleanup.py` exercises this verifier deterministically before the launcher
+  starts the server.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `replication_large.sh` (+`.py`) — real 2 GiB + 17 and 5 GiB + 17 logical-byte replication to
   native Cairn and a SHA-pinned MinIO binary. Multipart source generation and all download hashing
@@ -350,3 +358,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `bench-compare` jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
+
+Protocol-2 crash recovery can reclaim through exact journals before the full scan. Crash harnesses
+must verify retired alias absence and empty recovered intent/debt rather than require the scan's
+orphan counter to include journal work. Terminal multipart HTTP success precedes deferred cleanup;
+the focused stress harness uses a one-second sweep and bounded disk/debt/quota polling.

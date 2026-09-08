@@ -93,6 +93,7 @@ pub struct ShardedMetadataStore {
     replication_claim_cursor: AtomicUsize,
     /// Independent cleanup cursor: alternating cleanup/delivery claims must not pin even shards.
     replication_upload_claim_cursor: AtomicUsize,
+    storage_cleanup_claim_cursor: AtomicUsize,
     /// The same, for the webhook claim fan-out. A separate cursor from replication on purpose: a
     /// single shared cursor degenerates when the two callers alternate against an even shard count.
     webhook_claim_cursor: AtomicUsize,
@@ -121,6 +122,7 @@ impl ShardedMetadataStore {
             shards,
             replication_claim_cursor: AtomicUsize::new(0),
             replication_upload_claim_cursor: AtomicUsize::new(0),
+            storage_cleanup_claim_cursor: AtomicUsize::new(0),
             webhook_claim_cursor: AtomicUsize::new(0),
         }
     }
@@ -159,6 +161,46 @@ impl ShardedMetadataStore {
 impl MetadataStore for ShardedMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         match mutation {
+            Mutation::BeginStorageGeneration { generation } => {
+                for shard in &self.shards {
+                    match shard.submit(Mutation::BeginStorageGeneration { generation: generation.clone() }).await? {
+                        MutationOutcome::Ack => {},
+                        _ => return Err(MetaError::Engine("unexpected storage generation outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::ListStorageIntents { generation, limit } => {
+                let mut remaining = limit.clamp(1,1000);
+                let mut batch = Vec::new();
+                for shard in &self.shards {
+                    if remaining == 0 { break; }
+                    match shard.submit(Mutation::ListStorageIntents { generation: generation.clone(), limit: remaining }).await? {
+                        MutationOutcome::StorageIntentBatch(plans) if plans.len() <= remaining as usize => {
+                            remaining -= plans.len() as u32;
+                            batch.extend(plans);
+                        },
+                        _ => return Err(MetaError::Engine("unexpected storage recovery outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::StorageIntentBatch(batch))
+            }
+            Mutation::ClaimStorageCleanup { generation, limit, now, lease_secs } => {
+                let mut remaining = limit.clamp(1,1000);
+                let mut batch = Vec::new();
+                let start = self.rotate_start(&self.storage_cleanup_claim_cursor);
+                for offset in 0..self.n() {
+                    if remaining == 0 { break; }
+                    match self.shards[(start+offset)%self.n()].submit(Mutation::ClaimStorageCleanup { generation: generation.clone(), limit: remaining, now, lease_secs }).await? {
+                        MutationOutcome::StorageCleanupBatch(part) if part.len() <= remaining as usize => {
+                            remaining -= part.len() as u32;
+                            batch.extend(part);
+                        },
+                        _ => return Err(MetaError::Engine("unexpected storage cleanup outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::StorageCleanupBatch(batch))
+            }
             // DeleteBucket is per-bucket, but its apply also purges ACCOUNT-GLOBAL request_metrics
             // and object_shares on shard 0. For a nonzero bucket, clean shard 0 FIRST: this is
             // deliberately conservative because a crash between two database commits may leave the
@@ -211,6 +253,9 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetObjectRetention { .. }
             | Mutation::SetObjectLegalHold { .. }
             | Mutation::EnqueueReplication(_)
+            | Mutation::Storage { .. }
+            | Mutation::AdmitStorageWrite { .. }
+            | Mutation::PublishStorageWrite { .. }
             | Mutation::ReplicationUpload { .. }
             // Both of its statements are keyed on `bucket_name`, and every outbox row and version
             // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
@@ -984,7 +1029,12 @@ impl MetadataStore for ShardedMetadataStore {
 /// Extract the target bucket name from a per-bucket mutation, for shard routing.
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
-        Mutation::ReplicationUpload { bucket, .. } => bucket.as_str(),
+        Mutation::AdmitStorageWrite { plan, .. } | Mutation::PublishStorageWrite { plan, .. } => {
+            plan.bucket.as_str()
+        }
+        Mutation::Storage { bucket, .. } | Mutation::ReplicationUpload { bucket, .. } => {
+            bucket.as_str()
+        }
         Mutation::PutObjectVersion { row, .. } => row.bucket.as_str(),
         Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
@@ -1042,6 +1092,9 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
+        | Mutation::BeginStorageGeneration { .. }
+        | Mutation::ListStorageIntents { .. }
+        | Mutation::ClaimStorageCleanup { .. }
         | Mutation::ClaimReplicationUploadCleanup { .. }
         | Mutation::RecoverClaimedReplication
         | Mutation::EnqueueWebhooks(_)
@@ -1102,8 +1155,15 @@ impl ReconcileOracle for ShardedReconcileOracle {
         // into the original order so the caller's path/answer alignment is preserved.
         let n = self.oracles.len();
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut staging = Vec::new();
         for (i, p) in candidates.iter().enumerate() {
-            buckets[self.shard_for_path(p.as_str())].push(i);
+            if p.as_str().starts_with(".staging/") {
+                // Temporary/spool aliases carry an attempt, not the bucket routing identity.
+                // Ask every physical journal; hashing ".staging" would miss another shard's I/O.
+                staging.push(i);
+            } else {
+                buckets[self.shard_for_path(p.as_str())].push(i);
+            }
         }
         let mut out = vec![false; candidates.len()];
         for (shard, idxs) in buckets.into_iter().enumerate() {
@@ -1112,8 +1172,30 @@ impl ReconcileOracle for ShardedReconcileOracle {
             }
             let subset: Vec<StoragePath> = idxs.iter().map(|&i| candidates[i].clone()).collect();
             let answers = self.oracles[shard].live_blobs(&subset).await?;
+            if answers.len() != subset.len() {
+                return Err(MetaError::Engine(
+                    "incorrect reconciliation membership count".into(),
+                ));
+            }
             for (k, &i) in idxs.iter().enumerate() {
                 out[i] = answers[k];
+            }
+        }
+        if !staging.is_empty() {
+            let subset: Vec<_> = staging
+                .iter()
+                .map(|&index| candidates[index].clone())
+                .collect();
+            for oracle in &self.oracles {
+                let answers = oracle.live_blobs(&subset).await?;
+                if answers.len() != subset.len() {
+                    return Err(MetaError::Engine(
+                        "incorrect reconciliation membership count".into(),
+                    ));
+                }
+                for (&index, answer) in staging.iter().zip(answers) {
+                    out[index] |= answer;
+                }
             }
         }
         Ok(out)

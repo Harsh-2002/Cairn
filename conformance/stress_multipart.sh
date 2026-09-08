@@ -98,6 +98,8 @@ export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}"
 export CAIRN_MASTER_KEY="${CAIRN_MASTER_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
 # The sessions request `aws:kms`, so the key id must be on the write-time allow-list (label-only KMS).
 export CAIRN_KMS_KEY_IDS="$KEY_ID"
+# Terminal HTTP success records exact debt; exercise its asynchronous durable cleanup promptly.
+export CAIRN_MULTIPART_SWEEP_INTERVAL_SECS=1
 # Pin the server request timeout well above any plausible assemble time on a contended runner. If
 # left ambient, a slow box could yield a server-side 503 RequestTimeout, which would break BOTH the
 # "every Complete returned 200" gate and the exact-5xx-count gate at once — a load-dependent flake.

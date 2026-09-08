@@ -30,12 +30,15 @@ mod uring;
 // The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
 // optional io_uring path are interchangeable (ARCH 8.2). Each backend implements create →
 // streamed writes → commit (fsync file → rename → fsync dir) / abort with the same ordering.
+mod namespace;
+mod owned_file;
 mod staging;
 
 use crate::compress::{CompressedReader, is_precompressed};
 use crate::encode::StagedEncoder;
 use crate::hash::Hashers;
-use crate::staging::{Staging, UncommittedBlobCleanup};
+use crate::namespace::AdmittedPaths;
+use crate::staging::Staging;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::SecretKey32;
@@ -47,8 +50,9 @@ use cairn_types::blob::{
 };
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
-use cairn_types::id::{BucketName, StoragePath, UploadId};
+use cairn_types::id::StoragePath;
 use cairn_types::object::{ChecksumSet, CompressionDescriptor, ETag};
+use cairn_types::storage::{StorageCreationPermit, StorageWriteTarget};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
@@ -199,30 +203,30 @@ pub const SMALL_READ_MAX: u64 = 256 * 1024;
 pub const DEFAULT_BLOB_IO_CONCURRENCY: usize = 64;
 
 impl LocalBlobStore {
-    /// Open (creating the staging area) a blob store rooted at `data_root`.
+    /// Open a blob store with retained exclusive maintenance ownership. Initialize the staging
+    /// area through anchored descriptors, rejecting symlinks and nested mounts before writes.
     ///
     /// When built with the `io-uring` feature, the durable single-object staging write path
     /// (create tmp → write → fsync → rename → fsync dir) runs on the io_uring executor by
-    /// default; without the feature it always uses `tokio::fs`. Use [`Self::with_io_uring`] to
+    /// default; without the feature it uses retained blocking file jobs. Use [`Self::with_io_uring`] to
     /// override the choice explicitly (e.g. to compare backends in a benchmark).
     ///
     /// # Errors
     /// Returns a [`BlobError`] if the staging directory cannot be created.
-    pub async fn open(data_root: impl Into<PathBuf>) -> Result<Self, BlobError> {
+    pub async fn open(
+        data_root: impl Into<PathBuf>,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<Self, BlobError> {
         let data_root = data_root.into();
-        tokio::fs::create_dir_all(&data_root)
-            .await
-            .map_err(io_err)?;
-        let staging = data_root.join(STAGING);
-        tokio::fs::create_dir_all(&staging).await.map_err(io_err)?;
-        // `create_dir_all` does not make a new directory entry crash-durable. Persist each parent
-        // before descending so `.staging` and `.staging/multipart` cannot disappear independently
-        // after a successful open/part write (ARCH 8.2).
-        fsync_dir(&data_root).await?;
-        tokio::fs::create_dir_all(staging.join("multipart"))
-            .await
-            .map_err(io_err)?;
-        fsync_dir(&staging).await?;
+        let root = data_root.clone();
+        let operation = lease.try_child()?;
+        let (result, _lease) = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            (namespace::initialize(&root).map_err(io_err), lease)
+        })
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))?;
+        result?;
         Ok(Self {
             data_root: Arc::new(data_root),
             use_uring: cfg!(feature = "io-uring"),
@@ -367,30 +371,6 @@ impl LocalBlobStore {
     }
 }
 
-pub(crate) async fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
-    let d = tokio::fs::File::open(dir).await.map_err(io_err)?;
-    d.sync_all().await.map_err(io_err)?;
-    Ok(())
-}
-
-/// Ensure a per-bucket directory exists, fsyncing `data_root` when the directory entry is newly
-/// created (F-1, ARCH 8.2 step 4). `create_dir_all` makes the directory durable only once its
-/// own parent records the new entry: a power loss after the rename but before `data_root` is
-/// fsynced can lose the bucket directory entry, orphaning the committed blob inside it. We detect
-/// newness by probing for existence first, so the extra parent fsync is paid only on the rare
-/// first write into a bucket rather than on every commit.
-async fn ensure_bucket_dir(data_root: &Path, bucket_dir: &Path) -> Result<(), BlobError> {
-    let existed = tokio::fs::try_exists(bucket_dir).await.map_err(io_err)?;
-    tokio::fs::create_dir_all(bucket_dir)
-        .await
-        .map_err(io_err)?;
-    if !existed {
-        // The bucket directory entry now lives in data_root; make that entry durable.
-        fsync_dir(data_root).await?;
-    }
-    Ok(())
-}
-
 /// Select the actual on-disk transform once for both preflight and streaming. A precompressed
 /// content type bypasses compression, but must never bypass required encryption.
 fn encoding_policies(
@@ -426,7 +406,7 @@ async fn write_staged(
     file: &mut Staging,
     mut body: cairn_types::BodyStream,
     opts: &StageOptions,
-    spool_dir: &Path,
+    paths: &AdmittedPaths,
 ) -> Result<
     (
         u64,
@@ -450,7 +430,12 @@ async fn write_staged(
     // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
     // without compression/encryption (ARCH 21.1, 27).
     if let Some(pol) = block_pol {
-        let mut enc = StagedEncoder::new(pol, opts.encryption.clone(), spool_dir);
+        let mut enc = StagedEncoder::new(
+            pol,
+            opts.encryption.clone(),
+            paths.spool.clone(),
+            paths.lease.try_child()?,
+        );
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
             logical = logical
@@ -569,31 +554,26 @@ fn stream_input(
     Ok(())
 }
 
-/// Multipart part reads have no preceding response probe; prepare their reader once in the same
-/// blocking task that streams it. GET uses the prepared-reader handoff below instead.
-fn stream_blob(
-    path: &Path,
+/// Multipart inputs have no GET probe. Validate and stream this already anchored descriptor in
+/// the same leased blocking operation, preserving the metadata-pinned CRNB declaration.
+fn stream_part(
+    file: std::fs::File,
     cipher: BlobCipher,
-    compression: &CompressionDescriptor,
     expected_logical_len: u64,
-    offset: u64,
-    len: u64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
 ) -> Result<(), BlobError> {
-    let is_container =
-        cipher.is_encrypted() || !matches!(compression, CompressionDescriptor::Uncompressed);
-    let input = if is_container {
-        let file = std::fs::File::open(path).map_err(io_err)?;
-        StreamInput::Container(Box::new(CompressedReader::open_with_dek(
-            file,
-            cipher,
-            compression,
-            expected_logical_len,
-        )?))
-    } else {
-        StreamInput::Raw(path.to_owned())
-    };
-    stream_input(input, offset, len, tx)
+    let reader = CompressedReader::open_with_dek(
+        file,
+        cipher,
+        &CompressionDescriptor::Uncompressed,
+        expected_logical_len,
+    )?;
+    stream_input(
+        StreamInput::Container(Box::new(reader)),
+        0,
+        expected_logical_len,
+        tx,
+    )
 }
 
 /// The prepared input and reservations stay together through queued blocking work, including
@@ -688,24 +668,54 @@ impl LocalBlobStore {
         logical: &mut u64,
         physical: &mut u64,
         size_ceiling: u64,
+        lease: &cairn_types::storage::io::StorageIoLease,
     ) -> Result<(), BlobError> {
-        use tokio::io::AsyncReadExt;
         // Allocate only for the first plaintext part, then reuse across part boundaries. An
         // entirely encrypted upload keeps its existing bounded decoder buffers without this one.
         let mut plaintext_buf = None;
         for part in parts {
-            let part_path = self.resolve(&part.storage_path)?;
+            let part_path = part.storage_path.clone();
+            let root = self.data_root.clone();
             match part.cipher.clone() {
                 // Plaintext / pre-v21 part: raw read, unchanged.
                 BlobCipher::KnownPlaintext => {
-                    let mut f = tokio::fs::File::open(&part_path)
-                        .await
-                        .map_err(|_| BlobError::NotFound)?;
-                    let buf = plaintext_buf.get_or_insert_with(|| vec![0u8; READ_CHUNK]);
-                    loop {
-                        let n = f.read(buf).await.map_err(io_err)?;
+                    let read_lease = lease.try_child()?;
+                    let expected = part.size;
+                    let file = tokio::task::spawn_blocking(move || {
+                        let file = namespace::read_file(&root, &part_path).map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                BlobError::NotFound
+                            } else {
+                                io_err(error)
+                            }
+                        })?;
+                        if file.metadata().map_err(io_err)?.len() != expected {
+                            return Err(BlobError::Corruption(
+                                "part length does not match metadata".into(),
+                            ));
+                        }
+                        Ok::<_, BlobError>(owned_file::FileOwner::new(file, read_lease))
+                    })
+                    .await
+                    .map_err(|error| BlobError::Io(error.to_string()))??;
+                    let mut remaining = part.size;
+                    while remaining != 0 {
+                        let mut buf = plaintext_buf
+                            .take()
+                            .unwrap_or_else(|| vec![0u8; READ_CHUNK]);
+                        let want = remaining.min(READ_CHUNK as u64) as usize;
+                        let (buf, n) = file
+                            .run(move |mut file| {
+                                use std::io::Read;
+                                let n = file.read(&mut buf[..want])?;
+                                Ok((buf, n))
+                            })
+                            .await
+                            .map_err(io_err)?;
                         if n == 0 {
-                            break;
+                            return Err(BlobError::Corruption(
+                                "part truncated during assembly".into(),
+                            ));
                         }
                         feed_assembled_chunk(
                             sink,
@@ -717,6 +727,8 @@ impl LocalBlobStore {
                             size_ceiling,
                         )
                         .await?;
+                        remaining -= n as u64;
+                        plaintext_buf = Some(buf);
                     }
                 }
                 // Encrypted part: decrypt-on-read through the same CRNB reader GET uses, off the
@@ -726,19 +738,15 @@ impl LocalBlobStore {
                 // — no orphan, no plaintext, no partial object.
                 cipher => {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
-                    let path = part_path.clone();
                     let size = part.size;
+                    let read_lease = lease.try_child()?;
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = stream_blob(
-                            &path,
-                            cipher,
-                            &CompressionDescriptor::Uncompressed,
-                            size,
-                            0,
-                            size,
-                            &tx,
-                        ) {
-                            let _ = tx.blocking_send(Err(e));
+                        let _read_lease = read_lease;
+                        let result = namespace::read_file(&root, &part_path)
+                            .map_err(io_err)
+                            .and_then(|file| stream_part(file, cipher, size, &tx));
+                        if let Err(error) = result {
+                            let _ = tx.blocking_send(Err(error));
                         }
                     });
                     while let Some(item) = rx.recv().await {
@@ -979,7 +987,7 @@ impl BlobStore for LocalBlobStore {
 
     async fn stage(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -991,18 +999,21 @@ impl BlobStore for LocalBlobStore {
         // barrier itself is bounded by the coalescer (one fsync per directory per batch), not by
         // this semaphore, and a waiter only parks on a oneshot, holding no blocking thread.
         let copy_permit = self.acquire_io().await?;
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
-        let bucket_dir = self.data_root.join(bucket.as_str());
-        let final_path = bucket_dir.join(&id);
-        let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
-        // Keep ownership of both possible names across every await until the `StagedBlob` is
-        // returned. A canceled request therefore cannot strand either the pre-rename tmp or the
-        // post-rename blob before metadata has had a chance to reference it.
-        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
-
-        let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
-        let outcome = write_staged(&mut sink, body, &opts, &self.data_root.join(STAGING)).await;
+        if !matches!(permit.plan().target, StorageWriteTarget::Object { .. }) {
+            return Err(BlobError::Io(
+                "storage target is not an object write".into(),
+            ));
+        }
+        let paths = AdmittedPaths::open(&self.data_root, permit).await?;
+        let storage_path = paths.storage_path.clone();
+        let mut sink = Staging::create(
+            paths.staging.clone(),
+            self.use_uring,
+            opts.content_length,
+            paths.lease.try_child()?,
+        )
+        .await?;
+        let outcome = write_staged(&mut sink, body, &opts, &paths).await;
         let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
             Ok(v) => v,
             Err(e) => {
@@ -1010,17 +1021,11 @@ impl BlobStore for LocalBlobStore {
                 return Err(e);
             }
         };
-        // Create (and fsync the parent of) the bucket directory *before* the rename, so the
-        // commit can rename into an already-durable directory entry (F-1, ARCH 8.2 step 4). The
-        // commit performs: fdatasync the staged file → rename. The destination-directory fsync that
-        // makes the new entry durable is then issued through the coalescer, which batches it with
-        // any concurrent PUTs into the same bucket into a single fsync. `sync_dir` resolves only
-        // after that fsync completes, so the blob is fully durable before we proceed.
-        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        sink.commit(&final_path).await?;
-        // Release the copy permit before parking on the coalesced directory-fsync barrier.
+        sink.commit(&paths.final_file).await?;
         drop(copy_permit);
-        self.dir_sync.sync_dir(&bucket_dir).await?;
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
         // The crash window the durability ordering protects: the blob is now durable but no
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
         fail::fail_point!("blob_after_durable");
@@ -1035,7 +1040,6 @@ impl BlobStore for LocalBlobStore {
             internal_sha256,
             compression: descriptor,
         };
-        cleanup.disarm();
         Ok(staged)
     }
 
@@ -1087,41 +1091,75 @@ impl BlobStore for LocalBlobStore {
         }
     }
 
-    async fn delete(&self, path: &StoragePath) -> Result<(), BlobError> {
-        let file_path = self.resolve(path)?;
-        match tokio::fs::remove_file(&file_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(e)),
+    async fn confirm_storage_quiescence(
+        &self,
+        plan: &cairn_types::storage::StorageWritePlan,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError> {
+        plan.validate()
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        if !lease.owns(&plan.attempt, &plan.generation) {
+            return Err(BlobError::Io("storage recovery ownership mismatch".into()));
         }
+        let operation = lease.try_child()?;
+        let root = self.data_root.clone();
+        let paths = plan.paths.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            let _operation = operation;
+            let mut locked = Vec::with_capacity(paths.len());
+            for path in paths {
+                match namespace::read_file(&root, &path.path) {
+                    Ok(file) => {
+                        try_lock_exclusive(&file).map_err(io_err)?;
+                        locked.push(file);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_err(error)),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))?
+    }
+
+    async fn cleanup_storage(
+        &self,
+        cleanup: &cairn_types::storage::StorageCleanup,
+        lease: cairn_types::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError> {
+        cairn_types::storage::validate_storage_path(&cleanup.bucket, &cleanup.path)
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        if !lease.owns(&cleanup.id, &cleanup.generation) {
+            return Err(BlobError::Io("storage cleanup ownership mismatch".into()));
+        }
+        let operation = lease.try_child()?;
+        let root = self.data_root.clone();
+        let path = cleanup.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            let _operation = operation;
+            namespace::cleanup(&root, &path).map_err(io_err)
+        })
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))?
     }
 
     async fn stage_part(
         &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
+        permit: StorageCreationPermit,
         body: cairn_types::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
         encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError> {
         let _permit = self.acquire_io().await?;
-        let dir = self
-            .data_root
-            .join(STAGING)
-            .join("multipart")
-            .join(upload.as_str());
-        let multipart_dir = self.data_root.join(STAGING).join("multipart");
-        tokio::fs::create_dir_all(&dir).await.map_err(io_err)?;
-        // The first part creates the session directory. Persist its entry in the multipart parent
-        // before writing/acknowledging any part; syncing only the session directory below makes the
-        // part entry durable but cannot make the session directory itself survive a crash.
-        // Coalescing keeps simultaneous first parts for one/many uploads to one parent fsync batch.
-        self.dir_sync.sync_dir(&multipart_dir).await?;
+        if !matches!(permit.plan().target, StorageWriteTarget::Part { .. }) {
+            return Err(BlobError::Io("storage target is not a part write".into()));
+        }
+        let paths = AdmittedPaths::open(&self.data_root, permit).await?;
         fail::fail_point!("blob_after_multipart_session_dir");
-        let id = multipart_attempt_name(part_number, attempt_id)?;
-        let path = dir.join(&id);
         // A part is staged as ciphertext when `encryption` is Some (SSE / bucket-default / at-rest
         // multipart, ARCH 27) so nothing plaintext hits disk; otherwise it is a plaintext intermediate
         // artifact (compression is still deferred to `assemble`). Either way the requested
@@ -1138,9 +1176,15 @@ impl BlobStore for LocalBlobStore {
         };
         // A part's length is not known to this seam, so no preallocation here; the assembled blob
         // (whose size is the sum of the parts) is preallocated in `assemble`.
-        let mut sink = Staging::create(path, self.use_uring, None).await?;
+        let mut sink = Staging::create(
+            paths.staging.clone(),
+            self.use_uring,
+            None,
+            paths.lease.try_child()?,
+        )
+        .await?;
         let (logical, _phys, md5, checks, _desc, _internal_sha256) =
-            match write_staged(&mut sink, body, &opts, &self.data_root.join(STAGING)).await {
+            match write_staged(&mut sink, body, &opts, &paths).await {
                 Ok(v) => v,
                 Err(e) => {
                     sink.abort().await;
@@ -1154,43 +1198,20 @@ impl BlobStore for LocalBlobStore {
         // contract violation (ARCH 8.1) the single-part path already guards against by fsyncing the
         // bucket dir after rename (F-1). Routed through the coalescer so concurrent part uploads into
         // the same session share one fsync (audit 2026-07).
-        self.dir_sync.sync_dir(&dir).await?;
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
         Ok(StagedPart {
-            storage_path: StoragePath::from_string(format!(
-                "{}/multipart/{}/{}",
-                STAGING,
-                upload.as_str(),
-                id
-            )),
+            storage_path: paths.storage_path.clone(),
             size: logical,
             md5_hex: md5,
             checksums: checks,
         })
     }
 
-    async fn delete_part_attempt(
-        &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
-    ) -> Result<(), BlobError> {
-        let name = multipart_attempt_name(part_number, attempt_id)?;
-        let path = self
-            .data_root
-            .join(STAGING)
-            .join("multipart")
-            .join(upload.as_str())
-            .join(name);
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_err(error)),
-        }
-    }
-
     async fn assemble(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         parts: &[PartRef],
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -1200,15 +1221,20 @@ impl BlobStore for LocalBlobStore {
         let copy_permit = self.acquire_io().await?;
         drop(permit_timing);
         let assembly_timing = self.multipart_timings.start(MultipartStage::Assembly);
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
-        let bucket_dir = self.data_root.join(bucket.as_str());
-        let final_path = bucket_dir.join(&id);
-        let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
-        // Multipart assembly has the same pre-metadata ownership window as a single PUT. Keep a
-        // synchronous Drop guard armed across part reads, rename, and the directory-fsync barrier.
-        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
-
+        let StorageWriteTarget::Completion { upload_id, .. } = &permit.plan().target else {
+            return Err(BlobError::Io(
+                "storage target is not multipart assembly".into(),
+            ));
+        };
+        let prefix = format!(".staging/multipart/{upload_id}/");
+        if parts
+            .iter()
+            .any(|part| !part.storage_path.as_str().starts_with(&prefix))
+        {
+            return Err(BlobError::Io(
+                "assembly part does not belong to the admitted session".into(),
+            ));
+        }
         let (compress, block_pol) = encoding_policies(&opts);
         // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
         // preallocate the staging file to place it contiguously (ARCH 7.5).
@@ -1221,7 +1247,15 @@ impl BlobStore for LocalBlobStore {
         // (audit 2026-07). Checked up front on the recorded sizes; assemble_into also enforces on the
         // running sum in case a part's on-disk size disagrees with its record.
         validate_stage_len(&opts, Some(assembled_len))?;
-        let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
+        let paths = AdmittedPaths::open(&self.data_root, permit).await?;
+        let storage_path = paths.storage_path.clone();
+        let mut sink = Staging::create(
+            paths.staging.clone(),
+            self.use_uring,
+            Some(assembled_len),
+            paths.lease.try_child()?,
+        )
+        .await?;
         // Hash the assembled plaintext once, computing the MD5/ETag basis plus any supplementary
         // checksums the caller requested via `opts.extra_checksums` (a whole-object FULL_OBJECT
         // recompute at CompleteMultipartUpload). With no extra checksums this is byte-for-byte the
@@ -1230,7 +1264,15 @@ impl BlobStore for LocalBlobStore {
         let mut logical: u64 = 0;
         let mut physical: u64 = 0;
         let mut enc = block_pol
-            .map(|p| StagedEncoder::new(p, opts.encryption, &self.data_root.join(STAGING)));
+            .map(|policy| {
+                Ok::<_, BlobError>(StagedEncoder::new(
+                    policy,
+                    opts.encryption,
+                    paths.spool.clone(),
+                    paths.lease.try_child()?,
+                ))
+            })
+            .transpose()?;
 
         // The assemble write path mirrors `stage`: on any error before commit, unlink the staged
         // tmp via the same backend that created it, then propagate. A small closure keeps the
@@ -1244,6 +1286,7 @@ impl BlobStore for LocalBlobStore {
                 &mut logical,
                 &mut physical,
                 opts.size_ceiling,
+                &paths.lease,
             )
             .await;
         if let Err(e) = assembled {
@@ -1273,11 +1316,12 @@ impl BlobStore for LocalBlobStore {
 
         drop(assembly_timing);
         let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
-        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        sink.commit(&final_path).await?;
+        sink.commit(&paths.final_file).await?;
         // Release the copy permit before parking on the coalesced directory-fsync barrier.
         drop(copy_permit);
-        self.dir_sync.sync_dir(&bucket_dir).await?;
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
         drop(durability_timing);
         fail::fail_point!("blob_after_assemble");
 
@@ -1292,48 +1336,19 @@ impl BlobStore for LocalBlobStore {
             internal_sha256,
             compression: descriptor,
         };
-        cleanup.disarm();
         Ok(staged)
-    }
-
-    async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError> {
-        let dir = self
-            .data_root
-            .join(STAGING)
-            .join("multipart")
-            .join(upload.as_str());
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(e)),
-        }
     }
 
     async fn reconcile(
         &self,
         oracle: &dyn ReconcileOracle,
         opts: ReconcileOpts,
+        lease: cairn_types::storage::io::StorageIoLease,
     ) -> Result<ReconcileReport, BlobError> {
-        // The trait method is frozen, so `now` cannot be a parameter; obtain it once here from
-        // the system clock and thread it explicitly into the reconcile core so the staging
-        // safety-margin logic stays unit-testable with an injected `now`.
+        // Sample time once; the bounded exclusive walker retains actual maintenance ownership.
         let now = system_now();
-        reconcile_inner(&self.data_root, oracle, opts, now).await
+        reconcile_inner(&self.data_root, oracle, opts, now, lease).await
     }
-}
-
-fn multipart_attempt_name(part_number: u16, attempt_id: &str) -> Result<String, BlobError> {
-    if attempt_id.is_empty()
-        || attempt_id.len() > 64
-        || !attempt_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(BlobError::Io(
-            "unsafe multipart part-attempt identifier".to_owned(),
-        ));
-    }
-    Ok(format!("{part_number:05}-{attempt_id}"))
 }
 
 /// The wall-clock now as a [`Timestamp`], saturating at the epoch for clocks set before 1970.
@@ -1352,60 +1367,19 @@ async fn reconcile_inner(
     oracle: &dyn ReconcileOracle,
     opts: ReconcileOpts,
     now: Timestamp,
+    lease: cairn_types::storage::io::StorageIoLease,
 ) -> Result<ReconcileReport, BlobError> {
-    let mut report = ReconcileReport::default();
-    let mut entries = tokio::fs::read_dir(data_root).await.map_err(io_err)?;
-    // Reconcile buckets with bounded concurrency. The oracle is a borrowed `&dyn`, so the
-    // futures are not `'static` and cannot move into a detached `JoinSet`; a `FuturesUnordered`
-    // capped at `parallelism` gives the same bounded-concurrency, bounded-memory behaviour while
-    // keeping the borrow. Bucket enumeration streams too; each worker retains bounded bucket/leaf
-    // pages, so the working set is O(parallelism * batch_size), independent of total bucket count.
-    let parallelism = opts.parallelism.max(1);
-    let batch_size = opts.batch_size.max(1);
-    let mut inflight: futures_util::stream::FuturesUnordered<_> =
-        futures_util::stream::FuturesUnordered::new();
-    loop {
-        while inflight.len() < parallelism {
-            let Some(entry) = entries.next_entry().await.map_err(io_err)? else {
-                break;
-            };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                report.errors += 1;
-                continue;
-            };
-            let kind = entry.file_type().await.map_err(io_err)?;
-            if kind.is_symlink() {
-                report.errors += 1;
-                continue;
-            }
-            if !kind.is_dir() {
-                continue;
-            }
-            if name == STAGING {
-                reconcile_staging(&entry.path(), oracle, opts, now, &mut report).await?;
-                continue;
-            }
-            if BucketName::parse(&name).is_err() {
-                report.errors += 1;
-                continue;
-            }
-            #[cfg(unix)]
-            use reconcile::bucket as reconcile_bucket;
-            inflight.push(reconcile_bucket(
-                entry.path(),
-                name,
-                oracle,
-                batch_size,
-                opts.staging_safety_margin_secs,
-                now,
-            ));
-        }
-        let Some(part) = inflight.next().await else {
-            break;
-        };
-        merge_report(&mut report, part?);
+    #[cfg(unix)]
+    {
+        reconcile::run(data_root, oracle, opts, now, lease).await
     }
-    Ok(report)
+    #[cfg(not(unix))]
+    {
+        let _ = (data_root, oracle, opts, now, lease);
+        Err(BlobError::Io(
+            "safe exclusive reconciliation requires POSIX descriptors".into(),
+        ))
+    }
 }
 
 /// Fold a per-bucket reconcile report into the running total. `ReconcileReport` is a frozen type
@@ -1419,239 +1393,26 @@ fn merge_report(into: &mut ReconcileReport, part: ReconcileReport) {
     into.errors += part.errors;
 }
 
-/// Reconcile one per-bucket directory, reclaiming blobs no metadata row references, then pruning
-/// the directory if reconciliation left it empty. Returns its own report so callers can run it
-/// concurrently and fold the counts. Memory stays bounded: at most `batch_size` paths are held.
-#[cfg(not(unix))]
-async fn reconcile_bucket(
-    dir: PathBuf,
-    bucket: String,
-    oracle: &dyn ReconcileOracle,
-    batch_size: u32,
-    margin_secs: i64,
-    now: Timestamp,
-) -> Result<ReconcileReport, BlobError> {
-    let mut report = ReconcileReport::default();
-    let mut rd = tokio::fs::read_dir(&dir).await.map_err(io_err)?;
-    let mut batch: Vec<(PathBuf, StoragePath)> = Vec::new();
-    loop {
-        let next = rd.next_entry().await.map_err(io_err)?;
-        let is_end = next.is_none();
-        if let Some(entry) = next {
-            if entry.file_type().await.map_err(io_err)?.is_file() {
-                let file = entry.file_name().to_string_lossy().to_string();
-                let sp = StoragePath::from_string(format!("{bucket}/{file}"));
-                batch.push((entry.path(), sp));
-            }
-        }
-        if (is_end || batch.len() >= batch_size as usize) && !batch.is_empty() {
-            report.blobs_scanned += batch.len() as u64;
-            let paths: Vec<StoragePath> = batch.iter().map(|(_, sp)| sp.clone()).collect();
-            let live = oracle
-                .live_blobs(&paths)
-                .await
-                .map_err(|e| BlobError::Io(e.to_string()))?;
-            for ((path, _), is_live) in batch.drain(..).zip(live) {
-                if !is_live {
-                    // Do not reclaim a blob younger than the safety margin: it may belong to an
-                    // in-flight PUT whose metadata row has not yet committed, which the oracle would
-                    // report as not-live (audit #7). Mirrors the staging safety margin.
-                    if blob_too_young(&path, margin_secs, now).await {
-                        continue;
-                    }
-                    if tokio::fs::remove_file(&path).await.is_ok() {
-                        report.orphans_reclaimed += 1;
-                    } else {
-                        report.errors += 1;
-                    }
-                }
-            }
-        }
-        if is_end {
-            break;
-        }
-    }
-    // Prune the bucket directory if reconciliation emptied it. `remove_dir` only succeeds on an
-    // empty directory, so a concurrent write that re-populated it is left untouched.
-    if prune_if_empty(&dir).await? {
-        report.dirs_pruned += 1;
-    }
-    Ok(report)
-}
-
-/// Remove `dir` if it is empty, reporting whether it was pruned. A non-empty directory, or one a
-/// race repopulated, is left in place; a missing directory counts as not pruned.
-#[cfg(not(unix))]
-async fn prune_if_empty(dir: &Path) -> Result<bool, BlobError> {
-    let mut rd = match tokio::fs::read_dir(dir).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(io_err(e)),
-    };
-    if rd.next_entry().await.map_err(io_err)?.is_some() {
-        return Ok(false);
-    }
-    Ok(tokio::fs::remove_dir(dir).await.is_ok())
-}
-
-async fn reconcile_staging(
-    staging: &Path,
-    oracle: &dyn ReconcileOracle,
-    opts: ReconcileOpts,
-    now: Timestamp,
-    report: &mut ReconcileReport,
-) -> Result<(), BlobError> {
-    let mut rd = match tokio::fs::read_dir(staging).await {
-        Ok(rd) => rd,
-        Err(_) => return Ok(()),
-    };
-    while let Some(entry) = rd.next_entry().await.map_err(io_err)? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let ft = entry.file_type().await.map_err(io_err)?;
-        if ft.is_file() {
-            // A leftover single-part staging artifact, possibly from a crash — but possibly an
-            // in-flight write from a live process. Only reclaim it once it is older than the
-            // safety margin, so an out-of-band reconcile against a live data dir cannot delete a
-            // STAGING/{id}.tmp file that a concurrent write is still streaming into (ARCH 8.5).
-            if staging_artifact_expired(&entry, opts.staging_safety_margin_secs, now).await? {
-                if tokio::fs::remove_file(entry.path()).await.is_ok() {
-                    report.staging_cleaned += 1;
-                } else {
-                    report.errors += 1;
-                }
-            }
-        } else if ft.is_dir() && name == "multipart" {
-            let mut sessions = tokio::fs::read_dir(entry.path()).await.map_err(io_err)?;
-            while let Some(s) = sessions.next_entry().await.map_err(io_err)? {
-                let upload = UploadId::from_string(s.file_name().to_string_lossy().to_string());
-                let live = oracle
-                    .live_session(&upload)
-                    .await
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                if live {
-                    reconcile_live_multipart_session(
-                        &s.path(),
-                        &upload,
-                        oracle,
-                        opts.batch_size.max(1),
-                        opts.staging_safety_margin_secs,
-                        now,
-                        report,
-                    )
-                    .await?;
-                } else if tokio::fs::remove_dir_all(s.path()).await.is_ok() {
-                    report.sessions_cleaned += 1;
-                }
-            }
-            // Note: the `multipart` parent itself is left in place. It is recreated on every
-            // store open and on each `stage_part`, so pruning it would be pointless churn; only
-            // the per-session subdirectories are reclaimed (counted as `sessions_cleaned`).
-        }
-    }
-    Ok(())
-}
-
-async fn reconcile_live_multipart_session(
-    session_dir: &Path,
-    upload: &UploadId,
-    oracle: &dyn ReconcileOracle,
-    batch_size: u32,
-    margin_secs: i64,
-    now: Timestamp,
-    report: &mut ReconcileReport,
-) -> Result<(), BlobError> {
-    let mut entries = tokio::fs::read_dir(session_dir).await.map_err(io_err)?;
-    let mut batch = Vec::new();
-    loop {
-        let next = entries.next_entry().await.map_err(io_err)?;
-        let is_end = next.is_none();
-        if let Some(entry) = next {
-            if entry.file_type().await.map_err(io_err)?.is_file() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let storage_path = StoragePath::from_string(format!(
-                    "{STAGING}/multipart/{}/{}",
-                    upload.as_str(),
-                    file_name
-                ));
-                batch.push((entry, storage_path));
-            }
-        }
-        if (is_end || batch.len() >= batch_size as usize) && !batch.is_empty() {
-            let paths: Vec<_> = batch
-                .iter()
-                .map(|(_, storage_path)| storage_path.clone())
-                .collect();
-            let live = oracle
-                .live_multipart_parts(&paths)
-                .await
-                .map_err(|error| BlobError::Io(error.to_string()))?;
-            for ((entry, _), referenced) in batch.drain(..).zip(live) {
-                if referenced || !staging_artifact_expired(&entry, margin_secs, now).await? {
-                    continue;
-                }
-                if tokio::fs::remove_file(entry.path()).await.is_ok() {
-                    report.staging_cleaned += 1;
-                } else {
-                    report.errors += 1;
-                }
-            }
-        }
-        if is_end {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Whether a staging artifact is older than the safety margin and so safe to reclaim. The margin
-/// is compared against the file's mtime; an artifact whose mtime cannot be read (or sits in the
-/// future relative to `now`) is treated as fresh and preserved, erring toward never deleting a
-/// possibly-live in-flight write.
-/// Whether `path`'s mtime is within `margin_secs` of `now` — too recently written to safely reclaim
-/// as an orphan (it may be an in-flight PUT whose metadata row has not yet committed, ARCH 9). A
-/// margin of `0` (tests) or a path that cannot be stat-ed (already deleted, racing) is treated as
-/// not-young so the caller proceeds. The inverse of [`staging_artifact_expired`]'s age check.
-#[cfg(not(unix))]
-async fn blob_too_young(path: &Path, margin_secs: i64, now: Timestamp) -> bool {
-    if margin_secs <= 0 {
-        return false;
-    }
-    let Ok(meta) = tokio::fs::metadata(path).await else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    let mtime_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        // mtime predates the epoch: unambiguously old, so not "young".
-        Err(_) => return false,
-    };
-    now.as_secs() - mtime_secs < margin_secs
-}
-
-async fn staging_artifact_expired(
-    entry: &tokio::fs::DirEntry,
-    margin_secs: i64,
-    now: Timestamp,
-) -> Result<bool, BlobError> {
-    let meta = entry.metadata().await.map_err(io_err)?;
-    let Ok(modified) = meta.modified() else {
-        return Ok(false);
-    };
-    let mtime_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        // mtime predates the epoch: unambiguously old, so it is past any non-negative margin.
-        Err(_) => return Ok(margin_secs >= 0),
-    };
-    let age_secs = now.as_secs() - mtime_secs;
-    Ok(age_secs >= margin_secs.max(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_types::BucketName;
+    use cairn_types::testing::FixtureBlobStore;
     use cairn_types::testing::SetReconcileOracle;
+
+    async fn reconcile_inner(
+        root: &Path,
+        oracle: &dyn ReconcileOracle,
+        opts: ReconcileOpts,
+        now: Timestamp,
+    ) -> Result<ReconcileReport, BlobError> {
+        let (_watch, lease) = cairn_types::storage::io::StorageIoWatch::new(
+            cairn_types::storage::StorageToken::generate(),
+            cairn_types::storage::StorageToken::generate(),
+            Arc::new(()),
+        );
+        super::reconcile_inner(root, oracle, opts, now, lease).await
+    }
 
     /// Audit 2026-07: reads and writes draw from SEPARATE I/O pools, so a flood of slow-reading
     /// clients (which hold a read permit for the whole client-paced download) can exhaust the read
@@ -1660,7 +1421,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_write_io_pools_are_independent() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path())
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
             .unwrap()
             .with_io_pool_size(3)
@@ -1681,13 +1442,14 @@ mod tests {
         drop(held);
     }
 
-    /// The request-level guard is installed before the staging file is created, not merely around
-    /// the rename. Cancel a real `stage` future while its body is deterministically parked and
-    /// verify the provisional file disappears without waiting for reconciliation.
+    /// Cancellation ends production of bytes; exact admitted artifacts remain for the retained
+    /// recovery consumer, which is deliberately absent from this blob-only fixture.
     #[tokio::test]
-    async fn canceled_stage_unlinks_its_inflight_tmp() {
+    async fn canceled_stage_retains_its_admitted_tmp() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
         let bucket = BucketName::parse("bkt").unwrap();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let first = futures_util::stream::once(async move {
@@ -1698,7 +1460,7 @@ mod tests {
 
         let task = tokio::spawn(async move {
             store
-                .stage(
+                .stage_fixture(
                     &bucket,
                     body,
                     StageOptions {
@@ -1712,17 +1474,14 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
-        let mut entries = tokio::fs::read_dir(dir.path().join(STAGING)).await.unwrap();
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            assert!(
-                !entry.file_type().await.unwrap().is_file(),
-                "canceled stage left provisional file {}",
-                entry.path().display()
-            );
-        }
-        assert!(
-            !dir.path().join("bkt").exists(),
-            "a pre-rename cancellation must not create a final blob"
+        let files = std::fs::read_dir(dir.path().join(STAGING))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())
+            .count();
+        assert_eq!(files, 1);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("bkt")).unwrap().count(),
+            0
         );
     }
 
@@ -1736,13 +1495,13 @@ mod tests {
     #[tokio::test]
     async fn small_object_fast_path_holds_a_read_permit_across_both_polls() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path())
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
             .unwrap()
             .with_read_io_pool_size(1);
         let b = BucketName::parse("bkt").unwrap();
         let staged = store
-            .stage(
+            .stage_fixture(
                 &b,
                 Box::pin(futures_util::stream::once(async move {
                     Ok(Bytes::from(vec![7u8; 128]))
@@ -1808,9 +1567,11 @@ mod tests {
     #[tokio::test]
     async fn staging_safety_margin_preserves_fresh_reclaims_old() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
         let staging = dir.path().join(STAGING);
-        let tmp = staging.join("inflight.tmp");
+        let tmp = staging.join("11111111111111111111111111111111.tmp");
         tokio::fs::write(&tmp, b"streaming...").await.unwrap();
         let mtime = file_mtime_secs(&tmp).await;
 
@@ -1842,11 +1603,19 @@ mod tests {
     #[tokio::test]
     async fn staging_zero_margin_reclaims_immediately() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path()).await.unwrap();
-        let tmp = dir.path().join(STAGING).join("orphan.tmp");
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
+        let tmp = dir
+            .path()
+            .join(STAGING)
+            .join("22222222222222222222222222222222.tmp");
         tokio::fs::write(&tmp, b"leftover").await.unwrap();
         // Model a process crash in the scratch create/unlink window.
-        let index_tmp = dir.path().join(STAGING).join("orphan.index.tmp");
+        let index_tmp = dir
+            .path()
+            .join(STAGING)
+            .join("22222222222222222222222222222222.index.tmp");
         tokio::fs::write(&index_tmp, b"index entries")
             .await
             .unwrap();
@@ -1871,50 +1640,33 @@ mod tests {
         assert!(!index_tmp.exists());
     }
 
-    /// `ensure_bucket_dir` is a no-op-and-still-Ok on an existing directory and creates a missing
-    /// one; the durable parent fsync runs only on the create path (F-1, ARCH 8.2 step 4).
     #[tokio::test]
-    async fn ensure_bucket_dir_creates_and_is_idempotent() {
+    async fn admitted_bucket_preparation_creates_and_reuses_the_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let bucket = root.join("bkt");
-        assert!(!tokio::fs::try_exists(&bucket).await.unwrap());
-        // First call creates it (and fsyncs the parent for durability of the new entry).
-        ensure_bucket_dir(root, &bucket).await.unwrap();
-        assert!(tokio::fs::metadata(&bucket).await.unwrap().is_dir());
-        // Second call is a no-op that still succeeds.
-        ensure_bucket_dir(root, &bucket).await.unwrap();
-        assert!(tokio::fs::metadata(&bucket).await.unwrap().is_dir());
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
+        let bucket = BucketName::parse("bkt").unwrap();
+        for _ in 0..2 {
+            store
+                .stage_fixture(
+                    &bucket,
+                    Box::pin(futures_util::stream::empty()),
+                    StageOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert!(dir.path().join("bkt").is_dir());
+        }
     }
 
-    /// `prune_if_empty` removes only an empty directory, leaves a populated one, and treats a
-    /// missing directory as not pruned.
-    #[cfg(not(unix))]
-    #[tokio::test]
-    async fn prune_if_empty_only_removes_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let empty = dir.path().join("empty");
-        tokio::fs::create_dir(&empty).await.unwrap();
-        assert!(prune_if_empty(&empty).await.unwrap());
-        assert!(!tokio::fs::try_exists(&empty).await.unwrap());
-
-        let full = dir.path().join("full");
-        tokio::fs::create_dir(&full).await.unwrap();
-        tokio::fs::write(full.join("f"), b"x").await.unwrap();
-        assert!(!prune_if_empty(&full).await.unwrap());
-        assert!(tokio::fs::try_exists(&full).await.unwrap());
-
-        let missing = dir.path().join("missing");
-        assert!(!prune_if_empty(&missing).await.unwrap());
-    }
-
-    /// The data root and its in-root staging directory share one filesystem, so the startup check
-    /// passes for a normal temp dir (ARCH 2.4, 9.2).
     #[cfg(unix)]
     #[tokio::test]
     async fn single_filesystem_check_passes_for_same_fs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap();
         store.check_single_filesystem().unwrap();
     }
 
@@ -1942,15 +1694,16 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let dir = tempfile::tempdir().unwrap();
-            let store = LocalBlobStore::open(dir.path())
-                .await
-                .unwrap()
-                .with_small_read_max(0);
+            let store =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap()
+                    .with_small_read_max(0);
             for compression in [None, Some(CompressionPolicy::default())] {
                 let data = Bytes::from(vec![7; 64 * 1024]);
                 let size = data.len() as u64;
                 let staged = store
-                    .stage(
+                    .stage_fixture(
                         &BucketName::parse("bkt").unwrap(),
                         Box::pin(futures_util::stream::iter([Ok(data)])),
                         StageOptions {

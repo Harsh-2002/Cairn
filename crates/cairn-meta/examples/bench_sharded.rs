@@ -1,7 +1,10 @@
-//! Object-write throughput vs shard count (Phase 3.2). Spreads concurrent `PutObjectVersion`s
-//! across many buckets through the `ShardedMetadataStore` and measures puts/s for N = 1, 2, 4
-//! shards on real on-disk databases. The full object-write path is exercised (routing → quota
-//! check → upsert → roll-up counters). Run from the repo (ext4, not /tmp tmpfs):
+//! Protocol-2 end-to-end metadata admission/publication cost vs shard count (Phase 3.2).
+//! Spreads concurrent object inserts across buckets through `ShardedMetadataStore`, measuring
+//! acknowledged admission + publication pairs for N = 1, 2, 4 shards on on-disk SQLite databases.
+//! Includes routing, exact intent/path ownership, quota checks, upsert, roll-ups and cleanup-debt
+//! recording. Excludes blob I/O and cleanup draining; this example creates metadata fixtures only.
+//! Uses `OpenOptions::default()` (synchronous=NORMAL). These results are not comparable to the old
+//! bare-`PutObjectVersion` throughput numbers. Run from the repo (ext4, not /tmp tmpfs):
 //!   `cargo run --release --example bench_sharded -p cairn-meta`
 //! Env: BENCH_CONC (submitters), BENCH_SECS, BENCH_BUCKETS, BENCH_SHARDS (comma list).
 
@@ -9,21 +12,45 @@ use cairn_meta::{OpenOptions, ShardedMetadataStore, open};
 use cairn_types::authz::OwnershipMode;
 use cairn_types::bucket::{Bucket, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
-use cairn_types::meta::{InitialObjectState, Mutation, Precondition};
+use cairn_types::meta::{InitialObjectState, Mutation, MutationOutcome, Precondition};
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::storage::{
+    PlannedStorageWrite, StorageAdmission, StorageMutation, StorageToken, StorageWritePlan,
+    StorageWriteTarget,
+};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::MetadataStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-fn row(bucket: &str, key: &str, t: usize) -> ObjectVersionRow {
-    let b = BucketName::parse(bucket).unwrap();
-    ObjectVersionRow {
-        id: format!("{bucket}-{key}-{t}"),
-        bucket: b,
-        key: ObjectKey::parse(key).unwrap(),
-        version_id: VersionId::from_string(format!("v{t}")),
+fn row(
+    bucket: &str,
+    key: &str,
+    t: usize,
+    generation: &StorageToken,
+) -> (ObjectVersionRow, StorageWritePlan) {
+    let bucket = BucketName::parse(bucket).unwrap();
+    let key = ObjectKey::parse(key).unwrap();
+    let version_id = VersionId::from_string(format!("v{t}"));
+    let id = StorageToken::generate().as_str().to_owned();
+    let plan = PlannedStorageWrite::new(
+        bucket.clone(),
+        generation.clone(),
+        StorageWriteTarget::Object {
+            key: key.clone(),
+            version_id: version_id.clone(),
+            row_id: id.clone(),
+        },
+    )
+    .unwrap()
+    .plan()
+    .clone();
+    let row = ObjectVersionRow {
+        id,
+        bucket,
+        key,
+        version_id,
         is_latest: true,
         is_delete_marker: false,
         size_logical: 1024,
@@ -35,9 +62,7 @@ fn row(bucket: &str, key: &str, t: usize) -> ObjectVersionRow {
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
-            "{bucket}/{key}-{t}"
-        ))),
+        storage_path: Some(plan.final_path().unwrap().clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -51,7 +76,8 @@ fn row(bucket: &str, key: &str, t: usize) -> ObjectVersionRow {
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
-    }
+    };
+    (row, plan)
 }
 
 async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
@@ -64,6 +90,19 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
         })
         .collect();
     let store: Arc<dyn MetadataStore> = Arc::new(ShardedMetadataStore::new(stores));
+
+    // One broadcast establishes the same current generation on every shard before admission.
+    // The databases are fresh, privately owned metadata fixtures; there is no prior backend I/O.
+    let generation = StorageToken::generate();
+    assert_eq!(
+        store
+            .submit(Mutation::BeginStorageGeneration {
+                generation: generation.clone(),
+            })
+            .await
+            .unwrap(),
+        MutationOutcome::Ack,
+    );
 
     // Pre-create the buckets (spread across shards by name).
     for b in 0..buckets {
@@ -87,6 +126,7 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
     for task in 0..conc {
         let store = store.clone();
         let count = count.clone();
+        let generation = generation.clone();
         handles.push(tokio::spawn(async move {
             let mut i = task;
             while Instant::now() < deadline {
@@ -94,18 +134,43 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
                 // spread across shards.
                 let b = format!("bucket-{}", i % buckets);
                 let k = format!("k{task}-{i}");
-                if store
-                    .submit(Mutation::PutObjectVersion {
-                        row: Box::new(row(&b, &k, i)),
-                        precondition: Precondition::default(),
-                        initial_state: InitialObjectState::default(),
-                        replication: Vec::new(),
+                let (row, plan) = row(&b, &k, i, &generation);
+                let admission = store
+                    .submit(Mutation::Storage {
+                        bucket: row.bucket.clone(),
+                        operation: StorageMutation::Reserve {
+                            plan: Box::new(plan.clone()),
+                            now: Timestamp(1),
+                        },
                     })
                     .await
-                    .is_ok()
-                {
-                    count.fetch_add(1, Ordering::Relaxed);
-                }
+                    .expect("protocol-2 metadata admission failed");
+                assert!(matches!(
+                    admission,
+                    MutationOutcome::StorageAdmission(StorageAdmission::Granted(admitted))
+                        if *admitted == plan
+                ));
+                let version_id = row.version_id.clone();
+                let published = store
+                    .submit(Mutation::PublishStorageWrite {
+                        plan: Box::new(plan),
+                        operation: Box::new(Mutation::PutObjectVersion {
+                            row: Box::new(row),
+                            precondition: Precondition::default(),
+                            initial_state: InitialObjectState::default(),
+                            replication: Vec::new(),
+                        }),
+                    })
+                    .await
+                    .expect("protocol-2 metadata publication failed");
+                assert_eq!(
+                    published,
+                    MutationOutcome::Put {
+                        superseded: None,
+                        version_id
+                    }
+                );
+                count.fetch_add(1, Ordering::Relaxed);
                 i += conc;
             }
         }));
@@ -138,7 +203,7 @@ async fn main() {
         .unwrap_or_else(|| vec![1, 2, 4]);
 
     println!(
-        "sharded object-write throughput: {conc} submitters, {buckets} buckets, {secs}s each, on {:?} ({} cores)",
+        "protocol-2 metadata admission+publication throughput: {conc} submitters, {buckets} buckets, {secs}s each, on {:?} ({} cores)",
         std::env::current_dir().unwrap(),
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -152,7 +217,7 @@ async fn main() {
         }
         let speedup = if base > 0.0 { rate / base } else { 1.0 };
         println!(
-            "  shards={shards:<2}  {rate:>10.0} puts/s   ({speedup:.2}x vs shards={})",
+            "  shards={shards:<2}  {rate:>10.0} admitted publications/s   ({speedup:.2}x vs shards={})",
             shard_list[0]
         );
     }

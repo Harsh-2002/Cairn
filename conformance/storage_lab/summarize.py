@@ -131,6 +131,7 @@ def summarize_run(root, report, device):
               "profile": report["profile"], "workload": report["workload"],
               "manifest": report["manifest"], "server_configuration": report.get("server_configuration"),
               "cycles": cycles, "phase_observations": [],
+              "post_load_storage_cleanup": report.get("post_load_storage_cleanup"),
               "device": device_summary(samples, group, device),
               "checkpoints": [event for event in events if event.get("kind") == "checkpoint"]}
     series, nonfinite = {}, 0

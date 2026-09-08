@@ -12,7 +12,11 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v35 — the
+- `storage.rs` — protocol-2 Writer operations: exact admission/publication ownership, cancellation,
+  quiescence resolution, bounded intent recovery and leased cleanup. Validate the normalized
+  path/upload/reservation index against each persisted plan; mirror SQL and typed outcomes across
+  both metadata crates and the in-memory double.
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v37 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
@@ -47,12 +51,16 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   listed row identity and timestamp and can require the target still to be the sole/latest delete
   marker. An absent or stale predicate returns `DeleteNotApplied`; `DeleteMarker`/`Deleted` are
   reserved for rows actually changed by the writer.
-- `ResolveObjectWrite` parity is exact too: it is a writer-serialized bucket-routed probe over the
-  intended version's immutable row id and unique storage path. A match preserves the blob after an
-  acknowledgement loss; only a miss permits cancellation cleanup.
-- `ResolveMultipartPartWrite` has the same SQL and outcome parity for exact
-  `(upload_id, part_number, storage_path)` ownership. The attempt-derived path prevents delayed
-  recovery from matching a superseding retry.
+- Protocol-2 physical PUT, part and completion writes require `PublishStorageWrite` over their
+  exact admitted plan. Ordinary admission precedes staging; multipart admission joins the original
+  quota reserve or completion claim in one savepoint. Publication rechecks generation, intent,
+  cancellation and target before the original preconditions/side effects. Reject bare physical
+  publications; a missing owner returns `StoragePublicationNotApplied`.
+- `ResolveObjectWrite` and `ResolveMultipartPartWrite` retain exact FIFO identity probes for
+  acknowledgement ambiguity. A miss alone cannot authorize unlink or quota release. Actual
+  quiescence must be proven before storage-intent resolution, and physical reclamation requires
+  an exact leased Writer cleanup claim. Replacement/deletion records cleanup debt atomically with
+  reference removal; a returned superseded path is not cleanup authority.
 - Multipart terminal ownership is part of parity, not an implementation detail: Complete claims
   `active -> completing` under an exact persisted request token, Abort deletes only `active`, a
   failed claim releases only its own token, and final completion rechecks both `completing` and
@@ -63,8 +71,11 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   implement); the runner applies any version > current max, so the v12->v15 gap is correct. Don't
   renumber to close it.
 - **All writes go through the single `Writer`** task (group-commit, one savepoint per mutation, one
-  commit = one durability barrier). A failing mutation rolls back only its own savepoint. Never
-  open an ad-hoc write connection.
+  commit = one durability barrier). A failing mutation rolls back its own savepoint; a failed
+  savepoint operation aborts the entire batch because isolation is no longer established. Preserve
+  typed `MetaError::OutOfSpace` through batch fan-out and secondary rollback errors. A capacity
+  failure is not proof of nonpublication; retain the normal exact-identity ambiguity resolution.
+  Never open an ad-hoc write connection.
 - **Reads check out a connection exclusively.** A single libSQL/Turso connection cannot serve two
   concurrent reads — interleaved cursors return wrong/leaked rows (audit #8). The `ReadGuard` holds
   one pooled connection under its lock for the whole (possibly multi-query) read.
@@ -113,3 +124,22 @@ Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat pl
 full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
 sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
 without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.
+
+Schema v36 adds exact storage intents/paths/cleanup and a process-generation/coverage singleton,
+raises reader/writer protocol floors to 2, and preserves flat placement/full startup scans.
+Schema v37 adds indexed upload/reservation identity and `quota_owner_path` so unfinished multipart
+aliases follow their final part's sole v26 charge after replacement or terminal removal. All linked
+cleanup rows must retire, and no intent may protect the charged path, before that charge is freed.
+Attaching new quota ownership to a claimed alias invalidates its entire claim tuple immediately;
+stale acknowledgements remain rejected without forcing retry to wait for the old lease. Repeating
+the same quota attachment preserves its current claim. Mirror this in every implementation.
+Legacy cleanup release mutations exclude protocol-2 debts; existing protocol-1 charges are not
+forgiven by migration.
+
+Cancellation never proves I/O quiescence. Cleanup claims exclude live objects/parts and outstanding
+intents; settlement requires the exact id/path/bucket/token/generation/unexpired lease/debt identity
+after durable physical absence. Per-bucket operations retain routing after bucket/session deletion;
+generation changes reach every shard and global claims remain bounded. SQLite, libSQL, Turso and
+the in-memory double preserve these savepoint and typed outcome semantics. Coverage remains
+incomplete and Phase 3C gates remain tracked in `docs/storage-evolution-plan.md`; Phase 3D is not
+active.

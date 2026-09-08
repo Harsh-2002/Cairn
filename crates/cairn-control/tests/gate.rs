@@ -15,6 +15,8 @@ use cairn_types::object::{
     CompressionDescriptor, ETag, ExplicitObjectLockIntent, ObjectLockMode, ObjectRetention,
     ObjectVersionRow, StorageClass,
 };
+use cairn_types::storage::{StorageToken, StorageWriteTarget};
+use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
@@ -48,13 +50,15 @@ fn member() -> Principal {
 
 struct Harness {
     svc: ControlService,
+    fixture: PublicationFixture,
     meta: Arc<InMemoryMetadataStore>,
     blob: Arc<InMemoryBlobStore>,
     clock: Arc<TestClock>,
 }
 
-fn harness() -> Harness {
+async fn harness() -> Harness {
     let meta = Arc::new(InMemoryMetadataStore::new());
+    let fixture = meta.begin_fixture().await.unwrap();
     let blob = Arc::new(InMemoryBlobStore::new());
     let crypto = Arc::new(StubCrypto);
     let clock = Arc::new(TestClock::default());
@@ -75,9 +79,58 @@ fn harness() -> Harness {
     );
     Harness {
         svc,
+        fixture,
         meta,
         blob,
         clock,
+    }
+}
+
+async fn drain_cleanup(
+    fixture: &PublicationFixture,
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+) -> Vec<cairn_types::StoragePath> {
+    use cairn_types::storage::{StorageMutation, io::StorageIoWatch};
+    use cairn_types::{MutationOutcome, Timestamp};
+    let mut removed = Vec::new();
+    loop {
+        let MutationOutcome::StorageCleanupBatch(batch) = meta
+            .submit(Mutation::ClaimStorageCleanup {
+                generation: fixture.generation().clone(),
+                limit: 256,
+                now: Timestamp(1),
+                lease_secs: 60,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("exact cleanup batch expected")
+        };
+        if batch.is_empty() {
+            return removed;
+        }
+        for cleanup in batch {
+            let (_, lease) = StorageIoWatch::new(
+                cleanup.id.clone(),
+                cleanup.generation.clone(),
+                std::sync::Arc::new(()),
+            );
+            blob.cleanup_storage(&cleanup, lease).await.unwrap();
+            removed.push(cleanup.path.clone());
+            assert!(matches!(
+                meta.submit(Mutation::Storage {
+                    bucket: cleanup.bucket.clone(),
+                    operation: StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: Timestamp(1)
+                    },
+                })
+                .await
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            ));
+        }
     }
 }
 
@@ -145,10 +198,34 @@ async fn put_object_with_lock(
 ) -> (VersionId, cairn_types::StoragePath) {
     let bname = BucketName::parse(bucket).unwrap();
     let bucket_row = h.meta.get_bucket(&bname).await.unwrap().unwrap();
+    let now = h.clock.now();
+    let version_id = if bucket_row.versioning == VersioningState::Enabled {
+        VersionId::generate()
+    } else {
+        VersionId::null()
+    };
+    let row_id = StorageToken::generate().as_str().to_owned();
+    let planned = h
+        .blob
+        .plan_write(
+            bname.clone(),
+            h.fixture.generation().clone(),
+            StorageWriteTarget::Object {
+                key: ObjectKey::parse(key).unwrap(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+            },
+        )
+        .unwrap();
+    let (plan, permit) = h
+        .fixture
+        .admit_object(&*h.meta, planned, now)
+        .await
+        .unwrap();
     let staged = h
         .blob
         .stage(
-            &bname,
+            permit,
             body_stream(data),
             StageOptions {
                 compression: None,
@@ -161,14 +238,8 @@ async fn put_object_with_lock(
         )
         .await
         .unwrap();
-    let now = h.clock.now();
-    let version_id = if bucket_row.versioning == VersioningState::Enabled {
-        VersionId::generate()
-    } else {
-        VersionId::null()
-    };
     let row = ObjectVersionRow {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: row_id,
         bucket: bname,
         key: ObjectKey::parse(key).unwrap(),
         version_id: version_id.clone(),
@@ -199,15 +270,21 @@ async fn put_object_with_lock(
         updated_at: now,
     };
     h.meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState {
-                tags: Vec::new(),
-                lock_intent,
-            },
-            replication: Vec::new(),
-        })
+        .submit(
+            PublicationFixture::publication(
+                plan,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: Vec::new(),
+                        lock_intent,
+                    },
+                    replication: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     (version_id, staged.storage_path)
@@ -219,7 +296,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
 
 #[tokio::test]
 async fn health_is_unauthenticated_and_ok() {
-    let h = harness();
+    let h = harness().await;
     let resp = h
         .svc
         .handle(&Method::GET, "/health", &[], None, Bytes::new())
@@ -232,7 +309,7 @@ async fn health_is_unauthenticated_and_ok() {
 
 #[tokio::test]
 async fn non_admin_is_forbidden_on_overview() {
-    let h = harness();
+    let h = harness().await;
     let m = member();
     let resp = h
         .svc
@@ -244,7 +321,7 @@ async fn non_admin_is_forbidden_on_overview() {
 
 #[tokio::test]
 async fn anonymous_is_forbidden_on_overview() {
-    let h = harness();
+    let h = harness().await;
     let resp = h
         .svc
         .handle(&Method::GET, "/overview", &[], None, Bytes::new())
@@ -254,7 +331,7 @@ async fn anonymous_is_forbidden_on_overview() {
 
 #[tokio::test]
 async fn admin_bucket_lifecycle() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     // Create.
@@ -347,7 +424,7 @@ async fn admin_bucket_lifecycle() {
 
 #[tokio::test]
 async fn force_delete_removes_unprotected_bucket_and_blobs() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -381,12 +458,25 @@ async fn force_delete_removes_unprotected_bucket_and_blobs() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(
+        h.blob.blob_count(),
+        2,
+        "authoritative removal leaves exact physical debt"
+    );
+    let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("data/"))
+            .count(),
+        2
+    );
     assert_eq!(h.blob.blob_count(), 0);
 }
 
 #[tokio::test]
 async fn recursive_delete_removes_unprotected_versions_and_blobs() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -427,6 +517,19 @@ async fn recursive_delete_removes_unprotected_versions_and_blobs() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 0);
+    assert_eq!(
+        h.blob.blob_count(),
+        2,
+        "authoritative removal leaves exact physical debt"
+    );
+    let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("data/"))
+            .count(),
+        2
+    );
     assert_eq!(h.blob.blob_count(), 0);
 }
 
@@ -462,11 +565,11 @@ fn retained(mode: ObjectLockMode) -> ExplicitObjectLockIntent {
 
 #[tokio::test]
 async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     create_lock_bucket(&h, "worm", &a).await;
 
-    let (compliance, _) = put_object_with_lock(
+    let (compliance, compliance_path) = put_object_with_lock(
         &h,
         "worm",
         "compliance",
@@ -474,7 +577,7 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
         retained(ObjectLockMode::Compliance),
     )
     .await;
-    let (governance, _) = put_object_with_lock(
+    let (governance, governance_path) = put_object_with_lock(
         &h,
         "worm",
         "governance",
@@ -482,7 +585,7 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
         retained(ObjectLockMode::Governance),
     )
     .await;
-    let (held, _) = put_object_with_lock(
+    let (held, held_path) = put_object_with_lock(
         &h,
         "worm",
         "held",
@@ -493,7 +596,7 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
         },
     )
     .await;
-    let (unlocked, _) = put_object_with_lock(
+    let (unlocked, unlocked_path) = put_object_with_lock(
         &h,
         "worm",
         "z-unlocked",
@@ -513,7 +616,29 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
         )
         .await;
     assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(
+        h.blob.blob_count(),
+        4,
+        "protected blobs and pending cleanup remain present"
+    );
+    let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("worm/"))
+            .count(),
+        1
+    );
     assert_eq!(h.blob.blob_count(), 3);
+    assert!(removed.contains(&unlocked_path));
+    for (path, bytes) in [
+        (&compliance_path, b"c"),
+        (&governance_path, b"g"),
+        (&held_path, b"h"),
+    ] {
+        assert!(!removed.contains(path));
+        assert_eq!(h.blob.get_bytes(path).unwrap(), bytes);
+    }
     assert!(
         h.meta
             .get_bucket(&BucketName::parse("worm").unwrap())
@@ -581,10 +706,10 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
 
 #[tokio::test]
 async fn recursive_delete_reports_protected_and_deletes_later_unlocked_versions() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     create_lock_bucket(&h, "worm-prefix", &a).await;
-    let (protected_version, _) = put_object_with_lock(
+    let (protected_version, protected_path) = put_object_with_lock(
         &h,
         "worm-prefix",
         "folder/a-protected",
@@ -592,7 +717,7 @@ async fn recursive_delete_reports_protected_and_deletes_later_unlocked_versions(
         retained(ObjectLockMode::Compliance),
     )
     .await;
-    let (unlocked_version, _) = put_object_with_lock(
+    let (unlocked_version, unlocked_path) = put_object_with_lock(
         &h,
         "worm-prefix",
         "folder/z-unlocked",
@@ -642,12 +767,28 @@ async fn recursive_delete_reports_protected_and_deletes_later_unlocked_versions(
             .unwrap()
             .is_none()
     );
+    assert_eq!(
+        h.blob.blob_count(),
+        2,
+        "the unlocked path remains pending cleanup"
+    );
+    let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|path| path.as_str().starts_with("worm-prefix/"))
+            .count(),
+        1
+    );
+    assert!(removed.contains(&unlocked_path));
+    assert!(!removed.contains(&protected_path));
+    assert_eq!(h.blob.get_bytes(&protected_path).unwrap(), b"protected");
     assert_eq!(h.blob.blob_count(), 1);
 }
 
 #[tokio::test]
 async fn recursive_delete_pages_past_one_thousand_protected_versions() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     create_lock_bucket(&h, "worm-paged", &a).await;
 
@@ -717,7 +858,7 @@ async fn recursive_delete_pages_past_one_thousand_protected_versions() {
 
 #[tokio::test]
 async fn create_user_returns_secret_once_and_lists() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     let resp = h
@@ -786,7 +927,7 @@ async fn create_user_returns_secret_once_and_lists() {
 
 #[tokio::test]
 async fn management_session_boundary_preserves_parent_identity_denies() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.meta
         .submit(Mutation::CreateUser(Box::new(UserRecord {
@@ -876,7 +1017,7 @@ async fn management_session_boundary_preserves_parent_identity_denies() {
 
 #[tokio::test]
 async fn management_session_mint_fails_closed_when_parent_policy_read_fails() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.meta.set_fail_user_policy_reads(true);
 
@@ -916,7 +1057,7 @@ async fn management_session_mint_fails_closed_when_parent_policy_read_fails() {
 
 #[tokio::test]
 async fn overview_reflects_counts_after_put() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -954,7 +1095,7 @@ async fn overview_reflects_counts_after_put() {
 
 #[tokio::test]
 async fn overview_buckets_breakdown_sums_to_totals() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     for name in [r#"{"name":"vault"}"#, r#"{"name":"empty"}"#] {
         h.svc
@@ -1007,7 +1148,7 @@ async fn overview_buckets_breakdown_sums_to_totals() {
 
 #[tokio::test]
 async fn overview_buckets_requires_admin() {
-    let h = harness();
+    let h = harness().await;
     let m = member();
     let resp = h
         .svc
@@ -1024,7 +1165,7 @@ async fn overview_buckets_requires_admin() {
 
 #[tokio::test]
 async fn system_requires_admin() {
-    let h = harness();
+    let h = harness().await;
     let m = member();
     for principal in [Some(&m), None] {
         let resp = h
@@ -1038,7 +1179,7 @@ async fn system_requires_admin() {
 
 #[tokio::test]
 async fn system_reports_identity_and_disk() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let resp = h
         .svc
@@ -1063,7 +1204,7 @@ async fn system_reports_identity_and_disk() {
 
 #[tokio::test]
 async fn list_objects_with_prefix_and_limit() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -1113,7 +1254,7 @@ async fn list_objects_with_prefix_and_limit() {
 
 #[tokio::test]
 async fn activity_records_mutations() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -1137,7 +1278,7 @@ async fn activity_records_mutations() {
 
 #[tokio::test]
 async fn unknown_subpath_is_404() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let resp = h
         .svc
@@ -1149,7 +1290,7 @@ async fn unknown_subpath_is_404() {
 
 #[tokio::test]
 async fn bad_create_bucket_body_is_400() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let resp = h
         .svc
@@ -1188,7 +1329,7 @@ async fn make_bucket(h: &Harness, a: &Principal, name: &str) {
 
 #[tokio::test]
 async fn share_management_uses_stable_id_and_never_exposes_bearer_material() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "shared").await;
     let sentinel = "control-share-bearer-sentinel-029";
@@ -1250,7 +1391,7 @@ async fn share_management_uses_stable_id_and_never_exposes_bearer_material() {
 
 #[tokio::test]
 async fn webhook_secret_is_write_only_and_sealed_in_raw_metadata() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "hooks").await;
     let sentinel = "AUD015-raw-plaintext-must-not-survive";
@@ -1312,7 +1453,7 @@ async fn webhook_secret_is_write_only_and_sealed_in_raw_metadata() {
 
 #[tokio::test]
 async fn editing_legacy_webhook_config_migrates_inherited_secret() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "legacy-hooks").await;
     let bucket = BucketName::parse("legacy-hooks").unwrap();
@@ -1358,7 +1499,7 @@ async fn editing_legacy_webhook_config_migrates_inherited_secret() {
 
 #[tokio::test]
 async fn bucket_config_get_reflects_aspects() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "cfg").await;
 
@@ -1415,7 +1556,7 @@ async fn bucket_config_get_reflects_aspects() {
 
 #[tokio::test]
 async fn set_versioning_updates_state() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "vers").await;
 
@@ -1505,7 +1646,7 @@ async fn set_versioning_updates_state() {
 
 #[tokio::test]
 async fn object_lock_bucket_versioning_cannot_be_suspended_through_control_plane() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     create_lock_bucket(&h, "worm-versioning", &a).await;
 
@@ -1534,7 +1675,7 @@ async fn object_lock_bucket_versioning_cannot_be_suspended_through_control_plane
 
 #[tokio::test]
 async fn set_quota_is_accepted() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "quota").await;
 
@@ -1579,7 +1720,7 @@ async fn set_quota_is_accepted() {
 
 #[tokio::test]
 async fn policy_put_validates_and_get_round_trips() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "pol").await;
 
@@ -1696,7 +1837,7 @@ async fn create_member(h: &Harness, a: &Principal) -> (String, String) {
 
 #[tokio::test]
 async fn patch_user_changes_role_and_deactivates() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let (id, key_id) = create_member(&h, &a).await;
 
@@ -1810,7 +1951,7 @@ async fn patch_user_changes_role_and_deactivates() {
 /// none of these guards.
 #[tokio::test]
 async fn patch_user_cannot_strand_the_control_plane() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     // Promote a member so it is the only active administrator in the store.
@@ -1882,7 +2023,7 @@ async fn patch_user_cannot_strand_the_control_plane() {
 
 #[tokio::test]
 async fn rotate_credentials_mints_new_secret() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let (id, key_id) = create_member(&h, &a).await;
     let before = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
@@ -1941,7 +2082,7 @@ async fn rotate_credentials_mints_new_secret() {
 
 #[tokio::test]
 async fn failed_replication_lists_empty_and_is_gated() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     let resp = h
@@ -1976,8 +2117,9 @@ async fn failed_replication_lists_empty_and_is_gated() {
 #[tokio::test]
 async fn failed_replication_reflects_a_planted_terminal_entry() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
-    let h = harness();
+    let h = harness().await;
     let a = admin();
+    make_bucket(&h, &a, "repl").await;
 
     // Plant a replication outbox entry by committing a version that carries it, then mark it
     // terminally failed the way the replication engine does (next_attempt_at = None).
@@ -2018,9 +2160,10 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(cairn_types::id::StoragePath::from_string(
-            "repl/00000001".to_owned(),
-        )),
+        storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
+            "repl/{}",
+            StorageToken::generate().as_str()
+        ))),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -2036,12 +2179,15 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         updated_at: now,
     };
     h.meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        .submit_fixture(
+            &h.fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
         .await
         .unwrap();
     h.meta
@@ -2082,7 +2228,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
 
 #[tokio::test]
 async fn config_reports_a_set_quota() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "limited").await;
 
@@ -2151,7 +2297,7 @@ async fn config_reports_a_set_quota() {
 
 #[tokio::test]
 async fn config_mutations_record_activity() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "audit").await;
     h.svc
@@ -2180,7 +2326,7 @@ async fn config_mutations_record_activity() {
 
 #[tokio::test]
 async fn health_reflects_store_readiness() {
-    let h = harness();
+    let h = harness().await;
     // A working store probes ready.
     let resp = h
         .svc
@@ -2197,7 +2343,7 @@ async fn health_reflects_store_readiness() {
 
 #[tokio::test]
 async fn error_envelope_and_response_carry_request_id() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     // An error path: a 404 envelope carries a non-empty request_id that matches the response field.
@@ -2232,7 +2378,7 @@ async fn error_envelope_and_response_carry_request_id() {
 
 #[tokio::test]
 async fn record_activity_populates_actor() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "audited").await;
 
@@ -2247,7 +2393,7 @@ async fn record_activity_populates_actor() {
 
 #[tokio::test]
 async fn set_user_quota_is_accepted_and_gated() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let (id, _key) = create_member(&h, &a).await;
 
@@ -2320,7 +2466,7 @@ async fn set_user_quota_is_accepted_and_gated() {
 
 #[tokio::test]
 async fn create_user_with_replication_policy_attaches_it() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "mirror").await;
 
@@ -2392,7 +2538,7 @@ async fn create_user_with_replication_policy_attaches_it() {
 
 #[tokio::test]
 async fn import_job_lifecycle_and_secret_never_echoed() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     // Create an import job — the source secret is sealed and must never appear in any response.
@@ -2490,7 +2636,7 @@ async fn import_job_lifecycle_and_secret_never_echoed() {
 
 #[tokio::test]
 async fn import_history_is_large_safe_and_keyset_paginated() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     // One shared millisecond deliberately forces the id tie-breaker to carry every page boundary.
     // More than the hard ceiling proves the default API response cannot grow with history.
@@ -2600,7 +2746,7 @@ async fn probe_source_buckets_validates_and_guards() {
     // The "Fetch buckets" probe reuses the create-import connection validation: it rejects missing
     // fields, the CA-⊕-skip-verify conflict, and an internal endpoint (SSRF) — all before any
     // outbound dial — and never leaks the transient secret in the rejection body.
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     let leaked = |body: &[u8]| body.windows(b"leak-me".len()).any(|w| w == b"leak-me");
 
@@ -2679,7 +2825,7 @@ async fn replication_target_rejects_internal_endpoint() {
     // The SSRF guard (enforcing by default) must refuse a target whose endpoint is an internal IP
     // literal — otherwise it could be pointed at the node's own loopback or the cloud-metadata
     // service (ARCH 27). The secret must not leak in the rejection.
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "src").await;
     let resp = h
@@ -2705,7 +2851,7 @@ async fn replication_target_rejects_internal_endpoint() {
 
 #[tokio::test]
 async fn replication_target_add_list_hides_secret_and_delete_round_trip() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "src").await;
 
@@ -2834,8 +2980,9 @@ async fn replication_target_add_list_hides_secret_and_delete_round_trip() {
 #[tokio::test]
 async fn replication_retry_endpoint_requeues_failed_for_bucket() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
-    let h = harness();
+    let h = harness().await;
     let a = admin();
+    make_bucket(&h, &a, "repl").await;
 
     // Plant a terminally-failed outbox entry for bucket "repl".
     let bucket = BucketName::parse("repl").unwrap();
@@ -2875,9 +3022,10 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(cairn_types::id::StoragePath::from_string(
-            "repl/00000001".to_owned(),
-        )),
+        storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
+            "repl/{}",
+            StorageToken::generate().as_str()
+        ))),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -2893,12 +3041,15 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         updated_at: now,
     };
     h.meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        .submit_fixture(
+            &h.fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
         .await
         .unwrap();
     h.meta
@@ -2913,9 +3064,6 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         })
         .await
         .unwrap();
-    // The bucket row must exist for require_bucket to pass.
-    make_bucket(&h, &a, "repl").await;
-
     // Status reflects the one failed entry with its error.
     let resp = h
         .svc
@@ -2990,7 +3138,7 @@ fn versioning_variants_exist() {
 
 #[tokio::test]
 async fn user_policy_routes_validate_store_and_surface() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
 
     // Create a member, capture its id.
@@ -3128,7 +3276,7 @@ async fn user_policy_routes_validate_store_and_surface() {
 
 #[tokio::test]
 async fn bucket_encryption_default_round_trips() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -3206,7 +3354,7 @@ async fn bucket_encryption_default_round_trips() {
 
 #[tokio::test]
 async fn list_objects_with_delimiter_folds_folders() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     h.svc
         .handle(
@@ -3282,7 +3430,7 @@ async fn list_objects_with_delimiter_folds_folders() {
 #[tokio::test]
 async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_op() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "repl").await;
     let bucket = BucketName::parse("repl").unwrap();
@@ -3345,9 +3493,10 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(cairn_types::id::StoragePath::from_string(
-            "repl/00000001".to_owned(),
-        )),
+        storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
+            "repl/{}",
+            StorageToken::generate().as_str()
+        ))),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -3365,12 +3514,15 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         updated_at: now,
     };
     h.meta
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        .submit_fixture(
+            &h.fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
         .await
         .unwrap();
     replication_claims
@@ -3457,7 +3609,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
 /// repaired nothing.
 #[tokio::test]
 async fn resync_reports_the_existing_object_replication_trap() {
-    let h = harness();
+    let h = harness().await;
     let a = admin();
     make_bucket(&h, &a, "repl").await;
     let bucket = BucketName::parse("repl").unwrap();

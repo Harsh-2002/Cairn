@@ -2,7 +2,8 @@
 """Real-HTTP remote multipart journal recovery; requires schema v33 and streaming sender.
 
 A forwarding proxy holds a successful destination response until the source is killed. No
-production failpoints or SQL mutations are used. Complete table rows are compared before startup.
+production failpoints or SQL mutations are used. Snapshot rows are compared exactly; restore must
+preserve live rows and validate fresh storage ownership.
 Run BIN=/path/to/cairn python3 conformance/recovery_remote.py. --cleanup-lease additionally
 crashes an owned abort and proves startup releases its abandoned cleanup claim.
 """
@@ -21,7 +22,9 @@ import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-from recovery_state import durable_tables, rows, same_rows
+from recovery_state import (database_rows, durable_tables, fresh_storage_generation,
+                            recovered_artifacts_absent, recovered_database_rows, rows,
+                            same_database_rows, same_live_files)
 from replication_large import Client, MIB, NS, chunks, unused_port, wait_for
 
 
@@ -220,13 +223,17 @@ def scenario(binary, work, stage, cleanup_lease):
         snapshot = work / "snapshot"
         cli(source, "backup", str(snapshot))
         snapshot_db = snapshot / "metadata.sqlite3"
-        for table in durable_tables(database):
-            same_rows(database, snapshot_db, table)
+        same_database_rows(database, snapshot_db)
         cli(restored, "restore", str(snapshot))
-        for table in durable_tables(snapshot_db):
-            same_rows(snapshot_db, restored / "cairn.db", table)
-        start("source", restored, client)
+        snapshot_state = database_rows(snapshot_db)
         restored_db = restored / "cairn.db"
+        restored_state = database_rows(restored_db)
+        recovered_database_rows(snapshot_state, restored_state)
+        same_live_files(snapshot / "blobs", restored, snapshot_state)
+        recovered_artifacts_absent(restored, snapshot_state)
+        start("source", restored, client)
+        fresh_storage_generation(restored_state["storage_recovery_state"],
+                                 rows(restored_db, "storage_recovery_state"))
         if cleanup_lease:
             row = next((row for row in rows(restored_db, "replication_uploads") if row["id"] == attempt), None)
             assert row is None or row["cleanup_token"] != claimed["cleanup_token"], "startup must release the abandoned cleanup claim"
@@ -252,7 +259,7 @@ def scenario(binary, work, stage, cleanup_lease):
         else:
             assert not ids, "known remote upload must not leak"
         assert not proxy.errors, proxy.errors
-        print(f"PASS: {stage} response loss; full-table restore; " +
+        print(f"PASS: {stage} response loss; exact snapshot and validated restore transitions; " +
               ("abandoned cleanup claim released safely" if cleanup_lease else "unknown ID retained for lifecycle" if stage == "initiation" else "known upload reclaimed"), flush=True)
     finally:
         proxy.release.set()

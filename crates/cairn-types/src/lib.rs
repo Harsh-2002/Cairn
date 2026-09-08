@@ -23,6 +23,7 @@ pub mod replication;
 pub mod replication_upload;
 pub mod secret;
 pub mod sse;
+pub mod storage;
 pub mod time;
 pub mod traits;
 

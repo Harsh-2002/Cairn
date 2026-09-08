@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Focused wire regressions for the disposable recovery fault proxy (stdlib only)."""
 import contextlib
+import copy
 import http.client
 import http.server
+from pathlib import Path
+import sqlite3
+import tempfile
 import threading
 import unittest
 
 from recovery_remote import FaultProxy
+from recovery_state import (recovered_artifacts_absent, recovered_database_rows,
+                            same_database_rows, same_live_files)
 
 
 @contextlib.contextmanager
@@ -74,6 +80,136 @@ class FaultProxyTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.getheader("content-length"), "99")
             self.assertEqual(response.read(), b"")
+
+
+class RestoreStateTests(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        before = {
+            "storage_recovery_state": [{"singleton": 1, "generation": "1" * 32,
+                                        "coverage_state": "incomplete", "coverage_identity": None,
+                                        "baseline_completed_at": None}],
+            "storage_write_intents": [{"attempt_id": "owned"}],
+            "storage_intent_paths": [{"attempt_id": "owned", "storage_path": "scratch"}],
+            "storage_cleanups": [{"id": "cleanup", "claim_token": "old-token", "storage_path": "old-blob"}],
+            "multipart_uploads": [{"id": "upload", "bucket_name": "bucket", "owner_id": "owner",
+                                   "initiated_by": "writer", "status": "completing",
+                                   "completion_claim_token": "old-token", "additive_field": "preserve"}],
+            "multipart_parts": [{"upload_id": "upload", "size": 7, "storage_path": "part",
+                                 "etag": "part-etag"}],
+            "multipart_part_reservations": [{"upload_id": "upload", "reserved_bytes": 11}],
+            "multipart_staging_cleanups": [{"bucket_name": "bucket", "principal_id": "writer", "bytes": 13}],
+            "multipart_bucket_stats": [{"bucket_name": "bucket", "active_uploads": 1,
+                                        "staged_bytes": 31, "additive_field": "preserve"}],
+            "multipart_principal_stats": [{"principal_id": "writer", "active_uploads": 1,
+                                           "staged_bytes": 31}],
+            "object_versions": [{"storage_path": "object", "metadata": "preserve"}],
+            "future_empty_table": [],
+        }
+        after = copy.deepcopy(before)
+        after["storage_recovery_state"][0]["generation"] = "2" * 32
+        for table in ("storage_write_intents", "storage_intent_paths", "storage_cleanups",
+                      "multipart_part_reservations", "multipart_staging_cleanups"):
+            after[table] = []
+        after["multipart_uploads"][0].update(status="active", completion_claim_token=None)
+        for table in ("multipart_bucket_stats", "multipart_principal_stats"):
+            after[table][0]["staged_bytes"] = 7
+        return before, after
+
+    def test_exact_recovery_changes_pass_with_charged_reservation_and_debt(self):
+        recovered_database_rows(*self.fixture())
+
+    def test_missing_fresh_generation_or_changed_coverage_fails(self):
+        for change in ({"generation": "1" * 32}, {"generation": "not-a-token"},
+                       {"coverage_state": "complete"}, {"baseline_completed_at": 123}):
+            with self.subTest(change=change):
+                before, after = self.fixture()
+                after["storage_recovery_state"][0].update(change)
+                with self.assertRaises(AssertionError):
+                    recovered_database_rows(before, after)
+
+    def test_quota_undercharge_and_overcharge_fail(self):
+        for amount in (0, 6, 8, 31):
+            with self.subTest(amount=amount):
+                before, after = self.fixture()
+                for table in ("multipart_bucket_stats", "multipart_principal_stats"):
+                    after[table][0]["staged_bytes"] = amount
+                with self.assertRaises(AssertionError):
+                    recovered_database_rows(before, after)
+
+    def test_dropping_a_live_part_cannot_be_hidden_by_adjusting_quota(self):
+        before, after = self.fixture()
+        after["multipart_parts"] = []
+        for table in ("multipart_bucket_stats", "multipart_principal_stats"):
+            after[table][0]["staged_bytes"] = 0
+        with self.assertRaises(AssertionError):
+            recovered_database_rows(before, after)
+
+    def test_additive_fields_and_remaining_claims_are_not_ignored(self):
+        mutations = [
+            lambda state: state["multipart_uploads"][0].update(additive_field="lost"),
+            lambda state: state["multipart_bucket_stats"][0].update(additive_field="lost"),
+            lambda state: state["object_versions"][0].update(metadata="lost"),
+            lambda state: state["multipart_uploads"][0].update(completion_claim_token="old-token"),
+            lambda state: state["storage_cleanups"].append({"id": "unresolved"}),
+            lambda state: state.pop("future_empty_table"),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                before, after = self.fixture()
+                mutate(after)
+                with self.assertRaises(AssertionError):
+                    recovered_database_rows(before, after)
+
+    def test_snapshot_comparison_includes_empty_tables_and_all_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            left, right = (Path(directory) / name for name in ("source.db", "snapshot.db"))
+            for database in (left, right):
+                with sqlite3.connect(database) as connection:
+                    connection.executescript("CREATE TABLE future_empty (id); "
+                                             "CREATE TABLE metadata (id, additive_field); "
+                                             "INSERT INTO metadata VALUES (1, 'preserve');")
+            same_database_rows(left, right)
+            with sqlite3.connect(right) as connection:
+                connection.execute("UPDATE metadata SET additive_field='lost'")
+            with self.assertRaises(AssertionError):
+                same_database_rows(left, right)
+            with sqlite3.connect(right) as connection:
+                connection.execute("UPDATE metadata SET additive_field='preserve'")
+                connection.execute("DROP TABLE future_empty")
+            with self.assertRaises(AssertionError):
+                same_database_rows(left, right)
+
+    def test_retired_artifacts_must_be_physically_absent_but_live_aliases_survive(self):
+        before, _ = self.fixture()
+        before["storage_intent_paths"].append({"storage_path": "part"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "part").write_bytes(b"live")
+            recovered_artifacts_absent(root, before)
+            (root / "scratch").write_bytes(b"not reclaimed")
+            with self.assertRaises(AssertionError):
+                recovered_artifacts_absent(root, before)
+            (root / "scratch").unlink()
+            (root / "old-blob").symlink_to("missing-target")
+            with self.assertRaises(AssertionError):
+                recovered_artifacts_absent(root, before)
+
+    def test_live_file_verification_detects_same_size_corruption_and_absence(self):
+        before, _ = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, restored = (Path(directory) / name for name in ("snapshot", "restored"))
+            for root in (snapshot, restored):
+                root.mkdir()
+                (root / "object").write_bytes(b"object")
+                (root / "part").write_bytes(b"part")
+            same_live_files(snapshot, restored, before)
+            (restored / "part").write_bytes(b"rot!")
+            with self.assertRaises(AssertionError):
+                same_live_files(snapshot, restored, before)
+            (restored / "part").unlink()
+            with self.assertRaises(AssertionError):
+                same_live_files(snapshot, restored, before)
 
 
 if __name__ == "__main__":

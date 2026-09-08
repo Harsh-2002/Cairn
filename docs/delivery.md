@@ -50,7 +50,27 @@ upgrade steps are [`backup-restore.md`](./backup-restore.md).
 
 In steady-state operation the signals to watch are the write-queue depth for write saturation, the write-ahead-log size for checkpoint health since a log that grows without bound indicates long-lived readers starving the checkpointer, the reconciliation counts for startup integrity, the rate of out-of-space responses against storage capacity, and the replication lag and failure counts for the health of redundancy. Because Cairn does not implement drive redundancy, the operational guidance is to place the data filesystem on redundant storage appropriate to the deployment, such as a checksumming redundant filesystem that also detects silent corruption, software or hardware RAID, or a cloud block volume with provider redundancy, and to rely on the optional background scrub for early warning of bit rot and on bucket replication for cross-host and cross-site copies. Capacity, write saturation, and replication failures are the natural alerting targets, and the metrics of Section 26 expose all three.
 
-A planned process stop follows one bounded supervisor contract. Readiness is withdrawn before the stop signal reaches listeners and workers. Acceptors and claimers stop starting new work, then in-flight HTTP and retained ordinary background tasks drain concurrently for up to 30 seconds; tasks still running at the deadline are cancelled and joined. Durable replication/webhook leases and import cursors make that cancellation recoverable. A cancelled multipart Complete instead queues its exact-token claim release, plus any not-yet-referenced assembled path, synchronously from the request future's drop guard: the retained queue consumer remains alive through HTTP cancellation, receives a FIFO drain sentinel only after every connection is gone, and is joined under a separate five-second bound. The guard is armed before Claim awaits its writer acknowledgement, and the token prevents delayed or duplicate recovery from affecting a newer owner. A confirmed release restores retryability and permits assembled-orphan deletion; `NotOwner` preserves the path because completion may have committed. Startup claim recovery followed by full blob reconciliation remains fatal if it cannot run across every metadata shard, so process death, ambiguity, or an incomplete live drain cannot let a partially recovered node bind. After the drains, Cairn has a separate 30-second budget to flush request metrics, persist master-key seal counters, and perform final SQLite checkpoints. The final structured log distinguishes a fully completed tail from a timeout, flush error, or busy/failed checkpoint; automation must not interpret the latter as a clean durability-finalized shutdown.
+A planned process stop withdraws readiness before signalling listeners and workers. Acceptors and
+claimers stop new work; in-flight HTTP and retained ordinary background tasks drain concurrently
+for up to 30 seconds, then overrunning tasks are cancelled and joined. Durable replication/webhook
+leases and import cursors make that cancellation recoverable.
+
+Cancelled admitted object, part and completion writes synchronously close further I/O admission
+and queue their exact plan from the request guard. The retained storage recovery consumer remains
+alive until both HTTP and ordinary background producers, including direct S3 imports, have stopped;
+only then does it receive the FIFO drain sentinel and a separate five-second join budget. It waits
+for actual backend I/O quiescence, confirms the backend barrier, releases an exact completion token
+where applicable, and resolves storage ownership through the Writer. A claim release or ownership
+miss does not authorize direct deletion: unreferenced paths become exact cleanup debt, and leased
+cleanup settlement follows durable physical absence (Section 11.6). Recovery slots and actual
+backend operations retain the node-lock lifetime; a timeout cannot report quiescence or erase debt.
+Startup generation recovery and mandatory full blob reconciliation must succeed across every
+metadata shard before listener bind.
+
+After the drains, Cairn has a separate 30-second budget to flush request metrics, persist master-key
+seal counters, and perform final SQLite checkpoints. The final structured log distinguishes a fully
+completed tail from recovery, timeout, flush or checkpoint failure; automation must not interpret
+an incomplete tail as a clean durability-finalized shutdown.
 
 The same retained FIFO resolves ordinary-object and multipart-part commit acknowledgement ambiguity
 through exact writer probes before cleanup. Admission is bounded by the configured request
@@ -163,10 +183,30 @@ migration. It records compatibility, not journal coverage or an operator-selecta
 | Field | Type | Constraints and notes |
 |---|---|---|
 | singleton | integer | Primary key, exactly 1. |
-| minimum_reader | integer | At least 1; this binary supports exactly protocol 1. |
-| minimum_writer | integer | At least 1; this binary supports exactly protocol 1. |
+| minimum_reader | integer | At least 1; 1 for schema v35; 2 from v36 onward. |
+| minimum_writer | integer | At least 1; 1 for schema v35; 2 from v36 onward. |
 | write_layout | text | Not null; only `flat` is accepted. |
 | recovery_mode | text | Not null; only `full-scan` is accepted. |
+
+**Physical storage ownership (v36; alias/index extensions v37).** All identifiers/paths are text. No table below references
+buckets or multipart sessions with a cascading foreign key.
+
+| Table | Fields and constraints |
+|---|---|
+| storage_recovery_state | Singleton 1; nullable generation and coverage identity; coverage state `incomplete`/`complete`; nullable baseline completion timestamp. Phase 3C accepts only incomplete coverage. |
+| storage_write_intents | Attempt primary key, generation, routing bucket, validated plan JSON, cancellation boolean, creation timestamp. v37 adds nullable `upload_id`/`reservation_id`, backfilled from plans and validated against them. Indexed by generation/attempt, bucket/attempt and non-null upload/reservation identity with attempt. |
+| storage_intent_paths | Attempt/role primary key; role limited to temporary/final/index_spool; unique exact relative path. Only this bounded child table cascades from its intent. |
+| storage_cleanups | Cleanup primary key, unique exact path, retained bucket, optional quota-debt id; claim token/generation/lease are either all absent or all present. v37 adds nullable `quota_owner_path` linking unfinished aliases to their final part path. Pending, bucket, quota and non-null quota-owner indexes support bounded work. |
+
+Migration v36 marks existing `multipart_staging_cleanups.storage_protocol=1` without changing
+charged bytes. Protocol-2 physical rows link to that existing accounting; they do not charge bytes
+again. v37 also indexes non-null `multipart_staging_cleanups.storage_path`. When a final part
+reference disappears, unfinished aliases inherit its sole quota-debt id through `quota_owner_path`;
+the charge remains until all linked exact cleanup claims are retired and no intent protects its
+path. Legacy cleanup release cannot forgive protocol-2 debt. Admission, publication, reference
+removal and cleanup settlement use Writer savepoints with backend/double/shard parity (Section
+11.6). Reader/writer floors remain 2, flat writes and mandatory full startup scans remain, and
+coverage remains incomplete; these migrations do not complete Phase 3C or enable Phase 3D.
 
 **Users.**
 

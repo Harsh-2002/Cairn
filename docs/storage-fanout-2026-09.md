@@ -1,7 +1,7 @@
 # Flat versus directory fanout: September 2026
 
 Status: **INCONCLUSIVE — KEEP flat**. All 30 arms passed operation/survivor verification, but
-control drift exceeded the predeclared limit. Production remains flat; Phase 3B integration is pending.
+control drift exceeded the predeclared limit. Production remains flat; Phase 3B merged in PR #87 (`bf17dfe`).
 
 ## Baseline and implementation
 
@@ -173,7 +173,7 @@ passing outcome. Keep flat placement and mandatory full reconciliation.
 
 Validation: 28 Python regressions and nine Rust driver/coordinator tests; standalone Clippy,
 formatting and shellcheck. The unchanged production tree passed the full Phase 3A local gate;
-normal CI will validate the final Phase 3B commit before merge.
+all 54 final-head CI checks passed before merge.
 
 After reduction, export and artifact cleanup, the cumulative campaign consumed **390.191882
 seconds**, leaving **3,209.808118 seconds** of the original 3,600. Peak footprint is
@@ -192,4 +192,4 @@ bounded fixture repeats and the complete 28-test Python suite then passed; the i
 was not reproduced or attributed, so no root-cause fix is claimed. Failure summaries now include
 the recorded reason and bounded driver stderr, and the test retains the result reason in its
 assertion. This is a residual laboratory reliability observation, separate from the 30 successful
-measured arms. Final CI remains required.
+measured arms. The final-head storage-laboratory CI job and all other checks subsequently passed.

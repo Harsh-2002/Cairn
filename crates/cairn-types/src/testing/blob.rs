@@ -10,12 +10,48 @@ use crate::error::BlobError;
 use crate::id::{BucketName, StoragePath, UploadId};
 use crate::object::{CompressionDescriptor, ETag};
 use crate::secret::SecretKey32;
+use crate::storage::{StorageCreationPermit, StorageWriteTarget};
 use crate::traits::{BlobStore, ReconcileOracle};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Actual-operation ownership for one isolated fixture with no serving process/node lock.
+/// Production constructors must instead retain the real exclusive node guard in their lease.
+pub fn fixture_storage_io() -> crate::storage::io::StorageIoLease {
+    crate::storage::io::StorageIoWatch::new(
+        crate::storage::StorageToken::generate(),
+        crate::storage::StorageToken::generate(),
+        Arc::new(()),
+    )
+    .1
+}
+
+/// Synthetic exact cleanup receipt and matching I/O ownership for isolated blob fixtures.
+/// This creates no metadata claim; production callers must use their Writer-issued receipt.
+pub fn fixture_storage_cleanup(
+    bucket: BucketName,
+    path: StoragePath,
+) -> (
+    crate::storage::StorageCleanup,
+    crate::storage::io::StorageIoLease,
+) {
+    use crate::storage::{StorageCleanup, StorageToken, io::StorageIoWatch};
+    let cleanup = StorageCleanup {
+        id: StorageToken::generate(),
+        bucket,
+        path,
+        quota_debt_id: None,
+        claim_token: StorageToken::generate(),
+        generation: StorageToken::generate(),
+        lease_until: crate::Timestamp(i64::MAX),
+    };
+    let (_, lease) =
+        StorageIoWatch::new(cleanup.id.clone(), cleanup.generation.clone(), Arc::new(()));
+    (cleanup, lease)
+}
 
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
@@ -106,17 +142,27 @@ impl BlobStore for InMemoryBlobStore {
 
     async fn stage(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
+        let (plan, lease) = permit.into_parts();
+        if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+            return Err(BlobError::Io(
+                "storage target is not an object write".into(),
+            ));
+        }
+        let _operation = lease.try_child()?;
         let buf = Self::drain(body, opts.size_ceiling).await?;
         // The MD5/ETag is computed over the plaintext, before any (modelled) encryption — exactly
         // as the real store computes it pre-transform — so the ETag is identical with or without a
         // DEK (ARCH 21.1, SSE-S3).
         let md5 = md5_hex(&buf);
         let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
-        let path = StoragePath::generate(bucket);
+        let path = plan
+            .final_path()
+            .map_err(|e| BlobError::Io(e.to_string()))?
+            .clone();
         let len = buf.len() as u64;
         self.blobs.lock().unwrap().insert(
             path.as_str().to_owned(),
@@ -204,28 +250,56 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    async fn delete(&self, path: &StoragePath) -> Result<(), BlobError> {
-        self.blobs.lock().unwrap().remove(path.as_str());
+    async fn confirm_storage_quiescence(
+        &self,
+        plan: &crate::storage::StorageWritePlan,
+        lease: crate::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError> {
+        plan.validate()
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        let _operation = lease.try_child()?;
+        if !lease.owns(&plan.attempt, &plan.generation) {
+            return Err(BlobError::Io("storage recovery ownership mismatch".into()));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_storage(
+        &self,
+        cleanup: &crate::storage::StorageCleanup,
+        lease: crate::storage::io::StorageIoLease,
+    ) -> Result<(), BlobError> {
+        crate::storage::validate_storage_path(&cleanup.bucket, &cleanup.path)
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        let _operation = lease.try_child()?;
+        if !lease.owns(&cleanup.id, &cleanup.generation) {
+            return Err(BlobError::Io("storage cleanup ownership mismatch".into()));
+        }
+        self.blobs.lock().unwrap().remove(cleanup.path.as_str());
+        self.parts.lock().unwrap().remove(cleanup.path.as_str());
         Ok(())
     }
 
     async fn stage_part(
         &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
+        permit: StorageCreationPermit,
         body: crate::BodyStream,
         _checksums: crate::object::ChecksumSet,
         size_ceiling: u64,
         encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError> {
+        let (plan, lease) = permit.into_parts();
+        if !matches!(plan.target, StorageWriteTarget::Part { .. }) {
+            return Err(BlobError::Io("storage target is not a part write".into()));
+        }
+        let _operation = lease.try_child()?;
         let buf = Self::drain(body, size_ceiling).await?;
         let md5 = md5_hex(&buf);
         let size = buf.len() as u64;
-        let path = StoragePath::from_string(format!(
-            ".staging/multipart/{}/{part_number:05}-{attempt_id}",
-            upload.as_str()
-        ));
+        let path = plan
+            .final_path()
+            .map_err(|e| BlobError::Io(e.to_string()))?
+            .clone();
         self.parts.lock().unwrap().insert(
             path.as_str().to_owned(),
             (
@@ -247,26 +321,19 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    async fn delete_part_attempt(
-        &self,
-        upload: &UploadId,
-        part_number: u16,
-        attempt_id: &str,
-    ) -> Result<(), BlobError> {
-        let path = format!(
-            ".staging/multipart/{}/{part_number:05}-{attempt_id}",
-            upload.as_str()
-        );
-        self.parts.lock().unwrap().remove(&path);
-        Ok(())
-    }
-
     async fn assemble(
         &self,
-        bucket: &BucketName,
+        permit: StorageCreationPermit,
         parts: &[PartRef],
         _opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
+        let (plan, lease) = permit.into_parts();
+        if !matches!(plan.target, StorageWriteTarget::Completion { .. }) {
+            return Err(BlobError::Io(
+                "storage target is not multipart assembly".into(),
+            ));
+        }
+        let _operation = lease.try_child()?;
         let mut buf = Vec::new();
         {
             let parts_map = self.parts.lock().unwrap();
@@ -287,7 +354,10 @@ impl BlobStore for InMemoryBlobStore {
         }
         let md5 = md5_hex(&buf);
         let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
-        let path = StoragePath::generate(bucket);
+        let path = plan
+            .final_path()
+            .map_err(|e| BlobError::Io(e.to_string()))?
+            .clone();
         let len = buf.len() as u64;
         self.blobs.lock().unwrap().insert(
             path.as_str().to_owned(),
@@ -311,19 +381,11 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError> {
-        let prefix = format!(".staging/multipart/{}/", upload.as_str());
-        self.parts
-            .lock()
-            .unwrap()
-            .retain(|path, _| !path.starts_with(&prefix));
-        Ok(())
-    }
-
     async fn reconcile(
         &self,
         oracle: &dyn ReconcileOracle,
         opts: ReconcileOpts,
+        _lease: crate::storage::io::StorageIoLease,
     ) -> Result<ReconcileReport, BlobError> {
         let mut report = ReconcileReport::default();
         let paths: Vec<StoragePath> = {
@@ -373,4 +435,114 @@ impl BlobStore for InMemoryBlobStore {
         }
         Ok(report)
     }
+}
+
+/// Explicit blob-only fixture setup. These helpers model the Writer receipt for tests and
+/// microbenchmarks that have no metadata engine; production handlers use `BlobStore` directly.
+#[async_trait::async_trait]
+pub trait FixtureBlobStore: BlobStore {
+    async fn reconcile_fixture(
+        &self,
+        oracle: &dyn ReconcileOracle,
+        opts: ReconcileOpts,
+    ) -> Result<ReconcileReport, BlobError> {
+        let (_watch, lease) = crate::storage::io::StorageIoWatch::new(
+            crate::storage::StorageToken::generate(),
+            crate::storage::StorageToken::generate(),
+            Arc::new(()),
+        );
+        self.reconcile(oracle, opts, lease).await
+    }
+
+    async fn stage_fixture(
+        &self,
+        bucket: &BucketName,
+        body: crate::BodyStream,
+        opts: StageOptions,
+    ) -> Result<StagedBlob, BlobError> {
+        self.stage(
+            fixture_permit(
+                bucket.clone(),
+                StorageWriteTarget::Object {
+                    key: crate::ObjectKey::parse("fixture").expect("valid fixture key"),
+                    version_id: crate::VersionId::null(),
+                    row_id: crate::storage::StorageToken::generate().as_str().to_owned(),
+                },
+            )?,
+            body,
+            opts,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_part_fixture(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+        body: crate::BodyStream,
+        checksums: crate::object::ChecksumSet,
+        size_ceiling: u64,
+        encryption: Option<SecretKey32>,
+    ) -> Result<StagedPart, BlobError> {
+        self.stage_part(
+            fixture_permit(
+                BucketName::parse("fixture-bucket").expect("valid bucket"),
+                StorageWriteTarget::Part {
+                    upload_id: upload.clone(),
+                    part_number,
+                    reservation_id: attempt_id.to_owned(),
+                },
+            )?,
+            body,
+            checksums,
+            size_ceiling,
+            encryption,
+        )
+        .await
+    }
+
+    async fn assemble_fixture(
+        &self,
+        bucket: &BucketName,
+        parts: &[PartRef],
+        opts: StageOptions,
+    ) -> Result<StagedBlob, BlobError> {
+        let upload_id = parts
+            .first()
+            .and_then(|part| part.storage_path.as_str().split('/').nth(2))
+            .map(|id| UploadId::from_string(id.to_owned()))
+            .unwrap_or_else(UploadId::generate);
+        self.assemble(
+            fixture_permit(
+                bucket.clone(),
+                StorageWriteTarget::Completion {
+                    upload_id,
+                    claim_token: crate::storage::StorageToken::generate().as_str().to_owned(),
+                    key: crate::ObjectKey::parse("fixture").expect("valid fixture key"),
+                    version_id: crate::VersionId::null(),
+                    row_id: crate::storage::StorageToken::generate().as_str().to_owned(),
+                },
+            )?,
+            parts,
+            opts,
+        )
+        .await
+    }
+}
+
+impl<T: BlobStore + ?Sized> FixtureBlobStore for T {}
+
+fn fixture_permit(
+    bucket: BucketName,
+    target: StorageWriteTarget,
+) -> Result<StorageCreationPermit, BlobError> {
+    use crate::storage::{PlannedStorageWrite, StorageAdmission, StorageToken, io::StorageIoWatch};
+    let planned = PlannedStorageWrite::new(bucket, StorageToken::generate(), target)
+        .map_err(|error| BlobError::Io(error.to_string()))?;
+    let plan = planned.plan().clone();
+    let (_watch, lease) =
+        StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), Arc::new(()));
+    planned.admit(StorageAdmission::Granted(Box::new(plan)), lease)
 }

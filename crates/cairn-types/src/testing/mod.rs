@@ -6,12 +6,14 @@ mod blob;
 mod clock;
 mod crypto;
 mod meta;
+mod publication_fixture;
 mod replication;
 
-pub use blob::InMemoryBlobStore;
+pub use blob::{FixtureBlobStore, InMemoryBlobStore, fixture_storage_cleanup, fixture_storage_io};
 pub use clock::TestClock;
 pub use crypto::{StubCrypto, StubPublicUrl};
 pub use meta::{InMemoryMetadataStore, SetReconcileOracle};
+pub use publication_fixture::{FixtureMetadataStore, PublicationFixture};
 pub use replication::{
     FakeReplicationSink, RecordedIntent, ReplicationClaims, SinkBehavior,
     assert_replication_claim_fencing,
@@ -57,3 +59,6 @@ impl AuthorizationEngine for DenyAll {
 
 mod replication_upload_contract;
 pub use replication_upload_contract::assert_replication_upload_journal;
+
+mod storage_contract;
+pub use storage_contract::assert_storage_journal;

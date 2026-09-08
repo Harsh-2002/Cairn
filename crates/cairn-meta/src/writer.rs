@@ -5,6 +5,7 @@
 //! then acknowledges every caller whose mutation was in that batch.
 
 use crate::apply::apply;
+use crate::model::engine_err;
 use cairn_types::MetaError;
 use cairn_types::meta::{Mutation, MutationOutcome};
 use rusqlite::Connection;
@@ -457,7 +458,17 @@ fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
     });
     // Restore the connection's busy_timeout regardless of the checkpoint outcome.
     let _ = conn.busy_timeout(Duration::from_millis(prev_ms.max(0) as u64));
-    stats.map_err(|e| MetaError::Engine(e.to_string()))
+    stats.map_err(engine_err)
+}
+
+/// Transaction errors remain ambiguous. Preserve an observed capacity cause even if SQLite
+/// automatically rolled back and a later ROLLBACK reports that its savepoint no longer exists.
+fn rollback_failure(error: MetaError, rollback: MetaError) -> MetaError {
+    if matches!(error, MetaError::OutOfSpace) || matches!(rollback, MetaError::OutOfSpace) {
+        MetaError::OutOfSpace
+    } else {
+        MetaError::Engine(format!("{error}; rollback failed: {rollback}"))
+    }
 }
 
 /// Apply a batch in one transaction with a savepoint per mutation, commit once, then ack.
@@ -478,9 +489,9 @@ fn commit_batch(
     record_stage(stage_samples, "begin", begin_start, begin.is_ok());
     if let Err(e) = begin {
         // Could not even begin; fail the whole batch.
-        let msg = e.to_string();
+        let error = engine_err(e);
         for (_, ack, _) in batch {
-            let _ = ack.send(Err(MetaError::Engine(msg.clone())));
+            let _ = ack.send(Err(error.clone()));
         }
         return;
     }
@@ -493,29 +504,22 @@ fn commit_batch(
     // partial writes live, and committing would persist them. When that happens we record the
     // error and stop processing, so the block below aborts the WHOLE transaction instead of
     // committing suspect state.
-    let abort: Option<String> = loop {
+    let abort: Option<MetaError> = loop {
         let Some((idx, (mutation, ack, _))) = iter.next() else {
             break None;
         };
         let sp = format!("sp{idx}");
-        if conn.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
-            acks.push((
-                ack,
-                Err(MetaError::Engine("failed to open savepoint".to_owned())),
-            ));
-            continue;
+        if let Err(e) = conn.execute_batch(&format!("SAVEPOINT {sp}")) {
+            let error = engine_err(e);
+            acks.push((ack, Err(error.clone())));
+            break Some(error);
         }
         match apply(conn, mutation) {
             Ok(outcome) => {
                 if let Err(e) = conn.execute_batch(&format!("RELEASE {sp}")) {
-                    let msg = e.to_string();
-                    acks.push((
-                        ack,
-                        Err(MetaError::Engine(format!(
-                            "savepoint release failed: {msg}"
-                        ))),
-                    ));
-                    break Some(msg);
+                    let error = engine_err(e);
+                    acks.push((ack, Err(error.clone())));
+                    break Some(error);
                 }
                 acks.push((ack, Ok(outcome)));
             }
@@ -523,14 +527,9 @@ fn commit_batch(
                 // Roll back only this mutation; the rest of the batch is unaffected — unless the
                 // rollback itself fails, in which case the whole batch must abort.
                 if let Err(re) = conn.execute_batch(&format!("ROLLBACK TO {sp}; RELEASE {sp}")) {
-                    let msg = re.to_string();
-                    acks.push((
-                        ack,
-                        Err(MetaError::Engine(format!(
-                            "savepoint rollback failed: {msg}"
-                        ))),
-                    ));
-                    break Some(msg);
+                    let error = rollback_failure(e, engine_err(re));
+                    acks.push((ack, Err(error.clone())));
+                    break Some(error);
                 }
                 acks.push((ack, Err(e)));
             }
@@ -543,16 +542,19 @@ fn commit_batch(
         apply_start,
         abort.is_none() && acks.iter().all(|(_, r)| r.is_ok()),
     );
-    if let Some(msg) = abort {
+    if let Some(error) = abort {
         // Abort the entire transaction and fail every submitter — those already applied and those
         // not yet reached (still in `iter`) — rather than commit a transaction whose savepoint
         // bookkeeping is broken (#17).
-        let _ = conn.execute_batch("ROLLBACK");
+        let error = match conn.execute_batch("ROLLBACK") {
+            Ok(()) => error,
+            Err(rollback) => rollback_failure(error, engine_err(rollback)),
+        };
         for (ack, _) in acks {
-            let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
+            let _ = ack.send(Err(error.clone()));
         }
         for (_, (_, ack, _)) in iter {
-            let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
+            let _ = ack.send(Err(error.clone()));
         }
         return;
     }
@@ -581,10 +583,13 @@ fn commit_batch(
             }
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let msg = e.to_string();
+            let error = engine_err(e);
+            let error = match conn.execute_batch("ROLLBACK") {
+                Ok(()) => error,
+                Err(rollback) => rollback_failure(error, engine_err(rollback)),
+            };
             for (ack, _) in acks {
-                let _ = ack.send(Err(MetaError::Engine(format!("commit failed: {msg}"))));
+                let _ = ack.send(Err(error.clone()));
             }
         }
     }
@@ -593,6 +598,83 @@ fn commit_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sqlite_full_preserves_capacity_through_automatic_batch_rollback() {
+        use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+
+        // Pin this private in-memory database to its existing pages. The oversized document
+        // makes SQLite emit real SQLITE_FULL and automatically roll back the whole transaction.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bucket_config (bucket_name TEXT, aspect TEXT, doc TEXT,
+            PRIMARY KEY(bucket_name,aspect));
+            INSERT INTO bucket_config VALUES ('capacity','policy','original');",
+        )
+        .unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch(&format!("PRAGMA max_page_count={pages}"))
+            .unwrap();
+        let bucket = cairn_types::BucketName::parse("capacity").unwrap();
+        let config = |aspect, doc| Mutation::SetBucketConfig {
+            bucket: bucket.clone(),
+            aspect,
+            doc: Some(ConfigDoc(doc)),
+        };
+        let mut batch = Vec::new();
+        let mut replies = Vec::new();
+        for mutation in [
+            config(ConfigAspect::Policy, "first".into()),
+            config(ConfigAspect::Cors, "x".repeat(256 * 1024)),
+            config(ConfigAspect::Lifecycle, "last".into()),
+        ] {
+            let (ack, reply) = oneshot::channel();
+            batch.push((mutation, ack, Instant::now()));
+            replies.push(reply);
+        }
+        let commits = Mutex::new(VecDeque::new());
+        let stages = Mutex::new(StageBuffer::default());
+        commit_batch(&conn, batch, &commits, &stages);
+        for reply in replies {
+            assert!(matches!(reply.await.unwrap(), Err(MetaError::OutOfSpace)));
+        }
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("SELECT doc FROM bucket_config", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "original"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bucket_config", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        // Failed ROLLBACK-TO after SQLite's automatic rollback must not strand the writer.
+        conn.execute_batch("PRAGMA max_page_count=1024").unwrap();
+        let (ack, reply) = oneshot::channel();
+        commit_batch(
+            &conn,
+            vec![(
+                config(ConfigAspect::Policy, "recovered".into()),
+                ack,
+                Instant::now(),
+            )],
+            &commits,
+            &stages,
+        );
+        assert!(reply.await.unwrap().is_ok());
+        assert_eq!(
+            conn.query_row("SELECT doc FROM bucket_config", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "recovered"
+        );
+    }
 
     /// Small opt-in diagnostic; no S3 listener, disk corpus, or sustained workload.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

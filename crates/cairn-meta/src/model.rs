@@ -27,6 +27,9 @@ pub fn engine_err(e: rusqlite::Error) -> cairn_types::MetaError {
         if f.code == rusqlite::ErrorCode::ConstraintViolation {
             return cairn_types::MetaError::Conflict;
         }
+        if f.code == rusqlite::ErrorCode::DiskFull {
+            return cairn_types::MetaError::OutOfSpace;
+        }
     }
     cairn_types::MetaError::Engine(e.to_string())
 }
@@ -695,4 +698,28 @@ fn unreachable_bucket() -> BucketName {
 }
 fn unreachable_key() -> ObjectKey {
     ObjectKey::parse("invalid-key").expect("placeholder is valid")
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::engine_err;
+    use cairn_types::MetaError;
+
+    #[test]
+    fn capacity_classification_uses_sqlite_code() {
+        assert!(matches!(
+            engine_err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                Some("opaque diagnostic".into())
+            )),
+            MetaError::OutOfSpace
+        ));
+        assert!(matches!(
+            engine_err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("database or disk is full".into())
+            )),
+            MetaError::Engine(_)
+        ));
+    }
 }

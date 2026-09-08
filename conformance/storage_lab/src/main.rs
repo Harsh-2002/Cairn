@@ -2,6 +2,10 @@
 mod common;
 use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
+use cairn_types::storage::{
+    PlannedStorageWrite, StorageAdmission, StorageMutation, StorageToken, StorageWriteTarget,
+};
+use cairn_types::testing::{FixtureBlobStore, fixture_storage_cleanup, fixture_storage_io};
 use cairn_types::traits::{BlobStore, MetadataStore};
 use cairn_types::*;
 use common::{distribution, emit, payload};
@@ -31,7 +35,13 @@ struct Config {
     max_ops: u64,
 }
 
-fn row(bucket: &BucketName, key: ObjectKey, id: String, size: usize) -> ObjectVersionRow {
+fn row(
+    bucket: &BucketName,
+    key: ObjectKey,
+    id: String,
+    size: usize,
+    path: StoragePath,
+) -> ObjectVersionRow {
     ObjectVersionRow {
         id,
         bucket: bucket.clone(),
@@ -48,7 +58,7 @@ fn row(bucket: &BucketName, key: ObjectKey, id: String, size: usize) -> ObjectVe
         content_disposition: None,
         content_language: None,
         expires: None,
-        storage_path: Some(StoragePath::generate(bucket)),
+        storage_path: Some(path),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
         cold_locator: None,
@@ -73,7 +83,7 @@ async fn blob_operation(
     let start = Instant::now();
     let sent = data.clone();
     let staged = store
-        .stage(
+        .stage_fixture(
             bucket,
             Box::pin(futures_util::stream::once(async move { Ok(sent) })),
             StageOptions {
@@ -108,12 +118,14 @@ async fn blob_operation(
     }
     let read = start.elapsed().as_secs_f64();
     let start = Instant::now();
-    store.delete(&staged.storage_path).await?;
+    let (cleanup, lease) = fixture_storage_cleanup(bucket.clone(), staged.storage_path);
+    store.cleanup_storage(&cleanup, lease).await?;
     Ok([stage, read, start.elapsed().as_secs_f64()])
 }
 
 async fn meta_operation(
     store: &cairn_meta::SqliteMetadataStore,
+    generation: &StorageToken,
     bucket: &BucketName,
     worker: usize,
     sequence: u64,
@@ -121,16 +133,52 @@ async fn meta_operation(
 ) -> Result<[f64; 3], Error> {
     // Each worker owns a bounded 16-key overwrite ring. The immutable row identity changes.
     let key = ObjectKey::parse(&format!("worker-{worker:04}/key-{:02}", sequence % 16))?;
-    let id = format!("{worker}-{sequence}");
+    let id = StorageToken::generate().as_str().to_owned();
     let start = Instant::now();
-    store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(bucket, key.clone(), id.clone(), size)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
+    let planned = PlannedStorageWrite::new(
+        bucket.clone(),
+        generation.clone(),
+        StorageWriteTarget::Object {
+            key: key.clone(),
+            version_id: VersionId::null(),
+            row_id: id.clone(),
+        },
+    )?;
+    let plan = planned.plan().clone();
+    let version = row(
+        bucket,
+        key.clone(),
+        id.clone(),
+        size,
+        plan.final_path()?.clone(),
+    );
+    let admission = store
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: StorageMutation::Reserve {
+                plan: Box::new(plan.clone()),
+                now: Timestamp(1),
+            },
         })
         .await?;
+    if !matches!(admission, MutationOutcome::StorageAdmission(StorageAdmission::Granted(ref admitted)) if **admitted == plan)
+    {
+        return Err("metadata storage admission was not granted".into());
+    }
+    let outcome = store
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan),
+            operation: Box::new(Mutation::PutObjectVersion {
+                row: Box::new(version),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            }),
+        })
+        .await?;
+    if !matches!(outcome, MutationOutcome::Put { .. }) {
+        return Err("metadata publication did not apply".into());
+    }
     let put = start.elapsed().as_secs_f64();
     let start = Instant::now();
     let found = store
@@ -180,10 +228,13 @@ async fn run(config: Config) -> Result<(), Error> {
         .map(|n| BucketName::parse(&format!("lab-{n:04}")))
         .collect::<Result<Vec<_>, _>>()?;
     let blob = if config.layer == "blob" {
-        Some(Arc::new(LocalBlobStore::open(&config.root).await?))
+        Some(Arc::new(
+            LocalBlobStore::open(&config.root, fixture_storage_io()).await?,
+        ))
     } else {
         None
     };
+    let generation = StorageToken::generate();
     let meta = if config.layer == "meta" {
         let store = Arc::new(cairn_meta::open(
             &config.root.join("metadata.db"),
@@ -195,6 +246,15 @@ async fn run(config: Config) -> Result<(), Error> {
                 ..Default::default()
             },
         )?);
+        if store
+            .submit(Mutation::BeginStorageGeneration {
+                generation: generation.clone(),
+            })
+            .await?
+            != MutationOutcome::Ack
+        {
+            return Err("metadata storage generation was not initialized".into());
+        }
         for name in &buckets {
             store
                 .submit(Mutation::CreateBucket(Box::new(Bucket {
@@ -214,6 +274,8 @@ async fn run(config: Config) -> Result<(), Error> {
     };
     emit(
         json!({"kind": "prepared", "layer": config.layer, "metadata": {"synchronous": "FULL", "read_pool": 8, "cache_bytes_per_connection": 8388608, "mmap_bytes": 0},
+        "publication_variant": publication_variant(&config.layer),
+        "metadata_cleanup": (config.layer == "meta").then_some("durable_debt_retained_for_teardown_no_physical_files"),
         "unavailable": ["application_cache_live_bytes", "blob_internal_stage_timings", "runtime_active_tasks", "in_flight_buffer_bytes"]}),
     );
     let data = Bytes::from(payload(config.size, config.seed));
@@ -234,6 +296,7 @@ async fn run(config: Config) -> Result<(), Error> {
                 admitted.clone(),
             );
             let size = config.size;
+            let generation = generation.clone();
             tasks.spawn(async move {
                 let mut samples = [Vec::new(), Vec::new(), Vec::new()];
                 let mut bucket_counts = vec![0_u64; buckets.len()];
@@ -249,6 +312,7 @@ async fn run(config: Config) -> Result<(), Error> {
                     } else {
                         meta_operation(
                             meta.as_ref().ok_or("missing metadata driver")?,
+                            &generation,
                             bucket,
                             worker,
                             sequence + cycle as u64 * cap,
@@ -292,7 +356,8 @@ async fn run(config: Config) -> Result<(), Error> {
         let elapsed = start.elapsed().as_secs_f64();
         emit(
             json!({"kind": "cycle", "cycle": cycle, "elapsed": elapsed, "successful_transactions": all[0].len(),
-            "operation_names": if config.layer == "blob" { ["stage", "read", "delete"] } else { ["put", "read", "list"] },
+            "operation_names": if config.layer == "blob" { ["stage", "read", "delete"] } else { ["admit_publish", "read", "list"] },
+            "publication_variant": publication_variant(&config.layer),
             "bucket_transactions": bucket_counts,
             "transactions_per_second": all[0].len() as f64 / elapsed,
             "operation_cap_reached": admitted.load(Ordering::Relaxed) >= cap,
@@ -314,6 +379,14 @@ async fn run(config: Config) -> Result<(), Error> {
     }
     emit(json!({"kind": "complete", "status": "PASS"}));
     Ok(())
+}
+
+fn publication_variant(layer: &str) -> &'static str {
+    if layer == "meta" {
+        "writer_admission_exact_publication_v2"
+    } else {
+        "blob_only_fixture_permit_exact_cleanup_no_metadata_v3"
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
@@ -357,7 +430,10 @@ mod tests {
             for number in 0..2 {
                 let bucket = BucketName::parse(&format!("lab-{number:04}")).unwrap();
                 if layer == "blob" {
-                    assert!(fixture.path().join("data").join(bucket.as_str()).is_dir());
+                    assert!(
+                        !fixture.path().join("data").join(bucket.as_str()).exists(),
+                        "exact cleanup prunes the empty bucket namespace"
+                    );
                 } else {
                     let store = cairn_meta::open(
                         &fixture.path().join("data/metadata.db"),

@@ -720,6 +720,7 @@ mod tests {
     use cairn_types::notification::{NotificationConfig, WebhookEndpoint, WebhookSecret};
     use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
     use cairn_types::sse::SseDescriptor;
+    use cairn_types::testing::FixtureMetadataStore;
     use cairn_types::traits::{Crypto, MetadataStore};
     use cairn_types::{
         BucketName, ObjectKey, SecretString, StoragePath, Timestamp, UserId, VersionId,
@@ -1044,6 +1045,7 @@ mod tests {
         assert_eq!(names.len(), SEALED_SECRET_STREAMS.len());
 
         let store = Arc::new(cairn_meta::open_in_memory().unwrap());
+        let fixture = store.begin_fixture().await.unwrap();
         let cache = CachedMetadataStore::new(store.clone() as Arc<dyn MetadataStore>, 1024 * 1024);
         let old = SystemCrypto::from_ring(vec![(1, [1u8; 32].into())], 1, 1, 0).unwrap();
         let rotated =
@@ -1093,42 +1095,45 @@ mod tests {
         })
         .unwrap();
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(ObjectVersionRow {
-                    id: "old-key-object".to_owned(),
-                    bucket: bucket.clone(),
-                    key: ObjectKey::parse("object").unwrap(),
-                    version_id: VersionId::null(),
-                    is_latest: true,
-                    is_delete_marker: false,
-                    size_logical: 1,
-                    size_physical: 1,
-                    etag: ETag::from_string("etag".to_owned()),
-                    content_type: "application/octet-stream".to_owned(),
-                    content_encoding: None,
-                    cache_control: None,
-                    content_disposition: None,
-                    content_language: None,
-                    expires: None,
-                    storage_path: Some(StoragePath::generate(&bucket)),
-                    compression: CompressionDescriptor::Uncompressed,
-                    storage_class: StorageClass::Standard,
-                    cold_locator: None,
-                    owner_id: owner.clone(),
-                    user_metadata: Vec::new(),
-                    acl: None,
-                    checksums: Vec::new(),
-                    sse_descriptor: Some(descriptor),
-                    replication_status: None,
-                    internal_sha256: None,
-                    replicated_at: None,
-                    created_at: Timestamp(1),
-                    updated_at: Timestamp(1),
-                }),
-                precondition: Precondition::default(),
-                initial_state: cairn_types::InitialObjectState::default(),
-                replication: Vec::new(),
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(ObjectVersionRow {
+                        id: uuid::Uuid::new_v4().simple().to_string(),
+                        bucket: bucket.clone(),
+                        key: ObjectKey::parse("object").unwrap(),
+                        version_id: VersionId::null(),
+                        is_latest: true,
+                        is_delete_marker: false,
+                        size_logical: 1,
+                        size_physical: 1,
+                        etag: ETag::from_string("etag".to_owned()),
+                        content_type: "application/octet-stream".to_owned(),
+                        content_encoding: None,
+                        cache_control: None,
+                        content_disposition: None,
+                        content_language: None,
+                        expires: None,
+                        storage_path: Some(StoragePath::generate(&bucket)),
+                        compression: CompressionDescriptor::Uncompressed,
+                        storage_class: StorageClass::Standard,
+                        cold_locator: None,
+                        owner_id: owner.clone(),
+                        user_metadata: Vec::new(),
+                        acl: None,
+                        checksums: Vec::new(),
+                        sse_descriptor: Some(descriptor),
+                        replication_status: None,
+                        internal_sha256: None,
+                        replicated_at: None,
+                        created_at: Timestamp(1),
+                        updated_at: Timestamp(1),
+                    }),
+                    precondition: Precondition::default(),
+                    initial_state: cairn_types::InitialObjectState::default(),
+                    replication: Vec::new(),
+                },
+            )
             .await
             .unwrap();
 

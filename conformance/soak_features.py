@@ -23,7 +23,7 @@ THE MIX (all running continuously and concurrently against ONE node):
     version-scoped deletes so the reclaim path runs continuously.
   * MULTIPART + COMPOSITE CHECKSUMS — small 2-part uploads created and completed continuously with a
     flexible checksum requested (`CRC32`/`COMPOSITE`), so the composite path runs; a fixed fraction is
-    deliberately ABORTED to exercise the immediate staging-reclaim path, and a few sessions are
+    deliberately ABORTED to exercise durable staging reclamation, and a few sessions are
     ABANDONED at the start so the background multipart SWEEPER has real work to reclaim.
   * OBJECT LOCK — a lock-enabled bucket where versions get GOVERNANCE retention; a checker
     continuously attempts to delete an already-locked version and asserts WORM holds all run.
@@ -50,6 +50,7 @@ import hashlib
 import http.client
 import json
 import os
+from pathlib import Path
 import statistics
 import sys
 import threading
@@ -58,6 +59,7 @@ import time
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from soak_cleanup import CleanupProbe, TerminalCleanup
 
 AK, SK, EP, DATA_DIR = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 KEY_ID = sys.argv[5] if len(sys.argv) > 5 else "alias/cairn-soak"
@@ -138,6 +140,8 @@ sts = boto3.client("sts", endpoint_url=EP, aws_access_key_id=AK, aws_secret_acce
                    config=Config(retries={"total_max_attempts": 1, "mode": "standard"}))
 
 B_SSE, B_VER, B_MP, B_LOCK, B_LC = "soak-sse", "soak-ver", "soak-mp", "soak-lock", "soak-lc"
+TERMINAL_CLEANUP = TerminalCleanup(CleanupProbe(
+    os.environ.get("CAIRN_DB_PATH", str(Path(DATA_DIR) / "cairn.db")), DATA_DIR, B_MP))
 LC_EXPIRE_PREFIX = "exp/"       # the lifecycle rule's filter — these objects are meant to vanish
 LC_KEEP_PREFIX = "keep/"        # the control prefix the rule must NEVER touch
 
@@ -348,7 +352,7 @@ def ver_worker(idx, deadline):
 
 def mp_worker(idx, deadline):
     """Composite-checksum multipart churn: 2-part uploads with a flexible checksum requested, a fixed
-    1-in-N fraction ABORTED so the immediate staging-reclaim path runs continuously."""
+    1-in-N fraction ABORTED so the durable staging-reclaim path runs continuously."""
     n = 0
     while running(deadline):
         n += 1
@@ -370,15 +374,13 @@ def mp_worker(idx, deadline):
         if abort:
             try:
                 s3.abort_multipart_upload(Bucket=B_MP, Key=key, UploadId=uid)
+                TERMINAL_CLEANUP.register(uid)
                 bump("mp_aborts")
             except Exception as exc:  # noqa: BLE001
                 oops(f"mp abort {key}", exc)
                 continue
-            # The staging directory for an aborted upload must be gone immediately — this is the
-            # reclaim path that, if it regressed, would show up as the staging-bytes leak gate.
-            if os.path.isdir(staging_dir(uid)):
-                with LOCK:
-                    MISMATCH.append(f"{key}: staging dir survived abort ({uid})")
+            # The independent bounded observer proves disk/debt/quota retirement without making
+            # this worker idle while the server's exact cleanup consumer runs.
             continue
 
         parts = [{"PartNumber": 1, "ETag": p1["ETag"], "ChecksumCRC32": p1["ChecksumCRC32"]},
@@ -388,6 +390,7 @@ def mp_worker(idx, deadline):
             done = s3.complete_multipart_upload(Bucket=B_MP, Key=key, UploadId=uid,
                                                 MultipartUpload={"Parts": parts},
                                                 ChecksumType="COMPOSITE")
+            TERMINAL_CLEANUP.register(uid)
             bump("mp_completes")
         except Exception as exc:  # noqa: BLE001
             oops(f"mp complete {key}", exc)
@@ -402,9 +405,6 @@ def mp_worker(idx, deadline):
                                 f"type {done.get('ChecksumType')!r}")
         else:
             bump("mp_composite_ok")
-        if os.path.isdir(staging_dir(uid)):
-            with LOCK:
-                MISMATCH.append(f"{key}: staging dir survived complete ({uid})")
         # Verify on a DIFFERENT phase from the abort selector. With the defaults both are 1-in-4, so
         # `n % VERIFY_EVERY == 0` would only ever land on iterations that had already aborted and
         # `continue`d — the byte-exactness loop would iterate zero times and the gate would be
@@ -733,6 +733,7 @@ def main():
           f"plus object-lock / lifecycle / STS drivers", flush=True)
     setup()
     abandoned = abandon_sessions()
+    TERMINAL_CLEANUP.start()
 
     t0 = time.monotonic()
     deadline = t0 + SOAK_SECS
@@ -764,6 +765,11 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         list(pool.map(run, jobs))
     elapsed = time.monotonic() - t0
+    # Exclude the bounded idle drain from the shell's constant-load leak windows. The sampler also
+    # checks this marker immediately before appending a sample that may have started under load.
+    if marker := os.environ.get("SOAK_WORKLOAD_DONE"):
+        Path(marker).touch()
+    terminal_cleanup = TERMINAL_CLEANUP.finish()
 
     adv = {}
     sweeper_fail = check_sweeper(abandoned, elapsed, adv)
@@ -792,6 +798,14 @@ def main():
          f"all composite-checksummed ({c['mp_composite_ok']}), assemblies verified ({c['mp_verified']})",
          c["mp_completes"] > 0 and c["mp_aborts"] > 0
          and c["mp_composite_ok"] == c["mp_completes"] and c["mp_verified"] > 0)
+    terminals = c["mp_completes"] + c["mp_aborts"]
+    gate(f"every terminal multipart session reclaimed disk/debt/quota within 30s "
+         f"({terminal_cleanup['verified']}/{terminals}; "
+         f"pending peak {terminal_cleanup['peak']}/1024; "
+         f"{terminal_cleanup['first_failure'] or 'no failures'})",
+         terminals > 0 and terminal_cleanup["registered"] == terminals
+         and terminal_cleanup["verified"] == terminals
+         and terminal_cleanup["failed"] == 0 and terminal_cleanup["pending"] == 0)
     gate(f"WORM held for the whole soak: {c['worm_delete_attempts']} delete attempts on locked "
          f"versions, {c['worm_delete_refused']} refused, {len(WORM_BREACH)} breached "
          f"({WORM_BREACH[:2] or 'none'})",
@@ -819,6 +833,7 @@ def main():
         print(f"    skipped: STS expiry — {adv['sts_expiry']}", flush=True)
 
     adv.update({k: v for k, v in c.items()})
+    adv["terminal_cleanup"] = terminal_cleanup
     adv["elapsed_secs"] = round(elapsed, 1)
     adv["total_ops"] = sum(v for k, v in c.items()
                            if k.endswith(("_puts", "_deletes", "_completes", "_aborts",

@@ -5,6 +5,7 @@
 use cairn_types::authz::OwnershipMode;
 use cairn_types::bucket::{Bucket, VersioningState};
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::testing::FixtureMetadataStore;
 use cairn_types::traits::MetadataStore;
 use cairn_types::*;
 use std::sync::Arc;
@@ -94,9 +95,13 @@ async fn object_lock_races_remain_serialized_through_shard_routing() {
 #[tokio::test]
 async fn n1_is_a_faithful_passthrough() {
     let (store, inner) = shards(1);
+    let fixture = store.begin_fixture().await.unwrap();
     for n in NAMES {
         store.submit(bucket(n)).await.unwrap();
-        store.submit(put(row(n, "k", 10))).await.unwrap();
+        store
+            .submit_fixture(&fixture, put(row(n, "k", 10)))
+            .await
+            .unwrap();
     }
     // Everything is on the single shard, and the router reads it back identically.
     assert_eq!(store.list_buckets(None).await.unwrap().len(), NAMES.len());
@@ -120,9 +125,13 @@ async fn n1_is_a_faithful_passthrough() {
 async fn n3_routes_each_bucket_to_its_owning_shard() {
     let n = 3;
     let (store, inner) = shards(n);
+    let fixture = store.begin_fixture().await.unwrap();
     for name in NAMES {
         store.submit(bucket(name)).await.unwrap();
-        store.submit(put(row(name, "k", 7))).await.unwrap();
+        store
+            .submit_fixture(&fixture, put(row(name, "k", 7)))
+            .await
+            .unwrap();
     }
 
     // Each bucket lives on exactly its owning shard, and nowhere else.
@@ -502,10 +511,14 @@ async fn delete_bucket_purges_request_metrics_on_shard_zero() {
 #[tokio::test]
 async fn replication_attempts_are_fenced_on_every_shard() {
     let (store, _) = shards(3);
+    let fixture = store.begin_fixture().await.unwrap();
     for name in NAMES {
         store.submit(bucket(name)).await.unwrap();
         let object = row(name, "key", 1);
-        store.submit(put(object.clone())).await.unwrap();
+        store
+            .submit_fixture(&fixture, put(object.clone()))
+            .await
+            .unwrap();
         cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
         cairn_types::testing::assert_replication_upload_journal(&store, &object.bucket).await;
     }

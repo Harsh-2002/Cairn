@@ -194,11 +194,20 @@ commit sequence is: stream to staging → fsync the file → rename into place �
 directory** → validate hashes → commit the metadata transaction (the single linearization
 point) → reclaim superseded blobs. A write is acknowledged only after its metadata commit is
 durable. Drive-failure survival is delegated to the storage layer; host-failure survival comes
-from bucket replication. If a PUT/Copy request is cancelled or loses its commit acknowledgement,
-the shutdown-retained recovery worker serializes an exact row/path probe behind the original writer
-submission. It deletes only a writer-proven unreferenced path; an ambiguous result is preserved for
-the mandatory next-start reconciliation. Graceful shutdown drains this queue after HTTP requests
-and before the final WAL checkpoint.
+from bucket replication. Every write first commits its exact intended filenames through the Writer; admission is not an
+S3 success. If PUT/Copy, part upload or completion is cancelled or loses an acknowledgement,
+the retained recovery worker waits for backend I/O and kernel file ownership to quiesce, then
+resolves the intent through the Writer. Deletes and replacements persist exact cleanup debt;
+quota remains charged until unlink and namespace sync succeed. Errors preserve accounting for
+exclusive restart recovery. Shutdown drains this queue after HTTP and background producers,
+including imports, stop and before the final WAL checkpoint. Full startup scans remain mandatory;
+protocol 2 does not yet enable journal-only startup.
+
+The blob namespace requires Linux 5.6 or newer with `openat2` support. The configured data root
+may itself be a mount; descendant symlinks and mounts are rejected. Keep one filesystem beneath
+that root. Do not change the namespace or use unsupported older writers behind Cairn's node lock.
+Upgrade offline with a verified backup and fresh restore drill; rollback uses the pre-upgrade
+snapshot into a fresh directory, not an older binary pointed at protocol-2 state.
 
 The built-in backup/restore path is **offline and single-SQLite only**: it refuses a live node and
 any configured topology/backend mismatch rather than produce an incomplete snapshot. Its

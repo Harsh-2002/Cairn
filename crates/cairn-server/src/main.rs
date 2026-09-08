@@ -39,6 +39,8 @@ mod sendfile;
 #[cfg(all(feature = "fast-io", target_os = "linux"))]
 mod fast_get;
 mod stack;
+#[cfg(test)]
+mod storage_recovery_tests;
 mod tls;
 mod update_check;
 
@@ -209,11 +211,11 @@ fn main() -> ExitCode {
     // Every command that directly accesses node-local state cooperates on the data-root and
     // database locks. In particular this makes backup/restore explicitly offline relative to a
     // running Cairn process. `validate-config` remains side-effect-free.
-    let _node_lock = if matches!(&command, Command::ValidateConfig) {
+    let node_lock_guard = if matches!(&command, Command::ValidateConfig) {
         None
     } else {
         match node_lock::NodeLock::acquire(&cfg.data_dir, &cfg.db_path) {
-            Ok(lock) => Some(lock),
+            Ok(lock) => Some(Arc::new(lock)),
             Err(error) => {
                 eprintln!(
                     "cannot access node-local state exclusively: {error}; stop the running Cairn \
@@ -236,16 +238,36 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Bootstrap => bootstrap(cfg),
-        Command::Integrity { repair } => integrity(cfg, repair),
+        Command::Integrity { repair } => integrity(
+            cfg,
+            repair,
+            node_lock_guard
+                .as_ref()
+                .expect("integrity owns node lock")
+                .clone(),
+        ),
         Command::Migrate => migrate(cfg),
         Command::Backup { dir } => backup(cfg, &dir),
-        Command::Restore { dir } => restore(cfg, &dir),
+        Command::Restore { dir } => restore(
+            cfg,
+            &dir,
+            node_lock_guard
+                .as_ref()
+                .expect("restore owns node lock")
+                .clone(),
+        ),
         Command::Serve => {
             if let Err(e) = cfg.refuse_insecure_public_bind() {
                 eprintln!("configuration error: {e}");
                 return ExitCode::from(2);
             }
-            run_server(cfg)
+            run_server(
+                cfg,
+                node_lock_guard
+                    .as_ref()
+                    .expect("serve owns the node lock")
+                    .clone(),
+            )
         }
         // The one node-local replication subcommand (see the dispatch guard above).
         Command::Replication {
@@ -257,7 +279,17 @@ fn main() -> ExitCode {
                     verify,
                 },
             ..
-        } => replication_audit(cfg, before.as_deref(), bucket.as_deref(), json, verify),
+        } => replication_audit(
+            cfg,
+            before.as_deref(),
+            bucket.as_deref(),
+            json,
+            verify,
+            node_lock_guard
+                .as_ref()
+                .expect("audit owns node lock")
+                .clone(),
+        ),
         // The remote-admin variants are handled and returned above.
         Command::Bucket { .. }
         | Command::User { .. }
@@ -269,7 +301,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn integrity(cfg: Config, repair: bool) -> ExitCode {
+fn integrity(cfg: Config, repair: bool, node_lock: Arc<node_lock::NodeLock>) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
 
@@ -291,12 +323,17 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone()).await {
+        let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone(), stack::maintenance_lease(&cairn_types::storage::StorageToken::generate(), node_lock.clone())).await {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("failed to open blob store: {e}");
                 return ExitCode::FAILURE;
             }
+        };
+
+        let generation = match stack::recover_exclusive_storage(meta.as_ref(), &blob, node_lock.clone()).await {
+            Ok(generation) => generation,
+            Err(error) => { eprintln!("storage recovery failed: {error}"); return ExitCode::FAILURE; }
         };
 
         // First, the always-on forward pass: reclaim orphaned blobs (blobs with no metadata row).
@@ -307,8 +344,12 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
             staging_safety_margin_secs: 0,
             ..ReconcileOpts::default()
         };
-        match blob.reconcile(oracle.as_ref(), opts).await {
+        match blob.reconcile(oracle.as_ref(), opts, stack::maintenance_lease(&generation, node_lock.clone())).await {
             Ok(r) => {
+                if r.errors > 0 { eprintln!("reconciliation left {} unresolved artifacts", r.errors); return ExitCode::FAILURE; }
+                if let Err(error) = stack::finish_exclusive_storage_scan(meta.as_ref(), &blob, &generation, node_lock.clone()).await {
+                    eprintln!("reconciliation cleanup failed: {error}"); return ExitCode::FAILURE;
+                }
                 println!(
                     "reconciliation complete: scanned={} orphans_reclaimed={} staging_cleaned={} sessions_cleaned={} errors={}",
                     r.blobs_scanned, r.orphans_reclaimed, r.staging_cleaned, r.sessions_cleaned, r.errors
@@ -324,7 +365,7 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
         // on disk (ARCH 24.3/29.4). The forward reconcile cannot detect these — it only walks the
         // blob tree — so repair walks the metadata instead, probes the blob store for each version's
         // backing object, and deletes the row when the blob is gone.
-        if repair {
+        let outcome = if repair {
             match repair_dangling_rows(meta.as_ref(), &blob).await {
                 Ok(report) if report.protected == 0 => {
                     println!(
@@ -348,7 +389,11 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
             }
         } else {
             ExitCode::SUCCESS
+        };
+        if let Err(error) = stack::drain_exclusive_storage_cleanup(meta.as_ref(), &blob, &generation, node_lock.clone()).await {
+            eprintln!("integrity cleanup remains incomplete: {error}"); return ExitCode::FAILURE;
         }
+        outcome
     })
 }
 
@@ -441,12 +486,8 @@ async fn repair_dangling_rows(
                             })
                             .await
                         {
-                            Ok(MutationOutcome::Deleted { freed, .. }) => {
-                                // Best-effort, idempotent: the blob is already gone, but reclaim any
-                                // path the store reports freed so no surprise orphan remains.
-                                if let Some(freed) = freed {
-                                    let _ = blob.delete(&freed).await;
-                                }
+                            Ok(MutationOutcome::Deleted { .. }) => {
+                                // Even an absent file leaves exact debt for its namespace barrier.
                                 dropped += 1;
                             }
                             Ok(MutationOutcome::DeleteNotApplied) => {}
@@ -506,6 +547,7 @@ fn replication_audit(
     bucket: Option<&str>,
     json: bool,
     verify: bool,
+    node_lock: Arc<node_lock::NodeLock>,
 ) -> ExitCode {
     // The cutoff is required. `--before` wins; `CAIRN_REPLICATION_AUDIT_BEFORE` is the fallback so
     // an operator who configured the gauge does not have to retype it. There is deliberately NO
@@ -550,7 +592,7 @@ fn replication_audit(
         // `--verify` is the only arm that needs bytes, keys and the network; the default audit is
         // pure metadata and opens neither the blob store nor the master ring.
         let verifier = if verify {
-            match build_replica_verifier(&cfg, meta.clone()).await {
+            match build_replica_verifier(&cfg, meta.clone(), node_lock.clone()).await {
                 Ok(v) => Some(v),
                 Err(e) => {
                     eprintln!("failed to prepare --verify: {e}");
@@ -721,10 +763,17 @@ fn replication_audit(
 async fn build_replica_verifier(
     cfg: &Config,
     meta: Arc<dyn cairn_types::traits::MetadataStore>,
+    node_lock: Arc<node_lock::NodeLock>,
 ) -> Result<Box<HttpReplicaVerifier>, String> {
-    let blob = cairn_blob::LocalBlobStore::open(cfg.data_dir.clone())
-        .await
-        .map_err(|e| format!("opening the blob store: {e}"))?;
+    let blob = cairn_blob::LocalBlobStore::open(
+        cfg.data_dir.clone(),
+        stack::maintenance_lease(
+            &cairn_types::storage::StorageToken::generate(),
+            node_lock.clone(),
+        ),
+    )
+    .await
+    .map_err(|e| format!("opening the blob store: {e}"))?;
     let crypto = Arc::new(stack::build_crypto(cfg)?);
     Ok(Box::new(HttpReplicaVerifier {
         meta,
@@ -1609,7 +1658,7 @@ fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
 }
 
 /// Restore an offline single-SQLite snapshot, validating it before replacing any metadata.
-fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
+fn restore(cfg: Config, dir: &std::path::Path, node_lock: Arc<node_lock::NodeLock>) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
 
@@ -1697,13 +1746,29 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
             }
         };
         let oracle = store.reconcile_oracle();
-        let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone()).await {
+        let blob = match cairn_blob::LocalBlobStore::open(
+            cfg.data_dir.clone(),
+            stack::maintenance_lease(
+                &cairn_types::storage::StorageToken::generate(),
+                node_lock.clone(),
+            ),
+        )
+        .await
+        {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("failed to open blob store: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        let generation =
+            match stack::recover_exclusive_storage(&store, &blob, node_lock.clone()).await {
+                Ok(generation) => generation,
+                Err(error) => {
+                    eprintln!("restored storage recovery failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
         match blob
             .reconcile(
                 &oracle,
@@ -1711,12 +1776,24 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
                     staging_safety_margin_secs: 0,
                     ..ReconcileOpts::default()
                 },
+                stack::maintenance_lease(&generation, node_lock.clone()),
             )
             .await
         {
             Ok(r) => {
                 if let Err(error) = validate_restore_reconcile_report(&r) {
                     eprintln!("restore placed files but reconciliation was incomplete: {error}");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(error) = stack::finish_exclusive_storage_scan(
+                    &store,
+                    &blob,
+                    &generation,
+                    node_lock.clone(),
+                )
+                .await
+                {
+                    eprintln!("restored cleanup remains incomplete: {error}");
                     return ExitCode::FAILURE;
                 }
                 println!(
@@ -2376,7 +2453,7 @@ fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
     builder.build()
 }
 
-fn run_server(cfg: Config) -> ExitCode {
+fn run_server(cfg: Config, node_lock: Arc<node_lock::NodeLock>) -> ExitCode {
     observability::init_tracing(&cfg.log_level, cfg.log_format);
     let metrics = observability::init_metrics();
 
@@ -2394,7 +2471,7 @@ fn run_server(cfg: Config) -> ExitCode {
     };
 
     rt.block_on(async {
-        let stack = match stack::build(&cfg).await {
+        let stack = match stack::build(&cfg, node_lock.clone()).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!(error = %e, "failed to build engine stack");
@@ -2553,13 +2630,18 @@ mod tests {
 
     #[tokio::test]
     async fn integrity_repair_preserves_protected_dangling_rows_and_reports_incomplete() {
+        use cairn_types::testing::FixtureMetadataStore;
         use cairn_types::traits::MetadataStore;
 
         let workspace = tempfile::tempdir().unwrap();
-        let blob = cairn_blob::LocalBlobStore::open(workspace.path().join("blobs"))
-            .await
-            .unwrap();
+        let blob = cairn_blob::LocalBlobStore::open(
+            workspace.path().join("blobs"),
+            cairn_types::testing::fixture_storage_io(),
+        )
+        .await
+        .unwrap();
         let meta = cairn_types::testing::InMemoryMetadataStore::new();
+        let fixture = meta.begin_fixture().await.unwrap();
         let bucket_name = cairn_types::BucketName::parse("worm-repair").unwrap();
         let bucket = cairn_types::Bucket {
             name: bucket_name.clone(),
@@ -2578,49 +2660,58 @@ mod tests {
 
         let protected = dangling_row(&bucket_name, "protected");
         let protected_version = protected.version_id.clone();
-        meta.submit(cairn_types::Mutation::PutObjectVersion {
-            row: Box::new(protected),
-            precondition: cairn_types::Precondition::default(),
-            initial_state: cairn_types::InitialObjectState {
-                tags: Vec::new(),
-                lock_intent: cairn_types::ExplicitObjectLockIntent {
-                    retention: Some(cairn_types::ObjectRetention {
-                        mode: cairn_types::ObjectLockMode::Compliance,
-                        retain_until: cairn_types::Timestamp(i64::MAX / 2),
-                    }),
-                    legal_hold: None,
+        meta.submit_fixture(
+            &fixture,
+            cairn_types::Mutation::PutObjectVersion {
+                row: Box::new(protected),
+                precondition: cairn_types::Precondition::default(),
+                initial_state: cairn_types::InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: cairn_types::ExplicitObjectLockIntent {
+                        retention: Some(cairn_types::ObjectRetention {
+                            mode: cairn_types::ObjectLockMode::Compliance,
+                            retain_until: cairn_types::Timestamp(i64::MAX / 2),
+                        }),
+                        legal_hold: None,
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
 
         let held = dangling_row(&bucket_name, "held");
         let held_version = held.version_id.clone();
-        meta.submit(cairn_types::Mutation::PutObjectVersion {
-            row: Box::new(held),
-            precondition: cairn_types::Precondition::default(),
-            initial_state: cairn_types::InitialObjectState {
-                tags: Vec::new(),
-                lock_intent: cairn_types::ExplicitObjectLockIntent {
-                    retention: None,
-                    legal_hold: Some(true),
+        meta.submit_fixture(
+            &fixture,
+            cairn_types::Mutation::PutObjectVersion {
+                row: Box::new(held),
+                precondition: cairn_types::Precondition::default(),
+                initial_state: cairn_types::InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: cairn_types::ExplicitObjectLockIntent {
+                        retention: None,
+                        legal_hold: Some(true),
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
 
         let unprotected = dangling_row(&bucket_name, "unprotected");
         let unprotected_version = unprotected.version_id.clone();
-        meta.submit(cairn_types::Mutation::PutObjectVersion {
-            row: Box::new(unprotected),
-            precondition: cairn_types::Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        meta.submit_fixture(
+            &fixture,
+            cairn_types::Mutation::PutObjectVersion {
+                row: Box::new(unprotected),
+                precondition: cairn_types::Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
 
@@ -2780,7 +2871,7 @@ mod tests {
         let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
-            .execute("UPDATE storage_protocol SET minimum_writer=2", [])
+            .execute("UPDATE storage_protocol SET minimum_writer=3", [])
             .unwrap();
         drop(connection);
         // Rebind the deliberately incompatible bytes: rejection must come from the protocol

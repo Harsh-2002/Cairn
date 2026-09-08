@@ -55,11 +55,15 @@ pub enum BlobError {
 }
 
 /// Failures of the metadata store.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum MetaError {
     /// An underlying storage-engine error.
     #[error("metadata store error: {0}")]
     Engine(String),
+    /// The metadata engine exhausted its storage capacity. This classification does not prove
+    /// that a failed transaction or acknowledgement left no committed writes.
+    #[error("out of space in the metadata store")]
+    OutOfSpace,
     /// A uniqueness constraint was violated (e.g. bucket/key/version already exists).
     #[error("metadata uniqueness conflict")]
     Conflict,
@@ -220,7 +224,7 @@ pub enum Error {
     /// The object exceeds the configured maximum size.
     #[error("entity too large")]
     EntityTooLarge,
-    /// The data filesystem is out of space.
+    /// The blob filesystem or metadata engine is out of storage capacity.
     #[error("insufficient storage")]
     InsufficientStorage,
     /// A supplied checksum did not match the computed one.
@@ -345,7 +349,7 @@ impl From<MetaError> for Error {
             // 409 `BucketAlreadyExists`; a new user-collidable constraint must be mapped at its own
             // call site.
             MetaError::PreconditionFailed => Error::PreconditionFailed,
-            MetaError::QuotaExceeded => Error::InsufficientStorage,
+            MetaError::OutOfSpace | MetaError::QuotaExceeded => Error::InsufficientStorage,
             MetaError::MultipartNotActive => Error::NoSuchUpload,
             MetaError::NotEmpty => Error::BucketNotEmpty,
             other => Error::Internal(other.to_string()),
@@ -376,6 +380,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_capacity_maps_to_insufficient_storage_without_text_inference() {
+        assert!(matches!(
+            Error::from(MetaError::OutOfSpace.clone()),
+            Error::InsufficientStorage
+        ));
+        assert!(matches!(
+            Error::from(MetaError::Engine("database or disk is full".into())),
+            Error::Internal(_)
+        ));
+    }
 
     #[test]
     fn conflict_is_not_bucket_already_exists() {

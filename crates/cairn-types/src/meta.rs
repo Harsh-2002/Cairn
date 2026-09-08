@@ -80,6 +80,42 @@ pub struct CurrentVersionGuard {
 /// shared group-commit transaction, so one mutation's failure rolls back only itself.
 #[derive(Debug, Clone)]
 pub enum Mutation {
+    /// Advance every physical database under the exclusive node lock before serving requests.
+    /// Callers must establish backend teardown before using a fresh generation as restart proof.
+    BeginStorageGeneration {
+        generation: crate::storage::StorageToken,
+    },
+    /// Per-bucket physical admission, cancellation and cleanup. Routing survives bucket deletion.
+    Storage {
+        bucket: BucketName,
+        operation: crate::storage::StorageMutation,
+    },
+    /// Joint multipart quota reservation or completion claim and physical admission.
+    /// Only `ReserveMultipartPart` and `ClaimMultipart` are accepted as the inner operation.
+    AdmitStorageWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        operation: Box<Mutation>,
+        now: Timestamp,
+    },
+    /// Publish the exact admitted object/part and consume its intent in the same savepoint.
+    /// Only `PutObjectVersion`, `RecordPart` and `CompleteMultipart` are accepted inside.
+    PublishStorageWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        operation: Box<Mutation>,
+    },
+    /// Read a bounded page of prior-generation intents through the Writer. This does not resolve
+    /// ownership: exclusive restart must probe each plan's actual backend quiescence first.
+    ListStorageIntents {
+        generation: crate::storage::StorageToken,
+        limit: u32,
+    },
+    /// Claim a bounded page of exact debt only after checking live references and intent ownership.
+    ClaimStorageCleanup {
+        generation: crate::storage::StorageToken,
+        limit: u32,
+        now: Timestamp,
+        lease_secs: i64,
+    },
     /// Upsert an object version (the put commit point). Returns any superseded blob path.
     PutObjectVersion {
         /// The new version row.
@@ -776,8 +812,23 @@ pub enum Mutation {
 }
 
 /// The typed result of applying a [`Mutation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MutationOutcome {
+    /// A committed pre-stage admission. The acknowledgement itself is move-only.
+    StorageAdmission(crate::storage::StorageAdmission),
+    /// Joint completion claim and move-only storage admission.
+    StorageMultipartClaim {
+        admission: crate::storage::StorageAdmission,
+        claim: ClaimOutcome,
+    },
+    /// Publication lost its exact intent, generation or cancellation fence.
+    StoragePublicationNotApplied,
+    /// Exact physical-ownership mutation applied or lost its owner/generation.
+    StorageUpdated { applied: bool },
+    /// A bounded page of prior-generation plans requiring actual backend quiescence checks.
+    StorageIntentBatch(Vec<crate::storage::StorageWritePlan>),
+    /// Independently claimed physical debt, with retained routing and exact lease ownership.
+    StorageCleanupBatch(Vec<crate::storage::StorageCleanup>),
     /// Whether a replication update still owned its exact attempt.
     ReplicationClaimUpdated { applied: bool },
     /// Durable remote-upload cleanup work, independent of originating outbox retention.

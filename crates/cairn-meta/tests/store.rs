@@ -4,11 +4,15 @@
 
 use cairn_types::meta::MultipartLimits;
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::traits::{MetadataStore, ReconcileOracle};
 use cairn_types::*;
 
+#[path = "common/multipart_publication.rs"]
+mod multipart_publication;
 #[path = "common/object_lock_races.rs"]
 mod object_lock_races;
+use multipart_publication::MultipartPublication;
 
 fn row(
     bucket: &BucketName,
@@ -197,13 +201,29 @@ async fn object_shares_round_trip_and_revoke() {
 #[tokio::test]
 async fn put_is_visible_only_after_commit() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     let k = ObjectKey::parse("k").unwrap();
     store
-        .submit(put(
-            row(&b, "k", VersionId::null(), "e1", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "k", VersionId::null(), "e1", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
     // The submit future only resolved after the commit, so the row is immediately visible.
@@ -214,37 +234,59 @@ async fn put_is_visible_only_after_commit() {
 #[tokio::test]
 async fn conditional_write_atomic() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
-        .submit(put(
-            row(&b, "k", VersionId::null(), "e1", true),
-            Precondition::default(),
-        ))
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
+    store
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "k", VersionId::null(), "e1", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
 
     // If-None-Match: * must fail now that the object exists.
     let err = store
-        .submit(put(
-            row(&b, "k", VersionId::null(), "e2", true),
-            Precondition {
-                if_match: None,
-                if_none_match: Some(IfNoneMatch::Any),
-            },
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "k", VersionId::null(), "e2", true),
+                Precondition {
+                    if_match: None,
+                    if_none_match: Some(IfNoneMatch::Any),
+                },
+            ),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::PreconditionFailed));
 
     // If-Match the current etag succeeds.
     store
-        .submit(put(
-            row(&b, "k", VersionId::null(), "e3", true),
-            Precondition {
-                if_match: Some(ETag::from_string("e1".into())),
-                if_none_match: None,
-            },
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "k", VersionId::null(), "e3", true),
+                Precondition {
+                    if_match: Some(ETag::from_string("e1".into())),
+                    if_none_match: None,
+                },
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -262,41 +304,74 @@ async fn conditional_write_atomic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn group_commit_isolates_failed_mutations() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     // Seed one object so the failing precondition has something to collide with.
     store
-        .submit(put(
-            row(&b, "exists", VersionId::null(), "e", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "exists", VersionId::null(), "e", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
 
     // Fire many concurrent submits: 49 distinct successful puts + 1 doomed conditional put.
+    // Admit each physical write before releasing concurrent publication to the real Writer.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(51));
     let mut handles = Vec::new();
     for i in 0..49 {
-        let s = store.clone();
-        let bb = b.clone();
-        handles.push(tokio::spawn(async move {
-            s.submit(put(
-                row(&bb, &format!("k{i:03}"), VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+        let operation = fixture
+            .prepare_put(
+                &store,
+                put(
+                    row(&b, &format!("k{i:03}"), VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
+            .unwrap();
+        let s = store.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            s.submit(operation).await
         }));
     }
-    let s = store.clone();
-    let bb = b.clone();
-    let doomed = tokio::spawn(async move {
-        s.submit(put(
-            row(&bb, "exists", VersionId::null(), "e2", true),
-            Precondition {
-                if_match: None,
-                if_none_match: Some(IfNoneMatch::Any),
-            },
-        ))
+    let operation = fixture
+        .prepare_put(
+            &store,
+            put(
+                row(&b, "exists", VersionId::null(), "e2", true),
+                Precondition {
+                    if_match: None,
+                    if_none_match: Some(IfNoneMatch::Any),
+                },
+            ),
+        )
         .await
+        .unwrap();
+    let s = store.clone();
+    let doomed_barrier = barrier.clone();
+    let doomed = tokio::spawn(async move {
+        doomed_barrier.wait().await;
+        s.submit(operation).await
     });
+    barrier.wait().await;
 
     for h in handles {
         h.await.unwrap().expect("distinct puts must all commit");
@@ -317,17 +392,33 @@ async fn group_commit_isolates_failed_mutations() {
 #[tokio::test]
 async fn versioning_history_and_promotion() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     let k = ObjectKey::parse("doc").unwrap();
     let v1 = VersionId::from_string("00000001".into());
     let v2 = VersionId::from_string("00000002".into());
     let v3 = VersionId::from_string("00000003".into());
     for v in [&v1, &v2, &v3] {
         store
-            .submit(put(
-                row(&b, "doc", v.clone(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, "doc", v.clone(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -387,14 +478,27 @@ async fn versioning_history_and_promotion() {
 #[tokio::test]
 async fn object_write_resolution_is_exact_and_unversioned_aba_safe() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = BucketName::parse("write-resolution").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: bucket.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     let key = ObjectKey::parse("object").unwrap();
     let version_id = VersionId::null();
     let first = row(&bucket, "object", version_id.clone(), "first", true);
     let first_id = first.id.clone();
     let first_path = first.storage_path.clone().unwrap();
     store
-        .submit(put(first, Precondition::default()))
+        .submit_fixture(&fixture, put(first, Precondition::default()))
         .await
         .unwrap();
 
@@ -431,7 +535,7 @@ async fn object_write_resolution_is_exact_and_unversioned_aba_safe() {
     let second_id = second.id.clone();
     let second_path = second.storage_path.clone().unwrap();
     store
-        .submit(put(second, Precondition::default()))
+        .submit_fixture(&fixture, put(second, Precondition::default()))
         .await
         .unwrap();
     assert_eq!(
@@ -453,9 +557,11 @@ async fn multipart_part_write_resolution_is_exact_and_retry_aba_safe() {
         .into_iter()
         .enumerate()
     {
+        let fixture = store.begin_fixture().await.unwrap();
+        let mut publications = MultipartPublication::new(&fixture);
         let bucket_name = format!("part-resolution-{index}");
         let bucket = BucketName::parse(&bucket_name).unwrap();
-        let upload_id = UploadId::from_string(format!("part-resolution-upload-{index}"));
+        let upload_id = UploadId::generate();
         store
             .submit(Mutation::CreateBucket(Box::new(crate::bucket(
                 &bucket_name,
@@ -496,9 +602,12 @@ async fn multipart_part_write_resolution_is_exact_and_retry_aba_safe() {
             ".staging/multipart/{}/00001-first",
             upload_id.as_str()
         ));
-        store.submit(reserve("first")).await.unwrap();
-        store
-            .submit(record("first", first_path.clone()))
+        publications
+            .reserve_part(store, reserve("first"))
+            .await
+            .unwrap();
+        publications
+            .record_part(store, record("first", first_path.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -510,9 +619,12 @@ async fn multipart_part_write_resolution_is_exact_and_retry_aba_safe() {
             ".staging/multipart/{}/00001-second",
             upload_id.as_str()
         ));
-        store.submit(reserve("second")).await.unwrap();
-        store
-            .submit(record("second", second_path.clone()))
+        publications
+            .reserve_part(store, reserve("second"))
+            .await
+            .unwrap();
+        publications
+            .record_part(store, record("second", second_path.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -530,13 +642,29 @@ async fn multipart_part_write_resolution_is_exact_and_retry_aba_safe() {
 #[tokio::test]
 async fn listing_prefix_delimiter_and_pagination() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     for k in ["a/1", "a/2", "a/3", "b/1", "c"] {
         store
-            .submit(put(
-                row(&b, k, VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, k, VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -603,13 +731,29 @@ async fn listing_prefix_delimiter_and_pagination() {
 #[tokio::test]
 async fn listing_empty_delimiter_lists_all_objects() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     for k in ["a/1", "a/2", "b/1", "c"] {
         store
-            .submit(put(
-                row(&b, k, VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, k, VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -678,6 +822,8 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
         .into_iter()
         .enumerate()
     {
+        let fixture = store.begin_fixture().await.unwrap();
+        let mut publications = MultipartPublication::new(&fixture);
         let bucket_name = format!("terminal-{index}");
         let b = BucketName::parse(&bucket_name).unwrap();
         store
@@ -687,21 +833,49 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
 
         // Complete claims first: Abort loses and cannot consume the session. A failed completer can
         // release and reclaim, after which the guarded final mutation commits exactly once.
-        let complete_wins = UploadId::from_string(format!("complete-wins-{index}"));
+        let complete_wins = UploadId::generate();
         store
             .submit(multipart(&b, "complete", complete_wins.as_str()))
             .await
             .unwrap();
+        let orphan_row = row(
+            &b,
+            "complete",
+            VersionId::from_string("orphan".into()),
+            "orphan",
+            true,
+        );
+        let stale_row = row(
+            &b,
+            "complete",
+            VersionId::from_string("stale".into()),
+            "must-not-land",
+            true,
+        );
+        let completed_row = row(
+            &b,
+            "complete",
+            VersionId::from_string("v1".into()),
+            "completed",
+            true,
+        );
         let restart_orphan_token = MultipartClaimToken::generate();
         assert!(matches!(
-            store
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: complete_wins.clone(),
-                    claim_token: restart_orphan_token,
-                })
+            publications
+                .claim(
+                    store,
+                    Mutation::ClaimMultipart {
+                        upload_id: complete_wins.clone(),
+                        claim_token: restart_orphan_token,
+                    },
+                    &orphan_row
+                )
                 .await
                 .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+            MutationOutcome::StorageMultipartClaim {
+                claim: ClaimOutcome::Claimed(_),
+                ..
+            }
         ));
         assert!(matches!(
             store
@@ -728,14 +902,21 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
         );
         let stale_token = MultipartClaimToken::generate();
         assert!(matches!(
-            store
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: complete_wins.clone(),
-                    claim_token: stale_token.clone(),
-                })
+            publications
+                .claim(
+                    store,
+                    Mutation::ClaimMultipart {
+                        upload_id: complete_wins.clone(),
+                        claim_token: stale_token.clone(),
+                    },
+                    &stale_row
+                )
                 .await
                 .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+            MutationOutcome::StorageMultipartClaim {
+                claim: ClaimOutcome::Claimed(_),
+                ..
+            }
         ));
         assert!(matches!(
             store
@@ -749,14 +930,21 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
         ));
         let completing_token = MultipartClaimToken::generate();
         assert!(matches!(
-            store
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: complete_wins.clone(),
-                    claim_token: completing_token.clone(),
-                })
+            publications
+                .claim(
+                    store,
+                    Mutation::ClaimMultipart {
+                        upload_id: complete_wins.clone(),
+                        claim_token: completing_token.clone(),
+                    },
+                    &completed_row
+                )
                 .await
                 .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+            MutationOutcome::StorageMultipartClaim {
+                claim: ClaimOutcome::Claimed(_),
+                ..
+            }
         ));
         assert!(matches!(
             store
@@ -769,20 +957,17 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
             MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)
         ));
         assert!(matches!(
-            store
-                .submit(Mutation::CompleteMultipart {
-                    upload_id: complete_wins.clone(),
-                    claim_token: stale_token,
-                    row: Box::new(row(
-                        &b,
-                        "complete",
-                        VersionId::from_string("stale".into()),
-                        "must-not-land",
-                        true,
-                    )),
-                    precondition: Precondition::default(),
-                    replication: Vec::new(),
-                })
+            publications
+                .complete(
+                    store,
+                    Mutation::CompleteMultipart {
+                        upload_id: complete_wins.clone(),
+                        claim_token: stale_token,
+                        row: Box::new(stale_row),
+                        precondition: Precondition::default(),
+                        replication: Vec::new(),
+                    }
+                )
                 .await
                 .unwrap(),
             MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)
@@ -797,20 +982,17 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
             MultipartStatus::Completing
         );
         assert!(matches!(
-            store
-                .submit(Mutation::CompleteMultipart {
-                    upload_id: complete_wins,
-                    claim_token: completing_token,
-                    row: Box::new(row(
-                        &b,
-                        "complete",
-                        VersionId::from_string("v1".into()),
-                        "completed",
-                        true,
-                    )),
-                    precondition: Precondition::default(),
-                    replication: Vec::new(),
-                })
+            publications
+                .complete(
+                    store,
+                    Mutation::CompleteMultipart {
+                        upload_id: complete_wins,
+                        claim_token: completing_token,
+                        row: Box::new(completed_row),
+                        precondition: Precondition::default(),
+                        replication: Vec::new(),
+                    }
+                )
                 .await
                 .unwrap(),
             MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed { .. })
@@ -818,7 +1000,15 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
 
         // Abort removes active first: Claim and a direct final mutation both lose, and no object
         // row may be installed after the session has gone.
-        let abort_wins = UploadId::from_string(format!("abort-wins-{index}"));
+        let aborted_token = MultipartClaimToken::generate();
+        let aborted_row = row(
+            &b,
+            "aborted",
+            VersionId::from_string("v1".into()),
+            "must-not-land",
+            true,
+        );
+        let abort_wins = UploadId::generate();
         store
             .submit(multipart(&b, "aborted", abort_wins.as_str()))
             .await
@@ -831,33 +1021,36 @@ async fn multipart_terminal_owner_is_atomic_in_sqlite_and_double() {
             MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)
         ));
         assert!(matches!(
-            store
-                .submit(Mutation::ClaimMultipart {
-                    upload_id: abort_wins.clone(),
-                    claim_token: MultipartClaimToken::generate(),
-                })
+            publications
+                .claim(
+                    store,
+                    Mutation::ClaimMultipart {
+                        upload_id: abort_wins.clone(),
+                        claim_token: aborted_token.clone(),
+                    },
+                    &aborted_row
+                )
                 .await
                 .unwrap(),
-            MutationOutcome::MultipartClaim(ClaimOutcome::NotFound)
+            MutationOutcome::StorageMultipartClaim {
+                claim: ClaimOutcome::NotFound,
+                ..
+            }
         ));
         assert!(matches!(
-            store
-                .submit(Mutation::CompleteMultipart {
-                    upload_id: abort_wins,
-                    claim_token: MultipartClaimToken::generate(),
-                    row: Box::new(row(
-                        &b,
-                        "aborted",
-                        VersionId::from_string("v1".into()),
-                        "must-not-land",
-                        true,
-                    )),
-                    precondition: Precondition::default(),
-                    replication: Vec::new(),
-                })
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)
+            publications
+                .complete(
+                    store,
+                    Mutation::CompleteMultipart {
+                        upload_id: abort_wins,
+                        claim_token: aborted_token.clone(),
+                        row: Box::new(aborted_row),
+                        precondition: Precondition::default(),
+                        replication: Vec::new(),
+                    }
+                )
+                .await,
+            Ok(MutationOutcome::StoragePublicationNotApplied)
         ));
         assert!(
             store
@@ -881,9 +1074,11 @@ async fn zero_length_multipart_terminal_cleanup_remains_retryable() {
         .into_iter()
         .enumerate()
     {
+        let fixture = store.begin_fixture().await.unwrap();
+        let mut publications = MultipartPublication::new(&fixture);
         let bucket_name = format!("zero-cleanup-{index}");
         let bucket_id = BucketName::parse(&bucket_name).unwrap();
-        let upload_id = UploadId::from_string(format!("zero-upload-{index}"));
+        let upload_id = UploadId::generate();
         store
             .submit(Mutation::CreateBucket(Box::new(bucket(&bucket_name))))
             .await
@@ -892,33 +1087,39 @@ async fn zero_length_multipart_terminal_cleanup_remains_retryable() {
             .submit(multipart(&bucket_id, "empty", upload_id.as_str()))
             .await
             .unwrap();
-        store
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: upload_id.clone(),
-                part_number: 1,
-                attempt_id: "zero-attempt".to_owned(),
-                reserved_bytes: 0,
-                max_parts_per_upload: 10_000,
-                now: Timestamp(2),
-            })
+        publications
+            .reserve_part(
+                store,
+                Mutation::ReserveMultipartPart {
+                    upload_id: upload_id.clone(),
+                    part_number: 1,
+                    attempt_id: "zero-attempt".to_owned(),
+                    reserved_bytes: 0,
+                    max_parts_per_upload: 10_000,
+                    now: Timestamp(2),
+                },
+            )
             .await
             .unwrap();
-        store
-            .submit(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: "zero-attempt".to_owned(),
-                part: PartRecord {
-                    part_number: 1,
-                    size: 0,
-                    etag: "empty".to_owned(),
-                    storage_path: StoragePath::from_string(format!(
-                        ".staging/multipart/{}/00001-zero-attempt",
-                        upload_id.as_str()
-                    )),
-                    checksum: None,
-                    part_dek: None,
+        publications
+            .record_part(
+                store,
+                Mutation::RecordPart {
+                    upload_id: upload_id.clone(),
+                    attempt_id: "zero-attempt".to_owned(),
+                    part: PartRecord {
+                        part_number: 1,
+                        size: 0,
+                        etag: "empty".to_owned(),
+                        storage_path: StoragePath::from_string(format!(
+                            ".staging/multipart/{}/00001-zero-attempt",
+                            upload_id.as_str()
+                        )),
+                        checksum: None,
+                        part_dek: None,
+                    },
                 },
-            })
+            )
             .await
             .unwrap();
         store
@@ -926,13 +1127,21 @@ async fn zero_length_multipart_terminal_cleanup_remains_retryable() {
             .await
             .unwrap();
 
-        let cleanups = store.list_multipart_cleanups(10).await.unwrap();
-        let cleanup = cleanups
-            .iter()
-            .find(|cleanup| cleanup.upload_id == upload_id)
-            .expect("zero-byte terminal session remains retryable");
-        assert_eq!(cleanup.bytes, 0);
-        assert_eq!(cleanup.storage_path, None);
+        assert!(store.list_multipart_cleanups(10).await.unwrap().is_empty());
+        let batch = claim_fixture_cleanup(store, &fixture, Timestamp(3)).await;
+        let path = format!(".staging/multipart/{upload_id}/00001-zero-attempt");
+        assert!(
+            batch
+                .iter()
+                .any(|cleanup| cleanup.path.as_str() == path && cleanup.quota_debt_id.is_some()),
+            "even a zero-byte terminal part retains exact retryable cleanup debt"
+        );
+        retire_fixture_cleanup(store, batch, Timestamp(3)).await;
+        assert!(
+            claim_fixture_cleanup(store, &fixture, Timestamp(4))
+                .await
+                .is_empty()
+        );
     }
 }
 
@@ -1075,10 +1284,26 @@ async fn list_multipart_uploads_paginates_past_a_key_equal_to_the_prefix() {
 #[tokio::test]
 async fn reconcile_oracle_reports_membership() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     let r = row(&b, "k", VersionId::null(), "e", true);
     let live_path = r.storage_path.clone().unwrap();
-    store.submit(put(r, Precondition::default())).await.unwrap();
+    store
+        .submit_fixture(&fixture, put(r, Precondition::default()))
+        .await
+        .unwrap();
 
     let oracle = store.reconcile_oracle();
     let orphan = StoragePath::from_string("b/orphan".into());
@@ -1092,15 +1317,31 @@ async fn checkpoint_truncates_wal_and_reports_frames() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("meta.sqlite");
     let store = cairn_meta::open(&db, &cairn_meta::OpenOptions::default()).unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
 
     // Write enough versions to grow the WAL.
     for i in 0..64 {
         store
-            .submit(put(
-                row(&b, &format!("k{i:03}"), VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, &format!("k{i:03}"), VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -1139,10 +1380,13 @@ async fn checkpoint_truncates_wal_and_reports_frames() {
 
     // The store is still fully functional after the checkpoint.
     store
-        .submit(put(
-            row(&b, "after", VersionId::null(), "e", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "after", VersionId::null(), "e", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
     let counts = store.aggregate_counts().await.unwrap();
@@ -1256,6 +1500,7 @@ fn outbox_entry(b: &BucketName, key: &str, version: VersionId, id: &str) -> Outb
 
 async fn plant_outbox(
     store: &cairn_meta::SqliteMetadataStore,
+    fixture: &PublicationFixture,
     b: &BucketName,
     key: &str,
     version: VersionId,
@@ -1263,12 +1508,15 @@ async fn plant_outbox(
 ) {
     let entry = outbox_entry(b, key, version.clone(), id);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(b, key, version, "e", true)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        .submit_fixture(
+            fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(b, key, version, "e", true)),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
         .await
         .unwrap();
 }
@@ -1277,6 +1525,7 @@ async fn plant_outbox(
 async fn list_failed_replication_reports_terminal_entries_only() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -1285,8 +1534,8 @@ async fn list_failed_replication_reports_terminal_entries_only() {
 
     let v1 = VersionId::from_string("00000001".into());
     let v2 = VersionId::from_string("00000002".into());
-    plant_outbox(&store, &b, "k1", v1.clone(), "pending-1").await;
-    plant_outbox(&store, &b, "k2", v2.clone(), "doomed-1").await;
+    plant_outbox(&store, &fixture, &b, "k1", v1.clone(), "pending-1").await;
+    plant_outbox(&store, &fixture, &b, "k2", v2.clone(), "doomed-1").await;
 
     // Nothing terminal yet.
     assert!(store.list_failed_replication(100).await.unwrap().is_empty());
@@ -1340,6 +1589,7 @@ async fn list_failed_replication_reports_terminal_entries_only() {
 async fn replication_counts_aggregates_by_status_and_target() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("rcbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("rcbkt"))))
@@ -1373,12 +1623,15 @@ async fn replication_counts_aggregates_by_status_and_target() {
             lease_until: None,
         };
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(row(&b, key, v, "e", true)),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState::default(),
-                replication: vec![entry],
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row(&b, key, v, "e", true)),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: vec![entry],
+                },
+            )
             .await
             .unwrap();
     }
@@ -1527,6 +1780,7 @@ async fn delete_version_clears_object_tags() {
     // an unversioned bucket reuses the version id, so without this a re-created object at the same key
     // silently inherits the deleted object's tags — mis-firing tag lifecycle/replication rules.
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("tagbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("tagbkt"))))
@@ -1535,10 +1789,10 @@ async fn delete_version_clears_object_tags() {
     let k = ObjectKey::parse("k").unwrap();
     let v = VersionId::from_string("v1".into());
     store
-        .submit(put(
-            row(&b, "k", v.clone(), "e1", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(row(&b, "k", v.clone(), "e1", true), Precondition::default()),
+        )
         .await
         .unwrap();
     store
@@ -1571,10 +1825,10 @@ async fn delete_version_clears_object_tags() {
         .await
         .unwrap();
     store
-        .submit(put(
-            row(&b, "k", v.clone(), "e2", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(row(&b, "k", v.clone(), "e2", true), Precondition::default()),
+        )
         .await
         .unwrap();
     let tags = store.get_object_tags(&b, &k, &v).await.unwrap();
@@ -1589,6 +1843,7 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
     // Audit 2026-07: DeleteBucket must re-check emptiness INSIDE its savepoint (atomic with the
     // delete), and both objects AND in-progress multipart uploads keep a bucket non-empty.
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("delbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("delbkt"))))
@@ -1598,10 +1853,10 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
     // (1) A bucket holding an object cannot be deleted.
     let v = VersionId::from_string("v1".into());
     store
-        .submit(put(
-            row(&b, "k", v.clone(), "e1", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(row(&b, "k", v.clone(), "e1", true), Precondition::default()),
+        )
         .await
         .unwrap();
     assert!(
@@ -1686,13 +1941,14 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
 async fn defer_releases_claim_without_consuming_attempts() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("deferbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("deferbkt"))))
         .await
         .unwrap();
     let v = VersionId::from_string("00000001".into());
-    plant_outbox(&store, &b, "k", v.clone(), "d1").await;
+    plant_outbox(&store, &fixture, &b, "k", v.clone(), "d1").await;
 
     // Claim the entry: it goes `claimed` under a lease, so it leaves the due (pending) set.
     let claimed = replication_claims
@@ -1751,6 +2007,7 @@ async fn defer_releases_claim_without_consuming_attempts() {
 #[tokio::test]
 async fn replica_preserves_id_and_orders_by_version_id() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("rvbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("rvbkt"))))
@@ -1782,10 +2039,13 @@ async fn replica_preserves_id_and_orders_by_version_id() {
 
     // A normal local write of v2 is the latest.
     store
-        .submit(put(
-            row(&b, "k", v2.clone(), "e2", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "k", v2.clone(), "e2", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1800,10 +2060,10 @@ async fn replica_preserves_id_and_orders_by_version_id() {
 
     // A replica carrying an OLDER id is preserved as a version but does NOT demote the newer latest.
     store
-        .submit(put(
-            replica(&b, "k", v1.clone(), "e1"),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(replica(&b, "k", v1.clone(), "e1"), Precondition::default()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1823,10 +2083,10 @@ async fn replica_preserves_id_and_orders_by_version_id() {
 
     // A replica carrying a NEWER id becomes the latest.
     store
-        .submit(put(
-            replica(&b, "k", v3.clone(), "e3"),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(replica(&b, "k", v3.clone(), "e3"), Precondition::default()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1847,10 +2107,10 @@ async fn replica_preserves_id_and_orders_by_version_id() {
 
     // Re-delivering v3 (the SAME id) is an idempotent upsert — no duplicate version.
     store
-        .submit(put(
-            replica(&b, "k", v3.clone(), "e3"),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(replica(&b, "k", v3.clone(), "e3"), Precondition::default()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1872,13 +2132,14 @@ async fn replica_preserves_id_and_orders_by_version_id() {
 #[tokio::test]
 async fn recover_claimed_resets_to_pending() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("recbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("recbkt"))))
         .await
         .unwrap();
     let v = VersionId::from_string("00000001".into());
-    plant_outbox(&store, &b, "k", v, "r1").await;
+    plant_outbox(&store, &fixture, &b, "k", v, "r1").await;
 
     // Claim it: now `claimed` under a 300s lease, so it leaves the due (pending) set.
     store
@@ -1949,6 +2210,7 @@ async fn set_object_acl_updates_the_version_row() {
     use cairn_types::authz::{Acl, Grant, Grantee, Permission};
 
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("aclb").unwrap();
     let k = ObjectKey::parse("obj").unwrap();
     store
@@ -1958,10 +2220,13 @@ async fn set_object_acl_updates_the_version_row() {
 
     let v = VersionId::from_string("00000001".into());
     store
-        .submit(put(
-            row(&b, "obj", v.clone(), "e", true),
-            Precondition::default(),
-        ))
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "obj", v.clone(), "e", true),
+                Precondition::default(),
+            ),
+        )
         .await
         .unwrap();
     assert!(
@@ -2247,6 +2512,7 @@ async fn delete_version_row_identity_skips_same_timestamp_unversioned_overwrite(
     // An unversioned overwrite reuses the null version sentinel and may land in the same clock
     // tick. Lifecycle therefore compares the immutable object_versions.id captured by listing.
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("cadbkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("cadbkt"))))
@@ -2259,7 +2525,7 @@ async fn delete_version_row_identity_skips_same_timestamp_unversioned_overwrite(
     let mut r1 = row(&b, "k", v.clone(), "e1", true);
     r1.updated_at = Timestamp(100);
     store
-        .submit(put(r1, Precondition::default()))
+        .submit_fixture(&fixture, put(r1, Precondition::default()))
         .await
         .unwrap();
     let observed = store
@@ -2283,7 +2549,7 @@ async fn delete_version_row_identity_skips_same_timestamp_unversioned_overwrite(
     let replacement_id = r2.id.clone();
     assert_ne!(replacement_id, observed.row_id);
     store
-        .submit(put(r2, Precondition::default()))
+        .submit_fixture(&fixture, put(r2, Precondition::default()))
         .await
         .unwrap();
 
@@ -2348,6 +2614,7 @@ async fn delete_version_row_identity_skips_same_timestamp_unversioned_overwrite(
 #[tokio::test]
 async fn lifecycle_delete_marker_guard_rejects_replaced_current_version() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("marker-guard").unwrap();
     let k = ObjectKey::parse("k").unwrap();
     store
@@ -2359,7 +2626,7 @@ async fn lifecycle_delete_marker_guard_rejects_replaced_current_version() {
     let mut first = row(&b, "k", v1.clone(), "e1", true);
     first.updated_at = Timestamp(100);
     store
-        .submit(put(first, Precondition::default()))
+        .submit_fixture(&fixture, put(first, Precondition::default()))
         .await
         .unwrap();
 
@@ -2368,7 +2635,7 @@ async fn lifecycle_delete_marker_guard_rejects_replaced_current_version() {
     let mut second = row(&b, "k", v2.clone(), "e2", true);
     second.updated_at = Timestamp(200);
     store
-        .submit(put(second, Precondition::default()))
+        .submit_fixture(&fixture, put(second, Precondition::default()))
         .await
         .unwrap();
 
@@ -2456,6 +2723,7 @@ async fn lifecycle_delete_marker_guard_rejects_replaced_current_version() {
 #[tokio::test]
 async fn sole_delete_marker_guard_rejects_concurrently_arrived_version() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("sole-marker-guard").unwrap();
     let k = ObjectKey::parse("k").unwrap();
     store
@@ -2492,7 +2760,7 @@ async fn sole_delete_marker_guard_rejects_concurrently_arrived_version() {
     replica.replication_status = Some(ReplicationStatus::Replica);
     replica.updated_at = Timestamp(150);
     store
-        .submit(put(replica, Precondition::default()))
+        .submit_fixture(&fixture, put(replica, Precondition::default()))
         .await
         .unwrap();
 
@@ -2579,14 +2847,30 @@ async fn sole_delete_marker_guard_rejects_concurrently_arrived_version() {
 #[tokio::test]
 async fn start_after_is_exclusive_and_a_prefix_marker_skips_its_whole_group() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     // 3 chars minimum — "mk" is not a legal S3 bucket name and `parse` rejects it as `Length`.
     let b = BucketName::parse("mkr").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     for k in ["a/1", "a/2", "b/1", "m::n", "m::o"] {
         store
-            .submit(put(
-                row(&b, k, VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, k, VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -2666,13 +2950,29 @@ async fn start_after_is_exclusive_and_a_prefix_marker_skips_its_whole_group() {
 #[tokio::test]
 async fn version_listing_page_ending_on_a_group_resumes_past_it() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("vmk").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     for k in ["a/1", "b/1", "m::n", "m::o"] {
         store
-            .submit(put(
-                row(&b, k, VersionId::null(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, k, VersionId::null(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -2731,17 +3031,33 @@ async fn version_listing_paginates_a_many_version_key_without_re_listing() {
     // and now thread both markers: cairn-lifecycle's scanner (`expire_noncurrent_versions` and
     // `remove_expired_delete_markers`) and cairn-server's `repair_dangling_rows`.
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("mvk").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     // One key, five distinct versions — more than one page at limit=2.
     let versions: Vec<VersionId> = (1..=5)
         .map(|i| VersionId::from_string(format!("{i:08}")))
         .collect();
     for v in &versions {
         store
-            .submit(put(
-                row(&b, "doc", v.clone(), "e", true),
-                Precondition::default(),
-            ))
+            .submit_fixture(
+                &fixture,
+                put(
+                    row(&b, "doc", v.clone(), "e", true),
+                    Precondition::default(),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -2888,6 +3204,7 @@ async fn writer_records_commit_samples_for_group_committed_batches() {
 async fn requeue_replication_versions_reships_completed_encrypted_work() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -2916,18 +3233,22 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
         lease_until: None,
     };
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![enc_entry.clone()],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![enc_entry.clone()],
+            },
+        )
         .await
         .unwrap();
     // A PLAINTEXT version that also completed — unaffected by the incident.
     let vplain = VersionId::from_string("00000002".into());
     plant_outbox(
         &store,
+        &fixture,
         &b,
         "plain",
         vplain.clone(),
@@ -3017,6 +3338,7 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
 async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3024,7 +3346,7 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
         .unwrap();
 
     let v1 = VersionId::from_string("00000001".into());
-    plant_outbox(&store, &b, "failed", v1.clone(), "e-failed").await;
+    plant_outbox(&store, &fixture, &b, "failed", v1.clone(), "e-failed").await;
     replication_claims
         .claim(&store, 10, Timestamp(1))
         .await
@@ -3047,12 +3369,15 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
     let mut inbound = row(&b, "inbound", v2.clone(), "e", true);
     inbound.replication_status = Some(ReplicationStatus::Replica);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(inbound),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(inbound),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
 
@@ -3097,6 +3422,7 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
 async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3108,12 +3434,15 @@ async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
     let mut enc = row(&b, "k", v1.clone(), "e", true);
     enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
+            },
+        )
         .await
         .unwrap();
 
@@ -3187,6 +3516,7 @@ async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
 async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_same_key() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3197,31 +3527,45 @@ async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_sa
     let mut enc = row(&b, "k", v1.clone(), "e1", true);
     enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
+            },
+        )
         .await
         .unwrap();
 
     // v2: PLAINTEXT, current, and already replicated.
     let v2 = VersionId::from_string("00000002".into());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v2.clone(), "backfill:r1:k:2")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v2.clone(), "backfill:r1:k:2")],
+            },
+        )
         .await
         .unwrap();
 
     // A DIFFERENT key with no encrypted version at all must stay untouched — `only_encrypted` is
     // still a filter, just a key-level one.
     let v3 = VersionId::from_string("00000003".into());
-    plant_outbox(&store, &b, "other", v3.clone(), "backfill:r1:other:3").await;
+    plant_outbox(
+        &store,
+        &fixture,
+        &b,
+        "other",
+        v3.clone(),
+        "backfill:r1:other:3",
+    )
+    .await;
 
     replication_claims
         .claim(&store, 10, Timestamp(3))
@@ -3292,6 +3636,7 @@ async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_sa
 async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3300,7 +3645,7 @@ async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
 
     for i in 1..=5u32 {
         let v = VersionId::from_string(format!("0000000{i}"));
-        plant_outbox(&store, &b, &format!("k{i}"), v, &format!("e{i}")).await;
+        plant_outbox(&store, &fixture, &b, &format!("k{i}"), v, &format!("e{i}")).await;
     }
     replication_claims
         .claim(&store, 10, Timestamp(1))
@@ -3380,6 +3725,7 @@ async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
 async fn requeue_page_never_splits_a_keys_versions_across_batches() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3392,12 +3738,15 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
     let mut arow = row(&b, "a", av.clone(), "ea", true);
     arow.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(arow),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(arow),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
+            },
+        )
         .await
         .unwrap();
 
@@ -3406,23 +3755,29 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
     let mut enc = row(&b, "k", v1.clone(), "e1", true);
     enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
+            },
+        )
         .await
         .unwrap();
     // Key "k" v2: the NEWER version, `completed`.
     let v2 = VersionId::from_string("00000002".into());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v2.clone(), "k:2")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v2.clone(), "k:2")],
+            },
+        )
         .await
         .unwrap();
 
@@ -3517,6 +3872,7 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
 async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3527,12 +3883,15 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
     let mut arow = row(&b, "a", av.clone(), "ea", true);
     arow.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(arow),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(arow),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
+            },
+        )
         .await
         .unwrap();
 
@@ -3540,12 +3899,15 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
     let mut enc = row(&b, "k", v1.clone(), "e1", true);
     enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(enc),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
+            },
+        )
         .await
         .unwrap();
     let v2 = VersionId::from_string("00000002".into());
@@ -3649,13 +4011,14 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
 async fn mark_replication_done_stamps_replicated_at() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
         .await
         .unwrap();
     let v = VersionId::from_string("00000001".into());
-    plant_outbox(&store, &b, "k", v.clone(), "e1").await;
+    plant_outbox(&store, &fixture, &b, "k", v.clone(), "e1").await;
     let key = ObjectKey::parse("k").unwrap();
 
     // Fresh version: never shipped, so the stamp is absent.
@@ -3747,6 +4110,7 @@ async fn mark_replication_done_stamps_replicated_at() {
 async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3756,12 +4120,15 @@ async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
     let mut inbound = row(&b, "k", v.clone(), "e", true);
     inbound.replication_status = Some(ReplicationStatus::Replica);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(inbound),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(&b, "k", v.clone(), "e1")],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(inbound),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(&b, "k", v.clone(), "e1")],
+            },
+        )
         .await
         .unwrap();
     store
@@ -3806,6 +4173,7 @@ async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
 async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
     let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
@@ -3821,33 +4189,39 @@ async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
         let mut enc = row(&b, key, v1.clone(), "e1", true);
         enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(enc),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState::default(),
-                replication: vec![OutboxEntry {
-                    claim_token: None,
-                    enqueued_at: if key == "pruned" {
-                        Timestamp(0)
-                    } else {
-                        Timestamp(1_000)
-                    },
-                    ..outbox_entry(&b, key, v1.clone(), &format!("{key}:1"))
-                }],
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(enc),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: vec![OutboxEntry {
+                        claim_token: None,
+                        enqueued_at: if key == "pruned" {
+                            Timestamp(0)
+                        } else {
+                            Timestamp(1_000)
+                        },
+                        ..outbox_entry(&b, key, v1.clone(), &format!("{key}:1"))
+                    }],
+                },
+            )
             .await
             .unwrap();
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(row(&b, key, v2.clone(), "e2", true)),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState::default(),
-                replication: vec![OutboxEntry {
-                    claim_token: None,
-                    enqueued_at: Timestamp(1_000),
-                    ..outbox_entry(&b, key, v2.clone(), &format!("{key}:2"))
-                }],
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row(&b, key, v2.clone(), "e2", true)),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: vec![OutboxEntry {
+                        claim_token: None,
+                        enqueued_at: Timestamp(1_000),
+                        ..outbox_entry(&b, key, v2.clone(), &format!("{key}:2"))
+                    }],
+                },
+            )
             .await
             .unwrap();
     }
@@ -4029,9 +4403,55 @@ async fn vacuum_snapshot_runs_through_store_and_contains_committed_rows() {
     assert_eq!(count, 1);
 }
 
+async fn claim_fixture_cleanup(
+    store: &dyn MetadataStore,
+    fixture: &PublicationFixture,
+    now: Timestamp,
+) -> Vec<cairn_types::storage::StorageCleanup> {
+    let MutationOutcome::StorageCleanupBatch(batch) = store
+        .submit(Mutation::ClaimStorageCleanup {
+            generation: fixture.generation().clone(),
+            limit: 100,
+            now,
+            lease_secs: 60,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("exact storage cleanup batch")
+    };
+    batch
+}
+
+async fn retire_fixture_cleanup(
+    store: &dyn MetadataStore,
+    batch: Vec<cairn_types::storage::StorageCleanup>,
+    now: Timestamp,
+) {
+    // These metadata-only fixtures create no physical files. Explicitly model the blob layer's
+    // successful absence barrier, then retire only the exact Writer-issued cleanup claims.
+    for cleanup in batch {
+        assert_eq!(
+            store
+                .submit(Mutation::Storage {
+                    bucket: cleanup.bucket.clone(),
+                    operation: cairn_types::storage::StorageMutation::FinishCleanup {
+                        cleanup,
+                        now
+                    }
+                })
+                .await
+                .unwrap(),
+            MutationOutcome::StorageUpdated { applied: true }
+        );
+    }
+}
+
 #[tokio::test]
 async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let mut publications = MultipartPublication::new(&fixture);
     let bucket_row = bucket("mpquota");
     let bucket_name = bucket_row.name.clone();
     let principal = bucket_row.owner_id.clone();
@@ -4047,7 +4467,7 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         .await
         .unwrap();
 
-    let upload_id = UploadId::from_string("bounded-upload".to_owned());
+    let upload_id = UploadId::generate();
     let mut session = MultipartSession {
         upload_id: upload_id.clone(),
         bucket: bucket_name.clone(),
@@ -4082,7 +4502,7 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         .await
         .unwrap();
     let mut second = session.clone();
-    second.upload_id = UploadId::from_string("too-many-sessions".to_owned());
+    second.upload_id = UploadId::generate();
     assert!(matches!(
         store
             .submit(Mutation::CreateMultipart {
@@ -4093,61 +4513,73 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         Err(MetaError::QuotaExceeded)
     ));
 
-    store
-        .submit(Mutation::ReserveMultipartPart {
-            upload_id: upload_id.clone(),
-            part_number: 1,
-            attempt_id: "first".to_owned(),
-            reserved_bytes: 6,
-            max_parts_per_upload: limits.max_parts_per_upload,
-            now: Timestamp(2),
-        })
+    publications
+        .reserve_part(
+            &store,
+            Mutation::ReserveMultipartPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                attempt_id: "first".to_owned(),
+                reserved_bytes: 6,
+                max_parts_per_upload: limits.max_parts_per_upload,
+                now: Timestamp(2),
+            },
+        )
         .await
         .unwrap();
-    store
-        .submit(Mutation::RecordPart {
-            upload_id: upload_id.clone(),
-            attempt_id: "first".to_owned(),
-            part: PartRecord {
-                part_number: 1,
-                size: 6,
-                etag: "first".to_owned(),
-                storage_path: StoragePath::from_string(
-                    ".staging/multipart/bounded-upload/00001-first".to_owned(),
-                ),
-                checksum: None,
-                part_dek: None,
+    publications
+        .record_part(
+            &store,
+            Mutation::RecordPart {
+                upload_id: upload_id.clone(),
+                attempt_id: "first".to_owned(),
+                part: PartRecord {
+                    part_number: 1,
+                    size: 6,
+                    etag: "first".to_owned(),
+                    storage_path: StoragePath::from_string(format!(
+                        ".staging/multipart/{upload_id}/00001-first"
+                    )),
+                    checksum: None,
+                    part_dek: None,
+                },
             },
-        })
+        )
         .await
         .unwrap();
 
-    store
-        .submit(Mutation::ReserveMultipartPart {
-            upload_id: upload_id.clone(),
-            part_number: 1,
-            attempt_id: "replacement".to_owned(),
-            reserved_bytes: 7,
-            max_parts_per_upload: limits.max_parts_per_upload,
-            now: Timestamp(3),
-        })
+    publications
+        .reserve_part(
+            &store,
+            Mutation::ReserveMultipartPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                attempt_id: "replacement".to_owned(),
+                reserved_bytes: 7,
+                max_parts_per_upload: limits.max_parts_per_upload,
+                now: Timestamp(3),
+            },
+        )
         .await
         .unwrap();
-    let cleanup = match store
-        .submit(Mutation::RecordPart {
-            upload_id: upload_id.clone(),
-            attempt_id: "replacement".to_owned(),
-            part: PartRecord {
-                part_number: 1,
-                size: 7,
-                etag: "replacement".to_owned(),
-                storage_path: StoragePath::from_string(
-                    ".staging/multipart/bounded-upload/00001-replacement".to_owned(),
-                ),
-                checksum: None,
-                part_dek: None,
+    let cleanup = match publications
+        .record_part(
+            &store,
+            Mutation::RecordPart {
+                upload_id: upload_id.clone(),
+                attempt_id: "replacement".to_owned(),
+                part: PartRecord {
+                    part_number: 1,
+                    size: 7,
+                    etag: "replacement".to_owned(),
+                    storage_path: StoragePath::from_string(format!(
+                        ".staging/multipart/{upload_id}/00001-replacement"
+                    )),
+                    checksum: None,
+                    part_dek: None,
+                },
             },
-        })
+        )
         .await
         .unwrap()
     {
@@ -4162,19 +4594,22 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
     assert_eq!(recorded[0].etag, "replacement");
     assert_eq!(
         recorded[0].storage_path.as_str(),
-        ".staging/multipart/bounded-upload/00001-replacement"
+        format!(".staging/multipart/{upload_id}/00001-replacement")
     );
 
     assert!(matches!(
-        store
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: upload_id.clone(),
-                part_number: 2,
-                attempt_id: "blocked-by-debt".to_owned(),
-                reserved_bytes: 9,
-                max_parts_per_upload: limits.max_parts_per_upload,
-                now: Timestamp(4),
-            })
+        publications
+            .reserve_part(
+                &store,
+                Mutation::ReserveMultipartPart {
+                    upload_id: upload_id.clone(),
+                    part_number: 2,
+                    attempt_id: "blocked-by-debt".to_owned(),
+                    reserved_bytes: 9,
+                    max_parts_per_upload: limits.max_parts_per_upload,
+                    now: Timestamp(4),
+                }
+            )
             .await,
         Err(MetaError::QuotaExceeded)
     ));
@@ -4184,27 +4619,50 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         })
         .await
         .unwrap();
-    store
-        .submit(Mutation::ReserveMultipartPart {
-            upload_id: upload_id.clone(),
-            part_number: 2,
-            attempt_id: "fits-after-cleanup".to_owned(),
-            reserved_bytes: 9,
-            max_parts_per_upload: limits.max_parts_per_upload,
-            now: Timestamp(5),
-        })
+    let batch = claim_fixture_cleanup(&store, &fixture, Timestamp(4)).await;
+    assert!(
+        batch.iter().any(|item| item.quota_debt_id.is_some()),
+        "superseded bytes have exact durable debt"
+    );
+    retire_fixture_cleanup(&store, batch, Timestamp(4)).await;
+    let admitted_reservation = publications
+        .reserve_part(
+            &store,
+            Mutation::ReserveMultipartPart {
+                upload_id: upload_id.clone(),
+                part_number: 2,
+                attempt_id: "fits-after-cleanup".to_owned(),
+                reserved_bytes: 9,
+                max_parts_per_upload: limits.max_parts_per_upload,
+                now: Timestamp(5),
+            },
+        )
         .await
         .unwrap();
+    let MutationOutcome::StorageAdmission(cairn_types::storage::StorageAdmission::Granted(
+        reservation_plan,
+    )) = admitted_reservation
+    else {
+        panic!("admitted reservation")
+    };
+    let (mut io, lease) = cairn_types::storage::io::StorageIoWatch::new(
+        reservation_plan.attempt.clone(),
+        reservation_plan.generation.clone(),
+        std::sync::Arc::new(()),
+    );
     assert!(matches!(
-        store
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: upload_id.clone(),
-                part_number: 3,
-                attempt_id: "too-many-parts".to_owned(),
-                reserved_bytes: 0,
-                max_parts_per_upload: limits.max_parts_per_upload,
-                now: Timestamp(6),
-            })
+        publications
+            .reserve_part(
+                &store,
+                Mutation::ReserveMultipartPart {
+                    upload_id: upload_id.clone(),
+                    part_number: 3,
+                    attempt_id: "too-many-parts".to_owned(),
+                    reserved_bytes: 0,
+                    max_parts_per_upload: limits.max_parts_per_upload,
+                    now: Timestamp(6),
+                }
+            )
             .await,
         Err(MetaError::QuotaExceeded)
     ));
@@ -4214,7 +4672,13 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
             .await
             .unwrap()
             .len(),
-        1
+        0,
+        "legacy sweeps cannot reclaim journal-owned reservations merely because they are old"
+    );
+    assert!(
+        claim_fixture_cleanup(&store, &fixture, Timestamp(6))
+            .await
+            .is_empty()
     );
 
     assert_eq!(
@@ -4224,13 +4688,39 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
             .unwrap(),
         MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)
     );
-    let cleanups = store.list_multipart_cleanups(10).await.unwrap();
-    assert_eq!(cleanups.len(), 1);
-    assert_eq!(cleanups[0].upload_id, upload_id);
-    assert_eq!(cleanups[0].bytes, 16);
-    assert_eq!(cleanups[0].storage_path, None);
+    assert!(
+        store.list_multipart_cleanups(10).await.unwrap().is_empty(),
+        "journal debt is excluded from legacy cleanup"
+    );
+    let mut terminal_cleanup = claim_fixture_cleanup(&store, &fixture, Timestamp(7)).await;
+    assert!(
+        !terminal_cleanup
+            .iter()
+            .any(|item| &item.path == reservation_plan.final_path().unwrap()),
+        "abort cannot expose a still-owned reservation to physical reclamation"
+    );
+    drop(lease);
+    store
+        .submit(Mutation::Storage {
+            bucket: bucket_name.clone(),
+            operation: cairn_types::storage::StorageMutation::Resolve {
+                quiescence: io.quiescent().await,
+            },
+        })
+        .await
+        .unwrap();
+    terminal_cleanup.extend(claim_fixture_cleanup(&store, &fixture, Timestamp(7)).await);
+    assert_eq!(
+        terminal_cleanup
+            .iter()
+            .filter_map(|item| item.quota_debt_id.as_ref())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        2,
+        "aliases share debt: terminal cleanup retains the seven-byte part and nine-byte reservation"
+    );
 
-    let next_upload = UploadId::from_string("after-terminal".to_owned());
+    let next_upload = UploadId::generate();
     session.upload_id = next_upload.clone();
     session.created_at = Timestamp(7);
     session.updated_at = Timestamp(7);
@@ -4242,15 +4732,18 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         .await
         .unwrap();
     assert!(matches!(
-        store
-            .submit(Mutation::ReserveMultipartPart {
-                upload_id: next_upload.clone(),
-                part_number: 1,
-                attempt_id: "blocked-by-terminal-debt".to_owned(),
-                reserved_bytes: 20,
-                max_parts_per_upload: limits.max_parts_per_upload,
-                now: Timestamp(8),
-            })
+        publications
+            .reserve_part(
+                &store,
+                Mutation::ReserveMultipartPart {
+                    upload_id: next_upload.clone(),
+                    part_number: 1,
+                    attempt_id: "blocked-by-terminal-debt".to_owned(),
+                    reserved_bytes: 20,
+                    max_parts_per_upload: limits.max_parts_per_upload,
+                    now: Timestamp(8),
+                }
+            )
             .await,
         Err(MetaError::QuotaExceeded)
     ));
@@ -4258,15 +4751,19 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         .submit(Mutation::ReleaseMultipartUploadCleanups { upload_id })
         .await
         .unwrap();
-    store
-        .submit(Mutation::ReserveMultipartPart {
-            upload_id: next_upload,
-            part_number: 1,
-            attempt_id: "fits-after-terminal-cleanup".to_owned(),
-            reserved_bytes: 20,
-            max_parts_per_upload: limits.max_parts_per_upload,
-            now: Timestamp(9),
-        })
+    retire_fixture_cleanup(&store, terminal_cleanup, Timestamp(8)).await;
+    publications
+        .reserve_part(
+            &store,
+            Mutation::ReserveMultipartPart {
+                upload_id: next_upload,
+                part_number: 1,
+                attempt_id: "fits-after-terminal-cleanup".to_owned(),
+                reserved_bytes: 20,
+                max_parts_per_upload: limits.max_parts_per_upload,
+                now: Timestamp(9),
+            },
+        )
         .await
         .unwrap();
 }
@@ -4288,6 +4785,7 @@ async fn object_lock_concurrent_mutations_have_safe_writer_serialization() {
 #[tokio::test]
 async fn object_lock_writer_atomically_installs_side_state_and_enforces_compliance() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = bucket("worm-bucket");
     let bucket_name = bucket.name.clone();
     store
@@ -4334,18 +4832,21 @@ async fn object_lock_writer_atomically_installs_side_state_and_enforces_complian
     object.created_at = Timestamp(1_000);
     object.updated_at = Timestamp(1_000);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(object),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState {
-                tags: vec![("class".to_owned(), "archive".to_owned())],
-                lock_intent: ExplicitObjectLockIntent {
-                    retention: None,
-                    legal_hold: Some(true),
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: vec![("class".to_owned(), "archive".to_owned())],
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: None,
+                        legal_hold: Some(true),
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
 
@@ -4440,6 +4941,7 @@ async fn object_lock_writer_atomically_installs_side_state_and_enforces_complian
 #[tokio::test]
 async fn object_lock_blocks_null_replacement_and_rolls_back_atomic_put_failure() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = bucket("sentinel-worm");
     let bucket_name = bucket.name.clone();
     store
@@ -4458,21 +4960,24 @@ async fn object_lock_blocks_null_replacement_and_rolls_back_atomic_put_failure()
     );
     first.created_at = Timestamp(10);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(first),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState {
-                tags: vec![("generation".to_owned(), "first".to_owned())],
-                lock_intent: ExplicitObjectLockIntent {
-                    retention: Some(ObjectRetention {
-                        mode: ObjectLockMode::Governance,
-                        retain_until: Timestamp(1_000),
-                    }),
-                    legal_hold: None,
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(first),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: vec![("generation".to_owned(), "first".to_owned())],
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: Some(ObjectRetention {
+                            mode: ObjectLockMode::Governance,
+                            retain_until: Timestamp(1_000),
+                        }),
+                        legal_hold: None,
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
 
@@ -4486,12 +4991,15 @@ async fn object_lock_blocks_null_replacement_and_rolls_back_atomic_put_failure()
     replacement.created_at = Timestamp(20);
     assert!(matches!(
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(replacement),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState::default(),
-                replication: Vec::new(),
-            })
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(replacement),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: Vec::new(),
+                }
+            )
             .await,
         Err(MetaError::ObjectProtected)
     ));
@@ -4547,24 +5055,27 @@ async fn object_lock_blocks_null_replacement_and_rolls_back_atomic_put_failure()
     );
     assert!(matches!(
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(failed),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState {
-                    tags: vec![
-                        ("duplicate".to_owned(), "one".to_owned()),
-                        ("duplicate".to_owned(), "two".to_owned()),
-                    ],
-                    lock_intent: ExplicitObjectLockIntent {
-                        retention: Some(ObjectRetention {
-                            mode: ObjectLockMode::Compliance,
-                            retain_until: Timestamp(2_000),
-                        }),
-                        legal_hold: Some(true),
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(failed),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: vec![
+                            ("duplicate".to_owned(), "one".to_owned()),
+                            ("duplicate".to_owned(), "two".to_owned()),
+                        ],
+                        lock_intent: ExplicitObjectLockIntent {
+                            retention: Some(ObjectRetention {
+                                mode: ObjectLockMode::Compliance,
+                                retain_until: Timestamp(2_000),
+                            }),
+                            legal_hold: Some(true),
+                        },
                     },
-                },
-                replication: vec![outbox],
-            })
+                    replication: vec![outbox],
+                }
+            )
             .await,
         Err(MetaError::Conflict)
     ));
@@ -4603,6 +5114,8 @@ async fn object_lock_blocks_null_replacement_and_rolls_back_atomic_put_failure()
 #[tokio::test]
 async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let mut publications = MultipartPublication::new(&fixture);
     let bucket = bucket("multipart-worm");
     let bucket_name = bucket.name.clone();
     store
@@ -4617,7 +5130,7 @@ async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock
         .await
         .unwrap();
 
-    let upload_id = UploadId::from_string("locked-multipart".to_owned());
+    let upload_id = UploadId::generate();
     let key = ObjectKey::parse("assembled").unwrap();
     store
         .submit(Mutation::CreateMultipart {
@@ -4649,18 +5162,6 @@ async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock
         })
         .await
         .unwrap();
-    let claim_token = MultipartClaimToken::generate();
-    assert!(matches!(
-        store
-            .submit(Mutation::ClaimMultipart {
-                upload_id: upload_id.clone(),
-                claim_token: claim_token.clone(),
-            })
-            .await
-            .unwrap(),
-        MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
-    ));
-
     let version = VersionId::from_string("assembled-v1".to_owned());
     let mut object = row(
         &bucket_name,
@@ -4671,15 +5172,37 @@ async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock
     );
     object.created_at = Timestamp(100);
     object.updated_at = Timestamp(100);
+    let claim_token = MultipartClaimToken::generate();
     assert!(matches!(
-        store
-            .submit(Mutation::CompleteMultipart {
-                upload_id: upload_id.clone(),
-                claim_token,
-                row: Box::new(object),
-                precondition: Precondition::default(),
-                replication: Vec::new(),
-            })
+        publications
+            .claim(
+                &store,
+                Mutation::ClaimMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: claim_token.clone(),
+                },
+                &object
+            )
+            .await
+            .unwrap(),
+        MutationOutcome::StorageMultipartClaim {
+            claim: ClaimOutcome::Claimed(_),
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        publications
+            .complete(
+                &store,
+                Mutation::CompleteMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token,
+                    row: Box::new(object),
+                    precondition: Precondition::default(),
+                    replication: Vec::new(),
+                }
+            )
             .await
             .unwrap(),
         MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed { .. })
@@ -4711,6 +5234,7 @@ async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock
 #[tokio::test]
 async fn governance_bypass_and_late_outbox_failure_are_writer_atomic() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let bucket = bucket("governance-worm");
     let bucket_name = bucket.name.clone();
     store
@@ -4729,21 +5253,24 @@ async fn governance_bypass_and_late_outbox_failure_are_writer_atomic() {
     );
     protected.created_at = Timestamp(10);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(protected),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState {
-                tags: Vec::new(),
-                lock_intent: ExplicitObjectLockIntent {
-                    retention: Some(ObjectRetention {
-                        mode: ObjectLockMode::Governance,
-                        retain_until: Timestamp(1_000),
-                    }),
-                    legal_hold: None,
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(protected),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: Some(ObjectRetention {
+                            mode: ObjectLockMode::Governance,
+                            retain_until: Timestamp(1_000),
+                        }),
+                        legal_hold: None,
+                    },
                 },
+                replication: Vec::new(),
             },
-            replication: Vec::new(),
-        })
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -4783,23 +5310,26 @@ async fn governance_bypass_and_late_outbox_failure_are_writer_atomic() {
     let seed_version = VersionId::from_string("seed-v1".to_owned());
     let duplicate_id = "late-outbox-conflict";
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(
-                &bucket_name,
-                seed_key.as_str(),
-                seed_version.clone(),
-                "seed",
-                true,
-            )),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(
-                &bucket_name,
-                seed_key.as_str(),
-                seed_version,
-                duplicate_id,
-            )],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(
+                    &bucket_name,
+                    seed_key.as_str(),
+                    seed_version.clone(),
+                    "seed",
+                    true,
+                )),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(
+                    &bucket_name,
+                    seed_key.as_str(),
+                    seed_version,
+                    duplicate_id,
+                )],
+            },
+        )
         .await
         .unwrap();
 
@@ -4815,26 +5345,29 @@ async fn governance_bypass_and_late_outbox_failure_are_writer_atomic() {
     failed.created_at = Timestamp(20);
     assert!(matches!(
         store
-            .submit(Mutation::PutObjectVersion {
-                row: Box::new(failed),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState {
-                    tags: vec![("atomic".to_owned(), "yes".to_owned())],
-                    lock_intent: ExplicitObjectLockIntent {
-                        retention: Some(ObjectRetention {
-                            mode: ObjectLockMode::Compliance,
-                            retain_until: Timestamp(2_000),
-                        }),
-                        legal_hold: Some(true),
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(failed),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: vec![("atomic".to_owned(), "yes".to_owned())],
+                        lock_intent: ExplicitObjectLockIntent {
+                            retention: Some(ObjectRetention {
+                                mode: ObjectLockMode::Compliance,
+                                retain_until: Timestamp(2_000),
+                            }),
+                            legal_hold: Some(true),
+                        },
                     },
-                },
-                replication: vec![outbox_entry(
-                    &bucket_name,
-                    failed_key.as_str(),
-                    failed_version.clone(),
-                    duplicate_id,
-                )],
-            })
+                    replication: vec![outbox_entry(
+                        &bucket_name,
+                        failed_key.as_str(),
+                        failed_version.clone(),
+                        duplicate_id,
+                    )],
+                }
+            )
             .await,
         Err(MetaError::Conflict)
     ));
@@ -4876,6 +5409,8 @@ async fn governance_bypass_and_late_outbox_failure_are_writer_atomic() {
 #[tokio::test]
 async fn multipart_explicit_lock_survives_late_failure_and_retry() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let mut publications = MultipartPublication::new(&fixture);
     let bucket = bucket("multipart-retry-worm");
     let bucket_name = bucket.name.clone();
     store
@@ -4887,27 +5422,30 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
     let seed_version = VersionId::from_string("seed-v1".to_owned());
     let duplicate_id = "multipart-late-conflict";
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(row(
-                &bucket_name,
-                seed_key.as_str(),
-                seed_version.clone(),
-                "seed",
-                true,
-            )),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![outbox_entry(
-                &bucket_name,
-                seed_key.as_str(),
-                seed_version,
-                duplicate_id,
-            )],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row(
+                    &bucket_name,
+                    seed_key.as_str(),
+                    seed_version.clone(),
+                    "seed",
+                    true,
+                )),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![outbox_entry(
+                    &bucket_name,
+                    seed_key.as_str(),
+                    seed_version,
+                    duplicate_id,
+                )],
+            },
+        )
         .await
         .unwrap();
 
-    let upload_id = UploadId::from_string("explicit-lock-retry".to_owned());
+    let upload_id = UploadId::generate();
     let key = ObjectKey::parse("assembled").unwrap();
     let explicit = ObjectRetention {
         mode: ObjectLockMode::Governance,
@@ -4950,15 +5488,6 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
         })
         .await
         .unwrap();
-    let failed_claim_token = MultipartClaimToken::generate();
-    store
-        .submit(Mutation::ClaimMultipart {
-            upload_id: upload_id.clone(),
-            claim_token: failed_claim_token.clone(),
-        })
-        .await
-        .unwrap();
-
     let version = VersionId::from_string("retry-v1".to_owned());
     let mut object = row(
         &bucket_name,
@@ -4969,20 +5498,36 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
     );
     object.created_at = Timestamp(200);
     object.updated_at = Timestamp(200);
-    assert!(matches!(
-        store
-            .submit(Mutation::CompleteMultipart {
+    let failed_claim_token = MultipartClaimToken::generate();
+    publications
+        .claim(
+            &store,
+            Mutation::ClaimMultipart {
                 upload_id: upload_id.clone(),
                 claim_token: failed_claim_token.clone(),
-                row: Box::new(object.clone()),
-                precondition: Precondition::default(),
-                replication: vec![outbox_entry(
-                    &bucket_name,
-                    key.as_str(),
-                    version.clone(),
-                    duplicate_id,
-                )],
-            })
+            },
+            &object,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        publications
+            .complete(
+                &store,
+                Mutation::CompleteMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: failed_claim_token.clone(),
+                    row: Box::new(object.clone()),
+                    precondition: Precondition::default(),
+                    replication: vec![outbox_entry(
+                        &bucket_name,
+                        key.as_str(),
+                        version.clone(),
+                        duplicate_id,
+                    )],
+                }
+            )
             .await,
         Err(MetaError::Conflict)
     ));
@@ -5011,22 +5556,31 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
         })
         .await
         .unwrap();
+    object.id = uuid::Uuid::new_v4().simple().to_string();
+    object.storage_path = Some(StoragePath::generate(&bucket_name));
     let retry_claim_token = MultipartClaimToken::generate();
-    store
-        .submit(Mutation::ClaimMultipart {
-            upload_id: upload_id.clone(),
-            claim_token: retry_claim_token.clone(),
-        })
+    publications
+        .claim(
+            &store,
+            Mutation::ClaimMultipart {
+                upload_id: upload_id.clone(),
+                claim_token: retry_claim_token.clone(),
+            },
+            &object,
+        )
         .await
         .unwrap();
-    store
-        .submit(Mutation::CompleteMultipart {
-            upload_id,
-            claim_token: retry_claim_token,
-            row: Box::new(object),
-            precondition: Precondition::default(),
-            replication: Vec::new(),
-        })
+    publications
+        .complete(
+            &store,
+            Mutation::CompleteMultipart {
+                upload_id,
+                claim_token: retry_claim_token,
+                row: Box::new(object),
+                precondition: Precondition::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -5052,6 +5606,7 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
 #[tokio::test]
 async fn replication_attempts_are_fenced() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("claims").unwrap();
     store
         .submit(Mutation::CreateBucket(Box::new(bucket("claims"))))
@@ -5059,12 +5614,15 @@ async fn replication_attempts_are_fenced() {
         .unwrap();
     let object = row(&b, "key", VersionId::generate(), "e", true);
     store
-        .submit(Mutation::PutObjectVersion {
-            row: Box::new(object.clone()),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![],
-        })
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object.clone()),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![],
+            },
+        )
         .await
         .unwrap();
     cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
@@ -5084,7 +5642,20 @@ async fn multipart_replica_intent_survives_claim_recovery() {
 #[tokio::test]
 async fn internal_integrity_digest_round_trips_through_writer() {
     let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("digest-bucket").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
     for digest in [
         None,
         Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
@@ -5092,7 +5663,7 @@ async fn internal_integrity_digest_round_trips_through_writer() {
         let mut version = row(&b, "key", VersionId::null(), "etag-2", true);
         version.internal_sha256 = digest.clone();
         store
-            .submit(put(version, Precondition::default()))
+            .submit_fixture(&fixture, put(version, Precondition::default()))
             .await
             .unwrap();
         let got = store

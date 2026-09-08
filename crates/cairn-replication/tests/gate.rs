@@ -1,6 +1,8 @@
 //! Gate tests for the outbox-driven replication engine, run entirely against the in-memory
 //! doubles + a controllable clock.
 
+use cairn_types::storage::{StorageToken, StorageWritePlan, StorageWriteTarget};
+use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -46,28 +48,67 @@ fn body(bytes: &'static [u8]) -> cairn_types::BodyStream {
     }))
 }
 
-/// Stage `data` as a blob and return its storage path so a version row can reference it.
-async fn stage_blob(blobs: &InMemoryBlobStore, data: &'static [u8]) -> (StoragePath, ETag, u64) {
+/// Admit the exact object before staging; retain its plan through the publication savepoint.
+#[allow(clippy::too_many_arguments)]
+async fn stage_blob(
+    fixture: &PublicationFixture,
+    meta: &InMemoryMetadataStore,
+    blobs: &InMemoryBlobStore,
+    key: &str,
+    version: &VersionId,
+    data: &'static [u8],
+    now: Timestamp,
+    encryption: Option<cairn_types::SecretKey32>,
+) -> (StoragePath, ETag, u64, StorageWritePlan) {
+    let planned = blobs
+        .plan_write(
+            bucket(),
+            fixture.generation().clone(),
+            StorageWriteTarget::Object {
+                key: ObjectKey::parse(key).unwrap(),
+                version_id: version.clone(),
+                row_id: StorageToken::generate().as_str().to_owned(),
+            },
+        )
+        .unwrap();
+    let (plan, permit) = fixture.admit_object(meta, planned, now).await.unwrap();
     let staged = blobs
         .stage(
-            &bucket(),
+            permit,
             body(data),
             StageOptions {
                 compression: None,
                 extra_checksums: ChecksumSet::none(),
                 size_ceiling: 1 << 30,
                 content_type: "text/plain".to_owned(),
-                encryption: None,
+                encryption,
                 content_length: None,
             },
         )
         .await
         .unwrap();
-    (staged.storage_path, staged.etag, staged.size_logical)
+    (staged.storage_path, staged.etag, staged.size_logical, plan)
+}
+
+async fn begin_replication_fixture(meta: &InMemoryMetadataStore) -> PublicationFixture {
+    let fixture = meta.begin_fixture().await.unwrap();
+    meta.submit(Mutation::CreateBucket(Box::new(cairn_types::Bucket {
+        name: bucket(),
+        owner_id: UserId("owner".to_owned()),
+        created_at: Timestamp(0),
+        versioning: cairn_types::VersioningState::Enabled,
+        ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+    fixture
 }
 
 #[allow(clippy::too_many_arguments)]
 fn version_row(
+    plan: Option<&StorageWritePlan>,
     key: &str,
     version: &VersionId,
     storage_path: Option<StoragePath>,
@@ -78,7 +119,15 @@ fn version_row(
     now: Timestamp,
 ) -> ObjectVersionRow {
     ObjectVersionRow {
-        id: format!("row-{}-{}", key, version.as_str()),
+        id: plan.map_or_else(
+            || StorageToken::generate().as_str().to_owned(),
+            |plan| {
+                let StorageWriteTarget::Object { row_id, .. } = &plan.target else {
+                    panic!("object target expected")
+                };
+                row_id.clone()
+            },
+        ),
         bucket: bucket(),
         key: ObjectKey::parse(key).unwrap(),
         version_id: version.clone(),
@@ -111,7 +160,9 @@ fn version_row(
 }
 
 /// Commit an ObjectCreate version with a pending, due outbox entry, staging its blob.
+#[allow(clippy::too_many_arguments)]
 async fn put_with_outbox(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blobs: &InMemoryBlobStore,
     entry_id: &str,
@@ -120,9 +171,11 @@ async fn put_with_outbox(
     due_at: Timestamp,
     now: Timestamp,
 ) -> VersionId {
-    let (path, etag, size) = stage_blob(blobs, data).await;
     let version = VersionId::generate();
+    let (path, etag, size, plan) =
+        stage_blob(fixture, meta, blobs, key, &version, data, now, None).await;
     let row = version_row(
+        Some(&plan),
         key,
         &version,
         Some(path),
@@ -143,12 +196,18 @@ async fn put_with_outbox(
         due_at,
         0,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     version
@@ -156,7 +215,9 @@ async fn put_with_outbox(
 
 /// Commit an ObjectCreate version with an *explicit* version id (so the test controls per-key
 /// ordering) plus a pending, due outbox entry, staging its blob.
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_versioned(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blobs: &InMemoryBlobStore,
     entry_id: &str,
@@ -165,8 +226,10 @@ async fn enqueue_versioned(
     data: &'static [u8],
     due_at: Timestamp,
 ) {
-    let (path, etag, size) = stage_blob(blobs, data).await;
+    let (path, etag, size, plan) =
+        stage_blob(fixture, meta, blobs, key, version, data, due_at, None).await;
     let row = version_row(
+        Some(&plan),
         key,
         version,
         Some(path),
@@ -187,12 +250,18 @@ async fn enqueue_versioned(
         due_at,
         0,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
 }
@@ -236,13 +305,24 @@ fn engine_with_crypto(crypto: Arc<dyn Crypto>) -> ReplicationEngine {
 #[tokio::test]
 async fn object_create_replicates_and_completes() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
-    let version = put_with_outbox(&meta, &blobs, "e1", "obj/a", b"hello world", now, now).await;
+    let version = put_with_outbox(
+        &fixture,
+        &meta,
+        &blobs,
+        "e1",
+        "obj/a",
+        b"hello world",
+        now,
+        now,
+    )
+    .await;
 
     let report = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -287,13 +367,15 @@ async fn object_create_replicates_and_completes() {
 #[tokio::test]
 async fn retryable_failure_reschedules_then_succeeds_after_clock_advance() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
     let clock = TestClock::at_secs(2_000);
     let now = clock.now();
 
-    let version = put_with_outbox(&meta, &blobs, "e2", "obj/b", b"payload", now, now).await;
+    let version =
+        put_with_outbox(&fixture, &meta, &blobs, "e2", "obj/b", b"payload", now, now).await;
 
     // First pass: the sink fails retryably.
     router.0.set_behavior(SinkBehavior::Retryable);
@@ -360,6 +442,7 @@ async fn retryable_failure_reschedules_then_succeeds_after_clock_advance() {
 #[tokio::test]
 async fn later_version_defers_until_earlier_version_replicates() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -373,7 +456,7 @@ async fn later_version_defers_until_earlier_version_replicates() {
 
     // v1 is enqueued and fails retryably, so its backoff pushes it out of the due set — landing
     // it in a different batch from v2.
-    enqueue_versioned(&meta, &blobs, "e-v1", key, &v1, b"first", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "e-v1", key, &v1, b"first", now).await;
     router.0.set_behavior(SinkBehavior::Retryable);
     let r = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -387,7 +470,7 @@ async fn later_version_defers_until_earlier_version_replicates() {
 
     // v2 now arrives as the only due entry, with a *healthy* sink. Absent the cross-batch guard it
     // would ship immediately and reorder ahead of v1; with the guard it defers.
-    enqueue_versioned(&meta, &blobs, "e-v2", key, &v2, b"second", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "e-v2", key, &v2, b"second", now).await;
     router.0.set_behavior(SinkBehavior::Succeed);
     let r = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -448,10 +531,14 @@ async fn later_version_defers_until_earlier_version_replicates() {
 #[tokio::test]
 async fn unresolved_target_is_retried_not_terminally_failed() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let clock = TestClock::at_secs(5_000);
     let now = clock.now();
-    let _ = put_with_outbox(&meta, &blobs, "e-nosink", "obj/x", b"data", now, now).await;
+    let _ = put_with_outbox(
+        &fixture, &meta, &blobs, "e-nosink", "obj/x", b"data", now, now,
+    )
+    .await;
 
     let report = engine()
         .run_once(&meta, &NoSinkRouter, &blobs, &clock)
@@ -477,6 +564,7 @@ async fn unresolved_target_is_retried_not_terminally_failed() {
 #[tokio::test]
 async fn unavailable_target_retries_without_consuming_budget_then_resumes() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -484,7 +572,10 @@ async fn unavailable_target_retries_without_consuming_budget_then_resumes() {
     let now = clock.now();
     let eng = engine(); // max_attempts = 3
 
-    let version = put_with_outbox(&meta, &blobs, "e-down", "obj/down", b"data", now, now).await;
+    let version = put_with_outbox(
+        &fixture, &meta, &blobs, "e-down", "obj/down", b"data", now, now,
+    )
+    .await;
     router.0.set_behavior(SinkBehavior::Unavailable);
 
     // Drain far more times than max_attempts: the target is down on every pass, advancing the clock
@@ -525,6 +616,7 @@ async fn unavailable_target_retries_without_consuming_budget_then_resumes() {
 #[tokio::test]
 async fn terminally_failed_predecessor_does_not_block_successor() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -536,7 +628,7 @@ async fn terminally_failed_predecessor_does_not_block_successor() {
     let v2 = VersionId::from_string("v2".into());
 
     // v1 fails terminally on the first attempt.
-    enqueue_versioned(&meta, &blobs, "s-v1", key, &v1, b"first", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "s-v1", key, &v1, b"first", now).await;
     router.0.set_behavior(SinkBehavior::Terminal);
     let r = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -549,7 +641,7 @@ async fn terminally_failed_predecessor_does_not_block_successor() {
     );
 
     // v2 arrives with a healthy sink: it must ship despite v1 being terminally failed.
-    enqueue_versioned(&meta, &blobs, "s-v2", key, &v2, b"second", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "s-v2", key, &v2, b"second", now).await;
     router.0.set_behavior(SinkBehavior::Succeed);
     let r = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -575,6 +667,7 @@ async fn terminally_failed_predecessor_does_not_block_successor() {
 #[tokio::test]
 async fn deferred_successor_releases_claim_for_prompt_recheck() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -586,14 +679,14 @@ async fn deferred_successor_releases_claim_for_prompt_recheck() {
     let v2 = VersionId::from_string("v2".into());
 
     // v1 backs off into a future batch; v2 then arrives as the only due entry and must defer.
-    enqueue_versioned(&meta, &blobs, "d-v1", key, &v1, b"first", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "d-v1", key, &v1, b"first", now).await;
     router.0.set_behavior(SinkBehavior::Retryable);
     engine()
         .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
 
-    enqueue_versioned(&meta, &blobs, "d-v2", key, &v2, b"second", now).await;
+    enqueue_versioned(&fixture, &meta, &blobs, "d-v2", key, &v2, b"second", now).await;
     router.0.set_behavior(SinkBehavior::Succeed);
     let r = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -614,6 +707,7 @@ async fn deferred_successor_releases_claim_for_prompt_recheck() {
 #[tokio::test]
 async fn exceeding_max_attempts_marks_failed() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -621,7 +715,7 @@ async fn exceeding_max_attempts_marks_failed() {
     let now = clock.now();
     let eng = engine(); // max_attempts = 3
 
-    let version = put_with_outbox(&meta, &blobs, "e3", "obj/c", b"data", now, now).await;
+    let version = put_with_outbox(&fixture, &meta, &blobs, "e3", "obj/c", b"data", now, now).await;
     router.0.set_behavior(SinkBehavior::Retryable);
 
     // Attempt 1 -> retry (attempts becomes 1).
@@ -650,13 +744,14 @@ async fn exceeding_max_attempts_marks_failed() {
 #[tokio::test]
 async fn terminal_failure_marks_failed_immediately() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
     let clock = TestClock::at_secs(4_000);
     let now = clock.now();
 
-    let version = put_with_outbox(&meta, &blobs, "e4", "obj/d", b"data", now, now).await;
+    let version = put_with_outbox(&fixture, &meta, &blobs, "e4", "obj/d", b"data", now, now).await;
     router.0.set_behavior(SinkBehavior::Terminal);
 
     let report = engine()
@@ -678,6 +773,7 @@ async fn terminal_failure_marks_failed_immediately() {
 #[tokio::test]
 async fn delete_marker_entry_drives_sink_delete_marker() {
     let meta = InMemoryMetadataStore::new();
+    let _fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -687,6 +783,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
     // Commit a delete-marker version (no blob) plus a delete-marker outbox entry.
     let version = VersionId::generate();
     let row = version_row(
+        None,
         "obj/e",
         &version,
         None,
@@ -741,6 +838,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
 #[tokio::test]
 async fn replica_status_is_never_re_replicated() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -749,9 +847,20 @@ async fn replica_status_is_never_re_replicated() {
 
     // A version that arrived via replication is marked Replica; enqueue an entry for it to
     // simulate a misfire / loop attempt.
-    let (path, etag, size) = stage_blob(&blobs, b"replica-bytes").await;
     let version = VersionId::generate();
+    let (path, etag, size, plan) = stage_blob(
+        &fixture,
+        &meta,
+        &blobs,
+        "obj/f",
+        &version,
+        b"replica-bytes",
+        now,
+        None,
+    )
+    .await;
     let row = version_row(
+        Some(&plan),
         "obj/f",
         &version,
         Some(path),
@@ -772,12 +881,18 @@ async fn replica_status_is_never_re_replicated() {
         now,
         0,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
 
@@ -805,13 +920,14 @@ async fn replica_status_is_never_re_replicated() {
 #[tokio::test]
 async fn redelivering_completed_version_is_idempotent() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
     let clock = TestClock::at_secs(7_000);
     let now = clock.now();
 
-    let version = put_with_outbox(&meta, &blobs, "e7", "obj/g", b"once", now, now).await;
+    let version = put_with_outbox(&fixture, &meta, &blobs, "e7", "obj/g", b"once", now, now).await;
 
     // First delivery succeeds.
     engine()
@@ -837,21 +953,10 @@ async fn redelivering_completed_version_is_idempotent() {
         now,
         0,
     );
-    // Push the duplicate through the outbox by attaching it to a no-op re-put of the (now
-    // Completed) row so the entry lands due.
-    let existing = meta
-        .get_version(&bucket(), &ObjectKey::parse("obj/g").unwrap(), &version)
+    // Queue the duplicate against the existing version without changing its physical identity.
+    meta.submit(Mutation::EnqueueReplication(Box::new(dup)))
         .await
-        .unwrap()
         .unwrap();
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(existing),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![dup],
-    })
-    .await
-    .unwrap();
 
     // The duplicate re-ships (at-least-once): per-target idempotency is the durable claim's job, not
     // a version-level skip, so under fan-out a second target is never starved. A re-ship to the same
@@ -875,6 +980,7 @@ async fn fan_out_ships_every_target_for_one_version() {
     // target must ship to ALL of them. The first target to complete stamps the version `Completed`;
     // a version-level skip (the old behaviour) would wrongly starve the rest.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     // SingleSink returns the one fake sink for any ARN, so two distinct-ARN entries both land on it.
@@ -883,7 +989,8 @@ async fn fan_out_ships_every_target_for_one_version() {
     let now = clock.now();
 
     // One version; its put_with_outbox entry plus a second entry to a distinct target.
-    let version = put_with_outbox(&meta, &blobs, "ef", "obj/fan", b"data", now, now).await;
+    let version =
+        put_with_outbox(&fixture, &meta, &blobs, "ef", "obj/fan", b"data", now, now).await;
     let to_y = outbox_entry_for(
         "fan-y",
         bucket(),
@@ -895,19 +1002,9 @@ async fn fan_out_ships_every_target_for_one_version() {
         now,
         0,
     );
-    let existing = meta
-        .get_version(&bucket(), &ObjectKey::parse("obj/fan").unwrap(), &version)
+    meta.submit(Mutation::EnqueueReplication(Box::new(to_y)))
         .await
-        .unwrap()
         .unwrap();
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(existing),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![to_y],
-    })
-    .await
-    .unwrap();
 
     engine()
         .run_until_idle(&meta, &router, &blobs, &clock, 10)
@@ -923,6 +1020,7 @@ async fn fan_out_ships_every_target_for_one_version() {
 #[tokio::test]
 async fn per_key_ordering_defers_later_versions_when_earlier_one_stalls() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -931,9 +1029,9 @@ async fn per_key_ordering_defers_later_versions_when_earlier_one_stalls() {
 
     // Two versions of the same key, both due. The first (older) version id sorts before the
     // second because uuid v7 is time-ordered; enqueue v1 then v2.
-    let v1 = put_with_outbox(&meta, &blobs, "ord1", "same/key", b"v1", now, now).await;
+    let v1 = put_with_outbox(&fixture, &meta, &blobs, "ord1", "same/key", b"v1", now, now).await;
     // Ensure a distinct, later version id.
-    let v2 = put_with_outbox(&meta, &blobs, "ord2", "same/key", b"v2", now, now).await;
+    let v2 = put_with_outbox(&fixture, &meta, &blobs, "ord2", "same/key", b"v2", now, now).await;
     assert!(v1.as_str() < v2.as_str(), "v7 ids are time-ordered");
 
     // The sink fails retryably, so v1 stalls; v2 must be deferred (not shipped out of order).
@@ -961,6 +1059,7 @@ async fn per_key_ordering_defers_later_versions_when_earlier_one_stalls() {
 #[tokio::test]
 async fn run_until_idle_drains_independent_keys() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -971,9 +1070,11 @@ async fn run_until_idle_drains_independent_keys() {
         let id = format!("multi-{i}");
         let key = format!("k/{i}");
         // Distinct keys so there is no cross-key ordering constraint.
-        let (path, etag, size) = stage_blob(&blobs, b"x").await;
         let version = VersionId::generate();
+        let (path, etag, size, plan) =
+            stage_blob(&fixture, &meta, &blobs, &key, &version, b"x", now, None).await;
         let row = version_row(
+            Some(&plan),
             &key,
             &version,
             Some(path),
@@ -994,12 +1095,18 @@ async fn run_until_idle_drains_independent_keys() {
             now,
             0,
         );
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        meta.submit(
+            PublicationFixture::publication(
+                plan,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: vec![entry],
+                },
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     }
@@ -1036,6 +1143,7 @@ async fn completing_replication_does_not_demote_a_newer_version() {
     // would force is_latest and demote a v2 written during the ship window. mark_done now only stamps
     // the version's replication_status via a targeted update — never a whole-row PutObjectVersion.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
     let router = SingleSink(sink);
@@ -1044,26 +1152,34 @@ async fn completing_replication_does_not_demote_a_newer_version() {
     let key = ObjectKey::parse("k").unwrap();
 
     // v1: pending replication, latest at commit.
-    let v1 = put_with_outbox(&meta, &blobs, "e1", "k", b"one", now, now).await;
+    let v1 = put_with_outbox(&fixture, &meta, &blobs, "e1", "k", b"one", now, now).await;
     // v2: a newer version written with NO outbox entry — becomes latest, demoting v1. Stands in for a
     // client write landing during v1's ship window.
-    let (path, etag, size) = stage_blob(&blobs, b"two").await;
     let v2 = VersionId::generate();
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(version_row(
-            "k",
-            &v2,
-            Some(path),
-            etag,
-            size,
-            false,
-            ReplicationStatus::Completed,
-            now,
-        )),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![],
-    })
+    let (path, etag, size, plan) =
+        stage_blob(&fixture, &meta, &blobs, "k", &v2, b"two", now, None).await;
+    meta.submit(
+        PublicationFixture::publication(
+            plan.clone(),
+            Mutation::PutObjectVersion {
+                row: Box::new(version_row(
+                    Some(&plan),
+                    "k",
+                    &v2,
+                    Some(path),
+                    etag,
+                    size,
+                    false,
+                    ReplicationStatus::Completed,
+                    now,
+                )),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     let before = meta.current_version(&bucket(), &key).await.unwrap();
@@ -1171,11 +1287,13 @@ impl cairn_types::traits::ReplicationSink for CapturingSink {
 #[tokio::test]
 async fn replication_source_uses_the_blob_backends_allocation_and_frame_bounds() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(CapturingSink::default());
     let clock = TestClock::at_secs(1_000);
     let data = b"one backend-owned frame";
     put_with_outbox(
+        &fixture,
         &meta,
         &blobs,
         "memory-bound",
@@ -1266,6 +1384,7 @@ fn encrypted_fixture_dek() -> ([u8; 32], String) {
 /// Commit an encrypted ObjectCreate version (blob staged under `dek`, row carrying the matching
 /// `sse_descriptor`) with a pending, due outbox entry.
 async fn put_encrypted_with_outbox(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blobs: &InMemoryBlobStore,
     entry_id: &str,
@@ -1274,28 +1393,25 @@ async fn put_encrypted_with_outbox(
     now: Timestamp,
 ) -> VersionId {
     let (dek, descriptor) = encrypted_fixture_dek();
-    let staged = blobs
-        .stage(
-            &bucket(),
-            body(data),
-            StageOptions {
-                compression: None,
-                extra_checksums: ChecksumSet::none(),
-                size_ceiling: 1 << 30,
-                content_type: "text/plain".to_owned(),
-                encryption: Some(dek.into()),
-                content_length: None,
-            },
-        )
-        .await
-        .unwrap();
     let version = VersionId::generate();
-    let mut row = version_row(
+    let (path, etag, size, plan) = stage_blob(
+        fixture,
+        meta,
+        blobs,
         key,
         &version,
-        Some(staged.storage_path.clone()),
-        staged.etag.clone(),
-        staged.size_logical,
+        data,
+        now,
+        Some(dek.into()),
+    )
+    .await;
+    let mut row = version_row(
+        Some(&plan),
+        key,
+        &version,
+        Some(path),
+        etag,
+        size,
         false,
         ReplicationStatus::Pending,
         now,
@@ -1312,12 +1428,18 @@ async fn put_encrypted_with_outbox(
         now,
         0,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     version
@@ -1329,14 +1451,23 @@ async fn encrypted_version_replicates_plaintext_not_ciphertext() {
     // received the stored ciphertext at exactly the plaintext length — a mirror that answers 200
     // with garbage. Now the engine unseals `sse_descriptor` and ships the plaintext.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = CapturingSink::default();
     let router = SingleSink(sink);
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
-    let version =
-        put_encrypted_with_outbox(&meta, &blobs, "e1", "secret.txt", b"attack at dawn", now).await;
+    let version = put_encrypted_with_outbox(
+        &fixture,
+        &meta,
+        &blobs,
+        "e1",
+        "secret.txt",
+        b"attack at dawn",
+        now,
+    )
+    .await;
 
     let report = engine()
         .run_once(&meta, &router, &blobs, &clock)
@@ -1363,13 +1494,22 @@ async fn an_unknown_key_id_is_unavailable_and_preserves_the_attempt_budget() {
     // and silently stop the whole bucket replicating. And nothing may be shipped on the error path
     // — no ciphertext egress.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(CapturingSink::default());
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
-    let version =
-        put_encrypted_with_outbox(&meta, &blobs, "e2", "secret.txt", b"attack at dawn", now).await;
+    let version = put_encrypted_with_outbox(
+        &fixture,
+        &meta,
+        &blobs,
+        "e2",
+        "secret.txt",
+        b"attack at dawn",
+        now,
+    )
+    .await;
 
     let engine = engine_with_crypto(Arc::new(UnknownKeyCrypto));
     for _ in 0..5 {
@@ -1431,6 +1571,7 @@ async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not()
         (Some(r#","mode":"at-rest""#), false),
     ] {
         let meta = InMemoryMetadataStore::new();
+        let fixture = begin_replication_fixture(&meta).await;
         let blobs = Arc::new(InMemoryBlobStore::new());
         let router = SingleSink(CapturingSink::default());
         let clock = TestClock::at_secs(1_000);
@@ -1441,28 +1582,25 @@ async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not()
             Some(extra) => format!("{}{extra}}}", descriptor.trim_end_matches('}')),
             None => descriptor,
         };
-        let staged = blobs
-            .stage(
-                &bucket(),
-                body(b"attack at dawn"),
-                StageOptions {
-                    compression: None,
-                    extra_checksums: ChecksumSet::none(),
-                    size_ceiling: 1 << 30,
-                    content_type: "text/plain".to_owned(),
-                    encryption: Some(dek.into()),
-                    content_length: None,
-                },
-            )
-            .await
-            .unwrap();
         let version = VersionId::generate();
-        let mut row = version_row(
+        let (path, etag, size, plan) = stage_blob(
+            &fixture,
+            &meta,
+            &blobs,
             "secret.txt",
             &version,
-            Some(staged.storage_path.clone()),
-            staged.etag.clone(),
-            staged.size_logical,
+            b"attack at dawn",
+            now,
+            Some(dek.into()),
+        )
+        .await;
+        let mut row = version_row(
+            Some(&plan),
+            "secret.txt",
+            &version,
+            Some(path),
+            etag,
+            size,
             false,
             ReplicationStatus::Pending,
             now,
@@ -1479,12 +1617,18 @@ async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not()
             now,
             0,
         );
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: InitialObjectState::default(),
-            replication: vec![entry],
-        })
+        meta.submit(
+            PublicationFixture::publication(
+                plan,
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: vec![entry],
+                },
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -1506,11 +1650,22 @@ async fn an_unencrypted_version_is_not_flagged_client_encrypted() {
     // The common case must stay `false`, or every plaintext object would start being gated on an
     // http:// endpoint.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(CapturingSink::default());
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
-    put_with_outbox(&meta, &blobs, "p1", "plain.txt", b"hello", now, now).await;
+    put_with_outbox(
+        &fixture,
+        &meta,
+        &blobs,
+        "p1",
+        "plain.txt",
+        b"hello",
+        now,
+        now,
+    )
+    .await;
     let report = engine()
         .run_once(&meta, &router, &blobs, &clock)
         .await
@@ -1525,13 +1680,22 @@ async fn a_tampered_or_unopenable_dek_is_terminal() {
     // An AEAD failure can never succeed on retry: fail it fast and loudly rather than burning eight
     // attempts. Still fail-CLOSED — the sink is never contacted.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(CapturingSink::default());
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
-    let version =
-        put_encrypted_with_outbox(&meta, &blobs, "e3", "secret.txt", b"attack at dawn", now).await;
+    let version = put_encrypted_with_outbox(
+        &fixture,
+        &meta,
+        &blobs,
+        "e3",
+        "secret.txt",
+        b"attack at dawn",
+        now,
+    )
+    .await;
 
     let report = engine_with_crypto(Arc::new(TamperedCrypto))
         .run_once(&meta, &router, &blobs, &clock)
@@ -1552,14 +1716,19 @@ async fn a_tampered_or_unopenable_dek_is_terminal() {
 async fn a_malformed_sse_descriptor_is_terminal() {
     // A descriptor that does not parse is permanently unreadable — not a transient condition.
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(CapturingSink::default());
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
-    let (path, etag, size) = stage_blob(&blobs, b"plain").await;
     let version = VersionId::generate();
+    let (path, etag, size, plan) = stage_blob(
+        &fixture, &meta, &blobs, "bad.txt", &version, b"plain", now, None,
+    )
+    .await;
     let mut row = version_row(
+        Some(&plan),
         "bad.txt",
         &version,
         Some(path),
@@ -1581,12 +1750,18 @@ async fn a_malformed_sse_descriptor_is_terminal() {
         now,
         0,
     );
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(row),
-        precondition: Precondition::default(),
-        initial_state: InitialObjectState::default(),
-        replication: vec![entry],
-    })
+    meta.submit(
+        PublicationFixture::publication(
+            plan,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: vec![entry],
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
 
@@ -1616,11 +1791,13 @@ impl Clock for TickingClock {
 #[tokio::test]
 async fn replicated_at_is_stamped_at_ship_completion_not_batch_start() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let router = SingleSink(FakeReplicationSink::new());
     let clock = TickingClock(std::sync::atomic::AtomicI64::new(1_000_000));
 
     let version = put_with_outbox(
+        &fixture,
         &meta,
         &blobs,
         "e1",
@@ -1656,8 +1833,10 @@ async fn replicated_at_is_stamped_at_ship_completion_not_batch_start() {
 #[tokio::test]
 async fn memory_replication_attempts_are_fenced() {
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = InMemoryBlobStore::new();
     let v = put_with_outbox(
+        &fixture,
         &meta,
         &blobs,
         "seed",
@@ -1718,10 +1897,21 @@ impl BucketRoutedSink for HeldSink {
 async fn heartbeat_renews_active_and_waiting_entries_and_cancels_on_loss() {
     for loss in 0..3 {
         let meta = Arc::new(InMemoryMetadataStore::new());
+        let fixture = begin_replication_fixture(&meta).await;
         let blobs = Arc::new(InMemoryBlobStore::new());
         let clock = Arc::new(TestClock::at_secs(1_000));
         for (id, key) in [("first", "a"), ("waiting", "b")] {
-            put_with_outbox(&meta, &blobs, id, key, b"bytes", clock.now(), clock.now()).await;
+            put_with_outbox(
+                &fixture,
+                &meta,
+                &blobs,
+                id,
+                key,
+                b"bytes",
+                clock.now(),
+                clock.now(),
+            )
+            .await;
         }
         let sink = Arc::new(HeldSink {
             started: tokio::sync::Notify::new(),
@@ -1824,9 +2014,11 @@ impl BucketRoutedSink for ClockJumpSink<'_> {
 async fn every_delivery_result_checks_completion_time_ownership() {
     for failure in 0..4 {
         let meta = InMemoryMetadataStore::new();
+        let fixture = begin_replication_fixture(&meta).await;
         let blobs = Arc::new(InMemoryBlobStore::new());
         let clock = TestClock::at_secs(1_000);
         let version = put_with_outbox(
+            &fixture,
             &meta,
             &blobs,
             "first",
@@ -1865,10 +2057,21 @@ async fn every_delivery_result_checks_completion_time_ownership() {
 #[tokio::test(start_paused = true)]
 async fn settlement_ack_loss_keeps_waiting_leases_alive_until_worker_cancellation() {
     let meta = Arc::new(InMemoryMetadataStore::new());
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let clock = Arc::new(TestClock::at_secs(1_000));
     for (id, key) in [("first", "a"), ("waiting", "b")] {
-        put_with_outbox(&meta, &blobs, id, key, b"bytes", clock.now(), clock.now()).await;
+        put_with_outbox(
+            &fixture,
+            &meta,
+            &blobs,
+            id,
+            key,
+            b"bytes",
+            clock.now(),
+            clock.now(),
+        )
+        .await;
     }
     meta.hang_next_replication_done_ack();
     let engine = engine();
@@ -1923,6 +2126,7 @@ async fn settlement_ack_loss_keeps_waiting_leases_alive_until_worker_cancellatio
 }
 
 async fn plant_remote_upload(
+    fixture: &PublicationFixture,
     meta: &InMemoryMetadataStore,
     blobs: &InMemoryBlobStore,
     now: Timestamp,
@@ -1932,6 +2136,7 @@ async fn plant_remote_upload(
         RemoteMultipartDestination, RemoteMultipartUpload, ReplicationUploadMutation as Op,
     };
     put_with_outbox(
+        fixture,
         meta,
         blobs,
         "remote-origin",
@@ -2006,9 +2211,10 @@ async fn plant_remote_upload(
 async fn remote_cleanup_renews_and_cancels_on_expired_ownership() {
     for lose in [false, true] {
         let meta = Arc::new(InMemoryMetadataStore::new());
+        let fixture = begin_replication_fixture(&meta).await;
         let blobs = Arc::new(InMemoryBlobStore::new());
         let clock = Arc::new(TestClock::at_secs(0));
-        plant_remote_upload(&meta, &blobs, clock.now(), true).await;
+        plant_remote_upload(&fixture, &meta, &blobs, clock.now(), true).await;
         let sink = Arc::new(HeldSink {
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
@@ -2079,9 +2285,10 @@ async fn remote_cleanup_renews_and_cancels_on_expired_ownership() {
 async fn unknown_remote_receipts_and_removed_targets_stay_observable_after_pruning() {
     for known in [false, true] {
         let meta = InMemoryMetadataStore::new();
+        let fixture = begin_replication_fixture(&meta).await;
         let blobs = Arc::new(InMemoryBlobStore::new());
         let clock = TestClock::at_secs(0);
-        plant_remote_upload(&meta, &blobs, clock.now(), known).await;
+        plant_remote_upload(&fixture, &meta, &blobs, clock.now(), known).await;
         let engine = ReplicationEngine::new(ReplicationOpts::default(), Arc::new(StubCrypto));
         assert!(
             engine
@@ -2173,9 +2380,11 @@ async fn plaintext_small_read_frame_survives_signed_http_delivery() {
     )
     .unwrap();
     let meta = InMemoryMetadataStore::new();
+    let fixture = begin_replication_fixture(&meta).await;
     let blobs = Arc::new(InMemoryBlobStore::new());
     let clock = TestClock::at_secs(2_000);
     put_with_outbox(
+        &fixture,
         &meta,
         &blobs,
         "small-frame",

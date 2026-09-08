@@ -19,6 +19,7 @@
 
 use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
+use cairn_types::testing::FixtureBlobStore;
 use cairn_types::traits::BlobStore;
 use cairn_types::{
     BlobCipher, BodyStream, BucketName, CompressionDescriptor, StageOptions, StoragePath,
@@ -106,9 +107,13 @@ async fn main() {
     let dir = tempfile::tempdir_in(".").unwrap();
     // Default store takes the fast path up to 256 KiB; the `slow` store forces the streamed read on
     // every size, so the two read the identical committed file and differ only by the read path.
-    let fast = Arc::new(LocalBlobStore::open(dir.path()).await.unwrap());
+    let fast = Arc::new(
+        LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap(),
+    );
     let slow = Arc::new(
-        LocalBlobStore::open(dir.path())
+        LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
             .unwrap()
             .with_small_read_max(0),
@@ -127,7 +132,7 @@ async fn main() {
     for &size in &[1usize, 4, 16, 64, 256] {
         let bytes = size * 1024;
         let staged = fast
-            .stage(
+            .stage_fixture(
                 &bkt,
                 body(vec![0x5a; bytes]),
                 StageOptions {

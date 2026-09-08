@@ -565,7 +565,8 @@ mod tests {
     use cairn_types::id::{BucketName, ObjectKey, StoragePath, UserId, VersionId};
     use cairn_types::meta::{Mutation, Precondition, ReplicationStatus};
     use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
-    use cairn_types::testing::InMemoryMetadataStore;
+    use cairn_types::storage::StorageToken;
+    use cairn_types::testing::{FixtureMetadataStore, InMemoryMetadataStore, PublicationFixture};
     use cairn_types::time::Timestamp;
     use cairn_types::traits::MetadataStore;
 
@@ -615,7 +616,9 @@ mod tests {
     /// is a post-fix write and must be invisible to the audit.
     const CUTOFF: Timestamp = Timestamp(1_000);
 
+    #[allow(clippy::too_many_arguments)]
     async fn seed_version(
+        fixture: &PublicationFixture,
         meta: &InMemoryMetadataStore,
         bucket: &str,
         key: &str,
@@ -624,6 +627,7 @@ mod tests {
         status: ReplicationStatus,
     ) {
         seed_version_at(
+            fixture,
             meta,
             bucket,
             key,
@@ -638,6 +642,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn seed_version_at(
+        fixture: &PublicationFixture,
         meta: &InMemoryMetadataStore,
         bucket: &str,
         key: &str,
@@ -649,7 +654,7 @@ mod tests {
         replicated_at: Option<Timestamp>,
     ) {
         let row = ObjectVersionRow {
-            id: format!("{bucket}-{key}-{version}"),
+            id: StorageToken::generate().as_str().to_owned(),
             bucket: BucketName::parse(bucket).unwrap(),
             key: ObjectKey::parse(key).unwrap(),
             version_id: VersionId::from_string(version.to_owned()),
@@ -664,7 +669,7 @@ mod tests {
             content_disposition: None,
             content_language: None,
             expires: None,
-            storage_path: Some(StoragePath::from_string(format!("{bucket}/{version}"))),
+            storage_path: Some(StoragePath::generate(&BucketName::parse(bucket).unwrap())),
             compression: CompressionDescriptor::Uncompressed,
             storage_class: StorageClass::Standard,
             cold_locator: None,
@@ -679,12 +684,15 @@ mod tests {
             created_at,
             updated_at: created_at,
         };
-        meta.submit(Mutation::PutObjectVersion {
-            row: Box::new(row),
-            precondition: Precondition::default(),
-            initial_state: cairn_types::InitialObjectState::default(),
-            replication: Vec::new(),
-        })
+        meta.submit_fixture(
+            fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                initial_state: cairn_types::InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     }
@@ -701,8 +709,10 @@ mod tests {
     #[tokio::test]
     async fn audit_separates_present_and_suspect_from_absent_and_ignores_plaintext() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "enc-done",
@@ -712,6 +722,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "enc-fail",
@@ -721,6 +732,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "plain",
@@ -746,8 +758,10 @@ mod tests {
     #[tokio::test]
     async fn audit_ignores_pending_and_replica_versions() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "a",
@@ -757,6 +771,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "b",
@@ -780,8 +795,10 @@ mod tests {
     #[tokio::test]
     async fn audit_ignores_buckets_without_an_enabled_rule() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "norule", None).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "norule",
             "k",
@@ -794,6 +811,7 @@ mod tests {
         let disabled = RULE_XML.replace("<Status>Enabled</Status>", "<Status>Disabled</Status>");
         seed_bucket(&meta, "off", Some(&disabled)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "off",
             "k",
@@ -813,8 +831,10 @@ mod tests {
     #[tokio::test]
     async fn audit_flags_a_rule_without_existing_object_replication() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -840,9 +860,11 @@ mod tests {
     #[tokio::test]
     async fn audit_counts_non_current_suspects_separately() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         // Two versions of one key: the second put demotes the first from `is_latest`.
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -852,6 +874,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -876,12 +899,14 @@ mod tests {
         let arn = "arn:cairn:replication:us-east-1:abc:mirror";
         let xml = RULE_XML.replace("arn:aws:s3:::mirror", arn);
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(&xml)).await;
         let targets = format!(
             r#"[{{"arn":"{arn}","endpoint":"http://mirror.internal:9000","region":"us-east-1","dest_bucket":"mirror","access_key_id":"AK","secret_ciphertext":[1],"nonce":[2]}}]"#
         );
         set_config(&meta, "src", ConfigAspect::ReplicationTargets, &targets).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -919,6 +944,7 @@ mod tests {
         let arn = "arn:cairn:replication:us-east-1:abc:mirror";
         let xml = RULE_XML.replace("arn:aws:s3:::mirror", arn);
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(&xml)).await;
         set_config(
             &meta,
@@ -930,6 +956,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -953,9 +980,11 @@ mod tests {
     #[tokio::test]
     async fn audit_honours_the_bucket_filter() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "one", Some(RULE_XML)).await;
         seed_bucket(&meta, "two", Some(RULE_XML)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "one",
             "k",
@@ -965,6 +994,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "two",
             "k",
@@ -987,9 +1017,11 @@ mod tests {
     #[tokio::test]
     async fn audit_respects_the_rule_prefix() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         let scoped = RULE_XML.replace("<Prefix></Prefix>", "<Prefix>mirrored/</Prefix>");
         seed_bucket(&meta, "src", Some(&scoped)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "mirrored/a",
@@ -999,6 +1031,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "private/b",
@@ -1021,9 +1054,11 @@ mod tests {
     #[tokio::test]
     async fn audit_excludes_versions_created_at_or_after_the_cutoff() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         // Written by the PRE-fix binary: damaged.
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "old",
@@ -1036,6 +1071,7 @@ mod tests {
         .await;
         // Written exactly AT the cutoff, and after it: shipped through the DEK-aware path, healthy.
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "at",
@@ -1047,6 +1083,7 @@ mod tests {
         )
         .await;
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "new",
@@ -1073,8 +1110,10 @@ mod tests {
         // And the whole point: once every pre-cutoff version is repaired away, the signal is ZERO.
         // An unbounded predicate would still be reporting the two healthy post-fix versions here.
         let clean = InMemoryMetadataStore::new();
+        let fixture_clean = clean.begin_fixture().await.unwrap();
         seed_bucket(&clean, "src", Some(RULE_XML)).await;
         seed_version_at(
+            &fixture_clean,
             &clean,
             "src",
             "new",
@@ -1108,10 +1147,12 @@ mod tests {
     #[tokio::test]
     async fn audit_drops_a_repaired_version_so_the_gauge_can_reach_zero() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         // Damaged: created before the cutoff, and last shipped before it too (or never — a pre-v23
         // row). This is what the gauge must count.
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "damaged",
@@ -1131,8 +1172,10 @@ mod tests {
         // Now REPAIR it: same row, same `created_at` (nothing rewrites it), re-shipped correctly
         // after the cutoff so `MarkReplicationDone` stamped a fresh `replicated_at`.
         let repaired = InMemoryMetadataStore::new();
+        let fixture_repaired = repaired.begin_fixture().await.unwrap();
         seed_bucket(&repaired, "src", Some(RULE_XML)).await;
         seed_version_at(
+            &fixture_repaired,
             &repaired,
             "src",
             "damaged",
@@ -1164,8 +1207,10 @@ mod tests {
     #[tokio::test]
     async fn audit_treats_a_null_replicated_at_as_suspect() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "pre-v23",
@@ -1190,8 +1235,10 @@ mod tests {
     #[tokio::test]
     async fn audit_counts_in_flight_repair_separately_from_clean() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "queued",
@@ -1201,6 +1248,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "claimed",
@@ -1212,6 +1260,7 @@ mod tests {
         // A post-cutoff pending version is ordinary live work, NOT repair, and must not inflate the
         // repair gauge — otherwise the "done" condition never holds on a busy node.
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "live",
@@ -1245,12 +1294,14 @@ mod tests {
     #[tokio::test]
     async fn repair_pending_reaches_zero_after_a_forced_requeue_drains() {
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         // One key, two encrypted versions, both `completed` and both damaged. Neither has an outbox
         // row: 24 h after the incident the retention sweep has taken them all, which is the case
         // the runbook is actually written for.
         for v in ["v1", "v2"] {
             seed_version(
+                &fixture_meta,
                 &meta,
                 "src",
                 "k",
@@ -1290,6 +1341,7 @@ mod tests {
         // The repair ships. `MarkReplicationDone` stamps `replicated_at` past the cutoff, so the
         // repaired version leaves the population entirely instead of returning to the suspect count.
         seed_version_at(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -1343,9 +1395,11 @@ mod tests {
         }
 
         let meta = InMemoryMetadataStore::new();
+        let fixture_meta = meta.begin_fixture().await.unwrap();
         seed_bucket(&meta, "src", Some(RULE_XML)).await;
         // Two versions of one key: the second put demotes the first from `is_latest`.
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
@@ -1355,6 +1409,7 @@ mod tests {
         )
         .await;
         seed_version(
+            &fixture_meta,
             &meta,
             "src",
             "k",
