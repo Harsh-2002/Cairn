@@ -77,6 +77,22 @@ fn wal_bytes(root: &Path) -> Result<u64, Error> {
     }
 }
 
+async fn periodic_checkpoint(
+    store: &SqliteMetadataStore,
+    observation: &mut WriterObservation,
+) -> Result<(), Error> {
+    observation.checkpoint_attempts += 1;
+    let checkpoint = store.checkpoint().await?;
+    if checkpoint.busy {
+        // A live WAL reader may temporarily block truncation. Leave the next observation
+        // eligible to retry; the coordinator still enforces the deadline and space ceiling.
+        observation.checkpoint_busy += 1;
+    } else {
+        observation.checkpoint_completed += 1;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct FamilyStats {
     successful: Histogram,
@@ -161,12 +177,9 @@ where
                 observation.peak_wal_bytes = observation.peak_wal_bytes.max(bytes);
                 // The server owns a periodic checkpoint loop. The lab must explicitly run
                 // the same canonical Writer control seam to avoid unbounded WAL growth.
-                if !deadline_reached && failure.is_none() && bytes >= 64 * 1024 * 1024 {
-                    match store.checkpoint().await {
-                        Ok(checkpoint) if !checkpoint.busy => {},
-                        Ok(_) => {failure = Some("metadata checkpoint remained busy".into());},
-                        Err(error) => {failure = Some(error.into());}
-                    }
+                if !deadline_reached && failure.is_none() && bytes >= 64 * 1024 * 1024
+                    && let Err(error) = periodic_checkpoint(store, &mut observation).await {
+                    failure = Some(error);
                 }
             }
         }
@@ -396,6 +409,8 @@ async fn run(config: Config) -> Result<(), Error> {
         "before_checkpoint":before_checkpoint,"checkpoint_seconds":checkpoint_seconds,
         "post_checkpoint_wal_bytes":post_checkpoint_wal,"reopen_seconds":reopen_seconds,
         "reopen_writer":reopen_observation,"reopen_quota":reopen_quota,"final_database":final_database,
+        "cache_observations":{"application_cache":"absent","sqlite_hits":null,"sqlite_misses":null,
+            "reason":"canonical store exposes configured cache sizes, not per-connection cache-status counters"},
         "total_seconds":start.elapsed().as_secs_f64(),"physical_objects":"not_created_metadata_only"}),
     );
     Ok(())
@@ -427,5 +442,66 @@ async fn main() -> Result<(), Error> {
             emit(json!({"event":"error","status":status,"reason":reason}));
             std::process::exit(if status == "INCONCLUSIVE" { 2 } else { 1 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::{
+        Bucket, BucketName, MetadataStore, Mutation, OwnershipMode, Timestamp, UserId,
+        VersioningState,
+    };
+
+    #[tokio::test]
+    async fn periodic_checkpoint_retries_after_a_real_wal_reader_releases_its_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("metadata.sqlite3");
+        let store = cairn_meta::open(&path, &options()).unwrap();
+        let bucket = |name: &str| {
+            Mutation::CreateBucket(Box::new(Bucket {
+                name: BucketName::parse(name).unwrap(),
+                owner_id: UserId("checkpoint-owner".to_owned()),
+                created_at: Timestamp(1),
+                versioning: VersioningState::Enabled,
+                ownership_mode: OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".to_owned(),
+                compression: None,
+            }))
+        };
+        store.submit(bucket("checkpoint-first")).await.unwrap();
+        assert!(!store.checkpoint().await.unwrap().busy);
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let count = || {
+            reader
+                .query_row("SELECT count(*) FROM buckets", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        store.submit(bucket("checkpoint-second")).await.unwrap();
+        assert_eq!(count(), 1, "the reader must still own the old snapshot");
+        assert!(wal_bytes(root.path()).unwrap() > 0);
+
+        let mut observation = WriterObservation::start(&store);
+        periodic_checkpoint(&store, &mut observation).await.unwrap();
+        periodic_checkpoint(&store, &mut observation).await.unwrap();
+        assert_eq!(observation.checkpoint_attempts, 2);
+        assert_eq!(observation.checkpoint_busy, 2);
+        assert_eq!(observation.checkpoint_completed, 0);
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        periodic_checkpoint(&store, &mut observation).await.unwrap();
+        assert_eq!(observation.checkpoint_attempts, 3);
+        assert_eq!(observation.checkpoint_busy, 2);
+        assert_eq!(observation.checkpoint_completed, 1);
+        assert_eq!(wal_bytes(root.path()).unwrap(), 0);
+        assert!(!store.checkpoint_and_close().await.unwrap().busy);
     }
 }

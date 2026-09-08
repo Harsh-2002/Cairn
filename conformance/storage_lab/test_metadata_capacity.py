@@ -34,6 +34,7 @@ def histogram(count):
 def writer(occupancy=9., queue=.9):
     return {"dropped_at_start": 0, "dropped_at_end": 0, "queue_samples": 100,
             "queue_nonempty_samples": round(queue * 100), "queue_max": 32, "peak_wal_bytes": 1000,
+            "checkpoint_attempts": 0, "checkpoint_busy": 0, "checkpoint_completed": 0,
             "stages": {name: {"count": 200, "sum_seconds": occupancy / 3,
                                "max_seconds": .02, "failed": 0} for name in ("begin", "apply", "commit")}}
 
@@ -103,6 +104,18 @@ class MetadataCapacityTests(unittest.TestCase):
             result = assess(arms(**changes))
             self.assertEqual(result["status"], "PASS", result)
             self.assertEqual(result["writer_limit"], "NO demonstrated Writer limit")
+
+    def test_busy_checkpoint_retries_require_complete_outcome_counts(self):
+        values = arms()
+        observed = values[0]["records"][3]["report"]["writer"]
+        observed.update(checkpoint_attempts=3, checkpoint_busy=2, checkpoint_completed=1)
+        self.assertEqual(assess(values)["status"], "PASS")
+        for changes in ({"checkpoint_attempts": 2}, {"checkpoint_busy": -1},
+                        {"checkpoint_completed": True}, {"checkpoint_attempts": None}):
+            invalid = copy.deepcopy(values)
+            invalid[0]["records"][3]["report"]["writer"].update(changes)
+            with self.subTest(changes=changes):
+                self.assertEqual(assess(invalid)["status"], "INCONCLUSIVE")
 
     def test_qualifying_single_population_is_scoped_and_hot_c4_control_is_required(self):
         values = arms()
@@ -194,6 +207,7 @@ class MetadataCapacityTests(unittest.TestCase):
                 else:
                     self.assertIsNone(campaign.ledger["active"])
                     self.assertFalse((campaign.root / report["id"] / "data").exists())
+                return report
             finally: campaign.close()
 
     @unittest.skipUnless(os.environ.get("LAB_TEST_METADATA_DRIVER"),
@@ -302,6 +316,35 @@ class MetadataCapacityTests(unittest.TestCase):
                   "for record in records(c): print(json.dumps(record))\n")
         self.run_fake(script, "PASS")
         self.run_fake(script, "INCONCLUSIVE", late_overflow=True)
+
+    def test_final_cpu_is_read_after_exit_before_reaping(self):
+        import metadata_capacity
+        real_sample = metadata_capacity.process_sample
+        real_final = metadata_capacity.final_process_cpu_ticks
+        final_ticks = []
+
+        def stale_sample(pid):
+            observation = real_sample(pid)
+            observation["process_cpu_ticks"] = 0
+            return observation
+
+        def terminal_sample(pid):
+            # The real helper refuses live tasks and disappears after the child is reaped.
+            ticks = real_final(pid)
+            self.assertGreater(ticks, 0)
+            final_ticks.append(ticks)
+            return ticks
+
+        harness = str(Path(__file__).resolve().parent)
+        script = (f"sys.path.insert(0, {harness!r})\nfrom test_metadata_capacity import records\n"
+                  "import time\nend=time.process_time()+.03\nwhile time.process_time()<end: pass\n"
+                  "for record in records(c): print(json.dumps(record))\n")
+        with patch("metadata_capacity.process_sample", side_effect=stale_sample), \
+                patch("metadata_capacity.final_process_cpu_ticks", side_effect=terminal_sample):
+            report = self.run_fake(script, "PASS")
+        self.assertEqual(len(final_ticks), len(MATRIX))
+        self.assertEqual([arm["process_cpu_seconds"] for arm in report["arms"]],
+                         [ticks / os.sysconf("SC_CLK_TCK") for ticks in final_ticks])
 
     def test_owned_invalid_failure_and_deadline_outputs_clean_and_charge(self):
         self.run_fake("print('{}')\n", "INCONCLUSIVE")

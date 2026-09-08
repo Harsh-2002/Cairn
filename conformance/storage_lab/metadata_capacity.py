@@ -72,6 +72,11 @@ def validate_writer(writer, *, expected_apply_rejections=False):
         raise Unavailable("impossible Writer queue counts")
     count(writer.get("queue_max"), "queue maximum")
     count(writer.get("peak_wal_bytes"), "peak WAL bytes")
+    attempts = count(writer.get("checkpoint_attempts"), "checkpoint attempts")
+    busy = count(writer.get("checkpoint_busy"), "busy checkpoint attempts")
+    completed = count(writer.get("checkpoint_completed"), "completed checkpoints")
+    if attempts != busy + completed:
+        raise Unavailable("periodic checkpoint attempts do not match observed outcomes")
     stages = writer.get("stages")
     if not isinstance(stages, dict):
         raise Unavailable("missing Writer stage map")
@@ -321,6 +326,15 @@ def process_sample(pid):
             "observer_cpu_seconds": time.process_time()}
 
 
+def final_process_cpu_ticks(pid):
+    # Child.exited uses WNOWAIT: the terminal task remains inspectable until stop reaps it.
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields = stat[stat.rindex(")") + 2:].split()
+    if fields[0] != "Z":
+        raise Unavailable("final driver CPU requires an exited, unreaped process")
+    return int(fields[11]) + int(fields[12])
+
+
 def run_comparison(args, campaign):
     validate_args(args)
     prior = sum(run.get("elapsed_seconds", run["reserved_seconds"]) for run in campaign.ledger["runs"] if run["phase"] == "metadata")
@@ -408,6 +422,12 @@ def run_comparison(args, campaign):
                         peak_fds = max(peak_fds, observation["fds"])
                     final_ticks = observation["process_cpu_ticks"]
                     if driver.exited() is not None:
+                        final_ticks = final_process_cpu_ticks(driver.process.pid)
+                        stream.write(json.dumps({"event": "process_exit", "monotonic": time.monotonic(),
+                                                 "process_cpu_ticks": final_ticks}) + "\n")
+                        stream.flush()
+                        if stream.tell() > SAMPLE_LIMIT // len(MATRIX):
+                            raise Unavailable("bounded metadata process observations exceeded")
                         break
                     time.sleep(.05)
             outcome = driver.exited()

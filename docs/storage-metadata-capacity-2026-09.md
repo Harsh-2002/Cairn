@@ -81,12 +81,15 @@ semantic/migration/restore parity and the human architectural decision.
 
 ## Fixed-fixture validation
 
-Seven Rust metadata tests and all-target laboratory Clippy pass. Coverage includes the full
+Nine Rust metadata tests and all-target laboratory Clippy pass. Coverage includes the full
 mutation-family mix, 128 concurrent owners, a stable 1,024-key scattered ring, exact seed identity,
-quota/debt preservation and fresh FULL reopen. All eleven Python coordinator tests pass, including
+quota/debt preservation and fresh FULL reopen. All thirteen Python coordinator tests pass, including
 the actual 100-row CLI with all eighteen outcome families and no residual SQLite sidecars after
 close. The CLI fixture exposed and pinned a reporting-order fix: read-only size observation now
 precedes the final database close. It cannot reopen the database and recreate sidecars afterward.
+A retained WAL reader regression requires busy checkpoint attempts to remain eligible for retry
+and verifies truncation after reader release. Seed failure closes fresh admission and drains all
+started owners. The coordinator reads final process CPU after exit and before reaping.
 These are correctness checks, not the 100,000-row capacity experiment or a Writer-limit finding.
 The integrated full repository and final-head CI gates remain pending.
 
@@ -95,3 +98,8 @@ the runtime. Each worker has at most eighteen pairs of fixed 2,048-bin histogram
 of bin storage), plus bounded counters/map entries. It is not a measurement of SQLite-only RSS.
 Configured SQLite caches, actual Writer thread CPU, process CPU and database/index/WAL bytes are
 reported separately; no process-wide counter is relabeled as pure SQLite engine cost.
+
+SQLite connection-level cache-hit/miss counters are unavailable through the canonical store's
+public API and are recorded as unavailable. A new observer connection would describe its own
+cache, so it cannot stand in for the Writer/read-pool counters. Cache capacities are controlled
+and reported; no hit-rate, cache-cold or cache-only attribution claim follows from them.

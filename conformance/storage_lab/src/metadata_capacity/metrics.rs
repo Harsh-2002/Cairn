@@ -112,6 +112,9 @@ pub struct WriterObservation {
     pub queue_nonempty_samples: u64,
     pub queue_max: usize,
     pub peak_wal_bytes: u64,
+    pub checkpoint_attempts: u64,
+    pub checkpoint_busy: u64,
+    pub checkpoint_completed: u64,
 }
 
 impl WriterObservation {

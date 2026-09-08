@@ -11,7 +11,7 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::time::Instant;
 
@@ -211,6 +211,42 @@ fn row(bucket: &BucketName, key: ObjectKey, version_id: VersionId) -> ObjectVers
     }
 }
 
+/// Close fresh-key admission on the first failure, while retaining every started owner's
+/// future until it settles. The flag is set inside the owner, before refilling the stream.
+async fn seed_owners<F, Fut>(keys: u64, work: F) -> Result<(), String>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let failed = AtomicBool::new(false);
+    let results = stream::iter(0..keys)
+        .take_while(|_| std::future::ready(!failed.load(Ordering::Acquire)))
+        .map(|index| {
+            let failed = &failed;
+            let work = &work;
+            async move {
+                // A slot can be buffered before another owner fails but not yet admitted.
+                if failed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let result = work(index).await;
+                if result.is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+                result
+            }
+        })
+        .buffer_unordered(32);
+    tokio::pin!(results);
+    let mut first_error = None;
+    while let Some(result) = results.next().await {
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 pub async fn prepare(
     store: Arc<SqliteMetadataStore>,
     bucket_count: usize,
@@ -261,58 +297,44 @@ pub async fn prepare(
             .await?;
     }
     // Only 32 in-flight keys; no seed-row inventory survives preparation.
-    let first_error = {
-        let results = stream::iter(0..seed_rows * 9 / 10)
-            .map(|index| {
-                let fixture = &fixture;
-                async move {
-                    before(deadline)?;
-                    let bucket = &fixture.buckets[index as usize % fixture.buckets.len()];
-                    let key = seed_key(index);
-                    if index >= seed_rows * 8 / 10 {
-                        fixture.marker(bucket, &key, seed_version(index, 0)).await?;
-                    } else {
-                        let mut observations = OperationResult::default();
-                        if index < seed_rows / 10 {
-                            fixture
-                                .put(
-                                    row(bucket, key.clone(), seed_version(index, 0)),
-                                    Precondition::default(),
-                                    false,
-                                    Family::VersionAppend,
-                                    deadline,
-                                    &mut observations,
-                                )
-                                .await?;
-                        }
-                        fixture
-                            .put(
-                                row(bucket, key, seed_version(index, 1)),
-                                Precondition::default(),
-                                false,
-                                Family::VersionAppend,
-                                deadline,
-                                &mut observations,
-                            )
-                            .await?;
-                    }
-                    fixture.cleanup_page().await?;
-                    Ok::<_, String>(())
+    seed_owners(seed_rows * 9 / 10, |index| {
+        let fixture = &fixture;
+        async move {
+            before(deadline)?;
+            let bucket = &fixture.buckets[index as usize % fixture.buckets.len()];
+            let key = seed_key(index);
+            if index >= seed_rows * 8 / 10 {
+                fixture.marker(bucket, &key, seed_version(index, 0)).await?;
+            } else {
+                let mut observations = OperationResult::default();
+                if index < seed_rows / 10 {
+                    fixture
+                        .put(
+                            row(bucket, key.clone(), seed_version(index, 0)),
+                            Precondition::default(),
+                            false,
+                            Family::VersionAppend,
+                            deadline,
+                            &mut observations,
+                        )
+                        .await?;
                 }
-            })
-            .buffer_unordered(32);
-        tokio::pin!(results);
-        let mut first_error = None;
-        while let Some(result) = results.next().await {
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
+                fixture
+                    .put(
+                        row(bucket, key, seed_version(index, 1)),
+                        Precondition::default(),
+                        false,
+                        Family::VersionAppend,
+                        deadline,
+                        &mut observations,
+                    )
+                    .await?;
             }
+            fixture.cleanup_page().await?;
+            Ok(())
         }
-        first_error
-    };
-    if let Some(error) = first_error {
-        return Err(error);
-    }
+    })
+    .await?;
     for (index, bucket) in fixture.buckets.iter().enumerate() {
         before(deadline)?;
         let upload = session_id(seed, index, true);
@@ -1277,7 +1299,7 @@ mod tests {
                     Ok::<_, String>(())
                 }
             })
-            .buffer_unordered(32)
+            .buffer_unordered(128)
             .collect::<Vec<_>>()
             .await;
         for result in results {
@@ -1298,6 +1320,47 @@ mod tests {
             .await
             .unwrap();
     }
+    #[tokio::test]
+    async fn seed_failure_closes_admission_and_joins_all_started_owners() {
+        use futures_util::FutureExt;
+        let started = AtomicU64::new(0);
+        let settled = AtomicU64::new(0);
+        let admitted = tokio::sync::Barrier::new(32);
+        let release = tokio::sync::Semaphore::new(0);
+        let mut preparation = Box::pin(seed_owners(90_000, |index| {
+            let (started, settled, admitted, release) = (&started, &settled, &admitted, &release);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                admitted.wait().await;
+                if index == 0 {
+                    settled.fetch_add(1, Ordering::SeqCst);
+                    return Err("injected first seed failure".to_owned());
+                }
+                let _permit = release.acquire().await.unwrap();
+                settled.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+        for _ in 0..64 {
+            assert!(preparation.as_mut().now_or_never().is_none());
+            if settled.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 32);
+        assert_eq!(settled.load(Ordering::SeqCst), 1);
+        // Failure must not return by dropping the other admitted owners. Release them only
+        // after checking the pending state, then demand all acknowledgements before return.
+        release.add_permits(31);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), preparation)
+            .await
+            .expect("bounded mock owners should settle");
+        assert_eq!(result, Err("injected first seed failure".to_owned()));
+        assert_eq!(started.load(Ordering::SeqCst), 32);
+        assert_eq!(settled.load(Ordering::SeqCst), 32);
+    }
+
     #[tokio::test]
     async fn expired_admission_does_not_mutate_populated_fixture() {
         let store = Arc::new(cairn_meta::open_in_memory().unwrap());
