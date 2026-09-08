@@ -116,8 +116,9 @@ Measurement plus evidence export/owned cleanup charged **292.003397 seconds** to
 The campaign then stood at **1,210.642869 seconds**, with **1,778,102,272 bytes** peak combined
 footprint; its active reservation was empty. Original measurement data/processes/raw artifacts
 were removed after the checked archive was written. The resulting decision is **KEEP SQLite**
-while evaluating the explicitly qualified hot-bucket alternative; no production backend change
-or universal S3 bottleneck claim follows from this metadata-only trace.
+after the qualified hot-bucket alternative reached its preparation deadline: see
+[the final Phase 5B/5C decision](storage-metadata-alternative-2026-09.md#recorded-result-and-phase-5c-decision).
+No production backend change or universal S3 bottleneck claim follows from this metadata-only trace.
 
 ## Fixed-fixture validation
 

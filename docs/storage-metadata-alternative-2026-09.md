@@ -1,6 +1,8 @@
 # Conditional metadata comparison — Phase 5B
 
-This preregistration precedes alternative performance admission. The isolated adapter and its
+The preregistration below was committed before alternative performance admission. The recorded
+outcome is **INCONCLUSIVE / KEEP SQLite**: Fjall seed preparation reached its fixed deadline,
+so none of the ten paired load arms ran. See the recorded result at the end. The isolated adapter and its
 fixed correctness fixtures do not register an engine in Cairn or change the production lockfile.
 SQLite remains the production source of truth. The capability and migration gaps remain in
 [the engine comparison](storage-metadata-capabilities-2026-09.md).
@@ -126,3 +128,44 @@ evidence, charge actual time and keep SQLite. No automatic second attempt is aut
 Production adoption would additionally require complete semantic, migration, backup/restore,
 compatibility and operational parity and a human architectural decision. This experiment cannot
 change the production metadata ceiling, even if the bounded candidate qualifies.
+
+## Recorded result and Phase 5C decision
+
+[Machine-readable evidence](storage-metadata-alternative-2026-09.json) and the
+[bounded raw archive](storage-metadata-alternative-2026-09.raw.tar.gz) retain the exact source
+`5b3b95a325f6a6624bc979f6b9574a0f441be7e2`, binary/toolchain hashes, configurations, process
+samples and incomplete outcome. Both engines used that same optimized executable.
+
+SQLite completed preparation, full seed/quota verification, checkpoint and checked close in
+95.338541 seconds within its 100-second deadline. Fjall's preparation reached its fixed
+105-second deadline and returned `metadata workload deadline reached before admission`.
+The coordinator observed process exit after 105.441568 seconds. The incomplete candidate has
+no final verified seed or checked-close result; its process samples are retained as observations,
+not treated as a completed engine comparison. Every owned process exited and all temporary
+databases and original artifacts were removed after archive verification.
+
+**Zero of ten load arms and zero of five pairs completed.** There is no paired throughput,
+protected-latency, memory-adoption or p99 conclusion. In particular, a preparation deadline is
+not evidence that Fjall is universally slower, that its native engine is the cause, or that
+SQLite is the optimal engine. No shortened workload or automatic retry followed the result.
+
+Phase 5C therefore concludes **KEEP SQLite**. Phase 5A demonstrated a serialized Writer service
+limit for the declared 100,000-row hot-bucket metadata trace. That occupancy includes application
+mutation work, fsync and scheduling; it does not isolate SQLite computation or establish the
+bottleneck of a full S3 request. The distributed population missed its declared queue criterion.
+The conditional replacement experiment supplied no qualifying benefit. Production semantics,
+migration, backup/restore, physical recovery and power-loss parity remain unproven for the
+laboratory candidate, and production metadata dependencies remain unchanged.
+
+Comparison plus evidence export/cleanup charged **204.772213 seconds**; cumulative metadata
+consumption is **496.775609 / 600 seconds**. The complete campaign stands at
+**1,415.415082 / 3,600 seconds**, with **1,778,102,272 / 100,000,000,000 bytes** recorded peak
+combined footprint and no active reservation. Unused allowance does not authorize a changed
+experiment or another attempt.
+
+The full local root gate passed, including both Clippy configurations, 1,466 default and 1,492
+all-feature tests, two doctests, web lint/build/audits, dependency audits and installer checks.
+The final adapter/coordinator sources pass 98 laboratory Rust tests (one ignored child helper)
+and all 104 Python tests with every live fixture enabled. These are correctness results,
+separate from the inconclusive bounded performance comparison. Final-commit CI and integration
+remain required.

@@ -1,0 +1,622 @@
+{
+  "campaign": {
+    "active": null,
+    "export_and_cleanup_charged_seconds": 1.0396122317761183,
+    "finalization_allowance_seconds": 1,
+    "peak_bytes": 1778102272,
+    "spent_after_export_seconds": 1415.4150819499046,
+    "spent_before_export_seconds": 1414.3754697181284
+  },
+  "export_procedure_python": "#!/usr/bin/env python3\n\"\"\"Retain completed measurement evidence, charging bounded archival and cleanup.\"\"\"\nimport argparse\nimport hashlib\nimport json\nimport math\nimport os\nfrom pathlib import Path\nimport stat\nimport sys\nimport tarfile\nimport time\n\nparser = argparse.ArgumentParser()\nparser.add_argument('--checkout', required=True)\nparser.add_argument('--identity', required=True)\nparser.add_argument('--phase', choices=('packing', 'metadata'), required=True)\nparser.add_argument('--stem', required=True)\nparser.add_argument('--kind', choices=('packing-measurement', 'metadata', 'metadata_alternative'))\nargs = parser.parse_args()\ncheckout = Path(args.checkout).resolve(strict=True)\nsys.path.insert(0, str(checkout / 'conformance/storage_lab'))\nfrom budget import Campaign, atomic_json, footprint, remove_tree, valid_token\nif not valid_token(args.identity) or Path(args.stem).name != args.stem:\n    raise ValueError('exact run identity and simple output stem required')\ncampaign = Campaign('/SSD/dev/cairn-storage-campaign')\nprior_phase = sum(run.get('elapsed_seconds', run['reserved_seconds']) for run in campaign.ledger['runs'] if run['phase'] == args.phase)\nallowance = min(30, math.floor({'packing': 1080, 'metadata': 600}[args.phase] - prior_phase))\nif allowance < 3:\n    raise RuntimeError('insufficient phase allowance for evidence export')\nbefore = campaign.ledger['spent_seconds']\nreservation = campaign.admit(args.phase, allowance, 256 * 1024**2)\nstarted = time.monotonic()\nstatus, clean = 'FAIL', True\narchive = checkout / 'docs' / f'{args.stem}.raw.tar.gz'\ndestination = checkout / 'docs' / f'{args.stem}.json'\ntry:\n    report_path = campaign.root / f'{args.identity}.result.json'\n    if report_path.stat().st_size > 64 * 1024**2:\n        raise ValueError('bounded report exceeded')\n    report = json.loads(report_path.read_text())\n    expected_kind = args.kind or {'packing': 'packing-measurement', 'metadata': 'metadata'}[args.phase]\n    if report['id'] != args.identity or report['kind'] != expected_kind or not report['cleaned_data_and_processes']:\n        raise ValueError('measurement ownership and process/data cleanup must be complete')\n    if destination.exists() or archive.exists():\n        raise ValueError('refusing to replace existing retained evidence')\n    artifacts = campaign.root / args.identity / 'artifacts'\n    inventory = []\n    total_input = 0\n    with tarfile.open(archive, 'w:gz', compresslevel=3) as bundle:\n        for index, path in enumerate(sorted(artifacts.iterdir())):\n            if index >= 1024 or time.monotonic() > started + allowance - 3:\n                raise RuntimeError('bounded archival time/count exceeded')\n            info = path.lstat()\n            if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024**2:\n                raise ValueError('unexpected or oversized source artifact')\n            total_input += info.st_size\n            if total_input > 2 * 1024**3:\n                raise ValueError('bounded aggregate source evidence exceeded')\n            with path.open('rb') as source:\n                digest = hashlib.file_digest(source, 'sha256').hexdigest()\n            inventory.append({'name': path.name, 'bytes': info.st_size, 'sha256': digest})\n            bundle.add(path, arcname=path.name, recursive=False)\n            if archive.stat().st_size > 64 * 1024**2:\n                raise ValueError('bounded evidence archive exceeded')\n    with archive.open('rb') as source:\n        os.fsync(source.fileno())\n        archive_hash = hashlib.file_digest(source, 'sha256').hexdigest()\n    with tarfile.open(archive, 'r:gz') as bundle:\n        members = bundle.getmembers()\n        if [member.name for member in members] != [item['name'] for item in inventory]:\n            raise ValueError('archive member inventory mismatch')\n        for member, item in zip(members, inventory):\n            if time.monotonic() > started + allowance - 2:\n                raise RuntimeError('bounded archive verification time exceeded')\n            with bundle.extractfile(member) as source:\n                if hashlib.file_digest(source, 'sha256').hexdigest() != item['sha256']:\n                    raise ValueError('archive content hash mismatch')\n    evidence = {'measurement': report, 'raw_evidence': {'archive': archive.name, 'sha256': archive_hash,\n                'bytes': archive.stat().st_size, 'uncompressed_bytes': total_input, 'files': inventory},\n                'export_procedure_python': Path(__file__).read_text(),\n                'campaign': {'spent_before_export_seconds': before},\n                'owned_measurement_artifacts_removed': False}\n    projected = len(json.dumps(evidence).encode()) + 65536\n    campaign.ledger['peak_bytes'] = max(campaign.ledger['peak_bytes'], footprint(campaign.root) + archive.stat().st_size + projected * 2)\n    atomic_json(destination, evidence)\n    clean = False\n    remove_tree(campaign.root / args.identity, started + allowance - 1)\n    clean = True\n    evidence['owned_measurement_artifacts_removed'] = True\n    charged = time.monotonic() - started + 1\n    campaign.finish(charged, 'PASS', clean=True)\n    evidence['campaign'].update(spent_after_export_seconds=campaign.ledger['spent_seconds'],\n                                export_and_cleanup_charged_seconds=charged,\n                                finalization_allowance_seconds=1,\n                                peak_bytes=campaign.ledger['peak_bytes'], active=campaign.ledger['active'])\n    atomic_json(destination, evidence)\n    if time.monotonic() - started > charged:\n        raise RuntimeError('finalization exceeded charged allowance')\n    status = 'PASS'\n    print(json.dumps({'status': status, 'destination': str(destination), 'archive_bytes': archive.stat().st_size,\n                      'campaign': evidence['campaign']}))\nfinally:\n    if campaign.ledger['active'] is not None and campaign.ledger['active']['id'] == reservation:\n        campaign.finish(time.monotonic() - started + 1, status, clean=clean)\n    campaign.close()\n",
+  "measurement": {
+    "arms": [
+      {
+        "config": {
+          "action": "prepare",
+          "deadline_seconds": 100,
+          "engine": "sqlite",
+          "phase_seconds": 5,
+          "root": "/SSD/dev/cairn-storage-campaign/99a41f2321a843b7a15afa0a1b9bce82/data/sqlite",
+          "seed": 24301,
+          "seed_rows": 100000,
+          "ticks_per_second": 100
+        },
+        "coordinator_wall_seconds": 95.54194825794548,
+        "fd_samples_unavailable": 0,
+        "io_samples_unavailable": 1,
+        "peak_fds": 24,
+        "peak_rss_kib": 29856,
+        "process_cpu_seconds": 66.71,
+        "process_io_maxima": {
+          "cancelled_write_bytes": 0,
+          "rchar": 2172965728,
+          "read_bytes": 40960,
+          "syscr": 530411,
+          "syscw": 3030820,
+          "wchar": 6710301826,
+          "write_bytes": 6848069632
+        },
+        "process_sample_count": 1865,
+        "records": [
+          {
+            "config": {
+              "action": "prepare",
+              "deadline_seconds": 100,
+              "engine": "sqlite",
+              "phase_seconds": 5,
+              "root": "/SSD/dev/cairn-storage-campaign/99a41f2321a843b7a15afa0a1b9bce82/data/sqlite",
+              "seed": 24301,
+              "seed_rows": 100000,
+              "ticks_per_second": 100
+            },
+            "event": "opened",
+            "open_seconds": 0.055165275
+          },
+          {
+            "event": "prepared",
+            "expected": {
+              "auxiliary_part_bytes": 64,
+              "auxiliary_parts": 1,
+              "auxiliary_sessions": 1,
+              "current_data_rows": 80000,
+              "current_delete_markers": 10000,
+              "historical_data_rows": 10000,
+              "seed_logical_bytes": 11520000,
+              "seed_rows": 100000
+            },
+            "observation": {
+              "serialized_observed_seconds": 86.44252247899986,
+              "stages_complete": true,
+              "writer": {
+                "checkpoint_attempts": 84,
+                "checkpoint_busy": 0,
+                "checkpoint_completed": 84,
+                "dropped_at_end": 0,
+                "dropped_at_start": 0,
+                "peak_wal_bytes": 68680432,
+                "queue_max": 32,
+                "queue_nonempty_samples": 4332,
+                "queue_samples": 4632,
+                "stages": {
+                  "admission": {
+                    "count": 550011,
+                    "failed": 0,
+                    "max_seconds": 5.526e-05,
+                    "sum_seconds": 0.05067263799994991
+                  },
+                  "apply": {
+                    "count": 33875,
+                    "failed": 0,
+                    "max_seconds": 0.025452448,
+                    "sum_seconds": 42.609383996000254
+                  },
+                  "begin": {
+                    "count": 33875,
+                    "failed": 0,
+                    "max_seconds": 0.002582444,
+                    "sum_seconds": 0.47590225099999967
+                  },
+                  "checkpoint": {
+                    "count": 84,
+                    "failed": 0,
+                    "max_seconds": 0.111509518,
+                    "sum_seconds": 4.716702781000001
+                  },
+                  "commit": {
+                    "count": 33875,
+                    "failed": 0,
+                    "max_seconds": 0.036547063,
+                    "sum_seconds": 43.35723623199961
+                  },
+                  "queue": {
+                    "count": 550011,
+                    "failed": 0,
+                    "max_seconds": 0.038481129,
+                    "sum_seconds": 1079.3613593210066
+                  }
+                }
+              }
+            },
+            "seconds": 93.547147479
+          },
+          {
+            "event": "verified_before",
+            "expected": {
+              "auxiliary_part_bytes": 64,
+              "auxiliary_parts": 1,
+              "auxiliary_sessions": 1,
+              "current_data_rows": 80000,
+              "current_delete_markers": 10000,
+              "historical_data_rows": 10000,
+              "seed_logical_bytes": 11520000,
+              "seed_rows": 100000
+            },
+            "observation": {
+              "serialized_observed_seconds": 5.7953999999999994e-05,
+              "stages_complete": true,
+              "writer": {
+                "checkpoint_attempts": 0,
+                "checkpoint_busy": 0,
+                "checkpoint_completed": 0,
+                "dropped_at_end": 0,
+                "dropped_at_start": 0,
+                "peak_wal_bytes": 49889112,
+                "queue_max": 0,
+                "queue_nonempty_samples": 0,
+                "queue_samples": 84,
+                "stages": {
+                  "admission": {
+                    "count": 1,
+                    "failed": 0,
+                    "max_seconds": 5.28e-07,
+                    "sum_seconds": 5.28e-07
+                  },
+                  "apply": {
+                    "count": 1,
+                    "failed": 0,
+                    "max_seconds": 3.1138e-05,
+                    "sum_seconds": 3.1138e-05
+                  },
+                  "begin": {
+                    "count": 1,
+                    "failed": 0,
+                    "max_seconds": 1.9833e-05,
+                    "sum_seconds": 1.9833e-05
+                  },
+                  "commit": {
+                    "count": 1,
+                    "failed": 0,
+                    "max_seconds": 6.983e-06,
+                    "sum_seconds": 6.983e-06
+                  },
+                  "queue": {
+                    "count": 1,
+                    "failed": 0,
+                    "max_seconds": 5.3098e-05,
+                    "sum_seconds": 5.3098e-05
+                  }
+                }
+              }
+            },
+            "quota_verified": true
+          },
+          {
+            "checkpoint": {
+              "busy": false,
+              "checkpointed_frames": 0,
+              "log_frames": 0
+            },
+            "checkpoint_seconds": 0.082252467,
+            "close_complete": true,
+            "close_seconds": 0.002686737,
+            "disk_after_close": {
+              "allocated_bytes": 64573440,
+              "files": 2,
+              "logical_bytes": 64565346,
+              "physical_table_bytes": 0
+            },
+            "event": "result",
+            "expected": {
+              "auxiliary_part_bytes": 64,
+              "auxiliary_parts": 1,
+              "auxiliary_sessions": 1,
+              "current_data_rows": 80000,
+              "current_delete_markers": 10000,
+              "historical_data_rows": 10000,
+              "seed_logical_bytes": 11520000,
+              "seed_rows": 100000
+            },
+            "open_seconds": 0.055165275,
+            "phase": null,
+            "physical_objects": "not_created_metadata_only",
+            "process_io_after_close": {
+              "cancelled_write_bytes": 4096,
+              "rchar": 2172965729,
+              "read_bytes": 40960,
+              "syscr": 530412,
+              "syscw": 3030820,
+              "wchar": 6710301826,
+              "write_bytes": 6848069632
+            },
+            "status": "complete",
+            "total_seconds": 95.338540809
+          }
+        ],
+        "result": {
+          "checkpoint": {
+            "busy": false,
+            "checkpointed_frames": 0,
+            "log_frames": 0
+          },
+          "checkpoint_seconds": 0.082252467,
+          "close_complete": true,
+          "close_seconds": 0.002686737,
+          "disk_after_close": {
+            "allocated_bytes": 64573440,
+            "files": 2,
+            "logical_bytes": 64565346,
+            "physical_table_bytes": 0
+          },
+          "event": "result",
+          "expected": {
+            "auxiliary_part_bytes": 64,
+            "auxiliary_parts": 1,
+            "auxiliary_sessions": 1,
+            "current_data_rows": 80000,
+            "current_delete_markers": 10000,
+            "historical_data_rows": 10000,
+            "seed_logical_bytes": 11520000,
+            "seed_rows": 100000
+          },
+          "open_seconds": 0.055165275,
+          "phase": null,
+          "physical_objects": "not_created_metadata_only",
+          "process_io_after_close": {
+            "cancelled_write_bytes": 4096,
+            "rchar": 2172965729,
+            "read_bytes": 40960,
+            "syscr": 530412,
+            "syscw": 3030820,
+            "wchar": 6710301826,
+            "write_bytes": 6848069632
+          },
+          "status": "complete",
+          "total_seconds": 95.338540809
+        }
+      },
+      {
+        "config": {
+          "action": "prepare",
+          "deadline_seconds": 105,
+          "engine": "fjall",
+          "phase_seconds": 5,
+          "root": "/SSD/dev/cairn-storage-campaign/99a41f2321a843b7a15afa0a1b9bce82/data/fjall",
+          "seed": 24301,
+          "seed_rows": 100000,
+          "ticks_per_second": 100
+        },
+        "coordinator_wall_seconds": 105.44156752317213,
+        "fd_samples_unavailable": 0,
+        "io_samples_unavailable": 2,
+        "peak_fds": 8,
+        "peak_rss_kib": 103652,
+        "process_cpu_seconds": 102.88,
+        "process_io_maxima": {
+          "cancelled_write_bytes": 0,
+          "rchar": 5442113,
+          "read_bytes": 4096,
+          "syscr": 1160,
+          "syscw": 16946,
+          "wchar": 139781267,
+          "write_bytes": 163577856
+        },
+        "process_sample_count": 2050,
+        "records": [
+          {
+            "config": {
+              "action": "prepare",
+              "deadline_seconds": 105,
+              "engine": "fjall",
+              "phase_seconds": 5,
+              "root": "/SSD/dev/cairn-storage-campaign/99a41f2321a843b7a15afa0a1b9bce82/data/fjall",
+              "seed": 24301,
+              "seed_rows": 100000,
+              "ticks_per_second": 100
+            },
+            "event": "opened",
+            "open_seconds": 0.005194114
+          },
+          {
+            "event": "result",
+            "reason": "metadata workload deadline reached before admission",
+            "status": "incomplete"
+          }
+        ]
+      }
+    ],
+    "cache_state": "each arm uses a fresh process and full seed verification; filesystem cache is uncontrolled",
+    "candidate_qualified": false,
+    "charged_seconds": 203.73260099906474,
+    "cleaned_data_and_processes": true,
+    "criteria": {
+      "maximum_control_drift": 0.1,
+      "maximum_median_protected_ratio": 1.1,
+      "minimum_each_pair_throughput_gain": -0.1,
+      "minimum_family_outcomes_per_arm": 100,
+      "minimum_median_paired_throughput_gain": 0.2,
+      "p99_minimum_family_observations": 10000
+    },
+    "decision": "KEEP SQLite; conditional comparison did not qualify",
+    "elapsed_seconds": 202.73260099906474,
+    "id": "99a41f2321a843b7a15afa0a1b9bce82",
+    "kind": "metadata_alternative",
+    "manifest": {
+      "binary": "/SSD/dev/Cairn/target/release/cairn-metadata-comparison-lab",
+      "build_settings": "Rust stable 1.97.1; release opt-level=3 debug=2 thin LTO; standalone lab; Tokio workers=8; SQLite FULL readers=8 cache=8MiB/connection mmap=0 linger=none; Fjall 3.1.10 SyncAll cache=72MiB workers=2; uncontrolled filesystem cache",
+      "comparison_sources_sha256": {
+        "src/lib.rs": "8e59bbe2eafb277b03dc959cd14f2260c4486839f1689d3b431dcc423e4a5b52",
+        "src/metadata_capacity/metrics.rs": "36715a5b2fea3efaba8e9ba16b1749888a9e21a2e5c41b8a0fd4131fd30266e5",
+        "src/metadata_capacity/workload.rs": "8acc87707aa038f9b74fa4b48c236b86bef4b015fc6b3eaae97b24fb22023872",
+        "src/metadata_comparison.rs": "9955c24c5bf38801e2b500a86ce1170ea9d706bdc2730032a9f922dc3e545c5a",
+        "src/metadata_fjall/actor.rs": "4af4a50507580759087957b2fcf6f946fb5a8491879a4663949cb20f6b93d392",
+        "src/metadata_fjall/apply.rs": "0d7b46580fb9a857680b98d69b7b6453ed4f21a7a0f1524971780c7dba3d2f0d",
+        "src/metadata_fjall/facade.rs": "902d349763454ce387889847cd9fcafb29d172b2a5e0c49792a4318647c92090",
+        "src/metadata_fjall/journal.rs": "ba391abd5e6f021191493a512261ccac306257d20aa841caf8f445b9ec27898b",
+        "src/metadata_fjall/kv.rs": "c88d395dc2a5f590ac65ad3b0412393100c7a4ef39f89d37fcbf3db8440dce26",
+        "src/metadata_fjall/mod.rs": "63432ad6e427c85bf2b3c4ce285b7886508fb6cb81f0cb66e1a0fe93b5fedeb2",
+        "src/metadata_fjall/model.rs": "a4c627cb61ba78882197416354199f3da556a11434b7ded9ced5cf0c40bed891",
+        "src/metadata_fjall/multipart.rs": "2eac686b77afd92de28253173dbde5494d3ecaad8d96f0a774aca0b504833df9",
+        "src/metadata_fjall/outbox.rs": "498b9092ef3252f34ba5eceed4242a1354cecb438a82dbae4a7e997a9d7246c5",
+        "src/metadata_fjall/reads.rs": "6178e19d95cb099e84ce1e72aa48fc699a8d1394ebfd67186b5fa19f318cfa0b",
+        "src/metadata_run.rs": "9c7bb54a6b0d3b1f6f8b17300b305396f1d21e2ed805aa3f89ada7192c7228d4"
+      },
+      "coordinator_sha256": "895537059a34ee58c12e143339751c3530df23f1135def8d00dc7710e6b9f762",
+      "cpu": {
+        "exit": 0,
+        "output": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"39 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"4\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-3\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"Intel(R) Core(TM) i5-6500TE CPU @ 2.30GHz\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"94\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"4\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"3\"\n      },{\n         \"field\": \"CPU(s) scaling MHz:\",\n         \"data\": \"82%\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"3300.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"4599.93\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb pti ssbd ibrs ibpb stibp tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi md_clear flush_l1d arch_capabilities\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"128 KiB (4 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"128 KiB (4 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"1 MiB (4 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"6 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-3\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Vulnerable: No microcode\"\n      },{\n         \"field\": \"Vulnerability Ghostwrite:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"KVM: Mitigation: Split huge pages\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Mitigation; PTE Inversion; VMX conditional cache flushes, SMT disabled\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Mitigation; Clear CPU buffers; SMT disabled\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Mitigation; PTI\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Mitigation; Clear CPU buffers; SMT disabled\"\n      },{\n         \"field\": \"Vulnerability Old microcode:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Mitigation; IBRS\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; IBRS; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Mitigation; Microcode\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Mitigation; TSX disabled\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}\n"
+      },
+      "declared_commit": "5b3b95a325f6a6624bc979f6b9574a0f441be7e2",
+      "devices": {
+        "exit": 0,
+        "output": "{\n   \"blockdevices\": [\n      {\n         \"name\": \"loop0\",\n         \"type\": \"loop\",\n         \"size\": \"61.3M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/aws-cli/2308\"\n         ]\n      },{\n         \"name\": \"loop1\",\n         \"type\": \"loop\",\n         \"size\": \"61.3M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/aws-cli/2312\"\n         ]\n      },{\n         \"name\": \"loop2\",\n         \"type\": \"loop\",\n         \"size\": \"1.9M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/btop/1004\"\n         ]\n      },{\n         \"name\": \"loop3\",\n         \"type\": \"loop\",\n         \"size\": \"13.5M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/canonical-livepatch/406\"\n         ]\n      },{\n         \"name\": \"loop4\",\n         \"type\": \"loop\",\n         \"size\": \"74M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/core22/2411\"\n         ]\n      },{\n         \"name\": \"loop5\",\n         \"type\": \"loop\",\n         \"size\": \"1.9M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/btop/998\"\n         ]\n      },{\n         \"name\": \"loop6\",\n         \"type\": \"loop\",\n         \"size\": \"66.8M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/core24/1587\"\n         ]\n      },{\n         \"name\": \"loop7\",\n         \"type\": \"loop\",\n         \"size\": \"74M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/core22/2437\"\n         ]\n      },{\n         \"name\": \"loop8\",\n         \"type\": \"loop\",\n         \"size\": \"66.8M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/core24/1643\"\n         ]\n      },{\n         \"name\": \"loop9\",\n         \"type\": \"loop\",\n         \"size\": \"13.1M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/canonical-livepatch/414\"\n         ]\n      },{\n         \"name\": \"loop11\",\n         \"type\": \"loop\",\n         \"size\": \"50.1M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/snapd/27710\"\n         ]\n      },{\n         \"name\": \"loop12\",\n         \"type\": \"loop\",\n         \"size\": \"50.3M\",\n         \"rota\": false,\n         \"mountpoints\": [\n             \"/snap/snapd/27738\"\n         ]\n      },{\n         \"name\": \"sda\",\n         \"type\": \"disk\",\n         \"size\": \"1.7T\",\n         \"rota\": false,\n         \"mountpoints\": [],\n         \"children\": [\n            {\n               \"name\": \"sda1\",\n               \"type\": \"part\",\n               \"size\": \"1.7T\",\n               \"rota\": false,\n               \"mountpoints\": [\n                   \"/EX\"\n               ]\n            }\n         ]\n      },{\n         \"name\": \"sdb\",\n         \"type\": \"disk\",\n         \"size\": \"1.7T\",\n         \"rota\": false,\n         \"mountpoints\": [],\n         \"children\": [\n            {\n               \"name\": \"sdb1\",\n               \"type\": \"part\",\n               \"size\": \"1.7T\",\n               \"rota\": false,\n               \"mountpoints\": [\n                   \"/SSD\"\n               ]\n            }\n         ]\n      },{\n         \"name\": \"nvme0n1\",\n         \"type\": \"disk\",\n         \"size\": \"476.9G\",\n         \"rota\": false,\n         \"mountpoints\": [],\n         \"children\": [\n            {\n               \"name\": \"nvme0n1p1\",\n               \"type\": \"part\",\n               \"size\": \"1G\",\n               \"rota\": false,\n               \"mountpoints\": [\n                   \"/boot/efi\"\n               ]\n            },{\n               \"name\": \"nvme0n1p2\",\n               \"type\": \"part\",\n               \"size\": \"475.9G\",\n               \"rota\": false,\n               \"mountpoints\": [\n                   \"/\"\n               ]\n            }\n         ]\n      }\n   ]\n}\n"
+      },
+      "filesystem": {
+        "exit": 0,
+        "output": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/SSD\",\n         \"source\": \"/dev/sdb1\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime\"\n      }\n   ]\n}\n"
+      },
+      "harness_sources_sha256": {
+        "Cargo.lock": "4b3042af1fa6b62bb433ae27e5841a314c732e4fd7ff222189f3c6d9d6d51622",
+        "analyze.py": "416884010271fafcf431f54b422b7ae605698dab3c6614ec44dda6d686355ba4",
+        "budget.py": "eba141cdbd28f6d6ee39b77143089bd9af80ee92f5f3e53a4511ab529248974c",
+        "fanout.py": "80243417754e91a0521642bbe83a8cd184e9b5fdd7ee89d3d52cc3e85a507bf7",
+        "fanout_report.py": "7dd27f10763301943b106d1d4b759a06a59f377b363f840547118b883b7a64e3",
+        "journal_report.py": "6c1aa6a741dc2c45292ffa70a98974a7382e94a9cf72efd4a54602bb10ae6194",
+        "lab.py": "895537059a34ee58c12e143339751c3530df23f1135def8d00dc7710e6b9f762",
+        "metadata_alternative.py": "37f51a22a641f7470e2f2761ca1b521cb1e9960ed994ee4ac9fc896430751b5f",
+        "metadata_capacity.py": "b3facddc23f6e5b63991822af668278adddd5d5fcc9a64db46daa99c5fc2d650",
+        "packing.py": "cdc73b1f85ed00619e81dc384cbd1c60f0d2623cde7962d2b599d10fead00f4d",
+        "packing_measure.py": "cb8683cb80f463118c82a106ba98c2523dddeafde6ec749064db14373d0c3884",
+        "processes.py": "8b4066ad8722b8960b7d6ee14868a214e8ce3ee2c34792fe478c94905ef2378a",
+        "recovery.py": "6e6177d4746b8d1018a192e281b8641dedc4aed26656732083ba04104a387673",
+        "recovery_driver.py": "c2a6a77c870eeb7515d1d4693b33554ee2c85f12827599ee712eda43dd5bd323",
+        "s3_driver.py": "aa625d8fcb3b220083fa798e7352f69c6ca21314db8970bb96e1510cdc713442",
+        "src/common.rs": "958569b9a85c3335c73a422479ef7439b137fc2eadd58bb3c6ede43bac133ec0",
+        "src/fanout.rs": "b893d614b30e1c93b110f99703d12637ca5e847d14d29d5949156813c4d42d51",
+        "src/lib.rs": "8e59bbe2eafb277b03dc959cd14f2260c4486839f1689d3b431dcc423e4a5b52",
+        "src/main.rs": "d5ad2bd386d6614315f2188aa19dad3cb271c2cc598c18a58a83e94c31a5f19c",
+        "src/metadata_capacity.rs": "566eb09ed0f3057d80bc79672b8accfa47adcede43a7d6603dd1c636f236e5c7",
+        "src/metadata_comparison.rs": "9955c24c5bf38801e2b500a86ce1170ea9d706bdc2730032a9f922dc3e545c5a",
+        "src/metadata_run.rs": "9c7bb54a6b0d3b1f6f8b17300b305396f1d21e2ed805aa3f89ada7192c7228d4",
+        "src/packing.rs": "b77023ff520346f22699394b5f8c2f339c1b6b9eb8c321eed3ee77c1f028c45b",
+        "summarize.py": "48f33f670b36b5e1a259f50907ad21a07e59cbb126be2a0b4e4b8ffb27043dfe",
+        "test_attribution.py": "dd851f8cac699fd04b77f0ae3c79a90b7de08e083b8fc29db1ef4b60636005fc",
+        "test_cleanup.py": "86ad051643817d68e69714a33af606b0b52e76c9de90dc3a7d57dfbaf4896e85",
+        "test_fanout.py": "a0afbe05ed96632d7798df98e55ae201e3b6636e3901536b397cba2c2de59925",
+        "test_journal.py": "38e5802866f07eb7cfc0aa0ca1e1047e0b8f44c23cf927d45f4a600082da0dad",
+        "test_lab.py": "b4ca5d5cd157175a60b74008dd3278eb96a9f5d487ebeafbb9416a28ec6c1d1f",
+        "test_metadata_alternative.py": "8bebda6d7c8a8d4d0458f49cb719450a577ca04ccb8add28c37fbf48b3dac3b8",
+        "test_metadata_capacity.py": "0de9ac78a7b43a4a81073379f3defbf103c29aa2dbfaf58a0b3e7c959caa5968",
+        "test_packing.py": "0a828bf4433ad853171ce4fb0e2b0db93be5106d247794656fe491e654f0207d",
+        "test_packing_measure.py": "13ed4584426e2640bf1da797f141eb65f48a412111cc777f72decb90aa1bf578",
+        "test_recovery_cost.py": "45f6837bf0c21fe038ee9149fe18a251e28b43da06a804816f4712775d9bdf29"
+      },
+      "platform": "Linux-7.0.0-29-generic-x86_64-with-glibc2.43",
+      "production_coalescer_sha256": "755b87170b1ca145ad4d75ee2a1cbc217494229c22b9ae97ee950e5f1641edf3",
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "sha256": "b0ac1089d516bb7c89e3fb5c912c019025908d722908b5264898ac91f08bb84a",
+      "tools": {
+        "heaptrack": {
+          "unavailable": true
+        },
+        "perf": {
+          "exit": 0,
+          "output": "perf version 7.0.14\n"
+        },
+        "readelf": {
+          "exit": 0,
+          "output": "GNU readelf (GNU Binutils for Ubuntu) 2.46\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis program is free software; you may redistribute it under the terms of\nthe GNU General Public License version 3 or (at your option) any later version.\nThis program has absolutely no warranty.\n"
+        },
+        "rustc": {
+          "exit": 1,
+          "output": "error: Missing manifest in toolchain 'stable-x86_64-unknown-linux-gnu'\n"
+        }
+      }
+    },
+    "observer_process_cpu_seconds": 5.910660751,
+    "pairs_order": [
+      [
+        "sqlite",
+        "fjall"
+      ],
+      [
+        "fjall",
+        "sqlite"
+      ],
+      [
+        "sqlite",
+        "fjall"
+      ],
+      [
+        "fjall",
+        "sqlite"
+      ],
+      [
+        "sqlite",
+        "fjall"
+      ]
+    ],
+    "phase_seconds": 5,
+    "prerequisite": {
+      "measurement_id": "ccfcf6d0dc57456b9d8f51cf90513a01",
+      "revalidated_assessment": {
+        "comparisons": [
+          {
+            "buckets": 1,
+            "c128_throughput_gain_over_c32": 0.10261413139845432,
+            "c128_writer_cpu_seconds": [
+              6.29
+            ],
+            "control_drift_fraction_by_concurrency": {
+              "32": 0.0021794188544579374,
+              "4": 0.016406641816121503
+            },
+            "minimum_c128_queue_nonempty_fraction": 0.8187022900763359,
+            "minimum_c128_serialized_occupancy_fraction": 0.9522262790764249
+          },
+          {
+            "buckets": 16,
+            "c128_throughput_gain_over_c32": 0.0803727229617981,
+            "c128_writer_cpu_seconds": [
+              6.27
+            ],
+            "control_drift_fraction_by_concurrency": {
+              "32": 0.0026028480576032464
+            },
+            "minimum_c128_queue_nonempty_fraction": 0.7976878612716763,
+            "minimum_c128_serialized_occupancy_fraction": 0.9503086238865641
+          }
+        ],
+        "criteria": {
+          "c128_throughput_gain_over_c32_at_most": 0.2,
+          "minimum_queue_samples": 20,
+          "p99_minimum_successful_family_observations": 10000,
+          "queue_nonempty_fraction_at_least": 0.8,
+          "repeated_control_drift_at_most": 0.1,
+          "serialized_occupancy_fraction_at_least": 0.8
+        },
+        "decision": "KEEP SQLite; transactional Fjall experiment may be evaluated only for qualifying bucket populations [1] under full semantic parity",
+        "qualifying_populations_buckets": [
+          1
+        ],
+        "reasons": [],
+        "status": "PASS",
+        "writer_limit": "Observed Writer service meets the predeclared limiting criterion for bucket populations [1]"
+      },
+      "sha256": "391abe202da3b4d5400b9a9c2b026d190fc9b2d86b32d2788c30d3d31e6c045e"
+    },
+    "reasons": [
+      "comparison arm 01-prepare-fjall failed: {'event': 'result', 'reason': 'metadata workload deadline reached before admission', 'status': 'incomplete'}"
+    ],
+    "resource_scope": "50ms complete-process samples and Linux I/O counters; includes generator and engine workers; all database files counted",
+    "scope": "one hot bucket, C128, identical metadata-only trace; all actor/engine workers counted; no physical objects",
+    "seed_rows": 100000,
+    "status": "INCONCLUSIVE",
+    "ticks_per_second": 100,
+    "unproven": [
+      "production migration",
+      "backup/restore interchange",
+      "physical recovery",
+      "power-loss behavior",
+      "full S3 semantics outside the fixed trace"
+    ]
+  },
+  "owned_measurement_artifacts_removed": true,
+  "raw_evidence": {
+    "archive": "storage-metadata-alternative-2026-09.raw.tar.gz",
+    "bytes": 177586,
+    "files": [
+      {
+        "bytes": 254,
+        "name": "00-prepare-sqlite.config.json",
+        "sha256": "d3f1207713cb5f2d2ef6b2d56dbab8aef04008fa0f347a6c641d2099895cebef"
+      },
+      {
+        "bytes": 3203,
+        "name": "00-prepare-sqlite.jsonl",
+        "sha256": "f9c5745e23af78675d9350d3e0c633f07409c463975cbdcffcab58c02e700300"
+      },
+      {
+        "bytes": 555917,
+        "name": "00-prepare-sqlite.samples.jsonl",
+        "sha256": "507ca72e140e345b1389569c0b49d0c90d4a21b095b7fbbe3b3ffb40244972fb"
+      },
+      {
+        "bytes": 0,
+        "name": "00-prepare-sqlite.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 252,
+        "name": "01-prepare-fjall.config.json",
+        "sha256": "34d95e116b8ba6b7fefa10cd99211e1e85ad0cb4ec199b401985f76a433553d2"
+      },
+      {
+        "bytes": 378,
+        "name": "01-prepare-fjall.jsonl",
+        "sha256": "a84af15571a5a8eaa8cc43721e4ae06aa3700508e3774dba729783655a69a79c"
+      },
+      {
+        "bytes": 588385,
+        "name": "01-prepare-fjall.samples.jsonl",
+        "sha256": "894a9a42c5903b54f22406e083eaf2f65a95a2fee562bc67b0e7a19936241b1c"
+      },
+      {
+        "bytes": 0,
+        "name": "01-prepare-fjall.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 165,
+        "name": "tool-findmnt.jsonl",
+        "sha256": "bbe7dd9062c293152772aaf095401f3f7d1c8d30fc4cd33a8ffd9fd8a216f469"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-findmnt.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 3644,
+        "name": "tool-lsblk.jsonl",
+        "sha256": "7eb435755587b71f26a09211556ee92aa91f2da4bba3aca3520a1e90543acf2d"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-lsblk.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 4816,
+        "name": "tool-lscpu.jsonl",
+        "sha256": "0c1bcbb8330e91c7bd74044d659b68d27dde0c679dc774d0c2e7a47487aca6ad"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-lscpu.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 20,
+        "name": "tool-perf.jsonl",
+        "sha256": "496b3d503a88d37a5f9137643742e6101b6a7f183075dd04d279982e92dcc662"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-perf.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 288,
+        "name": "tool-readelf.jsonl",
+        "sha256": "6bcae8795963d5ec8c87193bb705f2f16ae2a5677abc27a87f62bef47bdd716b"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-readelf.stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 0,
+        "name": "tool-rustc.jsonl",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 71,
+        "name": "tool-rustc.stderr",
+        "sha256": "0337efa10c9ebac24f8f45234a9a599dc872641d651b03441af965395eb03314"
+      }
+    ],
+    "sha256": "95744b0bb51cb21c3437d774ef88da19874ac5981bfb26f90c7bf8c74e64e233",
+    "uncompressed_bytes": 1157393
+  }
+}

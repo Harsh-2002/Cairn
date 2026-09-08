@@ -18,7 +18,7 @@ specification. Experiments may correctly conclude **retain the current design**.
 - [x] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
 - [x] Complete 3A–3D in order, obtaining the required architectural decision before changing
   the storage-lifecycle protocol and retaining full reconciliation until activation qualifies.
-- [ ] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
+- [x] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
 - [ ] Complete 5A–5C and publish the supported metadata decision.
 - [ ] Verify the final integration and results record; remove owned temporary artifacts and
   merged worktrees/branches, leaving `main` and `website`.
@@ -95,7 +95,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   reader pins are gone; durable cleanup debt precedes reclamation. Preserve concurrent overwrites
   and Object Lock. Offline snapshots copy the referenced generation and publish manifest last.
   Fresh restore, survivor hashes, ENOSPC and interrupted collection are mandatory.
-- [ ] **4C: hybrid decision**. Screen 1/4/16/64/256 KiB and 1 MiB, then confirm crossover in
+- [x] **4C: hybrid decision** — merged in PR #96 (`d4c0ba6`); INCONCLUSIVE / KEEP files. Screen 1/4/16/64/256 KiB and 1 MiB, then confirm crossover in
   paired trials. Select only the largest contiguous passing range from the smallest tested size.
   Gains must survive overwrite/delete/GC; protect large streaming/ranges. No qualifying threshold
   means retain files. A passing candidate produces a separately reviewed production-format,
@@ -459,3 +459,23 @@ charged 326.493302 seconds; the campaign then stood at 918.639472 seconds and 1,
 bytes, with no active reservation or temporary dataset. Full local validation passed before the
 run; final-commit CI/integration remains required. This closes the bounded experiment with an
 explicit inconclusive decision, not a performance pass.
+
+Phase 4C merged in PR #96 as `d4c0ba6` after all 54 checks passed for `2fa360b`;
+review comments and open branch code-scanning alerts were empty. Its bounded negative decision
+and archived evidence are final; production keeps individual files.
+
+Phase 5A completed both canonical 100,000-row populations and all declared load phases. The hot
+bucket meets the Writer service-limit predicate (95.22% occupancy, 81.87% nonempty queue, 10.26%
+C128 gain over C32); distributed buckets miss the fixed 80% queue threshold at 79.77%. Stable
+controls and complete family/quota/reopen observations support only that scoped conclusion.
+The capability comparison covers SQLite, libSQL/Turso, redb, Fjall and RocksDB. Phase 5B's
+pinned durable Fjall adapter passed fixed correctness/failure fixtures, but its actual seed
+preparation reached the fixed 105-second deadline. No paired load arms ran. Phase 5C is therefore
+**INCONCLUSIVE comparison / KEEP SQLite**; this does not prove SQLite computation alone is the
+bottleneck or that a different native engine would improve S3 throughput. See
+[capacity evidence](storage-metadata-capacity-2026-09.md) and the
+[conditional comparison and final decision](storage-metadata-alternative-2026-09.md).
+The complete campaign charged **1,415.415082 seconds**, including **496.775609 metadata seconds**,
+with **1,778,102,272 bytes** recorded peak and no active reservation. All owned measurement data,
+processes and raw artifacts were removed after verified archive export. No retry or new budget.
+All local gates pass; final-head CI and merge remain required before checking Phase 5 delivery.

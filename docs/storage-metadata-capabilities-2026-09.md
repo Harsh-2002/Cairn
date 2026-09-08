@@ -11,8 +11,9 @@ RocksDB remains research-only.
 Claims below distinguish upstream primitives from Cairn adapter work. A documented transaction
 or fsync primitive does not establish this application's error handling, physical-write ordering,
 backup completeness, or power-loss test coverage. Hardware and filesystem flush correctness are
-necessary for every engine. No dependencies were installed, engines built, or measurements run
-for this comparison.
+necessary for every engine. The capability research itself installed no dependencies or engines.
+The subsequently authorized, separate Fjall laboratory pins its own dependency and records its
+correctness and measurement evidence in the conditional comparison report.
 
 ## Source and version identity
 
