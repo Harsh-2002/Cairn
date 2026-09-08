@@ -152,6 +152,16 @@ impl AbortAfterStagePartBlob {
 
 #[async_trait::async_trait]
 impl BlobStore for AbortAfterStagePartBlob {
+    fn read_memory_bound(
+        &self,
+        compression: &cairn_types::CompressionDescriptor,
+        encrypted: bool,
+        logical_len: u64,
+    ) -> Result<cairn_types::blob::ReadMemoryBound, cairn_types::BlobError> {
+        self.inner
+            .read_memory_bound(compression, encrypted, logical_len)
+    }
+
     async fn stage(
         &self,
         bucket: &BucketName,
@@ -171,6 +181,27 @@ impl BlobStore for AbortAfterStagePartBlob {
     ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
         self.inner
             .open_raw(path, range, cipher, compression, expected_logical_len)
+            .await
+    }
+
+    async fn open_raw_guarded(
+        &self,
+        path: &StoragePath,
+        range: Option<cairn_types::blob::ByteRange>,
+        cipher: cairn_types::blob::BlobCipher,
+        compression: &cairn_types::CompressionDescriptor,
+        expected_logical_len: u64,
+        lease: cairn_types::blob::ReadBufferLease,
+    ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::BlobError> {
+        self.inner
+            .open_raw_guarded(
+                path,
+                range,
+                cipher,
+                compression,
+                expected_logical_len,
+                lease,
+            )
             .await
     }
 
@@ -326,6 +357,16 @@ impl AssembleGateBlob {
 
 #[async_trait::async_trait]
 impl BlobStore for AssembleGateBlob {
+    fn read_memory_bound(
+        &self,
+        compression: &cairn_types::CompressionDescriptor,
+        encrypted: bool,
+        logical_len: u64,
+    ) -> Result<cairn_types::blob::ReadMemoryBound, cairn_types::BlobError> {
+        self.inner
+            .read_memory_bound(compression, encrypted, logical_len)
+    }
+
     async fn stage(
         &self,
         bucket: &BucketName,
@@ -345,6 +386,27 @@ impl BlobStore for AssembleGateBlob {
     ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
         self.inner
             .open_raw(path, range, cipher, compression, expected_logical_len)
+            .await
+    }
+
+    async fn open_raw_guarded(
+        &self,
+        path: &StoragePath,
+        range: Option<cairn_types::blob::ByteRange>,
+        cipher: cairn_types::blob::BlobCipher,
+        compression: &cairn_types::CompressionDescriptor,
+        expected_logical_len: u64,
+        lease: cairn_types::blob::ReadBufferLease,
+    ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::BlobError> {
+        self.inner
+            .open_raw_guarded(
+                path,
+                range,
+                cipher,
+                compression,
+                expected_logical_len,
+                lease,
+            )
             .await
     }
 

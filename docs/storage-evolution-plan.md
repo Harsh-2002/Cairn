@@ -11,7 +11,7 @@ specification. Experiments may correctly conclude **retain the current design**.
 
 - [x] Recover local branches/worktrees, preserve existing changes, and inspect final-commit CI
   and review status for the interrupted work.
-- [ ] Integrate 1A after its correctness checks; update 1B onto merged main, finish its review
+- [x] Integrate 1A after its correctness checks; update 1B onto merged main, finish its review
   and validation, and integrate it independently.
 - [ ] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
   ownership; validate and integrate its independent PR.
@@ -37,7 +37,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   identities. Append the spool and existing authentication before the final file's durability
   barrier; no independently committed sidecar. Cover spool failures, ENOSPC, cancellation,
   detached filesystem work and startup cleanup. Input and output batches must also be bounded.
-- [ ] **1C: bounded verified index reader**. Keep the 64-MiB cap; use 65,529-byte pages
+- [ ] **1C: bounded verified index reader** — active on `codex/storage-01c-index-reader`. Keep the 64-MiB cap; use 65,529-byte pages
   (7,281 entries). Stream initial structural/HMAC validation, retaining provisional SHA-256 page
   fingerprints and physical starting offsets. Publish a usable reader only after full validation.
   Reread the same descriptor, verify a whole page before interpreting it, retain trusted geometry,
@@ -191,3 +191,26 @@ workspace formatting passed. Commands: `cargo nextest run -p cairn-blob --all-fe
 `cargo fmt --all --check`. Nextest 0.9.140 was checksum-verified against its official release.
 The shared blob target was cleaned before the recorded nextest run to prevent reuse of a stale
 test binary from the older checkout. Final-commit CI remains the integration gate.
+
+PR #82 final head `ab67eef` passed normal CI and CodeQL, with no posted review findings, and merged
+as `f092a81`. The additional local `make check-all` passed: 1,327 workspace tests, two doctests,
+both Clippy configurations, formatting, web build and installer checks. Web lint and both npm
+audits passed separately (zero vulnerabilities); cargo-audit 0.22.2 passed with the existing
+allowed rustls-pemfile maintenance warning. The merged 1A/1B branches and 1B worktree are removed.
+
+Phase 1C resumed from `f092a81`: provisional page summaries, whole-index authentication, verified
+page reuse and prepared-reader handoff are implemented. The backend now supplies read allocation
+and frame bounds to replication. All 107 all-feature blob tests pass (two benchmarks skipped),
+including three-page v1/v2/v3 fixtures, changed/swapped/evicted pages, partial-page offset and MAC
+corruption, retained-memory bounds, wrong-key/downgrade regressions, descriptor replacement and
+raw/encoded cancellation lease retention. Another 373 protocol/replication/type tests passed,
+including backend-owned admission bounds. Owning all-feature Clippy, formatting, web lint/build
+and both npm audits passed. The final workspace and CI gates remain pending. No performance experiment has run; campaign consumption remains **0 seconds / 0 bytes**.
+
+Phase 1C commands: `cargo nextest run -p cairn-blob --all-features` (107 passed, two skipped),
+`cargo nextest run -p cairn-types -p cairn-replication -p cairn-protocol --all-features`
+(373 passed), and `cargo clippy -p cairn-blob -p cairn-types -p cairn-replication -p cairn-protocol
+--all-targets --all-features -- -D warnings`. A combined intermediate run passed 479 tests;
+the final additional test checks the existing zstd bulk decoder's native workspace against its
+fixed allowance. Page fixtures use deterministic seed `0x5eed` and fresh test encryption keys;
+no benchmark dataset or server was created.

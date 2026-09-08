@@ -125,3 +125,9 @@ ordinary and legacy uploads have no replica capability.
 `BlobStore::open_raw_guarded` adds caller-owned `ReadBufferLease` retention to the same read seam.
 The default retains it with the returned stream; any backend that starts blocking/background I/O
 must override it and clone the lease into that work until actual completion, including cancellation.
+
+`BlobStore::read_memory_bound` is a required synchronous, I/O-free backend method. It reports
+`ReadMemoryBound { buffer_bytes, max_frame_bytes }` from trusted compression/encryption/length
+metadata. Replication uses it before admission; every double/wrapper must report or delegate its
+own actual read behavior. Prepared blocking-task results must retain their lease while owning
+buffers, even if the awaiting caller has already been cancelled.

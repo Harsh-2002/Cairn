@@ -7,6 +7,17 @@ use crate::object::{ChecksumSet, ChecksumValue, CompressionDescriptor, ETag};
 use crate::secret::SecretKey32;
 use std::sync::Arc;
 
+/// A backend's conservative per-read allocation allowance, obtained before starting I/O.
+/// Includes index bookkeeping, decoder workspaces and queued/output frames, but excludes stored
+/// data, kernel file cache, allocator retention and the caller's network/control buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadMemoryBound {
+    /// Maximum live bytes owned by one backend read, including its delivered frame.
+    pub buffer_bytes: u64,
+    /// Maximum logical frame size emitted by that read (at least one, even for an empty object).
+    pub max_frame_bytes: u64,
+}
+
 /// Shared ownership of a caller's read-buffer reservation. Backends with background reads must
 /// retain a clone until the actual I/O work stops, even if the awaiting request is cancelled.
 #[derive(Clone)]

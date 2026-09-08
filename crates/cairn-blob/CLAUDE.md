@@ -80,16 +80,18 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   remains arbitrary data and round-trips byte-for-byte. The server mirrors the cumulative mismatch
   count as `cairn_blob_plaintext_length_mismatch_total`; non-zero means missing/inconsistent
   metadata or truncated local storage, not a content classification.
-- **Index allocation is bounded before authentication.** Trailer `index_len` is capped at 64 MiB
-  (enough for a 5-GiB object at the minimum supported 1-KiB block size) and its block count must
-  match the independently stored logical size and block geometry before allocation. A corrupt large
-  file therefore cannot make pre-v3 or pre-MAC parsing allocate in proportion to its physical size.
+- **Index memory is paged before authentication.** The 64-MiB format ceiling and metadata-bound
+  block count remain. Initial validation uses 65,529-byte pages (7,281 entries), retaining only
+  SHA-256 fingerprints and physical starting offsets. Summaries are provisional until the full
+  structure and v3 HMAC pass. Later loads verify an entire page on the same descriptor before
+  parsing entries; one page and its offsets are cached. Index working allocations stay below
+  192 KiB at the ceiling. Initial open still scans the whole index; v1 gains no initial MAC.
 - **Writers obey the same index ceiling.** `BlockEncoder::feed` is fallible and rejects an excessive
   logical size before buffering input; finalization also fails after a rejected feed. Known encoded
   lengths fail before staging/preallocation, and multipart totals use checked addition. Effective
   limits depend on block geometry (ARCH 9.3); raw files retain their configured ceiling. This does
   not provide 5-TiB encrypted-object support. Writes drain entries to the bounded `encode.rs` spool;
-  readers still retain the complete index. See `docs/storage-evolution-plan.md` for the reader work.
+  readers retain verified pages. See `docs/storage-evolution-plan.md` for subsequent evaluations.
 - **Block allocations obey trusted metadata on every CRNB version.** Trailer algorithm, block
   size and logical total must match metadata for v1/v2/v3. Every raw payload is exactly logical
   length and every compressed payload is nonempty and shorter, excluding the encrypted GCM tag.
@@ -98,9 +100,12 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   `..`/root/prefix component → `BlobError::Io("unsafe storage path")`. Object bytes live under opaque
   IDs, never under the user key, so key-based traversal is structurally impossible — keep it that way.
 - **Guarded read reservations follow blocking work.** `open_raw_guarded` keeps the caller's
-  `ReadBufferLease` in both the probe and lazy streaming blocking closures, plus the response body.
-  Request timeout/cancellation cannot return the replication byte budget while those tasks still
-  own decoder/index buffers. Ordinary `open_raw` callers remain unchanged.
+  `ReadBufferLease` in the probe, its returned `ReadProbe`, the streaming blocking closure and
+  response body. The prepared encoded reader transfers into that body; never reopen/reparse it
+  after validation. Request cancellation cannot return admission while detached work or its result
+  still owns buffers. `BlobStore::read_memory_bound` owns decoder/page/frame accounting and is what
+  replication reserves. Include configurable small-read coalescing; raw reads cannot grow their
+  allocation past the probed length. Kernel cache and allocator retention are separate costs.
 - **One filesystem.** `data_root`, `.staging`, and every bucket dir must share a filesystem or the
   atomic rename fails with `EXDEV`. `check_single_filesystem` is called at startup to fail fast.
 - ENOSPC (errno 28 / `StorageFull`) → `BlobError::OutOfSpace` → HTTP 507. Map it via `io_err`.
@@ -113,12 +118,13 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   for stage/stage_part/assemble (ARCH 7.4). The split is deliberate: a read permit is held for the whole
   *client-paced* transfer, so a flood of slow readers pins only read permits and can never starve writes
   (a read-side slow-loris that once stalled the data plane, audit 2026-07). Reads use an *owned* permit
-  and defer the file open until the body is first polled, so a kernel zero-copy GET that drops the body
-  unpolled opens no file and releases the permit immediately (Phase 2.5).
+  and defer raw streaming's extra open until the body is polled, so a kernel zero-copy GET that
+  drops the fallback unpolled releases its permit without another open. Encoded bodies reuse the
+  descriptor and reader already prepared by the initial probe.
 - **Small-object GET fast path.** An uncompressed blob at or below `small_read_max` (default `SMALL_READ_MAX
   = 256 KiB`, below the sendfile floor; `with_small_read_max` overrides, `0` forces the streamed path for
   an A/B) is read WHOLE in the single probe `open` and served as one `Bytes` with the range sliced from
-  that buffer — no second open, no read permit, no per-chunk `mpsc` streaming channel. Larger objects take
+  that buffer with a read permit but no second open or per-chunk `mpsc` streaming channel. Larger objects take
   the streamed read (+ zero-copy hint). Measured ~1.3–2.6× faster in-process for tiny GETs; isolated by
   `cargo run --release --example bench_small_get -p cairn-blob`.
 

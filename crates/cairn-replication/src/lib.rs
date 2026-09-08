@@ -681,38 +681,21 @@ impl ReplicationEngine {
             ));
         };
 
-        // The reader's index is bounded by CRNB's 64 MiB index ceiling; count its decoded
-        // entries/offsets and the bounded channel plus decrypt/decompress frames before admission.
-        let block_size = match row.compression {
-            cairn_types::CompressionDescriptor::Compressed { block_size, .. } => {
-                u64::from(block_size)
-            }
-            _ => 64 * 1024,
-        };
-        let encoded = row.sse_descriptor.is_some()
-            || !matches!(
-                row.compression,
-                cairn_types::CompressionDescriptor::Uncompressed
-            );
-        let buffer_bytes = if encoded {
-            if block_size == 0 || block_size > 16 * 1024 * 1024 {
-                return Err(ReplicationError::Terminal(
-                    "invalid source block geometry".to_owned(),
-                ));
-            }
-            row.size_logical
-                .div_ceil(block_size)
-                .saturating_mul(32)
-                .saturating_add(block_size.saturating_mul(10))
-                .saturating_add(128 * 1024)
-        } else {
-            1024 * 1024
-        };
+        // The blob backend owns its decoder, index and frame geometry. Ask it for admission
+        // before opening a source range instead of duplicating those allocation assumptions here.
+        let memory = blobs
+            .read_memory_bound(
+                &row.compression,
+                row.sse_descriptor.is_some(),
+                row.size_logical,
+            )
+            .map_err(|e| {
+                ReplicationError::Terminal(format!("invalid source read geometry: {e}"))
+            })?;
         let expected = row.clone();
         let source = cairn_types::replication::ReplicationSource {
-            buffer_bytes,
-            // Plain small-object reads may coalesce up to 256 KiB into one frame.
-            max_frame_bytes: if encoded { block_size } else { 1024 * 1024 },
+            buffer_bytes: memory.buffer_bytes,
+            max_frame_bytes: memory.max_frame_bytes,
             open: Box::new(move |range: ByteRange, lease| {
                 let expected = expected.clone();
                 Box::pin(async move {

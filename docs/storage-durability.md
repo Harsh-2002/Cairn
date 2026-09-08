@@ -61,9 +61,20 @@ with overflow-safe addition before assembly and still checks streamed bytes. Rej
 `EntityTooLarge` and preserves retryable parts. Raw plaintext files have no CRNB index limit.
 
 This prevents new writers from publishing a container the reader refuses for index size. It does
-not repair an existing oversized container or promise 5-TiB encoded-object support. The current
-reader still holds index state proportional to block count up to that cap; paged reader bookkeeping
-is tracked in the [storage evolution plan](storage-evolution-plan.md).
+not repair an existing oversized container or promise 5-TiB encoded-object support.
+
+Readers scan the index in 65,529-byte pages (7,281 entries), retaining a SHA-256 fingerprint and
+starting physical offset per page. Summaries remain provisional until the complete index passes
+structural validation and, for v3, the existing index/trailer HMAC. Later page loads use the same
+file descriptor and verify the entire page fingerprint before interpreting any entry. One verified
+page and its physical offsets are cached at a time; trailer geometry is never reloaded. This keeps
+index working allocations below 192 KiB at the format ceiling, including page summaries, without
+changing CRNB v1–v3 bytes. Plain v1 gains no initial cryptographic authentication.
+
+The initial GET probe transfers its prepared reader to the response body, avoiding a second
+complete parse and preventing a replaced pathname from selecting a different encoded file after
+validation. Initial index I/O remains linear for every open, including each replication range pass.
+Larger encoded objects or sublinear authenticated opening require a separately reviewed format.
 
 The encoder drains serialized entries after each 64-KiB input batch and updates the v3 metadata
 HMAC incrementally. An index of at most 64 KiB stays in a bounded request-owned buffer. Larger
@@ -125,9 +136,13 @@ logical geometry even when an unencrypted index or trailer is damaged. Physical-
 alone is not a sufficient allocation bound.
 
 Replication's guarded reader also carries a shared buffer reservation through the probe and
-streaming blocking tasks. Cancelling the HTTP delivery drops its own reference, but the
-reservation remains charged until the underlying filesystem work and returned body release it.
-This prevents a timed-out reader from releasing admission while its decoder buffers remain live.
+streaming blocking tasks, their prepared-reader results, and the response body. Cancelling the
+HTTP delivery drops its own reference, but the reservation remains charged until the underlying
+filesystem work and returned buffers release it. `BlobStore::read_memory_bound` supplies the
+backend's decoder, page and queued-frame allowance before replication admission; the engine no
+longer duplicates CRNB allocation assumptions. The allowance excludes kernel file cache, allocator
+retention and caller-owned network/control buffers. Coalesced raw reads are bounded by the probed
+length even if a local writer subsequently grows the file.
 
 ### 10.4 Algorithm choice and the incompressibility heuristic
 
@@ -151,7 +166,7 @@ The space saved is observable: the management API and metrics expose logical ver
 
 ### 10.7 Encryption at rest reuses the block container
 
-Server-side encryption at rest (Section 27) is layered onto the same self-describing block container as compression rather than a separate format. When a data-encryption key is supplied — for an SSE-S3, bucket-default, `aws:kms`-labelled, or at-rest-mode object — each logical block is compressed first and then encrypted with AES-256-GCM (compress-then-encrypt, because ciphertext does not compress), the 16-byte GCM tag is appended to the block so its recorded physical length covers ciphertext-plus-tag, and the trailer's version byte marks the blob encrypted so a read attempted without a key fails fast rather than returning ciphertext. The per-block 96-bit nonce is derived deterministically as the first twelve bytes of HMAC-SHA256 of the data key over the little-endian block index, so nonces are unique per block without any nonce being stored on disk and never repeat for a fixed key within a blob. Encrypted format v3 additionally appends a domain-separated HMAC-SHA256 tag over every byte of the plaintext index and fixed trailer. The reader validates bounded layout fields only far enough to locate that tag, authenticates it, and only then trusts the algorithm, per-block compression flags, logical geometry, or offsets. It does not trust the trailer's version byte to select those semantics: new object descriptors persist `blob_format_version: 3`, new encrypted multipart-part envelopes carry a `crnb3:` prefix, and the reader requires that declaration to match the file. Only an absent object marker or an unprefixed part envelope — representations written by the legacy v2 code — authorizes the v2 parser; unknown explicit versions and either mismatch direction fail closed. Legacy encrypted v2 blobs therefore remain readable without a schema migration, but their unauthenticated semantics are constrained by writer invariants before any block read: trailer algorithm/block size must equal trusted metadata; after subtracting the 16-byte GCM tag, a raw entry must have physical length exactly equal to logical length, while a compressed entry must have a non-empty physical payload strictly shorter than logical length. Those disjoint lengths prevent an unauthenticated compression-flag flip even when one byte string is a valid same-length compressed/plaintext polyglot. Any normal rewrite produces v3, providing an incremental migration path without an offline format conversion. An unencrypted blob is byte-for-byte identical to the pre-encryption format, so existing blobs read unchanged. Decryption fails closed: a wrong or missing key, a tampered or bit-rotted block, a metadata/container version mismatch, trusted-compression mismatch, or authenticated-metadata mismatch returns an error rather than plaintext, ciphertext, compressed representation, or zeros. Key management — the per-object data key sealed under the master-key ring — is specified in Section 27.
+Server-side encryption at rest (Section 27) is layered onto the same self-describing block container as compression rather than a separate format. When a data-encryption key is supplied — for an SSE-S3, bucket-default, `aws:kms`-labelled, or at-rest-mode object — each logical block is compressed first and then encrypted with AES-256-GCM (compress-then-encrypt, because ciphertext does not compress), the 16-byte GCM tag is appended to the block so its recorded physical length covers ciphertext-plus-tag, and the trailer's version byte marks the blob encrypted so a read attempted without a key fails fast rather than returning ciphertext. The per-block 96-bit nonce is derived deterministically as the first twelve bytes of HMAC-SHA256 of the data key over the little-endian block index, so nonces are unique per block without any nonce being stored on disk and never repeat for a fixed key within a blob. Encrypted format v3 additionally appends a domain-separated HMAC-SHA256 tag over every byte of the plaintext index and fixed trailer. The reader checks bounded geometry against authoritative metadata and streams structural validation, the metadata HMAC, and page fingerprints. Its provisional summaries become usable only after complete index/trailer authentication succeeds. It does not trust the trailer's version byte to select those semantics: new object descriptors persist `blob_format_version: 3`, new encrypted multipart-part envelopes carry a `crnb3:` prefix, and the reader requires that declaration to match the file. Only an absent object marker or an unprefixed part envelope — representations written by the legacy v2 code — authorizes the v2 parser; unknown explicit versions and either mismatch direction fail closed. Legacy encrypted v2 blobs therefore remain readable without a schema migration, but their unauthenticated semantics are constrained by writer invariants before any block read: trailer algorithm/block size must equal trusted metadata; after subtracting the 16-byte GCM tag, a raw entry must have physical length exactly equal to logical length, while a compressed entry must have a non-empty physical payload strictly shorter than logical length. Those disjoint lengths prevent an unauthenticated compression-flag flip even when one byte string is a valid same-length compressed/plaintext polyglot. Any normal rewrite produces v3, providing an incremental migration path without an offline format conversion. An unencrypted blob is byte-for-byte identical to the pre-encryption format, so existing blobs read unchanged. Decryption fails closed: a wrong or missing key, a tampered or bit-rotted block, a metadata/container version mismatch, trusted-compression mismatch, or authenticated-metadata mismatch returns an error rather than plaintext, ciphertext, compressed representation, or zeros. Key management — the per-object data key sealed under the master-key ring — is specified in Section 27.
 
 The trusted logical total is necessary in addition to those per-block invariants: without it, a v2
 attacker could flip a compressed entry to raw and shrink both unauthenticated length fields to the
