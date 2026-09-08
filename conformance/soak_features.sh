@@ -32,7 +32,8 @@
 # GATED — CORRECTNESS (all valid regardless of offered load):
 #   * zero operation errors; every sampled GET byte-exact; every locked version still undeletable;
 #     the lifecycle control prefix never touched; a tampered session token refused on every mint;
-#     multipart assemblies byte-exact with a COMPOSITE checksum; aborted uploads leave no staging.
+#     multipart assemblies byte-exact with a COMPOSITE checksum; every completed/aborted upload
+#     retires its staging directory and exact cleanup/quota debt within 30s of its response.
 #   * `/healthz` never STOPS answering (a 60 s per-probe WEDGE timeout — probe latency under a
 #     saturating debug-build workload is offered load, not signal), and the server is alive at the end.
 #   * HTTP 5xx EQUAL to the driver's declared budget, which for this mix is exactly ZERO: every
@@ -144,6 +145,7 @@ export CAIRN_REQUEST_TIMEOUT_SECS="${CAIRN_REQUEST_TIMEOUT_SECS:-600}"
 
 # Values the driver needs to reason about the sweeper window must MATCH the server's config.
 export SOAK_SECS SOAK_MP_SWEEP="$MP_SWEEP" SOAK_MP_LIFETIME="$MP_LIFETIME"
+export SOAK_WORKLOAD_DONE="$DATA/workload-done"
 
 SRV=""
 SAMPLER=""
@@ -164,6 +166,7 @@ command -v "$PY" >/dev/null 2>&1 || fail "python interpreter not found: $PY"
 # boto3 is NOT optional: it IS the harness. A box that quietly lost boto3 must go red rather than
 # green-with-no-coverage (the provenance lesson from stress_encrypted.sh).
 "$PY" -c "import boto3" 2>/dev/null || fail "boto3 not importable by '$PY' — this harness IS the boto3 driver"
+"$PY" "$ROOT/conformance/test_soak_cleanup.py" || fail "terminal cleanup verifier regression tests failed"
 [ "$SOAK_SECS" -ge 60 ] 2>/dev/null || fail "SOAK_SECS must be >= 60 (got $SOAK_SECS): the sampler's \
 third-vs-third leak windows need enough samples to mean anything"
 [ "$HEAVY_EVERY" -ge 1 ] 2>/dev/null || fail "SOAK_HEAVY_EVERY must be >= 1 (got $HEAVY_EVERY)"
@@ -255,7 +258,7 @@ PYEOF
 
 (
   tick=0; staging=0; sess=0
-  while kill -0 "$SRV" 2>/dev/null; do
+  while kill -0 "$SRV" 2>/dev/null && [ ! -e "$SOAK_WORKLOAD_DONE" ]; do
     tick=$((tick + 1))
     rss="$(ps -o rss= -p "$SRV" 2>/dev/null | tr -d ' ')"
     fd="$(ls "/proc/$SRV/fd" 2>/dev/null | wc -l)"
@@ -272,6 +275,7 @@ PYEOF
       staging="$(du -sb "$STAGING" 2>/dev/null | awk '{print $1+0}')"
       sess="$(sess_rows | tr -dc '0-9')"
     fi
+    [ ! -e "$SOAK_WORKLOAD_DONE" ] || break
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${rss:-0}" "${fd:-0}" "${th:-0}" "${wal:-0}" "${cpu:-0}" \
       "${staging:-0}" "${sess:-0}" "${wq:-0}" >>"$SAMPLES"
@@ -289,7 +293,8 @@ DRIVER_RC=0
 "$PY" "$ROOT/conformance/soak_features.py" "$AK" "$SK" "http://127.0.0.1:$PORT" \
   "$CAIRN_DATA_DIR" "$KEY_ID" "$SOAK_JSON" || DRIVER_RC=$?
 
-# Stop sampling THE INSTANT the workload stops. Everything below (metric scrapes, liveness probe)
+# The driver marks workload stop before its bounded terminal-cleanup drain; the sampler excludes
+# that drain. Also stop it here on any driver error. Everything below (scrapes, liveness probe)
 # runs against an idle server; samples taken then would land in the last third and bias the plateau
 # gates toward PASS — staging drains and the WAL checkpoints down once nothing is writing.
 kill "$SAMPLER" 2>/dev/null; SAMPLER=""

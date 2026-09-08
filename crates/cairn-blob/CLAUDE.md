@@ -1,5 +1,13 @@
 # cairn-blob
 
+Directory lifetime is part of admitted I/O ownership: `namespace::open_directory` takes a shared
+flock and revalidates the linked inode. `AnchoredPath` clones retain that fence through queued
+creation/rename/sync work. Exact cleanup shares traversal locks, then releases the child's shared
+lock and prunes only after acquiring nonblocking exclusive ownership; its parent stays locked.
+Completed syncs drop all directory descriptors before acknowledgements but retain actual job
+leases through completion. Do not remove a shared parent merely because it is currently empty;
+an admitted multipart completion may already hold its final directory descriptor.
+
 The local-filesystem `BlobStore` (`LocalBlobStore`) — **the only crate in the workspace that performs
 filesystem syscalls**. It owns the durable commit sequence, the self-describing CRNB block format
 (compression + SSE-S3 encryption at rest), and the reconcile (orphan-reclaim) path. Object bytes are

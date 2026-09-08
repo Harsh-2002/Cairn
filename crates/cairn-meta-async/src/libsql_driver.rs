@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 /// it in `Error::SqliteFailure(code, _)`; the extended code is `19 | (sub << 8)`, so the primary
 /// code is the low byte.
 const SQLITE_CONSTRAINT: i32 = 19;
+const SQLITE_FULL: i32 = 13;
 
 /// One libSQL connection behind the async driver seam, plus a per-connection prepared-statement
 /// cache. libSQL's local `Connection::execute`/`query` re-compile the SQL on every call, so the
@@ -59,10 +60,13 @@ impl LibsqlDriver {
 
 /// Map a libSQL error to a domain metadata error, surfacing constraint violations as the typed
 /// [`MetaError::Conflict`] so callers map them exactly as the rusqlite store does (`engine_err`).
-fn map_err(e: libsql::Error) -> MetaError {
+pub(crate) fn map_err(e: libsql::Error) -> MetaError {
     if let libsql::Error::SqliteFailure(code, _) = &e {
         if code & 0xff == SQLITE_CONSTRAINT {
             return MetaError::Conflict;
+        }
+        if code & 0xff == SQLITE_FULL {
+            return MetaError::OutOfSpace;
         }
     }
     MetaError::Engine(e.to_string())
@@ -135,5 +139,30 @@ impl AsyncSqlDriver for LibsqlDriver {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_classification_uses_libsql_code() {
+        for code in [SQLITE_FULL, SQLITE_FULL | (1 << 8)] {
+            assert!(matches!(
+                map_err(libsql::Error::SqliteFailure(
+                    code,
+                    "opaque diagnostic".into()
+                )),
+                MetaError::OutOfSpace
+            ));
+        }
+        assert!(matches!(
+            map_err(libsql::Error::SqliteFailure(
+                10,
+                "database or disk is full".into()
+            )),
+            MetaError::Engine(_)
+        ));
     }
 }

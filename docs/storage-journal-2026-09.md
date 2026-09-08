@@ -61,12 +61,12 @@ The production tests exercise admitted plans across every metadata backend and s
 late blocking I/O/cancellation, exact multipart quota debt including scratch aliases, failed
 namespace synchronization, symlinks and same-filesystem bind mounts, claimed cleanup scan
 protection, publication ambiguity and fresh-generation recovery. The final local Rust gate passed
-1,388 default-feature and 1,413 all-feature tests (four/seven skipped), two doctests, formatting and
+1,403 default-feature and 1,429 all-feature tests (four/seven skipped), two doctests, formatting and
 both all-target Clippy configurations. Web lint/build, both npm audits, cargo audit and installer
 checks passed; 50 Python laboratory tests passed with two optional live fixtures skipped. The
 cleanup scheduler regressions additionally cover more than one page with the default hourly
-stale-upload interval, shutdown before claims and locked-file debt retention. Final-head CI and
-the measured revision/results remain pending.
+stale-upload interval, shutdown before claims and locked-file debt retention. The CI follow-up fixes also pass 15 deterministic soak-cleanup verifier tests and the rebuilt
+privileged pending-kernel-write fixture. Final-head CI and the measured revision/results remain pending.
 
 The privileged Linux io_uring fixture freezes only its own mounted ext4 image, observes an actual
 submitted write pending in the kernel, sends SIGKILL, and confirms node/file exclusion remains

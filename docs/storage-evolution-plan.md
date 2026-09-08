@@ -300,3 +300,19 @@ local gate passes 1,388 default-feature and 1,413 all-feature tests, both Clippy
 formatting and two doctests. Web, npm audits, cargo audits and installer checks pass. Final-head CI,
 the admission-cost comparison, final review and merge remain pending.
 Phase 3C is not complete and Phase 3D is not activated. Campaign consumption is unchanged.
+
+PR #91 opened at `537c2b3`. Initial CI passed 52 checks and exposed two integration gaps: metadata
+admission on a full filesystem returned 500 instead of 507, and cleanup could prune an empty bucket
+directory held by pending multipart assembly. Typed capacity propagation and directory lifetime
+fences now have focused regressions; the mixed-feature harness is being updated to verify exact
+deferred cleanup within a deadline. The async Writer review additionally found ignored savepoint
+failures; whole-batch abort tests accompany its fix, and the additional issue candidate is pending
+operator approval. No comparison ran on the rejected candidate; the ledger remains unchanged.
+
+The CI follow-up revision passes the complete Rust gate: 1,403 default-feature and 1,429
+all-feature tests (four/seven skipped), two doctests, formatting and both Clippy configurations.
+The directory-lock review also corrected completed coalescer/io_uring descriptor release before
+acknowledgement; deterministic response-boundary regressions and the rebuilt privileged
+pending-kernel-write SIGKILL fixture pass. Fifteen terminal-cleanup verifier tests pass.
+The prior web/audit/installer results apply to their unchanged source and dependency inputs.
+New-head CI and the predeclared cost comparison remain pending; no additional experiment ran.

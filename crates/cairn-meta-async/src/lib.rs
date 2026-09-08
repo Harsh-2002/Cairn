@@ -88,7 +88,7 @@ impl Default for OpenOptions {
 /// Apply the pragmas every connection shares (foreign keys, temp-store, busy timeout, mmap, cache).
 async fn apply_common_pragmas(conn: &Connection, opts: &OpenOptions) -> Result<(), MetaError> {
     conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))
-        .map_err(|e| MetaError::Engine(e.to_string()))?;
+        .map_err(libsql_driver::map_err)?;
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys=ON;
          PRAGMA temp_store=MEMORY;
@@ -97,7 +97,7 @@ async fn apply_common_pragmas(conn: &Connection, opts: &OpenOptions) -> Result<(
         opts.mmap_bytes, opts.cache_size
     ))
     .await
-    .map_err(|e| MetaError::Engine(e.to_string()))?;
+    .map_err(libsql_driver::map_err)?;
     Ok(())
 }
 
@@ -110,7 +110,7 @@ pub async fn open_libsql(
     db_path: &Path,
     opts: &OpenOptions,
 ) -> Result<LibsqlMetadataStore, MetaError> {
-    let map = |e: libsql::Error| MetaError::Engine(e.to_string());
+    let map = libsql_driver::map_err;
 
     // A single libSQL Database handle over the file; every connection opens the same file in WAL
     // mode (the rusqlite store likewise opens one write connection + an r2d2 read pool on the file).
@@ -170,7 +170,7 @@ pub async fn open_libsql(
 /// # Errors
 /// Returns a [`MetaError`] on failure.
 pub async fn open_libsql_in_memory() -> Result<LibsqlMetadataStore, MetaError> {
-    let map = |e: libsql::Error| MetaError::Engine(e.to_string());
+    let map = libsql_driver::map_err;
     let name = format!(
         "file:cairn-libsql-mem-{}?mode=memory&cache=shared",
         uuid::Uuid::new_v4().simple()
@@ -220,7 +220,7 @@ async fn apply_turso_pragmas(
     opts: &OpenOptions,
 ) -> Result<(), MetaError> {
     conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout_ms))
-        .map_err(|e| MetaError::Engine(e.to_string()))?;
+        .map_err(turso_driver::map_err)?;
     // Best-effort: ignore an error so a PRAGMA the beta engine does not implement does not abort
     // startup. Turso enforces foreign keys for the multipart-parts cascade the store relies on.
     let sync = if opts.synchronous_full {
@@ -246,7 +246,7 @@ pub async fn open_turso(
     db_path: &Path,
     opts: &OpenOptions,
 ) -> Result<TursoMetadataStore, MetaError> {
-    let map = |e: turso::Error| MetaError::Engine(e.to_string());
+    let map = turso_driver::map_err;
     let path = db_path
         .to_str()
         .ok_or_else(|| MetaError::Engine("db_path is not valid UTF-8".to_owned()))?;
@@ -289,7 +289,7 @@ pub async fn open_turso(
 /// # Errors
 /// Returns a [`MetaError`] on failure.
 pub async fn open_turso_in_memory() -> Result<TursoMetadataStore, MetaError> {
-    let map = |e: turso::Error| MetaError::Engine(e.to_string());
+    let map = turso_driver::map_err;
 
     let db = turso::Builder::new_local(":memory:")
         .experimental_vacuum(true)

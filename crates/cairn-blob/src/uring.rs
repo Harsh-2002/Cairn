@@ -11,8 +11,8 @@
 //!
 //! The durable-commit ordering is preserved byte-for-byte with the `tokio::fs` path: write the
 //! payload, **fsync the file**, **rename** it into the bucket directory, then **fsync that
-//! directory** (the F-1 ordering, ARCH 8.2). All of those steps are issued as io_uring ops on
-//! the executor thread that owns the staging file's fd.
+//! directory** (the F-1 ordering, ARCH 8.2). Data writes and file sync use io_uring; the anchored
+//! rename runs in a leased blocking job, followed by the shared directory-sync coalescer.
 
 use crate::namespace::AnchoredPath;
 use crate::owned_file::FileOwner;
@@ -276,15 +276,22 @@ async fn writer_task(
                 let _ = reply.send(result.map_err(io_err));
             }
             WriteCmd::Commit(destination, reply) => {
-                let result = async {
-                    file.sync_data().await.map_err(io_err)?;
-                    file.close().await.map_err(io_err)?;
-                    owner
+                let synced = file.sync_data().await.map_err(io_err);
+                let closed = file.close().await.map_err(io_err);
+                let result = match synced.and(closed) {
+                    Ok(()) => owner
                         .run(move |_| staging.rename_to(&destination))
                         .await
-                        .map_err(io_err)
-                }
-                .await;
+                        .map_err(io_err),
+                    Err(error) => {
+                        drop(staging);
+                        drop(destination);
+                        Err(error)
+                    }
+                };
+                // The completed task must not retain file/directory fences after waking callers
+                // which can immediately publish and retire their final cleanup debt.
+                let _lease = owner.into_lease();
                 let _ = reply.send(result.clone_shallow());
                 let _ = final_result.send(result);
                 return;
@@ -293,19 +300,26 @@ async fn writer_task(
                 let result = file.sync_data().await.map_err(io_err);
                 let closed = file.close().await.map_err(io_err);
                 let result = result.and(closed);
+                drop(staging);
+                let _lease = owner.into_lease();
                 let _ = reply.send(result.clone_shallow());
                 let _ = final_result.send(result);
                 return;
             }
             WriteCmd::Abort(reply) => {
                 let result = file.close().await.map_err(io_err);
+                drop(staging);
+                let _lease = owner.into_lease();
                 let _ = reply.send(result.clone_shallow());
                 let _ = final_result.send(result);
                 return;
             }
         }
     }
-    let _ = final_result.send(file.close().await.map_err(io_err));
+    let result = file.close().await.map_err(io_err);
+    drop(staging);
+    let _lease = owner.into_lease();
+    let _ = final_result.send(result);
 }
 
 /// `BlobError` is not `Clone`; this gives us a cheap shallow clone for the two-sink fan-out
@@ -331,5 +345,140 @@ fn clone_blob_error(e: &BlobError) -> BlobError {
         BlobError::Corruption(s) => BlobError::Corruption(s.clone()),
         // Body errors never originate from the executor-side commit; map to Io defensively.
         other => BlobError::Io(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::storage::{StorageToken, io::StorageIoWatch};
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Wake, Waker};
+
+    #[tokio::test]
+    async fn terminal_acknowledgements_release_file_and_directory_fences_before_waking() {
+        enum Terminal {
+            Commit,
+            Sync,
+            Abort,
+            ChannelClosed,
+        }
+        struct Probe {
+            directories: Vec<std::path::PathBuf>,
+            file: std::path::PathBuf,
+            watch: Mutex<StorageIoWatch>,
+            wakes: AtomicUsize,
+        }
+        impl Wake for Probe {
+            fn wake(self: Arc<Self>) {
+                for path in self.directories.iter().chain(std::iter::once(&self.file)) {
+                    let file = crate::open_readonly_nofollow(path).unwrap();
+                    crate::try_lock_exclusive(&file)
+                        .expect("terminal acknowledgement retained a completed descriptor fence");
+                }
+                assert!(
+                    self.watch
+                        .lock()
+                        .unwrap()
+                        .quiescent()
+                        .now_or_never()
+                        .is_none(),
+                    "the terminal task must retain its I/O lease through the acknowledgement"
+                );
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for terminal in [
+            Terminal::Commit,
+            Terminal::Sync,
+            Terminal::Abort,
+            Terminal::ChannelClosed,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let session = root.path().join("session");
+            let bucket = root.path().join("bucket");
+            std::fs::create_dir(&session).unwrap();
+            std::fs::create_dir(&bucket).unwrap();
+            let source_path = session.join("source");
+            let final_path = bucket.join("final");
+            let staging = AnchoredPath::fixture(&source_path);
+            rustix::fs::flock(&*staging.parent, rustix::fs::FlockOperation::LockShared).unwrap();
+            let file = staging.create_new().unwrap();
+            let (mut watch, lease) = StorageIoWatch::new(
+                StorageToken::generate(),
+                StorageToken::generate(),
+                Arc::new(()),
+            );
+            let owner = FileOwner::new(file, lease);
+            let is_commit = matches!(terminal, Terminal::Commit);
+            let is_closed = matches!(terminal, Terminal::ChannelClosed);
+            let probe = Arc::new(Probe {
+                directories: vec![session, bucket],
+                file: if is_commit {
+                    final_path.clone()
+                } else {
+                    source_path
+                },
+                watch: Mutex::new(watch.clone()),
+                wakes: AtomicUsize::new(0),
+            });
+            let waker = Waker::from(probe.clone());
+            let (commands, receiver) = tokio::sync::mpsc::channel(1);
+            let (ready, ready_rx) = oneshot::channel();
+            let (done, mut done_rx) = oneshot::channel();
+            let (ended, ended_rx) = oneshot::channel();
+            assert!(
+                Pin::new(&mut done_rx)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            executor()
+                .spawn_detached(move || async move {
+                    writer_task(staging, owner, receiver, ready, done).await;
+                    ended.send(()).unwrap();
+                })
+                .unwrap();
+            ready_rx.await.unwrap().unwrap();
+            let (reply, mut reply_rx) = oneshot::channel();
+            if !is_closed {
+                assert!(
+                    Pin::new(&mut reply_rx)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            let command = match terminal {
+                Terminal::Commit => {
+                    let destination = AnchoredPath::fixture(&final_path);
+                    rustix::fs::flock(&*destination.parent, rustix::fs::FlockOperation::LockShared)
+                        .unwrap();
+                    Some(WriteCmd::Commit(destination, reply))
+                }
+                Terminal::Sync => Some(WriteCmd::FsyncInPlace(reply)),
+                Terminal::Abort => Some(WriteCmd::Abort(reply)),
+                Terminal::ChannelClosed => {
+                    drop(reply);
+                    None
+                }
+            };
+            if let Some(command) = command {
+                commands.send(command).await.unwrap();
+            }
+            drop(commands);
+            // Do not poll either terminal receiver again before the worker finishes: their
+            // custom wakers inspect the exact synchronous send boundary on the ring executor.
+            ended_rx.await.unwrap();
+            done_rx.try_recv().unwrap().unwrap();
+            if !is_closed {
+                reply_rx.try_recv().unwrap().unwrap();
+            }
+            assert_eq!(
+                probe.wakes.load(Ordering::SeqCst),
+                if is_closed { 1 } else { 2 }
+            );
+            assert!(watch.quiescent().now_or_never().is_some());
+        }
     }
 }

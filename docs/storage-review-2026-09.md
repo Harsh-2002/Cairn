@@ -63,3 +63,40 @@ checks also passed. The cleanup scheduler's three additional regressions prove p
 shutdown, and retained debt while a file lock prevents cleanup. Fifty Python laboratory tests pass
 (two optional live fixtures skipped); the standalone laboratory lockfile audit passes with its
 pre-existing allowed yanked-package warning. Final-head CI, cost measurements and merge remain pending.
+
+## Additional finding: async Writer ignores savepoint failures
+
+Issue filing approval is pending. The optional async Writer on merged main `bf17dfe` ignores
+failed `release` and `rollback_to` results before committing a batch. A deterministic driver fixture
+performs a real configuration write, returns an apply error and injects a rollback-to-savepoint
+failure. Whole-batch rollback now preserves the original row instead of allowing that partial
+mutation to reach commit. Failure-point tests also cover savepoint creation/release, typed capacity
+errors and a real commit followed by an acknowledgement error. That last case preserves committed
+state and explicitly prevents interpreting an error as proof of nonpublication.
+
+This was found while investigating PR #91's new admission path returning 500 on a full metadata
+filesystem. SQLite, libSQL and Turso now retain typed capacity failures through Writer response
+fan-out and secondary rollback errors; the canonical mapping returns 507. The protocol regression
+checks the body remains unpolled, no file is created, and a later retry round-trips its bytes.
+The focused backend/protocol tests pass; final combined validation remains pending.
+
+Initial PR #91 CI also found an integration race where empty-directory pruning invalidated a
+pending completion's final directory descriptor. Directory fences now protect prepared namespace
+operations and have deterministic creation/cancellation/pruning regressions. The soak's former
+immediate cleanup assertion is replaced by bounded exact physical/debt/quota verification;
+5xx, byte-integrity and leak-shape thresholds are preserved. No local full soak or performance
+comparison was run on the rejected revision.
+
+The final ordering review additionally found that coalesced directory-sync acknowledgements and
+io_uring terminal responses could wake callers before releasing completed descriptor locks.
+The coalescer now drops every completed directory descriptor before any batch acknowledgement;
+the ring writer closes its ring descriptor and releases its original file/namespace descriptors
+before terminal responses. Both retain I/O leases through actual task completion. Custom-waker
+regressions probe the locks at the response boundary, and an eight-pruner barrier proves finite
+competing cleanups release shared child locks before acquiring exclusive pruning ownership.
+All 131 enabled all-feature blob tests pass, with four privileged/opt-in fixtures skipped in
+that run. The rebuilt privileged pending-kernel-write SIGKILL fixture also passes separately;
+its owned loop device, mount and image were removed, and the original loop inventory is unchanged.
+This still proves the observed exclusion through process teardown, not physical power-loss
+behavior or an observed post-exit kernel-reference window. The combined workspace gate passes 1,403 default-feature and 1,429 all-feature tests, two
+doctests, formatting and both all-target Clippy configurations. Final-head CI remains required.

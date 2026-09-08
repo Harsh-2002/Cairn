@@ -35,6 +35,15 @@ impl FileOwner {
         })
     }
 
+    /// Release this completed operation's descriptor before acknowledgement while retaining
+    /// its actual task lifetime. Any other file owners keep their own descriptors and leases.
+    #[cfg(feature = "io-uring")]
+    pub(crate) fn into_lease(self) -> StorageIoLease {
+        let Self { file, lease } = self;
+        drop(file);
+        lease
+    }
+
     /// The result owns the lease too: cancelling the await cannot expose a still-open descriptor
     /// or retained buffer after the recovery observer reports quiescence.
     pub(crate) async fn run<T, F>(&self, operation: F) -> io::Result<T>

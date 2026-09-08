@@ -375,6 +375,88 @@ async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMeta
     (harness, meta)
 }
 
+/// Admission can hit a full metadata filesystem before staging ever observes blob ENOSPC.
+/// Preserve the storage-capacity response and leave the body/files untouched until a later retry.
+#[tokio::test]
+async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
+    let (h, meta) = in_memory_harness().await;
+    let bucket = "full-admission";
+    assert_eq!(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![])
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    meta.reject_next_storage_admission_out_of_space();
+    let staging_entries = || {
+        let mut names = std::fs::read_dir(h._dir.path().join(".staging"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = staging_entries();
+    let (request, _) = req(Method::PUT, Some(bucket), Some("object"), &[], &[], vec![]);
+    let polled = Arc::new(AtomicBool::new(false));
+    let observed = polled.clone();
+    let body = Box::pin(futures_util::stream::once(async move {
+        observed.store(true, Ordering::Release);
+        Ok(Bytes::from_static(b"must not stage"))
+    }));
+    let (status, _, response) = drain(h.svc.handle(request, body).await).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("InsufficientStorage")
+    );
+    assert!(!polled.load(Ordering::Acquire));
+    h.settle_recovery().await;
+    assert!(!h._dir.path().join(bucket).exists());
+    assert_eq!(staging_entries(), before);
+    assert!(
+        meta.current_version(
+            &BucketName::parse(bucket).unwrap(),
+            &ObjectKey::parse("object").unwrap()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let expected = b"capacity restored".to_vec();
+    assert_eq!(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some("object"),
+                &[],
+                &[],
+                expected.clone()
+            )
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let (status, _, bytes) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some(bucket), Some("object"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, expected);
+}
+
 async fn in_memory_harness_with_clock() -> (
     Harness,
     Arc<cairn_types::testing::InMemoryMetadataStore>,

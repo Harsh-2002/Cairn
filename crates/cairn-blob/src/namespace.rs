@@ -80,19 +80,62 @@ pub(crate) fn initialize(root: &Path) -> std::io::Result<()> {
 }
 
 fn ensure_directory(parent: &File, name: &str) -> std::io::Result<File> {
-    match mkdirat(parent, name, Mode::from_bits_truncate(0o700)) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-        Err(error) => return Err(error.into()),
-    }
-    let directory = open_beneath(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
+    let directory = open_directory(parent, name, true)?;
     // EXIST can race a creator whose parent barrier has not completed yet.
     parent.sync_all()?;
     Ok(directory)
+}
+
+/// Keep the shared lock on this open description, so cloned anchored paths and queued jobs
+/// exclude empty-directory pruning until their final File reference is released.
+fn open_directory(parent: &File, name: &str, create: bool) -> std::io::Result<File> {
+    loop {
+        if create {
+            match mkdirat(parent, name, Mode::from_bits_truncate(0o700)) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let directory = match open_beneath(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(directory) = lock_linked_directory(parent, name, directory)? {
+            return Ok(directory);
+        }
+        // A pruner may have won between open and flock, including while flock waited. Reopen
+        // the linked name; an already-unlinked descriptor must never become a creation target.
+    }
+}
+
+fn lock_linked_directory(
+    parent: &File,
+    name: &str,
+    directory: File,
+) -> std::io::Result<Option<File>> {
+    rustix::fs::flock(&directory, rustix::fs::FlockOperation::LockShared)?;
+    let expected = fstat(&directory)?;
+    let named = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(named) => named,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if expected.st_nlink == 0 || named.st_dev != expected.st_dev || named.st_ino != expected.st_ino
+    {
+        return Ok(None);
+    }
+    if expected.st_dev != fstat(parent)?.st_dev
+        || FileType::from_raw_mode(named.st_mode) != FileType::Directory
+    {
+        return Err(std::io::Error::other("unsupported storage directory"));
+    }
+    Ok(Some(directory))
 }
 
 #[derive(Clone, Debug)]
@@ -244,24 +287,9 @@ fn prepare_path(
             parent = directory.clone();
             continue;
         }
-        match mkdirat(&*parent, name, Mode::from_bits_truncate(0o700)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let child = open_beneath(
-            &parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        if fstat(&child)?.st_dev != fstat(&*parent)?.st_dev {
-            return Err(std::io::Error::other(
-                "storage directory crosses filesystems",
-            ));
-        }
         // Existing does not imply durable: another creator may have failed its parent sync.
         // Complete this barrier in the same non-cancellable closure before dependent creation.
-        parent.sync_all()?;
+        let child = ensure_directory(&parent, name)?;
         parent = Arc::new(child);
         directories.insert(prefix.clone(), parent.clone());
     }
@@ -324,12 +352,7 @@ pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
     let mut parent = Arc::new(root);
     let mut chain = Vec::new();
     for (index, name) in components[..components.len() - 1].iter().enumerate() {
-        let child = match open_beneath(
-            &parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
+        let child = match open_directory(&parent, name, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 sync_absence(&parent)?;
@@ -337,9 +360,6 @@ pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
             }
             Err(error) => return Err(error),
         };
-        if fstat(&child)?.st_dev != fstat(&*parent)?.st_dev {
-            return Err(std::io::Error::other("storage cleanup crosses filesystems"));
-        }
         let child = Arc::new(child);
         chain.push(DirectoryLink {
             parent,
@@ -402,9 +422,26 @@ struct DirectoryLink {
 }
 
 fn prune(chain: Vec<DirectoryLink>) -> std::io::Result<()> {
+    prune_with(chain, || {})
+}
+
+fn prune_with(
+    chain: Vec<DirectoryLink>,
+    mut before_exclusive: impl FnMut(),
+) -> std::io::Result<()> {
     for link in chain.into_iter().rev() {
         if !link.prunable {
             break;
+        }
+        // Release shared ownership explicitly: finite competing cleanups must not all fail an
+        // upgrade while retaining their shared locks, then retire the last debt without pruning.
+        // The parent stays shared-locked. Revalidate the child after obtaining exclusive ownership.
+        rustix::fs::flock(&*link.child, rustix::fs::FlockOperation::Unlock)?;
+        before_exclusive();
+        match crate::try_lock_exclusive(&link.child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
         }
         match rustix::fs::statat(&*link.parent, link.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(named) => {
@@ -664,14 +701,20 @@ mod tests {
     }
 
     fn admitted() -> (StorageWritePlan, StorageIoWatch, StorageCreationPermit) {
+        admitted_target(StorageWriteTarget::Object {
+            key: ObjectKey::parse("key").unwrap(),
+            version_id: VersionId::null(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        })
+    }
+
+    fn admitted_target(
+        target: StorageWriteTarget,
+    ) -> (StorageWritePlan, StorageIoWatch, StorageCreationPermit) {
         let planned = PlannedStorageWrite::new(
             BucketName::parse("bucket").unwrap(),
             StorageToken::generate(),
-            StorageWriteTarget::Object {
-                key: ObjectKey::parse("key").unwrap(),
-                version_id: VersionId::null(),
-                row_id: StorageToken::generate().as_str().to_owned(),
-            },
+            target,
         )
         .unwrap();
         let plan = planned.plan().clone();
@@ -701,6 +744,286 @@ mod tests {
 
     fn probe_lease(plan: &StorageWritePlan) -> StorageIoLease {
         StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), Arc::new(())).1
+    }
+
+    #[tokio::test]
+    async fn prepared_completion_and_part_survive_cleanup_of_the_last_old_file() {
+        let targets = [
+            StorageWriteTarget::Completion {
+                upload_id: cairn_types::UploadId::generate(),
+                claim_token: StorageToken::generate().as_str().to_owned(),
+                key: ObjectKey::parse("key").unwrap(),
+                version_id: VersionId::null(),
+                row_id: StorageToken::generate().as_str().to_owned(),
+            },
+            StorageWriteTarget::Part {
+                upload_id: cairn_types::UploadId::generate(),
+                part_number: 2,
+                reservation_id: StorageToken::generate().as_str().to_owned(),
+            },
+        ];
+        for target in targets {
+            let root = tempfile::tempdir().unwrap();
+            let store = crate::LocalBlobStore::open(
+                root.path(),
+                cairn_types::testing::fixture_storage_io(),
+            )
+            .await
+            .unwrap();
+            let is_part = matches!(target, StorageWriteTarget::Part { .. });
+            let (plan, mut watch, permit) = admitted_target(target);
+            let final_path = plan.final_path().unwrap().clone();
+            let relative_parent = final_path.as_str().rsplit_once('/').unwrap().0;
+            let old_name = if is_part {
+                "00001-old".to_owned()
+            } else {
+                StorageToken::generate().as_str().to_owned()
+            };
+            let old_path = StoragePath::from_string(format!("{relative_parent}/{old_name}"));
+            std::fs::create_dir_all(root.path().join(relative_parent)).unwrap();
+            std::fs::write(root.path().join(old_path.as_str()), b"old").unwrap();
+            let paths = AdmittedPaths::open(root.path(), permit).await.unwrap();
+
+            let old_cleanup = claim(&plan, old_path);
+            store
+                .cleanup_storage(&old_cleanup, cleanup_lease(&old_cleanup))
+                .await
+                .unwrap();
+            assert!(root.path().join(relative_parent).is_dir());
+            let mut staged = crate::staging::Staging::create(
+                paths.staging.clone(),
+                false,
+                None,
+                paths.lease.try_child().unwrap(),
+            )
+            .await
+            .unwrap();
+            staged.write_all(b"new").await.unwrap();
+            if is_part {
+                staged.fsync_in_place().await.unwrap();
+            } else {
+                staged.commit(&paths.final_file).await.unwrap();
+            }
+            paths.final_file.parent.sync_all().unwrap();
+            assert_eq!(
+                std::fs::read(root.path().join(final_path.as_str())).unwrap(),
+                b"new"
+            );
+            drop(paths);
+            watch.quiescent().await;
+
+            let new_cleanup = claim(&plan, final_path.clone());
+            store
+                .cleanup_storage(&new_cleanup, cleanup_lease(&new_cleanup))
+                .await
+                .unwrap();
+            assert!(!root.path().join(relative_parent).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_rename_keeps_the_directory_fence_until_its_actual_job_finishes() {
+        use futures_util::FutureExt;
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            crate::LocalBlobStore::open(root.path(), cairn_types::testing::fixture_storage_io())
+                .await
+                .unwrap();
+        let (plan, mut watch, permit) = admitted();
+        let paths = AdmittedPaths::open(root.path(), permit).await.unwrap();
+        let old_path =
+            StoragePath::from_string(format!("bucket/{}", StorageToken::generate().as_str()));
+        std::fs::write(root.path().join(old_path.as_str()), b"old").unwrap();
+        let mut file = paths.staging.create_new().unwrap();
+        file.write_all(b"late rename").unwrap();
+        let owner = crate::owned_file::FileOwner::new(file, paths.lease.try_child().unwrap());
+        let source = paths.staging.clone();
+        let destination = paths.final_file.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            owner
+                .run(move |file| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    file.sync_data()?;
+                    source.rename_to(&destination)?;
+                    destination.parent.sync_all()
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        watch.cancel();
+        drop(paths);
+        assert!(watch.quiescent().now_or_never().is_none());
+
+        let old_cleanup = claim(&plan, old_path);
+        store
+            .cleanup_storage(&old_cleanup, cleanup_lease(&old_cleanup))
+            .await
+            .unwrap();
+        assert!(root.path().join("bucket").is_dir());
+        release_tx.send(()).unwrap();
+        watch.quiescent().await;
+        assert_eq!(
+            std::fs::read(root.path().join(plan.final_path().unwrap().as_str())).unwrap(),
+            b"late rename"
+        );
+        let final_cleanup = claim(&plan, plan.final_path().unwrap().clone());
+        store
+            .cleanup_storage(&final_cleanup, cleanup_lease(&final_cleanup))
+            .await
+            .unwrap();
+        assert!(!root.path().join("bucket").exists());
+    }
+
+    #[test]
+    fn shared_lock_waiter_rejects_a_pruned_descriptor_before_reopening_the_name() {
+        for replace in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("bucket")).unwrap();
+            let parent = Arc::new(crate::open_readonly_nofollow(root.path()).unwrap());
+            let old = open_beneath(
+                &parent,
+                "bucket",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+            let old_inode = fstat(&old).unwrap().st_ino;
+            // Keep the removed inode allocated while checking that reopen chose a new one.
+            let _old_identity = old.try_clone().unwrap();
+            let pruning = open_beneath(
+                &parent,
+                "bucket",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+            crate::try_lock_exclusive(&pruning).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let waiting_parent = parent.clone();
+            let waiter = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                assert!(
+                    lock_linked_directory(&waiting_parent, "bucket", old)
+                        .unwrap()
+                        .is_none()
+                );
+                open_directory(&waiting_parent, "bucket", true).unwrap()
+            });
+            entered_rx.recv().unwrap();
+            unlinkat(&*parent, "bucket", AtFlags::REMOVEDIR).unwrap();
+            if replace {
+                mkdirat(&*parent, "bucket", Mode::from_bits_truncate(0o700)).unwrap();
+            }
+            parent.sync_all().unwrap();
+            drop(pruning);
+            let linked = waiter.join().unwrap();
+            let named = rustix::fs::statat(&*parent, "bucket", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            assert_ne!(fstat(&linked).unwrap().st_ino, old_inode);
+            assert_eq!(fstat(&linked).unwrap().st_ino, named.st_ino);
+        }
+    }
+
+    #[test]
+    fn concurrent_pruners_stop_on_shared_descendants_then_prune_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("bucket/ab")).unwrap();
+        let root_file = Arc::new(crate::open_readonly_nofollow(root.path()).unwrap());
+        let chain = || {
+            let bucket = Arc::new(open_directory(&root_file, "bucket", false).unwrap());
+            let leaf = Arc::new(open_directory(&bucket, "ab", false).unwrap());
+            vec![
+                DirectoryLink {
+                    parent: root_file.clone(),
+                    child: bucket.clone(),
+                    name: "bucket".into(),
+                    prunable: true,
+                },
+                DirectoryLink {
+                    parent: bucket,
+                    child: leaf,
+                    name: "ab".into(),
+                    prunable: true,
+                },
+            ]
+        };
+        let first = chain();
+        let second = chain();
+        prune(first).unwrap();
+        assert!(root.path().join("bucket/ab").is_dir());
+        prune(second).unwrap();
+        assert!(!root.path().join("bucket").exists());
+    }
+
+    #[test]
+    fn competing_session_pruners_release_shared_fences_and_remove_the_final_directory() {
+        const PRUNERS: usize = 8;
+        let root = tempfile::tempdir().unwrap();
+        let upload = StorageToken::generate();
+        let session = format!(".staging/multipart/{}", upload.as_str());
+        std::fs::create_dir_all(root.path().join(&session)).unwrap();
+        let root_file = Arc::new(crate::open_readonly_nofollow(root.path()).unwrap());
+        let chains: Vec<_> = (0..PRUNERS)
+            .map(|_| {
+                let staging = Arc::new(open_directory(&root_file, ".staging", false).unwrap());
+                let multipart = Arc::new(open_directory(&staging, "multipart", false).unwrap());
+                let directory =
+                    Arc::new(open_directory(&multipart, upload.as_str(), false).unwrap());
+                vec![
+                    DirectoryLink {
+                        parent: root_file.clone(),
+                        child: staging.clone(),
+                        name: ".staging".into(),
+                        prunable: false,
+                    },
+                    DirectoryLink {
+                        parent: staging,
+                        child: multipart.clone(),
+                        name: "multipart".into(),
+                        prunable: false,
+                    },
+                    DirectoryLink {
+                        parent: multipart,
+                        child: directory,
+                        name: upload.as_str().to_owned(),
+                        prunable: true,
+                    },
+                ]
+            })
+            .collect();
+        let released = std::sync::Barrier::new(PRUNERS + 1);
+        let resume = std::sync::Barrier::new(PRUNERS + 1);
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = chains
+                .into_iter()
+                .map(|chain| {
+                    scope.spawn(|| {
+                        prune_with(chain, || {
+                            released.wait();
+                            resume.wait();
+                        })
+                    })
+                })
+                .collect();
+            released.wait();
+            let probe = crate::open_readonly_nofollow(&root.path().join(&session)).unwrap();
+            let unlocked = crate::try_lock_exclusive(&probe);
+            drop(probe);
+            resume.wait();
+            unlocked
+                .expect("every contender must release its shared fence before trying exclusive");
+            for job in jobs {
+                job.join().unwrap().unwrap();
+            }
+        });
+        assert!(!root.path().join(session).exists());
+        assert!(root.path().join(".staging/multipart").is_dir());
     }
 
     #[tokio::test]

@@ -82,18 +82,33 @@ async fn run(mut requests: mpsc::UnboundedReceiver<SyncRequest>) {
             by_dir.entry(request.identity).or_default().push(request);
         }
         let syncs = by_dir.into_values().map(|waiters| async move {
-            // The closure owns every waiter and lease through actual fsync completion. Neither
-            // request cancellation nor dropping this coordinator future can release them early.
-            let _ = tokio::task::spawn_blocking(move || {
-                let result = waiters[0].dir.sync_all().map_err(|error| error.to_string());
-                for waiter in waiters {
-                    let _ = waiter.done.send(result.clone());
-                }
-            })
-            .await;
+            // Returned leases retain ownership through actual closure completion and even an
+            // abandoned join result. Completed directory fences need not delay terminal cleanup.
+            let _ = tokio::task::spawn_blocking(move || sync_waiters(waiters)).await;
         });
         futures_util::future::join_all(syncs).await;
     }
+}
+
+fn sync_waiters(waiters: Vec<SyncRequest>) -> Vec<StorageIoLease> {
+    let result = waiters[0].dir.sync_all().map_err(|error| error.to_string());
+    let mut completions = Vec::with_capacity(waiters.len());
+    let mut leases = Vec::with_capacity(waiters.len());
+    for SyncRequest {
+        dir, done, lease, ..
+    } in waiters
+    {
+        drop(dir);
+        completions.push(done);
+        leases.push(lease);
+    }
+    // A wake may immediately publish/complete/delete on another executor thread. Release ALL
+    // this batch's directory fences first, so its last cleanup cannot defer pruning on a finished
+    // sync operation whose acknowledgement has already allowed the final debt to be retired.
+    for done in completions {
+        let _ = done.send(result.clone());
+    }
+    leases
 }
 
 async fn direct_sync(dir: Arc<File>, lease: StorageIoLease) -> Result<(), BlobError> {
@@ -146,6 +161,86 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_release_all_directory_fences_but_retain_actual_job_leases() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct Probe {
+            directory: std::path::PathBuf,
+            watch: Mutex<StorageIoWatch>,
+            wakes: AtomicUsize,
+        }
+        impl Wake for Probe {
+            fn wake(self: Arc<Self>) {
+                let directory = crate::open_readonly_nofollow(&self.directory).unwrap();
+                crate::try_lock_exclusive(&directory)
+                    .expect("completed directory fences must be gone before acknowledgement wake");
+                assert!(
+                    self.watch
+                        .lock()
+                        .unwrap()
+                        .quiescent()
+                        .now_or_never()
+                        .is_none(),
+                    "the still-executing sync job must retain its I/O leases"
+                );
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut watch, lease) = StorageIoWatch::new(
+            StorageToken::generate(),
+            StorageToken::generate(),
+            Arc::new(()),
+        );
+        let probe = Arc::new(Probe {
+            directory: dir.path().to_owned(),
+            watch: Mutex::new(watch.clone()),
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(probe.clone());
+        let mut requests = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..2 {
+            // Separate open descriptions model callers which independently prepared this same
+            // directory: dropping one waiter must not leave another completed waiter's fence.
+            let file = crate::open_readonly_nofollow(dir.path()).unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+            let metadata = file.metadata().unwrap();
+            let (done, mut receiver) = oneshot::channel();
+            assert!(
+                Pin::new(&mut receiver)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            requests.push(SyncRequest {
+                dir: Arc::new(file),
+                identity: (metadata.dev(), metadata.ino()),
+                done,
+                lease: lease.try_child().unwrap(),
+            });
+            receivers.push(receiver);
+        }
+        drop(lease);
+        let retained = tokio::task::spawn_blocking(move || sync_waiters(requests))
+            .await
+            .unwrap();
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 2);
+        for receiver in receivers {
+            receiver.await.unwrap().unwrap();
+        }
+        assert!(
+            watch.quiescent().now_or_never().is_none(),
+            "even a completed join result retains the actual job's leases"
+        );
+        drop(retained);
+        assert!(watch.quiescent().now_or_never().is_some());
     }
 
     #[test]

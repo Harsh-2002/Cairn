@@ -71,8 +71,11 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   implement); the runner applies any version > current max, so the v12->v15 gap is correct. Don't
   renumber to close it.
 - **All writes go through the single `Writer`** task (group-commit, one savepoint per mutation, one
-  commit = one durability barrier). A failing mutation rolls back only its own savepoint. Never
-  open an ad-hoc write connection.
+  commit = one durability barrier). A failing mutation rolls back its own savepoint; a failed
+  savepoint operation aborts the entire batch because isolation is no longer established. Preserve
+  typed `MetaError::OutOfSpace` through batch fan-out and secondary rollback errors. A capacity
+  failure is not proof of nonpublication; retain the normal exact-identity ambiguity resolution.
+  Never open an ad-hoc write connection.
 - **Reads check out a connection exclusively.** A single libSQL/Turso connection cannot serve two
   concurrent reads — interleaved cursors return wrong/leaked rows (audit #8). The `ReadGuard` holds
   one pooled connection under its lock for the whole (possibly multi-query) read.

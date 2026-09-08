@@ -23,6 +23,16 @@ First, the object's bytes are streamed to a staging file in the staging director
 
 The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob without a visible object row, whose admitted intent is resolved into exact cleanup during recovery; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
 
+Prepared creation paths hold shared locks on their actual directory descriptors. These locks
+follow cloned descriptors into queued namespace work, so cleanup cannot remove an empty target
+directory before a pending rename. Cleanup holds shared directory locks through unlink and sync,
+then releases the child's shared lock before attempting nonblocking exclusive ownership for
+pruning; the parent stays locked. A busy directory is left in place. Completed coalesced syncs
+release all directory descriptors before acknowledgements, while their I/O leases remain owned
+through actual job completion.
+Acquisition rechecks the directory's name/inode after taking its lock and reopens if a pruner won
+the race; an unlinked descriptor is never accepted as a creation target.
+
 Cancellation does not synchronously unlink admitted paths. A bounded recovery slot and an exact
 plan guard are acquired before admission can reach the Writer, covering a lost admission
 acknowledgement as well as cancellation during staging, checksum validation and publication.

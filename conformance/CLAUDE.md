@@ -270,7 +270,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   and — every `SOAK_HEAVY_EVERY` ticks — `.staging` bytes and the `session_credentials` row count.
   **GATED, correctness:** zero operation errors, every sampled read byte-exact, WORM unbroken for the
   whole soak, the lifecycle control prefix never touched (and expirations actually observed), a
-  tampered session token refused on **every** mint, aborted uploads leaving no staging, `/healthz`
+  tampered session token refused on **every** mint, every completed/aborted upload retiring its
+  staging directory and exact cleanup/quota debt within 30 seconds of its response, `/healthz`
   never *stopping* (60 s per-probe **wedge** timeout — latency is load, not signal), server alive, and
   a 5xx counter EQUAL to the declared budget, which for this mix is exactly **zero** (every
   deliberate rejection here is a 4xx). **GATED, leak shape** (middle-third vs last-third, the
@@ -288,7 +289,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `SOAK_SECS` > ~930). The `session_credentials` row count is sampled and **reported, never gated**,
   for the same reason: on a sub-900 s soak a rising row count is *correct*. Everything rate-shaped —
   ops/s, Complete wall times, CPU-s/GiB, expirations observed — is advisory (CI drives the debug
-  artifact); `SOAK_OUT=` writes it all as JSON.
+  artifact); `SOAK_OUT=` writes it all as JSON. The independent cleanup observer retains at most
+  1024 pending session IDs, probes 64 at a time, and fails on overflow, overdue debt, unsupported
+  schema, or inconsistent bucket/principal quota totals. It never idles a load worker. Its final
+  drain preserves original deadlines and is excluded from the leak samples by a workload-stop
+  marker. `test_soak_cleanup.py` exercises this verifier deterministically before the launcher
+  starts the server.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `replication_large.sh` (+`.py`) — real 2 GiB + 17 and 5 GiB + 17 logical-byte replication to
   native Cairn and a SHA-pinned MinIO binary. Multipart source generation and all download hashing

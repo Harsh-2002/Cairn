@@ -37,9 +37,11 @@ impl TursoDriver {
 /// [`MetaError::Conflict`] so callers map them exactly as the rusqlite store does (`engine_err`).
 /// Turso reports a constraint failure with the dedicated [`turso::Error::Constraint`] variant
 /// (there is no extended numeric code to inspect, unlike libSQL's `SqliteFailure`).
-fn map_err(e: turso::Error) -> MetaError {
+pub(crate) fn map_err(e: turso::Error) -> MetaError {
     match e {
         turso::Error::Constraint(_) => MetaError::Conflict,
+        turso::Error::DatabaseFull(_)
+        | turso::Error::IoError(std::io::ErrorKind::StorageFull, _) => MetaError::OutOfSpace,
         other => MetaError::Engine(other.to_string()),
     }
 }
@@ -99,5 +101,31 @@ impl AsyncSqlDriver for TursoDriver {
         // synchronous database-image rebuild for this backend.
         self.conn.execute_batch("VACUUM").await.map_err(map_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_classification_uses_turso_variants() {
+        for error in [
+            turso::Error::DatabaseFull("opaque diagnostic".into()),
+            turso::Error::IoError(std::io::ErrorKind::StorageFull, "write"),
+        ] {
+            assert!(matches!(map_err(error), MetaError::OutOfSpace));
+        }
+        assert!(matches!(
+            map_err(turso::Error::Error("database or disk is full".into())),
+            MetaError::Engine(_)
+        ));
+        assert!(matches!(
+            map_err(turso::Error::IoError(
+                std::io::ErrorKind::Other,
+                "disk full"
+            )),
+            MetaError::Engine(_)
+        ));
     }
 }

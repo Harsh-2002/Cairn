@@ -477,6 +477,7 @@ pub struct InMemoryMetadataStore {
     hang_next_part_record_ack: AtomicBool,
     part_record_ack_hanging: AtomicBool,
     fail_next_storage_admission_ack: AtomicBool,
+    reject_next_storage_admission_out_of_space: AtomicBool,
     hang_next_storage_admission_ack: AtomicBool,
     storage_admission_ack_hanging: AtomicBool,
 }
@@ -499,6 +500,13 @@ impl InMemoryMetadataStore {
     /// obtain a creation permit. The retained consumer must resolve its persisted exact plan.
     pub fn fail_next_storage_admission_ack(&self) {
         self.fail_next_storage_admission_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Reject the next ordinary physical-write admission before applying its transaction, as a
+    /// full metadata filesystem can do before the blob body is read.
+    pub fn reject_next_storage_admission_out_of_space(&self) {
+        self.reject_next_storage_admission_out_of_space
             .store(true, Ordering::Release);
     }
 
@@ -858,6 +866,18 @@ fn page_rows(
 #[async_trait::async_trait]
 impl MetadataStore for InMemoryMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        if matches!(
+            &mutation,
+            Mutation::Storage {
+                operation: crate::storage::StorageMutation::Reserve { .. },
+                ..
+            }
+        ) && self
+            .reject_next_storage_admission_out_of_space
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(MetaError::OutOfSpace);
+        }
         if matches!(&mutation, Mutation::RenewReplicationClaim { .. })
             && self
                 .fail_next_replication_renew
