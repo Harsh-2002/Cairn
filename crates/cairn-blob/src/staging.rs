@@ -36,7 +36,7 @@ impl UncommittedBlobCleanup {
         }
     }
 
-    fn staging_only(staging_path: PathBuf) -> Self {
+    pub(crate) fn staging_only(staging_path: PathBuf) -> Self {
         Self {
             staging_path,
             final_path: None,

@@ -124,6 +124,7 @@ fn decrypt_block(
 /// Authenticate the complete plaintext index and fixed trailer. The fixed domain label makes this
 /// HMAC invocation disjoint from the per-block nonce derivation, which feeds only an eight-byte
 /// block index to HMAC under the same DEK.
+#[cfg(test)]
 fn metadata_tag(dek: &[u8; 32], index: &[u8], trailer: &[u8]) -> [u8; METADATA_TAG_LEN] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(dek).expect("HMAC accepts any key length");
     mac.update(METADATA_MAC_DOMAIN);
@@ -229,15 +230,16 @@ fn decompress_block(
 }
 
 /// Streaming block encoder. Feed logical bytes; it emits physical bytes for completed blocks
-/// and, on finish, the last block plus the index and trailer. The index remains in memory up to
-/// the shared format ceiling; payload output is proportional to the supplied chunk. With a DEK
+/// and retains only index entries not yet drained by the staging adapter. That adapter limits
+/// feed chunks and spools entries before finalization. With a DEK
 /// ([`new_encrypted`](BlockEncoder::new_encrypted)), each block is AES-256-GCM-encrypted after
 /// compression and the trailer records [`VERSION_ENCRYPTED`].
-pub struct BlockEncoder {
+pub(crate) struct BlockEncoder {
     algo: CompressionAlgorithm,
     block_size: usize,
     buf: Vec<u8>,
-    index: Vec<IndexEntry>,
+    index: Vec<u8>,
+    metadata_mac: Option<Hmac<Sha256>>,
     index_limit: usize,
     logical_len: u64,
     phys_len: u64,
@@ -245,7 +247,7 @@ pub struct BlockEncoder {
     dek: Option<SecretKey32>,
     /// The next block index to emit (drives the deterministic per-block nonce).
     block_index: u64,
-    /// Set if a block encryption failed; surfaced from [`finish`](BlockEncoder::finish).
+    /// Set if a block encryption failed; surfaced from [`finish_parts`](BlockEncoder::finish_parts).
     error: Option<BlobError>,
 }
 
@@ -268,6 +270,12 @@ impl BlockEncoder {
             block_size: block_size as usize,
             buf: Vec::new(),
             index: Vec::new(),
+            metadata_mac: dek.as_ref().map(|key| {
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.expose_secret())
+                    .expect("HMAC accepts any key length");
+                mac.update(METADATA_MAC_DOMAIN);
+                mac
+            }),
             index_limit: MAX_INDEX_LEN,
             logical_len: 0,
             phys_len: 0,
@@ -291,11 +299,18 @@ impl BlockEncoder {
             return Err(BlobError::SizeExceeded);
         }
         self.logical_len = next.ok_or(BlobError::SizeExceeded)?;
-        self.buf.extend_from_slice(data);
+        let mut remaining = data;
         let mut out = Vec::new();
-        while self.buf.len() >= self.block_size {
-            let block: Vec<u8> = self.buf.drain(..self.block_size).collect();
-            self.emit_block(&block, &mut out);
+        while !remaining.is_empty() {
+            let n = remaining.len().min(self.block_size - self.buf.len());
+            self.buf.extend_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            if self.buf.len() == self.block_size {
+                let mut block = std::mem::take(&mut self.buf);
+                self.emit_block(&block, &mut out);
+                block.clear();
+                self.buf = block;
+            }
         }
         Ok(out)
     }
@@ -312,23 +327,27 @@ impl BlockEncoder {
                 }
             }
         }
-        self.index.push(IndexEntry {
-            phys_len: phys.len() as u32,
-            logical_len: logical.len() as u32,
-            compressed,
-        });
+        let mut entry = [0u8; INDEX_ENTRY_LEN];
+        entry[..4].copy_from_slice(&(phys.len() as u32).to_le_bytes());
+        entry[4..8].copy_from_slice(&(logical.len() as u32).to_le_bytes());
+        entry[8] = u8::from(compressed);
+        self.index.extend_from_slice(&entry);
+        if let Some(mac) = &mut self.metadata_mac {
+            mac.update(&entry);
+        }
         self.phys_len += phys.len() as u64;
         self.block_index += 1;
         out.extend_from_slice(&phys);
     }
 
-    /// Flush the final partial block and append the index and trailer; returns those bytes, or an
-    /// error if any block failed to encrypt.
-    ///
-    /// # Errors
-    /// Returns [`BlobError::SizeExceeded`] for an unrepresentable index, or
-    /// [`BlobError::Corruption`] if a block's AES-256-GCM encryption failed.
-    pub fn finish(mut self) -> Result<Vec<u8>, BlobError> {
+    /// Drain serialized entries after each bounded feed, before accepting more input.
+    pub(crate) fn take_index(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.index)
+    }
+
+    /// Flush the final partial block and return the remaining index and fixed footer separately.
+    /// All earlier drained index entries must precede this footer in the final blob.
+    pub(crate) fn finish_parts(mut self) -> Result<EncodedTail, BlobError> {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
@@ -342,16 +361,10 @@ impl BlockEncoder {
             return Err(e);
         }
         let index_offset = self.phys_len;
-        let index_len = index_len_for_blocks(self.index.len(), self.index_limit)
+        let index_len = index_len_for_blocks(self.block_index as usize, self.index_limit)
             .ok_or(BlobError::SizeExceeded)?;
-        let block_count = u32::try_from(self.index.len()).map_err(|_| BlobError::SizeExceeded)?;
+        let block_count = u32::try_from(self.block_index).map_err(|_| BlobError::SizeExceeded)?;
         let index_len_u32 = u32::try_from(index_len).map_err(|_| BlobError::SizeExceeded)?;
-        let mut index_bytes = Vec::with_capacity(index_len);
-        for e in &self.index {
-            index_bytes.extend_from_slice(&e.phys_len.to_le_bytes());
-            index_bytes.extend_from_slice(&e.logical_len.to_le_bytes());
-            index_bytes.push(u8::from(e.compressed));
-        }
         let version = if self.dek.is_some() {
             VERSION_ENCRYPTED
         } else {
@@ -367,11 +380,34 @@ impl BlockEncoder {
         trailer.extend_from_slice(&index_offset.to_le_bytes());
         trailer.extend_from_slice(&index_len_u32.to_le_bytes());
 
-        out.extend_from_slice(&index_bytes);
-        if let Some(dek) = self.dek.as_ref() {
-            out.extend_from_slice(&metadata_tag(dek.expose_secret(), &index_bytes, &trailer));
+        let mut footer = Vec::with_capacity(METADATA_TAG_LEN + TRAILER_LEN as usize);
+        if let Some(mut mac) = self.metadata_mac {
+            mac.update(&trailer);
+            footer.extend_from_slice(&mac.finalize().into_bytes());
         }
-        out.extend_from_slice(&trailer);
+        footer.extend_from_slice(&trailer);
+        Ok(EncodedTail {
+            payload: out,
+            index: self.index,
+            footer,
+        })
+    }
+}
+
+/// Final payload and index bytes precede the fixed authentication/trailer footer on disk.
+pub(crate) struct EncodedTail {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) index: Vec<u8>,
+    pub(crate) footer: Vec<u8>,
+}
+
+#[cfg(test)]
+impl BlockEncoder {
+    fn finish(self) -> Result<Vec<u8>, BlobError> {
+        let tail = self.finish_parts()?;
+        let mut out = tail.payload;
+        out.extend(tail.index);
+        out.extend(tail.footer);
         Ok(out)
     }
 }
@@ -1544,11 +1580,11 @@ mod tests {
                 out.extend(enc.feed(chunk).unwrap());
             }
             assert_eq!(enc.logical_len, 3072);
-            assert_eq!(enc.index.len(), 3);
+            assert_eq!(enc.index.len(), 3 * INDEX_ENTRY_LEN);
             assert!(enc.buf.is_empty());
             assert!(matches!(enc.feed(&[42]), Err(BlobError::SizeExceeded)));
             assert_eq!(enc.logical_len, 3072);
-            assert_eq!(enc.index.len(), 3);
+            assert_eq!(enc.index.len(), 3 * INDEX_ENTRY_LEN);
             assert!(enc.buf.is_empty());
             assert!(matches!(enc.finish(), Err(BlobError::SizeExceeded)));
         }
@@ -1599,5 +1635,66 @@ mod tests {
             BlockEncoder::new(CompressionAlgorithm::Zstd, 0).finish(),
             Err(BlobError::SizeExceeded)
         ));
+    }
+    /// A small reference serializer deliberately keeps the pre-spool wire algorithm: complete
+    /// index, then one-shot MAC over index + trailer. Chunk draining must be byte-identical.
+    #[test]
+    fn drained_encoder_preserves_reference_wire_bytes() {
+        for algo in [
+            CompressionAlgorithm::None,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4,
+        ] {
+            for encrypted in [false, true] {
+                let key = Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
+                let key: [u8; 32] = key.into();
+                for len in [0usize, 1024, 3073] {
+                    let data: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+                    let mut expected = Vec::new();
+                    let mut index = Vec::new();
+                    for (number, logical) in data.chunks(1024).enumerate() {
+                        let (mut physical, compressed) = compress_block(algo, logical);
+                        if encrypted {
+                            physical = encrypt_block(&key, number as u64, &physical).unwrap();
+                        }
+                        index.extend_from_slice(&(physical.len() as u32).to_le_bytes());
+                        index.extend_from_slice(&(logical.len() as u32).to_le_bytes());
+                        index.push(u8::from(compressed));
+                        expected.extend(physical);
+                    }
+                    let mut trailer = Vec::from(*MAGIC);
+                    trailer.extend([if encrypted { 3 } else { 1 }, algo_code(algo)]);
+                    trailer.extend(1024u32.to_le_bytes());
+                    trailer.extend((len as u64).to_le_bytes());
+                    trailer.extend((len.div_ceil(1024) as u32).to_le_bytes());
+                    trailer.extend((expected.len() as u64).to_le_bytes());
+                    trailer.extend((index.len() as u32).to_le_bytes());
+                    expected.extend(&index);
+                    if encrypted {
+                        expected.extend(metadata_tag(&key, &index, &trailer));
+                    }
+                    expected.extend(trailer);
+
+                    for chunk_size in [1, 1023, 1024, 2049] {
+                        let mut encoder =
+                            BlockEncoder::with_dek(algo, 1024, encrypted.then(|| key.into()));
+                        let mut actual = Vec::new();
+                        let mut spooled = Vec::new();
+                        for chunk in data.chunks(chunk_size) {
+                            actual.extend(encoder.feed(chunk).unwrap());
+                            spooled.extend(encoder.take_index());
+                            assert!(encoder.index.is_empty());
+                            assert!(encoder.buf.len() < 1024);
+                        }
+                        let tail = encoder.finish_parts().unwrap();
+                        actual.extend(tail.payload);
+                        spooled.extend(tail.index);
+                        actual.extend(spooled);
+                        actual.extend(tail.footer);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
     }
 }

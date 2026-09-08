@@ -7,13 +7,32 @@ specification. Experiments may correctly conclude **retain the current design**.
 
 ## Delivery checklist
 
-- [ ] **1A: writer/read format limits** — in progress on `storage/01a-container-limits`.
+### Resumed execution tasks
+
+- [x] Recover local branches/worktrees, preserve existing changes, and inspect final-commit CI
+  and review status for the interrupted work.
+- [ ] Integrate 1A after its correctness checks; update 1B onto merged main, finish its review
+  and validation, and integrate it independently.
+- [ ] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
+  ownership; validate and integrate its independent PR.
+- [ ] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
+- [ ] Complete 3A–3D in order, obtaining the required architectural decision before changing
+  the storage-lifecycle protocol and retaining full reconciliation until activation qualifies.
+- [ ] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
+- [ ] Complete 5A–5C and publish the supported metadata decision.
+- [ ] Verify the final integration and results record; remove owned temporary artifacts and
+  merged worktrees/branches, leaving `main` and `website`.
+
+### Phase acceptance
+
+- [x] **1A: writer/read format limits** — merged in PR #81 (`5269e1b`).
   Share checked 9-byte-entry/64-MiB-index arithmetic; reject before copying/encoding excessive
   input. Known encoded lengths fail before staging/preallocation, multipart totals use checked
   addition, unknown streams abort safely. Preserve raw-file limits and the existing S3 error.
   Test exact and exceeded limits, overflow, chunk boundaries, synthetic small encoder ceilings,
   cleanup and retryable multipart completion. Document actual encoded-object ceilings.
-- [ ] **1B: bounded encoder index spool**. Replace the complete index vector/final output copy
+- [ ] **1B: bounded encoder index spool** — implementation/testing active on
+  `codex/storage-01b-index-spool`. Replace the complete index vector/final output copy
   with an owned temporary spool and bounded payload/index sinks. Preserve v1–v3 bytes and block
   identities. Append the spool and existing authentication before the final file's durability
   barrier; no independently committed sidecar. Cover spool failures, ENOSPC, cancellation,
@@ -151,3 +170,24 @@ Phase 1A: [PR #81](https://github.com/Harsh-2002/Cairn/pull/81) opened. Blob tes
 88 all-feature tests passed (two benchmarks ignored). The preflight regression fails on baseline
 `e38bc6c` and passes with the fix. S3 size-rejection/retry regression passes with the existing
 HTTP 400 `EntityTooLarge` response. Final-head CI and review are pending; no merge claimed.
+
+Phase 1B: bounded index spooling implemented in an isolated checkout; 91 default and 94 all-feature blob tests pass (two benchmarks ignored); all-feature blob Clippy passes.
+Wire-reference comparison covers plaintext/encrypted and all three algorithms across chunk and
+partial-block boundaries. Spool tests cover threshold/roundtrip, cancellation, create/read errors
+and real ENOSPC via `/dev/full` without filling a disk. CI, review and merge remain pending.
+
+2026-09-08 resumed: recovered clean 1A/1B/1C worktrees and verified both existing PR heads had
+passing normal CI and no posted review findings. PR #81 head `667b286` passed all 88 blob tests
+again (`RUSTUP_TOOLCHAIN=stable CARGO_HOME=/SSD/dev/.cargo cargo test -p cairn-blob --all-features`;
+two benchmarks ignored) and was merged as `5269e1b`. The original local AUDIT findings are preserved
+in that merge. PR #82 is now based on `main`; its resumed validation also exercises cancellation
+before queued spool creation can execute. The 1C worktree contains no unique implementation yet.
+No local performance experiment has run: campaign consumption remains **0 seconds / 0 bytes**.
+
+Resumed 1B checks: 95 all-feature blob tests passed (two benchmarks skipped), including
+`cancelled_spool_creation_cleans_up_after_detached_work`; all-feature owning-crate Clippy and
+workspace formatting passed. Commands: `cargo nextest run -p cairn-blob --all-features`,
+`cargo clippy -p cairn-blob --all-targets --all-features -- -D warnings`, and
+`cargo fmt --all --check`. Nextest 0.9.140 was checksum-verified against its official release.
+The shared blob target was cleaned before the recorded nextest run to prevent reuse of a stale
+test binary from the older checkout. Final-commit CI remains the integration gate.
