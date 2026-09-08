@@ -191,3 +191,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   MD5. Composite-only legacy rows remain counted skips; never invent a baseline by scrubbing.
   `CAIRN_SCRUB_BYTES_PER_SEC=0` preserves unthrottled behavior; positive values pace logical bytes
   and shutdown cancels both reads and sleeps.
+
+Schema/storage compatibility is validated before metadata maintenance. Sharded SQLite preflights
+every existing file before opening any Writer; snapshots and restore staging use the same read-only
+SQLite guard. This does not make previously released older binaries safe downgrade targets.

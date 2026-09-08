@@ -12,7 +12,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v34 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v35 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
@@ -108,3 +108,8 @@ independently using exact renewed leases; saved endpoint/bucket identity must ma
 
 Schema v34 adds writer-maintained current-visible `bucket_stats.objects`; overview counts read
 these roll-ups without scanning object versions. Migration backfills existing databases once.
+
+Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat placement,
+full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
+sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
+without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.

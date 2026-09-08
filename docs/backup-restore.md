@@ -67,8 +67,8 @@ systemctl start cairn
 ```
 
 Before changing the target, restore requires the final manifest, rejects an unsupported format,
-topology, blob layout, or schema newer than the running binary, and verifies the database's exact
-size and SHA-256. It rejects snapshot `metadata.sqlite3-wal`, `-shm`, and `-journal` sidecars rather
+topology, blob layout, schema newer than the running binary, or unsupported storage-protocol state,
+and verifies the database's exact size and SHA-256. It rejects snapshot `metadata.sqlite3-wal`, `-shm`, and `-journal` sidecars rather
 than silently ignoring them, runs SQLite integrity/foreign-key checks, verifies every referenced
 object and multipart-part file, and rejects symlinks, special nodes, and top-level regular files in
 `blobs/`.

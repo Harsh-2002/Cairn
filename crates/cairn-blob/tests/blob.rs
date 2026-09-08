@@ -2979,3 +2979,105 @@ async fn missing_part_records_assembly_failure_without_durability_or_leaked_tmp(
                 .ends_with(".tmp"))
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reconcile_preserves_flat_and_nested_reads_and_prunes_empty_leaves() {
+    let root = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(root.path()).await.unwrap();
+    let bucket = BucketName::parse("mixed-layout").unwrap();
+    let flat = store
+        .stage(&bucket, body(b"flat".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let mut nested = store
+        .stage(
+            &bucket,
+            body(vec![b'n'; 8192]),
+            opts(Some(CompressionPolicy::default()), "text/plain"),
+        )
+        .await
+        .unwrap();
+    let id = nested
+        .storage_path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let leaf = &id[..2];
+    let nested_path = StoragePath::from_string(format!("{bucket}/{leaf}/{id}"));
+    std::fs::create_dir(root.path().join(bucket.as_str()).join(leaf)).unwrap();
+    std::fs::rename(
+        root.path().join(nested.storage_path.as_str()),
+        root.path().join(nested_path.as_str()),
+    )
+    .unwrap();
+    nested.storage_path = nested_path;
+    // A separate leaf contains only an orphan and must be pruned along with its durable parent change.
+    let orphan_leaf = if leaf == "00" { "01" } else { "00" };
+    let orphan_dir = root.path().join(bucket.as_str()).join(orphan_leaf);
+    std::fs::create_dir(&orphan_dir).unwrap();
+    std::fs::write(
+        orphan_dir.join(format!("{orphan_leaf}{}", "f".repeat(30))),
+        b"orphan",
+    )
+    .unwrap();
+    let oracle = SetReconcileOracle {
+        live_paths: [
+            flat.storage_path.as_str().to_owned(),
+            nested.storage_path.as_str().to_owned(),
+        ]
+        .into_iter()
+        .collect(),
+        live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
+    };
+    let report = store
+        .reconcile(
+            &oracle,
+            ReconcileOpts {
+                batch_size: 1,
+                parallelism: 2,
+                staging_safety_margin_secs: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.blobs_scanned, 3);
+    assert_eq!(report.orphans_reclaimed, 1);
+    assert_eq!(report.dirs_pruned, 1);
+    assert_eq!(report.errors, 0);
+    assert!(!orphan_dir.exists());
+    assert_eq!(
+        read_all(
+            &store,
+            &flat.storage_path,
+            None,
+            &flat.compression,
+            flat.size_logical
+        )
+        .await,
+        b"flat"
+    );
+    assert_eq!(
+        read_all(
+            &store,
+            &nested.storage_path,
+            None,
+            &nested.compression,
+            nested.size_logical
+        )
+        .await,
+        vec![b'n'; 8192]
+    );
+    let fresh = store
+        .stage(
+            &bucket,
+            body(b"still flat".to_vec()),
+            opts(None, "text/plain"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.storage_path.as_str().split('/').count(), 2);
+}

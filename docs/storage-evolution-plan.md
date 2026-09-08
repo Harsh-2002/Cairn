@@ -15,7 +15,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   and validation, and integrate it independently.
 - [x] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
   ownership; validate and integrate its independent PR.
-- [ ] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
+- [x] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
 - [ ] Complete 3A–3D in order, obtaining the required architectural decision before changing
   the storage-lifecycle protocol and retaining full reconciliation until activation qualifies.
 - [ ] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
@@ -50,7 +50,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   owned `/SSD` directory, persistent campaign ledger, bounded process groups and cleanup.
   Record hashes/revisions/configuration/tools/hardware and PASS/FAIL/INCONCLUSIVE/CANCELLED.
   Missing tools, exhausted budgets or inadequate samples never become passes.
-- [ ] **2B: CPU/memory/storage attribution report**. Separate real metadata, blob and S3 work;
+- [x] **2B: CPU/memory/storage attribution report** — merged in PR #85 (`d83b051`). Separate real metadata, blob and S3 work;
   one hot bucket versus many buckets. Separate unprofiled rates from CPU and heap profiling.
   Record live allocations, anonymous/file memory, cache use, tasks/threads/descriptors, writer
   stages, filesystem waits and device/host pressure. Three equal load/idle cycles; no RSS-only
@@ -242,4 +242,16 @@ After data/profile/process cleanup, the cumulative campaign is **250.787718 seco
 **219,529,216 bytes recorded peak**; 349.212282 unused baseline seconds carry forward. The
 persistent ledger is `/SSD/dev/cairn-storage-campaign/ledger.json`; it must not be reset.
 Local validation passes 21 Python regressions, two Rust driver tests, standalone Clippy,
-formatting and shellcheck. Integration remains pending final-commit CI and review.
+formatting and shellcheck. Final head `95315011d460e0b40ec74f8a384fa3369a4fc828` passed all CI/CodeQL jobs with no posted review findings; PR #85 merged as `d83b051`. Its branch/worktree are removed.
+
+Phase 3A starts from merged `d83b051`. Append-only v35 records storage compatibility while keeping
+flat writes and mandatory full scans. SQLite/libSQL/Turso startup and migration entry points reject
+unsupported state before maintenance; sharded startup preflights all files and snapshot validation
+checks before target staging. POSIX reconciliation streams buckets and bounded flat/nested pages,
+preserves unknown layouts/symlinks, and synchronizes parent changes before reporting pruning.
+Correctness fixtures are separate from experiments; the campaign ledger is unchanged. All 642
+owning-crate tests pass with all features (five skipped), including SQLite/libSQL/Turso admission,
+all-shard preflight, snapshot refusal and mixed-layout reconciliation. Web lint/build and both npm
+audits pass with zero vulnerabilities; cargo audit passes with allowed rustls-pemfile maintenance
+and pre-existing chacha20 yanked-version warnings. The full workspace gate and final-commit CI
+remain pending.

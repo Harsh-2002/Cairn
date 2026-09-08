@@ -120,6 +120,7 @@ pub async fn open_libsql(
     // server's W3 validation), journal_size_limit caps the WAL footprint, analysis_limit bounds the
     // periodic optimize.
     let write_conn = db.connect().map_err(map)?;
+    schema::validate_compatibility(&LibsqlDriver::new(write_conn.clone())).await?;
     write_conn
         .execute_batch(&format!(
             "PRAGMA journal_mode=WAL;
@@ -258,6 +259,7 @@ pub async fn open_turso(
 
     // The single write connection, owned by the writer task.
     let write_conn = db.connect().map_err(map)?;
+    schema::validate_compatibility(&TursoDriver::new(write_conn.clone())).await?;
     apply_turso_pragmas(&write_conn, opts).await?;
     let write_driver: Arc<dyn AsyncSqlDriver> = Arc::new(TursoDriver::new(write_conn));
     schema::run_migrations(write_driver.as_ref()).await?;

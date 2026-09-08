@@ -788,12 +788,80 @@ UPDATE bucket_stats SET objects = (
 );
 "#,
     },
+    Migration {
+        version: 35,
+        name: "storage protocol compatibility",
+        sql: r#"
+-- Compatibility is authoritative metadata, not an operator feature flag. This build still
+-- places flat files and performs full reconciliation; later protocols must raise their floors.
+CREATE TABLE storage_protocol (
+    singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+    minimum_reader INTEGER NOT NULL CHECK (minimum_reader>=1),
+    minimum_writer INTEGER NOT NULL CHECK (minimum_writer>=1),
+    write_layout TEXT NOT NULL,
+    recovery_mode TEXT NOT NULL
+);
+INSERT INTO storage_protocol VALUES (1, 1, 1, 'flat', 'full-scan');
+"#,
+    },
 ];
+
+/// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
+pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Result<i64, MetaError> {
+    let has_migrations = driver.query(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')", vec![]
+    ).await?.first().is_some_and(|row| matches!(row.value(0), Value::Int(1)));
+    let applied = if has_migrations {
+        let rows = driver
+            .query(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                vec![],
+            )
+            .await?;
+        match rows.first().map(|row| row.value(0)) {
+            Some(Value::Int(version)) => *version,
+            _ => return Err(MetaError::Engine("invalid metadata schema version".into())),
+        }
+    } else {
+        0
+    };
+    let latest = MIGRATIONS.last().map_or(0, |migration| migration.version);
+    if !(0..=latest).contains(&applied) {
+        return Err(MetaError::Engine(format!(
+            "unsupported metadata schema version {applied}; this binary supports through {latest}"
+        )));
+    }
+    let has_protocol = driver.query(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_protocol')", vec![]
+    ).await?.first().is_some_and(|row| matches!(row.value(0), Value::Int(1)));
+    if has_protocol != (applied >= 35) {
+        return Err(MetaError::Engine(
+            "storage protocol state does not match the applied schema".into(),
+        ));
+    }
+    if has_protocol {
+        let rows = driver.query(
+            "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol WHERE singleton=1", vec![]
+        ).await?;
+        if !rows.first().is_some_and(|row| {
+            matches!(row.value(0), Value::Int(1))
+                && matches!(row.value(1), Value::Int(1))
+                && row.value(2).as_str() == Some("flat")
+                && row.value(3).as_str() == Some("full-scan")
+        }) {
+            return Err(MetaError::Engine(
+                "unsupported or missing storage protocol state".into(),
+            ));
+        }
+    }
+    Ok(applied)
+}
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
 /// wrapped in its own transaction (begin/commit), matching the rusqlite runner's
 /// `unchecked_transaction` per migration.
 pub async fn run_migrations(driver: &dyn AsyncSqlDriver) -> Result<(), MetaError> {
+    let applied = validate_compatibility(driver).await?;
     // Ask SQLite-family engines to zero deleted b-tree content before v25 overwrites and rebuilds
     // the legacy plaintext-token table. Unsupported beta-engine PRAGMAs are harmless; the SQL
     // migration still destroys every redeemable value and VACUUM below rebuilds physical storage.
@@ -807,14 +875,6 @@ pub async fn run_migrations(driver: &dyn AsyncSqlDriver) -> Result<(), MetaError
             );",
         )
         .await?;
-    let applied: i64 = driver
-        .query(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            vec![],
-        )
-        .await?
-        .first()
-        .map_or(0, |r| r.get_i64(0));
     for m in MIGRATIONS {
         if m.version <= applied {
             continue;
@@ -903,6 +963,96 @@ mod tests {
     use std::sync::Arc;
 
     const ASYNC_LEGACY_SHARE_SENTINEL: &str = "async-legacy-share-plaintext-sentinel-029";
+
+    enum FixtureDb {
+        Libsql(libsql::Database),
+        Turso(turso::Database),
+    }
+
+    impl FixtureDb {
+        async fn open(path: &std::path::Path, turso: bool) -> Self {
+            if turso {
+                Self::Turso(
+                    turso::Builder::new_local(path.to_str().unwrap())
+                        .experimental_vacuum(true)
+                        .build()
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Self::Libsql(libsql::Builder::new_local(path).build().await.unwrap())
+            }
+        }
+
+        fn driver(&self) -> Box<dyn AsyncSqlDriver> {
+            match self {
+                Self::Libsql(db) => Box::new(LibsqlDriver::new(db.connect().unwrap())),
+                Self::Turso(db) => Box::new(TursoDriver::new(db.connect().unwrap())),
+            }
+        }
+    }
+
+    async fn assert_startup_compatibility(turso: bool) {
+        for change in [
+            "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
+            "UPDATE storage_protocol SET minimum_reader=2",
+            "UPDATE storage_protocol SET minimum_writer=2",
+            "UPDATE storage_protocol SET write_layout='fanout-v1'",
+            "UPDATE storage_protocol SET recovery_mode='journal'",
+            "DELETE FROM storage_protocol",
+            "DROP TABLE storage_protocol",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("metadata.db");
+            let db = FixtureDb::open(&path, turso).await;
+            let driver = db.driver();
+            run_migrations(driver.as_ref()).await.unwrap();
+            run_migrations(driver.as_ref()).await.unwrap();
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 35);
+            driver.execute_batch(change).await.unwrap();
+            driver
+                .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
+                .await
+                .unwrap();
+            assert!(
+                run_migrations(driver.as_ref()).await.is_err(),
+                "accepted {change}"
+            );
+            assert!(share_sanitation_pending(driver.as_ref()).await.unwrap());
+            drop(driver);
+            drop(db);
+            let opened = if turso {
+                crate::open_turso(&path, &crate::OpenOptions::default()).await
+            } else {
+                crate::open_libsql(&path, &crate::OpenOptions::default()).await
+            };
+            let error = match opened {
+                Ok(_) => panic!("startup accepted incompatible metadata"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("unsupported") || error.contains("storage protocol"),
+                "unexpected rejection for {change}: {error}"
+            );
+            let db = FixtureDb::open(&path, turso).await;
+            assert!(
+                share_sanitation_pending(db.driver().as_ref())
+                    .await
+                    .unwrap(),
+                "rejected startup ran maintenance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_compatibility_in_libsql() {
+        assert_startup_compatibility(false).await;
+    }
+
+    #[tokio::test]
+    async fn startup_compatibility_in_turso() {
+        assert_startup_compatibility(true).await;
+    }
 
     async fn migrated_driver() -> Arc<dyn AsyncSqlDriver> {
         let name = format!(

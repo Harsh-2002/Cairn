@@ -12,6 +12,16 @@ The metadata store is the source of truth for every fact about the system that i
 
 The store opens one write connection, owned by the single group-committing writer task (Section 7.2), and a pool of read-only connections for concurrent snapshot reads (Section 7.3). On open, each connection is configured for write-ahead logging, foreign-key enforcement, the chosen synchronous level, a busy timeout as defense in depth even though the single-writer design makes contention rare, and memory-mapping and cache sizing tuned to the working set so that reads touch the kernel as little as possible. Migrations run on the write connection at startup, before any request is served, and are recorded so they apply exactly once and in order. The WAL checkpointer (Section 8.4) runs against the write connection on its schedule.
 
+Before changing connection PRAGMAs or performing application mutations, startup validates the
+highest applied schema and storage-protocol state. Migrations beyond this binary's ceiling are
+rejected; schema v35 adds a singleton requiring reader/writer protocol 1, `write_layout='flat'`
+and `recovery_mode='full-scan'`. Inconsistent, missing or unsupported state fails closed. Both async
+backends mirror this preflight, including direct migration calls. Sharded SQLite checks all
+existing database files before migrating any shard. The snapshot validator uses the same read-only
+SQLite guard before target staging. No shared mutation/read trait is added: this is startup
+compatibility state, initialized only by the append-only migration. Released binaries without the
+check remain unsafe downgrade targets; see `upgrade-rollback.md` for verified snapshot rollback.
+
 The writer measures channel admission, admitted queue residence, transaction stages, and checkpoint execution using bounded per-stage sample rings (Section 26.2). Queue depth counts only admitted mutations not yet collected into a batch; cancellation while waiting for admission cannot inflate it. Checkpoint busy-wait prevention and batching policy remain unchanged.
 
 ### 11.3 Entities

@@ -157,6 +157,17 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 
 The schema below is the reference for the SQLite store. Types are given in the engine's affinity terms; timestamps are stored in a sortable textual or integer form consistently; and the configuration aspects that arrive as documents are stored as validated text. Identifiers are opaque strings.
 
+**Storage protocol (v35).** `storage_protocol` is a singleton initialized by an append-only
+migration. It records compatibility, not journal coverage or an operator-selectable layout.
+
+| Field | Type | Constraints and notes |
+|---|---|---|
+| singleton | integer | Primary key, exactly 1. |
+| minimum_reader | integer | At least 1; this binary supports exactly protocol 1. |
+| minimum_writer | integer | At least 1; this binary supports exactly protocol 1. |
+| write_layout | text | Not null; only `flat` is accepted. |
+| recovery_mode | text | Not null; only `full-scan` is accepted. |
+
 **Users.**
 
 | Field | Type | Constraints and notes |

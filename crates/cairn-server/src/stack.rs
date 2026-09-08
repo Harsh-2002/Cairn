@@ -393,6 +393,18 @@ async fn open_meta(cfg: &Config) -> Result<OpenedMeta, String> {
             }
             // Sharded (Phase 3.2): open N shard databases, partition by bucket name through the
             // routing store, and route each storage path to its owning shard for reconcile.
+            // Validate every existing shard before opening any Writer: an unsupported later
+            // shard must not allow an earlier one to migrate or sanitize its database first.
+            for i in 0..cfg.meta_shards {
+                let path = shard_db_path(&cfg.db_path, i);
+                if path
+                    .try_exists()
+                    .map_err(|e| format!("inspect metadata shard {i}: {e}"))?
+                {
+                    cairn_meta::validate_database_compatibility(&path)
+                        .map_err(|e| format!("metadata compatibility on shard {i}: {e}"))?;
+                }
+            }
             let mut metas: Vec<Arc<dyn MetadataStore>> = Vec::with_capacity(cfg.meta_shards);
             let mut oracles: Vec<Box<dyn ReconcileOracle + Send + Sync>> =
                 Vec::with_capacity(cfg.meta_shards);
@@ -1106,6 +1118,46 @@ mod sharding_tests {
             region: "us-east-1".to_owned(),
             compression: None,
         }))
+    }
+
+    #[tokio::test]
+    async fn incompatible_later_shard_prevents_earlier_shard_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("meta.db"),
+            meta_shards: 2,
+            ..Config::default()
+        };
+        for index in 0..2 {
+            let path = super::shard_db_path(&cfg.db_path, index);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").unwrap();
+            if index == 1 {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
+                        [],
+                    )
+                    .unwrap();
+            }
+        }
+        let before = std::fs::read(&cfg.db_path).unwrap();
+        let error = match open_meta(&cfg).await {
+            Ok(_) => panic!("future shard admitted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unsupported metadata schema"), "{error}");
+        assert_eq!(std::fs::read(&cfg.db_path).unwrap(), before);
+        let connection = rusqlite::Connection::open(&cfg.db_path).unwrap();
+        let tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "earlier shard must not apply any migration");
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   abort, exact-token claim release, and final `status='completing'` plus token verification must
   remain in the writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`**
   (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 34 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 35 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
@@ -105,3 +105,8 @@ independently using exact renewed leases; saved endpoint/bucket identity must ma
 
 Schema v34 adds writer-maintained current-visible `bucket_stats.objects`; overview counts read
 these roll-ups without scanning object versions. Migration backfills existing databases once.
+
+Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat placement,
+full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
+sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
+without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.
