@@ -54,3 +54,57 @@ async fn sharded_storage_journal_contract() {
     let store = cairn_meta::ShardedMetadataStore::new(shards);
     cairn_types::testing::assert_storage_journal(&store).await;
 }
+
+#[tokio::test]
+async fn sqlite_storage_baseline_contract() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    cairn_types::testing::assert_storage_baseline(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_storage_baseline_authority_contract() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    cairn_types::testing::assert_storage_baseline_authority(&store).await;
+}
+
+#[tokio::test]
+async fn sharded_storage_baseline_contract() {
+    let shards = (0..4)
+        .map(|_| {
+            std::sync::Arc::new(cairn_meta::open_in_memory().unwrap())
+                as std::sync::Arc<dyn cairn_types::MetadataStore>
+        })
+        .collect();
+    let store = cairn_meta::ShardedMetadataStore::new(shards);
+    cairn_types::testing::assert_storage_baseline(&store).await;
+}
+
+#[tokio::test]
+async fn sharded_storage_baseline_authority_contract() {
+    let shards = (0..4)
+        .map(|_| {
+            std::sync::Arc::new(cairn_meta::open_in_memory().unwrap())
+                as std::sync::Arc<dyn cairn_types::MetadataStore>
+        })
+        .collect();
+    let store = cairn_meta::ShardedMetadataStore::new(shards);
+    cairn_types::testing::assert_storage_baseline_authority(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_storage_baseline_native_aliases() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    cairn_types::testing::assert_storage_baseline_native_aliases(&store).await;
+}
+
+#[tokio::test]
+async fn sharded_storage_baseline_native_aliases() {
+    let shards = (0..4)
+        .map(|_| {
+            std::sync::Arc::new(cairn_meta::open_in_memory().unwrap())
+                as std::sync::Arc<dyn cairn_types::MetadataStore>
+        })
+        .collect();
+    let store = cairn_meta::ShardedMetadataStore::new(shards);
+    cairn_types::testing::assert_storage_baseline_native_aliases(&store).await;
+}

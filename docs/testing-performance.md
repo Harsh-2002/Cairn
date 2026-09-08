@@ -53,6 +53,16 @@ exact origin-token binding, retains unknown-ID orphan incidents, reclaims known 
 startup invalidates abandoned cleanup claims before exact-version redelivery. Its third abort arm
 uses no timing shortcut or production failpoint.
 
+The same live recovery fixture holds active encrypted parts and protected history while exercising
+the explicit offline baseline. A test-owned unknown root entry prevents coverage without deleting
+classified bytes or releasing legacy quota. Startup/repair must refuse held state, held snapshots
+must preserve charges across fresh-generation restore, and explicit resume must reclaim exact
+orphans while retaining authoritative rows, part charges and successful S3 reads/completion.
+Owning tests separately interrupt classification, namespace synchronization and authorized release,
+and reject stale proof, missing/truncated references, unsupported links/mounts and partial shard
+transitions. A command failure, task cancellation or deterministic publication seam is labeled
+separately from process-kill and power-loss evidence.
+
 ### 29.5 Conformance against real clients and the standard suite
 
 The decisive tests run real S3 clients against a running Cairn. The boto3 AWS SDK drives a matrix covering the object operations including plain, unsigned-payload, and streaming-chunked puts so that the chunked path and real SigV4 are exercised by a real client, ranged and conditional gets, heads, deletes, bulk deletes, copies, the full multipart cycle including abort and out-of-order completion, and presigned URLs, together with versioning behaviour and version listing, tagging, and copy. Independently, the MinIO warp macro benchmark drives the server as a second real client across get, put, and mixed profiles in strict mode with a zero-error gate, so a genuinely different client validates the wire under load. Beyond driving Cairn alone, a per-commit CI job (`conformance/bench_compare.sh`) stands up Cairn **and** a pinned MinIO server binary on the same runner and runs the identical warp matrix against each side by side — put, get, stat, delete, list, and mixed at small and large object sizes — reporting the Cairn-versus-MinIO throughput ratio together with each engine's CPU and resident memory while serving. It is a *reported* comparison rather than a throughput gate, because a shared runner's absolute numbers vary run to run, so it fails only on warp operation errors and never on who is faster; the ratio, not the absolute rate, is the signal. The boto3 conformance script runs as a CI gate covering the core object lifecycle, versioning, tagging, multipart, copy, and bulk delete, and it is joined by dedicated live-client gates for the surfaces it does not touch: `authz.sh` exercises policy and public-access-block, `buckets.sh` drives a real CORS preflight, `lifecycle.sh` drives expiry enforcement and transition-rule handling, and `mesh.sh`, `replication_chaos.sh`, and `soak.sh` exercise replication round-trips end to end — all CI gates alongside the boto3 script, and backed by the unit and integration suites. Replication is tested end to end between two Cairn instances and with a fake sink that can simulate failures to exercise retry and backoff; lifecycle is tested with a controllable clock so that expiry, transition, and abort timing are deterministic; and compression is tested for round-trip fidelity, for correct ranged reads against compressed blobs, for the incompressibility heuristic, and for ETag invariance between compressed and uncompressed storage of the same content.
@@ -77,6 +87,9 @@ attribution gaps and the independent adoption gates. No laboratory dependency en
 Phase 3B uses the actual BlobStore for reads/deletion/reconciliation and a raw publisher that
 compiles the production directory-sync coordinator. Adoption requires the full predeclared
 paired workload matrix; single-case runs cannot qualify. See `storage-fanout-2026-09.md`.
+The offline recovery-cost screen in `storage-recovery-2026-09.md` records descriptive command
+costs for backup, baseline, full-scan readiness and fresh restore, with complete source/restored
+byte verification. It cannot activate journal-only startup or establish a large-store scaling law.
 Profile decoding and reduction are separately admitted and charged. Timestamped load/idle phases,
 executable-specific process samples and heap timelines distinguish application, client and profiler
 memory. The [September attribution record](storage-attribution-2026-09.md) preserves eight baseline

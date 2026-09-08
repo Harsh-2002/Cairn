@@ -508,6 +508,48 @@ pub fn is_encrypted_container_trailer(trailer: &[u8], total: u64) -> bool {
             == Some(total)
 }
 
+/// DEK-free geometry check for an already anchored encrypted multipart file. Parts are always
+/// uncompressed, so trusted plaintext length and format determine their physical extent exactly.
+/// This reads only the fixed trailer; it neither authenticates metadata nor checks payload bytes.
+pub(crate) fn verify_encrypted_part_geometry(
+    file: &mut (impl Read + Seek),
+    total: u64,
+    logical_len: u64,
+    authenticated: bool,
+) -> Result<(), BlobError> {
+    let error = || BlobError::Corruption("encrypted part framing does not match metadata".into());
+    if total < TRAILER_LEN {
+        return Err(error());
+    }
+    validate_encoded_len(logical_len, crate::DEFAULT_ENCRYPTED_BLOCK_SIZE)?;
+    file.seek(SeekFrom::End(-(TRAILER_LEN as i64)))
+        .map_err(crate::io_err)?;
+    let mut trailer = [0; TRAILER_BYTES];
+    file.read_exact(&mut trailer).map_err(crate::io_err)?;
+    let block_size = u64::from(crate::DEFAULT_ENCRYPTED_BLOCK_SIZE);
+    let blocks = logical_len.div_ceil(block_size);
+    let payload_len = blocks
+        .checked_mul(GCM_TAG_LEN)
+        .and_then(|tags| logical_len.checked_add(tags))
+        .ok_or_else(error)?;
+    let version = if authenticated {
+        VERSION_ENCRYPTED
+    } else {
+        VERSION_ENCRYPTED_V2
+    };
+    if !is_encrypted_container_trailer(&trailer, total)
+        || trailer[4] != version
+        || trailer[5] != algo_code(CompressionAlgorithm::None)
+        || u64::from(u32::from_le_bytes(trailer[6..10].try_into().unwrap())) != block_size
+        || u64::from_le_bytes(trailer[10..18].try_into().unwrap()) != logical_len
+        || u64::from(u32::from_le_bytes(trailer[18..22].try_into().unwrap())) != blocks
+        || u64::from_le_bytes(trailer[22..30].try_into().unwrap()) != payload_len
+    {
+        return Err(error());
+    }
+    Ok(())
+}
+
 /// A random-access reader over a compressed (and optionally SSE-S3-encrypted) blob file.
 pub struct CompressedReader<R: Read + Seek> {
     inner: R,

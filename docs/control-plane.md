@@ -83,6 +83,12 @@ As an API client the CLI offers commands mirroring the management API: creating,
 
 ### 24.3 Node-local commands
 
+`storage-baseline <empty-backup-dir>` creates and validates an offline safety snapshot, classifies
+the supported namespace through the metadata Writer, drains exact cleanup and completes coverage
+before releasing legacy staging charges (Section 8.5.1). It supports the native single-SQLite
+backup topology. An interrupted baseline blocks ordinary startup and reclaiming maintenance until
+an explicit resume with a new empty backup destination succeeds. Full startup scans remain enabled.
+
 The local commands run on the host against the data directory and database directly. They include the bootstrap command that ensures the single root administrator exists (the same identity `serve` seeds from `CAIRN_ROOT_ACCESS_KEY` / `CAIRN_ROOT_SECRET_KEY`) and prints its credentials — idempotent, so it never produces a second default admin; an integrity command that runs reconciliation on demand and, in its repair mode, resolves divergences such as rows whose blobs are missing, which is the recovery tool referenced by the durability and backup sections. Repair uses the same writer-level Object Lock gate as every API path: a retained or legally-held missing-blob row is preserved, counted as `protected_unresolved`, and makes the command fail so an operator must resolve the damaged protected version explicitly rather than silently erase WORM metadata. The local set also includes a backup command that performs the consistent snapshot procedure of Section 31 and its counterpart `restore <DIR>` command that places a snapshot into the data directory and runs reconciliation (ARCH 31.4); a `replication audit --before <ts> [--bucket] [--json] [--verify]` command that reads the durable per-version `replication_status` ledger directly; configuration validation that checks a configuration without starting the server; and the database migration that the server also runs at startup, exposed for operators who prefer to migrate explicitly. These commands are how an operator bootstraps, verifies, backs up, and repairs a deployment from the host shell, complementing the remote administration that the API-client commands provide.
 
 ---

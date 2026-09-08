@@ -9,6 +9,7 @@ recovery transitions, with fresh ownership, preserved live files and independent
 import argparse
 import base64
 import concurrent.futures
+from contextlib import closing
 import datetime
 import hashlib
 import http.client
@@ -30,20 +31,20 @@ import xml.etree.ElementTree as ET
 
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 def durable_tables(database):
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
         return [row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
 
 
 def rows(database, table):
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute(f'SELECT * FROM "{table}"')]
 
 
 def database_rows(database, tables=None):
     """Capture all tables in one read transaction, including empty tables and additive columns."""
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         inventory = [row[0] for row in conn.execute(
@@ -176,6 +177,123 @@ def wait_for(probe, label, timeout=20):
             return
         time.sleep(0.05)
     raise AssertionError(f"timed out: {label}")
+
+
+def exercise_storage_baseline(work, data, cli, start, stop, upload_id):
+    """Fixed offline legacy fixture; failures are not process-kill or power-loss evidence."""
+    database = data / "cairn.db"
+    cli(data, "storage-baseline", str(work / "baseline-live-refused"), succeeds=False)
+    stop()
+    cli(data, "storage-baseline", str(work / "baseline-shards-refused"),
+        succeeds=False, CAIRN_META_SHARDS="2")
+    before = database_rows(database)
+    multipart_accounting(before)
+    assert before["multipart_parts"], "baseline must preserve active encrypted parts"
+    session = next(row for row in before["multipart_uploads"] if row["id"] == upload_id)
+    principal = session["initiated_by"] or session["owner_id"]
+    attempt, debt_id = secrets.token_hex(16), secrets.token_hex(16)
+    reservation_bytes, debt_bytes = 40, 64
+    paths = [
+        f".staging/multipart/{upload_id}/00002-{attempt}",
+        f".staging/{secrets.token_hex(16)}.tmp",
+        f".staging/{secrets.token_hex(16)}.index.tmp",
+        f"baseline-deleted/{secrets.token_hex(16)}",
+    ]
+    for path in paths:
+        destination = data / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"owned legacy fixture")
+    # Offline fixture injection represents pre-journal accounting, including an alias whose
+    # random filename cannot be attributed to a particular old coarse cleanup row.
+    with closing(sqlite3.connect(database)) as conn, conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("INSERT INTO multipart_part_reservations "
+                     "(attempt_id,upload_id,part_number,reserved_bytes,created_at) VALUES (?,?,?,?,?)",
+                     (attempt, upload_id, 2, reservation_bytes, 1))
+        conn.execute("INSERT INTO multipart_staging_cleanups "
+                     "(id,upload_id,bucket_name,principal_id,bytes,storage_path,created_at,storage_protocol) "
+                     "VALUES (?,?,?,?,?,NULL,?,1)",
+                     (debt_id, upload_id, session["bucket_name"], principal, debt_bytes, 1))
+        conn.execute("UPDATE multipart_bucket_stats SET staged_bytes=staged_bytes+? WHERE bucket_name=?",
+                     (reservation_bytes + debt_bytes, session["bucket_name"]))
+        conn.execute("UPDATE multipart_principal_stats SET staged_bytes=staged_bytes+? WHERE principal_id=?",
+                     (reservation_bytes + debt_bytes, principal))
+    charged = database_rows(database)
+    multipart_accounting(charged)
+    # Backup's legacy lock filter ignores this name; baseline must use its exact configured
+    # allowlist, so it reaches a held classification failure instead of accepting false coverage.
+    unknown = data / ".unexpected.cairn-db.lock"
+    unknown.write_bytes(b"not a configured Cairn lock")
+    first_snapshot = work / "baseline-first-snapshot"
+    failed = cli(data, "storage-baseline", str(first_snapshot), succeeds=False)
+    assert "baseline" in (failed.stdout + failed.stderr).lower()
+    held = database_rows(database)
+    state = held["storage_recovery_state"][0]
+    assert state["legacy_accounting_hold"] == 1 and state["legacy_release_authorized"] == 0
+    assert state["coverage_state"] == "incomplete" and state["coverage_identity"] is None
+    assert state["baseline_id"], "failed classification lost its baseline ownership"
+    assert all((data / path).is_file() for path in paths), "failed classification deleted legacy bytes"
+    for table in ("multipart_part_reservations", "multipart_staging_cleanups",
+                  "multipart_bucket_stats", "multipart_principal_stats"):
+        assert held[table] == charged[table], f"classification prematurely released {table}"
+    for command in (("serve",), ("integrity", "--repair")):
+        refused = cli(data, *command, succeeds=False)
+        assert "baseline" in (refused.stdout + refused.stderr).lower()
+        guarded = database_rows(database)
+        for table in ("storage_recovery_state", "multipart_part_reservations",
+                      "multipart_staging_cleanups", "multipart_bucket_stats", "multipart_principal_stats"):
+            assert guarded[table] == held[table], f"held command changed {table}"
+    # A held snapshot is conservatively restorable. Copied coverage authorization must never
+    # let normal restore/startup forgive its quota before an explicit new baseline.
+    held_snapshot, held_target = work / "baseline-held-snapshot", work / "baseline-held-target"
+    cli(data, "backup", str(held_snapshot))
+    held_manifest = (held_snapshot / "manifest.json").read_bytes()
+    held_hash = digest(held_snapshot / "metadata.sqlite3")
+    restored = cli(held_target, "restore", str(held_snapshot), succeeds=False)
+    assert "baseline" in (restored.stdout + restored.stderr).lower()
+    restored_state = database_rows(held_target / "cairn.db")
+    restored_hold = restored_state["storage_recovery_state"][0]
+    assert restored_hold["legacy_accounting_hold"] == 1
+    assert restored_hold["legacy_release_authorized"] == 0
+    assert restored_hold["generation"] != state["generation"]
+    for table in ("multipart_part_reservations", "multipart_staging_cleanups",
+                  "multipart_bucket_stats", "multipart_principal_stats"):
+        assert restored_state[table] == held[table], f"held restore released {table}"
+    same_live_files(data, held_target, held)
+    cli(held_target, "storage-baseline", str(work / "baseline-held-target-snapshot"))
+    target_complete = database_rows(held_target / "cairn.db")
+    assert target_complete["storage_recovery_state"][0]["coverage_state"] == "complete"
+    assert target_complete["storage_recovery_state"][0]["legacy_accounting_hold"] == 0
+    multipart_accounting(target_complete)
+    assert not target_complete["multipart_part_reservations"]
+    assert not target_complete["multipart_staging_cleanups"]
+    assert digest(held_snapshot / "metadata.sqlite3") == held_hash
+    assert (held_snapshot / "manifest.json").read_bytes() == held_manifest
+
+    unknown.unlink()  # The operator removes only this known, fixture-owned unsupported artifact.
+    cli(data, "storage-baseline", str(first_snapshot), succeeds=False)
+    assert rows(database, "storage_recovery_state")[0] == state
+    cli(data, "storage-baseline", str(work / "baseline-resume-snapshot"))
+    completed = database_rows(database)
+    complete = completed["storage_recovery_state"][0]
+    assert complete["coverage_state"] == "complete" and complete["coverage_identity"]
+    assert complete["legacy_accounting_hold"] == complete["legacy_release_authorized"] == 0
+    assert complete["baseline_id"] is None
+    assert complete["generation"] != state["generation"]
+    assert all(not (data / path).exists() for path in paths), "baseline left classified orphan bytes"
+    for table in ("storage_write_intents", "storage_intent_paths", "storage_cleanups",
+                  "multipart_part_reservations", "multipart_staging_cleanups"):
+        assert not completed[table], f"baseline completed with pending {table}"
+    for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts",
+                  "multipart_bucket_stats", "multipart_principal_stats"):
+        assert completed[table] == before[table], f"baseline changed authoritative state in {table}"
+    multipart_accounting(completed)
+    same_live_files(held_target, data, completed)
+    start(data)
+    serving = rows(database, "storage_recovery_state")[0]
+    assert serving["coverage_identity"] == complete["coverage_identity"]
+    assert serving["legacy_accounting_hold"] == 0
+    print("PASS: offline baseline holds legacy quota through failure/restore, preserves live encrypted parts/history, and resumes explicitly", flush=True)
 
 
 def main():
@@ -432,6 +550,8 @@ def main():
             recovered_outbox = rows(restored_db, "replication_outbox")
             assert all(row["status"] != "claimed" and row.get("claim_token") is None for row in recovered_outbox)
             assert {row["id"] for row in recovered_outbox} == {row["id"] for row in rows(source_db, "replication_outbox")}
+
+            exercise_storage_baseline(work, restored, cli, start, stop, upload_id)
 
             request("POST", f"/recovery/incomplete?{query}", completion)
             body, _ = request("GET", "/recovery/incomplete")

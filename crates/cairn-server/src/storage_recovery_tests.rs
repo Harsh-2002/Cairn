@@ -250,6 +250,93 @@ async fn sharded_full_scan_finds_staging_ownership_on_another_shard() {
 }
 
 #[tokio::test]
+async fn any_shard_baseline_hold_refuses_recovery_before_changing_any_generation() {
+    use cairn_types::storage_baseline::{StorageBaselineToken, StorageBaselineTransition};
+    let first = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let held = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let meta = cairn_meta::ShardedMetadataStore::new(vec![first.clone(), held.clone()]);
+    let generation = stack::begin_storage_generation(&meta).await.unwrap();
+    let token = StorageBaselineToken {
+        generation,
+        baseline_id: StorageToken::generate(),
+    };
+    assert_eq!(
+        held.submit(Mutation::BeginStorageBaseline { token })
+            .await
+            .unwrap(),
+        MutationOutcome::StorageBaselineUpdated(StorageBaselineTransition::Applied)
+    );
+    let before = meta.storage_baseline_states().await.unwrap();
+    assert!(!before[0].legacy_accounting_hold);
+    assert!(before[1].legacy_accounting_hold);
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("data");
+    let node = Arc::new(NodeLock::acquire(&root, &workspace.path().join("meta.db")).unwrap());
+    let blob = LocalBlobStore::open(
+        &root,
+        stack::maintenance_lease(&StorageToken::generate(), node.clone()),
+    )
+    .await
+    .unwrap();
+    let orphan = root.join(format!(
+        ".staging/{}.tmp",
+        StorageToken::generate().as_str()
+    ));
+    std::fs::write(&orphan, b"held legacy bytes").unwrap();
+    let error = stack::recover_exclusive_storage(&meta, &blob, node.clone())
+        .await
+        .unwrap_err();
+    assert!(error.contains("storage-baseline"), "{error}");
+    assert!(
+        stack::finish_exclusive_storage_scan(
+            &meta,
+            &blob,
+            before[0].generation.as_ref().unwrap(),
+            node,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(meta.storage_baseline_states().await.unwrap(), before);
+    assert_eq!(std::fs::read(&orphan).unwrap(), b"held legacy bytes");
+}
+
+#[tokio::test]
+async fn held_startup_refuses_before_blob_initialization_and_generation() {
+    use cairn_types::storage_baseline::StorageBaselineToken;
+    let workspace = tempfile::tempdir().unwrap();
+    let cfg = crate::Config {
+        data_dir: workspace.path().join("data"),
+        db_path: workspace.path().join("metadata.db"),
+        ..crate::Config::default()
+    };
+    let node = Arc::new(NodeLock::acquire(&cfg.data_dir, &cfg.db_path).unwrap());
+    let store = cairn_meta::open(&cfg.db_path, &Default::default()).unwrap();
+    let generation = stack::begin_storage_generation(&store).await.unwrap();
+    store
+        .submit(Mutation::BeginStorageBaseline {
+            token: StorageBaselineToken {
+                generation,
+                baseline_id: StorageToken::generate(),
+            },
+        })
+        .await
+        .unwrap();
+    let before = store.storage_baseline_states().await.unwrap();
+    store.checkpoint_and_close().await.unwrap();
+    assert!(!cfg.data_dir.join(".staging").exists());
+    let error = match stack::build(&cfg, node).await {
+        Ok(_) => panic!("held startup must fail"),
+        Err(error) => error,
+    };
+    assert!(error.contains("storage-baseline"), "{error}");
+    assert!(!cfg.data_dir.join(".staging").exists());
+    let store = cairn_meta::open(&cfg.db_path, &Default::default()).unwrap();
+    assert_eq!(store.storage_baseline_states().await.unwrap(), before);
+    store.checkpoint_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn exclusive_recovery_refuses_a_generation_with_an_outstanding_file_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().join("data");

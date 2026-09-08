@@ -6,4 +6,8 @@ if [ "${1-}" = fanout ]; then
     shift
     exec python3 "$LAB_SCRIPT_DIR/fanout.py" "$@"
 fi
+if [ "${1-}" = recovery-cost ]; then
+    shift
+    exec python3 "$LAB_SCRIPT_DIR/recovery.py" "$@"
+fi
 exec python3 "$LAB_SCRIPT_DIR/lab.py" "$@"

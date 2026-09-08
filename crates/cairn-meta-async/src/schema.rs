@@ -878,6 +878,15 @@ CREATE INDEX idx_storage_intents_reservation ON storage_write_intents (reservati
     WHERE reservation_id IS NOT NULL;
 "#,
     },
+    Migration {
+        version: 38,
+        name: "offline_storage_baseline_accounting_hold",
+        sql: r#"
+ALTER TABLE storage_recovery_state ADD COLUMN baseline_id TEXT;
+ALTER TABLE storage_recovery_state ADD COLUMN legacy_accounting_hold INTEGER NOT NULL DEFAULT 0 CHECK (legacy_accounting_hold IN (0,1));
+ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER NOT NULL DEFAULT 0 CHECK (legacy_release_authorized IN (0,1));
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -924,7 +933,7 @@ pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Resul
             "unsupported storage journal for the applied schema".into(),
         ));
     }
-    if applied >= 36 {
+    if (36..38).contains(&applied) {
         let state = driver.query(
             "SELECT EXISTS(SELECT 1 FROM storage_recovery_state WHERE singleton=1 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL)", vec![]
         ).await?;
@@ -936,6 +945,11 @@ pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Resul
                 "unsupported or missing storage recovery state".into(),
             ));
         }
+    }
+    if applied >= 38 {
+        crate::baseline::state(driver).await.map_err(|error| {
+            MetaError::Engine(format!("unsupported storage recovery state: {error}"))
+        })?;
     }
     if has_protocol {
         let rows = driver.query(
@@ -1100,6 +1114,10 @@ mod tests {
             "DROP TABLE storage_cleanups",
             "DELETE FROM storage_recovery_state",
             "UPDATE storage_recovery_state SET coverage_state='complete'",
+            "UPDATE storage_recovery_state SET legacy_accounting_hold=1",
+            "UPDATE storage_recovery_state SET legacy_release_authorized=1",
+            "UPDATE storage_recovery_state SET baseline_id='11111111111111111111111111111111'",
+            "UPDATE storage_recovery_state SET generation='11111111111111111111111111111111',baseline_id='invalid',legacy_accounting_hold=1",
             "UPDATE storage_protocol SET write_layout='fanout-v1'",
             "UPDATE storage_protocol SET recovery_mode='journal'",
             "DELETE FROM storage_protocol",
@@ -1111,7 +1129,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 37);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 38);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")

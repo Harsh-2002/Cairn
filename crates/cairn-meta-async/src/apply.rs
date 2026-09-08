@@ -99,7 +99,35 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
 }
 
 async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
+    if matches!(
+        &m,
+        Mutation::ReleaseMultipartReservation { .. }
+            | Mutation::ReleaseMultipartCleanup { .. }
+            | Mutation::ReleaseMultipartUploadCleanups { .. }
+            | Mutation::RecoverMultipartStagingAccounting { .. }
+    ) && let Some(baseline_id) = crate::baseline::held(driver).await?
+    {
+        return Ok(MutationOutcome::MultipartAccountingHeld { baseline_id });
+    }
+
     match m {
+        Mutation::BeginStorageBaseline { token } => crate::baseline::begin(driver, &token).await,
+        Mutation::ClassifyStorageBaseline {
+            bucket,
+            token,
+            paths,
+        } => crate::baseline::classify(driver, &bucket, &token, &paths).await,
+        Mutation::AuthorizeStorageBaselineRelease { proof } => {
+            crate::baseline::authorize(driver, proof.token()).await
+        }
+        Mutation::FinalizeStorageBaselineLegacy { token, limit } => {
+            crate::baseline::finalize(driver, &token, limit).await
+        }
+        Mutation::CompleteStorageBaseline {
+            token,
+            completed_at,
+        } => crate::baseline::complete(driver, &token, completed_at).await,
+
         Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
@@ -2735,6 +2763,8 @@ async fn enforce_multipart_reservation_quota(
     context: &MultipartContext,
     reserved_bytes: u64,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(driver).await?;
+
     let bucket_quota = query_one(
         driver,
         "SELECT quota_bytes FROM buckets WHERE name=?1",
@@ -2806,6 +2836,8 @@ async fn release_multipart_reservation(
     upload_id: &cairn_types::UploadId,
     attempt_id: &str,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(driver).await?;
+
     let row = query_one(
         driver,
         "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
@@ -2962,6 +2994,8 @@ async fn record_part(
 }
 
 async fn release_multipart_cleanup(driver: &dyn AsyncSqlDriver, cleanup_id: &str) -> R<()> {
+    crate::baseline::ensure_unheld(driver).await?;
+
     let row = query_one(
         driver,
         "SELECT bucket_name, principal_id, bytes
@@ -2988,6 +3022,8 @@ async fn release_multipart_upload_cleanups(
     driver: &dyn AsyncSqlDriver,
     upload_id: &cairn_types::UploadId,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(driver).await?;
+
     let row = query_one(
         driver,
         "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
@@ -3039,6 +3075,8 @@ async fn recover_multipart_staging_accounting(
     driver: &dyn AsyncSqlDriver,
     limit: u32,
 ) -> R<MutationOutcome> {
+    crate::baseline::ensure_unheld(driver).await?;
+
     let limit = i64::from(limit.clamp(1, 1_000));
     let reservations = driver
         .query(

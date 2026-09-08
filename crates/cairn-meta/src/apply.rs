@@ -97,7 +97,35 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
 }
 
 fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
+    if matches!(
+        &m,
+        Mutation::ReleaseMultipartReservation { .. }
+            | Mutation::ReleaseMultipartCleanup { .. }
+            | Mutation::ReleaseMultipartUploadCleanups { .. }
+            | Mutation::RecoverMultipartStagingAccounting { .. }
+    ) && let Some(baseline_id) = crate::baseline::held(conn)?
+    {
+        return Ok(MutationOutcome::MultipartAccountingHeld { baseline_id });
+    }
+
     match m {
+        Mutation::BeginStorageBaseline { token } => crate::baseline::begin(conn, &token),
+        Mutation::ClassifyStorageBaseline {
+            bucket,
+            token,
+            paths,
+        } => crate::baseline::classify(conn, &bucket, &token, &paths),
+        Mutation::AuthorizeStorageBaselineRelease { proof } => {
+            crate::baseline::authorize(conn, proof.token())
+        }
+        Mutation::FinalizeStorageBaselineLegacy { token, limit } => {
+            crate::baseline::finalize(conn, &token, limit)
+        }
+        Mutation::CompleteStorageBaseline {
+            token,
+            completed_at,
+        } => crate::baseline::complete(conn, &token, completed_at),
+
         Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
@@ -2593,6 +2621,8 @@ fn enforce_multipart_reservation_quota(
     context: &MultipartContext,
     reserved_bytes: u64,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(conn)?;
+
     let bucket_quota: Option<i64> = conn
         .query_row(
             "SELECT quota_bytes FROM buckets WHERE name=?1",
@@ -2664,6 +2694,8 @@ fn release_multipart_reservation(
     upload_id: &cairn_types::UploadId,
     attempt_id: &str,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(conn)?;
+
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
@@ -2796,6 +2828,8 @@ fn record_part(
 }
 
 fn release_multipart_cleanup(conn: &Connection, cleanup_id: &str) -> R<()> {
+    crate::baseline::ensure_unheld(conn)?;
+
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT bucket_name, principal_id, bytes
@@ -2820,6 +2854,8 @@ fn release_multipart_upload_cleanups(
     conn: &Connection,
     upload_id: &cairn_types::UploadId,
 ) -> R<()> {
+    crate::baseline::ensure_unheld(conn)?;
+
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
@@ -2861,6 +2897,8 @@ fn retire_multipart_session(conn: &Connection, upload_id: &cairn_types::UploadId
 }
 
 fn recover_multipart_staging_accounting(conn: &Connection, limit: u32) -> R<MutationOutcome> {
+    crate::baseline::ensure_unheld(conn)?;
+
     let limit = i64::from(limit.clamp(1, 1_000));
     let reservations: Vec<(String, String)> = {
         let mut stmt = conn

@@ -191,6 +191,36 @@ pub trait BlobStore: Send + Sync {
         opts: ReconcileOpts,
         lease: crate::storage::io::StorageIoLease,
     ) -> Result<ReconcileReport, BlobError>;
+
+    /// Validate the complete supported namespace in bounded pages and durably classify every
+    /// storage file through the existing Writer. All physical shards must hold the exact run.
+    /// This phase never unlinks files or prunes directories; errors preserve unknown artifacts.
+    async fn classify_storage_baseline(
+        &self,
+        _meta: &dyn MetadataStore,
+        _opts: &crate::blob::StorageBaselineOptions,
+        _lease: crate::storage::io::StorageIoLease,
+    ) -> Result<crate::blob::StorageClassificationReport, BlobError> {
+        Err(BlobError::Io(
+            "storage baseline classification is unavailable".into(),
+        ))
+    }
+
+    /// After exact cleanup, prove every authoritative object/history/part path exists beneath the
+    /// same opened root, then strictly verify and sync the remaining namespace child-first.
+    /// No current intent, intent path, exact debt or native quota debt may remain. The returned
+    /// proof retains the classification and node lifetime; legacy accounting remains held.
+    async fn verify_storage_baseline(
+        &self,
+        _meta: &dyn MetadataStore,
+        _opts: &crate::blob::StorageBaselineOptions,
+        _classification: &crate::blob::StorageClassificationReport,
+        _lease: crate::storage::io::StorageIoLease,
+    ) -> Result<crate::blob::StorageBaselineProof, BlobError> {
+        Err(BlobError::Io(
+            "storage baseline verification is unavailable".into(),
+        ))
+    }
 }
 
 /// A bounded membership oracle for reconciliation: tells the blob store which storage paths
@@ -215,6 +245,42 @@ pub trait ReconcileOracle: Send + Sync {
 /// enumeration is paged and bounded.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Uncached, one state per physical database; never inferred from bucket enumeration.
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<crate::storage_baseline::StorageBaselineState>, MetaError> {
+        Err(MetaError::Engine(
+            "storage baseline state is unavailable".into(),
+        ))
+    }
+    /// Unconditional EXISTS over all journal/accounting rows, including claimed and protected work.
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<crate::storage_baseline::StorageBaselinePending, MetaError> {
+        Err(MetaError::Engine(
+            "storage baseline pending state is unavailable".into(),
+        ))
+    }
+    /// At most 128 exact paths, aligned to input order. Any conflicting retained owner is an error.
+    async fn storage_path_owners(
+        &self,
+        _paths: &[StoragePath],
+    ) -> Result<Vec<crate::storage_baseline::StoragePathOwnership>, MetaError> {
+        Err(MetaError::Engine(
+            "storage path ownership is unavailable".into(),
+        ))
+    }
+    /// Bounded keyset pagination over every local object version and live multipart part.
+    async fn enumerate_storage_authority(
+        &self,
+        _cursor: Option<&crate::storage_baseline::StorageAuthorityCursor>,
+        _limit: u32,
+    ) -> Result<crate::storage_baseline::StorageAuthorityPage, MetaError> {
+        Err(MetaError::Engine(
+            "storage authority enumeration is unavailable".into(),
+        ))
+    }
+
     /// Submit a mutation to the group-committing writer. The returned future resolves only
     /// after the batch containing this mutation has been made durable.
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError>;

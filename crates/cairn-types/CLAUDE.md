@@ -152,8 +152,23 @@ closes child-lease admission; only a drained ownership set creates a quiescence 
 remains incomplete and startup retains full scans; neither the traits nor test helpers enable
 Phase 3D recovery.
 
-`PrepareStorageRestore` is an exclusive staged-image Writer operation at schema v37. It requires
+`PrepareStorageRestore` is an exclusive staged-image Writer operation. It requires
 a fresh generation, atomically clears coverage identity/completion and cleanup claims, and
 preserves old intent generations, authoritative references, cleanup debts and multipart charges.
 Fan it out to every physical shard. It neither marks coverage complete nor enables journal
-recovery; unsupported source coverage is still rejected by read-only startup preflight.
+recovery. Restore clears release authorization and preserves a copied baseline HOLD and run id.
+
+Schema v38 adds a global legacy-accounting HOLD with exact generation/run authorization. The
+baseline first holds every physical shard; ordinary startup refuses any held shard before recovery.
+The four legacy release helpers enforce HOLD internally, and shard routing checks every state
+before its first release dispatch. Native exact cleanup remains valid; new storage admission does
+not. Bounded classification records durable exact debt before deletion. Authorization checks all
+intent/path/cleanup rows and all native quota debts with unconditional EXISTS; claimed or protected
+work still blocks it. Only a completed blob proof authorizes bounded legacy release while HOLD
+remains set. Completion requires all reservations and cleanup charges gone, while live part charges
+remain intact. A generation change clears authorization; restore also clears coverage and claims.
+Both preserve HOLD. Full startup scans and flat protocol-2 writes remain mandatory.
+`storage_baseline_states`, pending work, exact path owners, and authority pages are uncached safety
+reads. Authority pages cover every historical object row and live part, including orphan-parent
+errors. Path-owner reads fan out across all shards and retain deleted bucket/upload attribution;
+only genuinely ownerless staging paths use the stable `cairn-storage-orphans` route.

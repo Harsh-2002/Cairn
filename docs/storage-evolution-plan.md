@@ -66,7 +66,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   Measure directory creation, PUT/GET/delete, reconciliation and directory-fsync coalescing.
   It reduces neither inode count nor total scan work. Failure/inconclusive means no default
   change; success produces a separate promotion PR with offline migration and legacy tests.
-- [ ] **3C: complete storage lifecycle accounting**. Retain full scans during implementation.
+- [x] **3C: complete storage lifecycle accounting** — merged in PR #91 (`a72c98e`). Retain full scans during implementation.
   Plan every unique attempt/path before creation, reserve through the Writer, await reservation
   before I/O. Publish only after data durability/hash validation; atomically verify exact intent,
   install metadata, retire intent and enqueue superseded paths in one savepoint. Deletes enqueue
@@ -374,3 +374,33 @@ and wrong-key refusal before changing either a fresh or existing target. Twelve 
 helper tests pass. Web lint/build, both npm audits, cargo audit and installer checks pass.
 The complete workspace gate and final-head CI remain required before this PR merges. No further
 local experiment has run; consumption remains 574.519391 seconds and recorded peak 571,154,432 bytes.
+
+PR #92 final head `b7013702ed924e189f852675f1089d917eae8a9c` passed all 54 CI checks with no
+posted review findings or open branch scanning alerts. The complete local gate passed 1,423
+default-feature and 1,449 all-feature tests (four/seven skipped), two doctests, formatting, both
+Clippy configurations, web checks, dependency audits and installer checks. It merged as
+`093b8428c30362d64304ef2cfbe6a824acc1357b`; its branch and worktree are removed.
+
+The separate earlier `a72c98e` post-merge CI run had one infrastructure failure: the routing job's
+binary artifact download received HTTP 403 from an intermediary, before executing its test.
+The routing job passes on `b7013702`; no routing assertion or source change was needed for that
+artifact-access failure.
+
+Phase 3D's offline baseline work starts from merged `093b842` on `codex/storage-03d-baseline`.
+It adds an explicit single-SQLite safety-snapshot/baseline command and v38 conservative legacy
+accounting holds. A failed or restored held run requires explicit resume; full startup scans
+remain mandatory. The additional cost screen is predeclared in `storage-recovery-2026-09.md`.
+Implementation and local validation are complete. The final Rust source passes 1,466 default
+workspace tests (five skipped), 1,492 all-feature tests (eight skipped), both Clippy configurations
+and two doctests. The ten standalone Rust lab tests, 58 Python lab tests with every live fixture,
+13 recovery helper tests, web checks, dependency audits, installer checks and release policy pass.
+The privileged blob bind-mount fixture passes. The encrypted live restore/baseline drill verifies
+held quota through classification failure and restore, explicit resume, active encrypted parts,
+historical versions, ACL/tags and Object Lock.
+
+Integration caught an unnecessary SQLite reopen after publishing a held restore; the command now
+returns from its validated receipt before opening metadata, with immediate sidecar-absence
+coverage. The live harness now closes every observation/injection connection explicitly and
+observes the production cleanup worker before taking the cost fixture offline. These are fixed
+correctness fixtures, not campaign measurements. The predeclared cost screen and final-head CI
+remain pending; campaign consumption is still 574.519391 seconds and 571,154,432 bytes peak.

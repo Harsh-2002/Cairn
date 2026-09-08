@@ -778,6 +778,7 @@ pub async fn build(
 pub(crate) async fn begin_storage_generation(
     meta: &dyn MetadataStore,
 ) -> Result<cairn_types::storage::StorageToken, String> {
+    require_unheld_storage(meta).await?;
     let generation = cairn_types::storage::StorageToken::generate();
     match meta
         .submit(cairn_types::Mutation::BeginStorageGeneration {
@@ -789,6 +790,62 @@ pub(crate) async fn begin_storage_generation(
         cairn_types::MutationOutcome::Ack => Ok(generation),
         _ => Err("unexpected storage generation acknowledgement".into()),
     }
+}
+
+/// Incomplete coverage alone still permits the ordinary full scan. A durable accounting hold
+/// instead requires the explicit baseline path, before generation changes or physical recovery.
+pub(crate) async fn require_unheld_storage(meta: &dyn MetadataStore) -> Result<(), String> {
+    let states = meta
+        .storage_baseline_states()
+        .await
+        .map_err(|error| format!("read storage baseline state: {error}"))?;
+    if states.is_empty() {
+        return Err("storage baseline state is missing".into());
+    }
+    if states.iter().any(|state| state.legacy_accounting_hold) {
+        return Err(
+            "storage baseline is held; resume with cairn storage-baseline <empty-backup-dir>"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn require_baseline_ownership(
+    meta: &dyn MetadataStore,
+    token: &cairn_types::storage_baseline::StorageBaselineToken,
+) -> Result<(), String> {
+    let states = meta
+        .storage_baseline_states()
+        .await
+        .map_err(|error| format!("read held storage baseline state: {error}"))?;
+    if states.is_empty() || states.iter().any(|state| !state.matches(token)) {
+        return Err("storage baseline does not own every metadata database".into());
+    }
+    Ok(())
+}
+
+/// The baseline has classified the complete namespace before resolving copied intents. This
+/// converts their exact ownership to debt without invoking ordinary reconciliation or release.
+pub(crate) async fn recover_baseline_storage(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    token: &cairn_types::storage_baseline::StorageBaselineToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    require_baseline_ownership(meta, token).await?;
+    recover_storage_intents(meta, blob, &token.generation, lifetime).await?;
+    recover_orphaned_multipart_claims(meta).await
+}
+
+pub(crate) async fn drain_baseline_storage_cleanup(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    token: &cairn_types::storage_baseline::StorageBaselineToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    require_baseline_ownership(meta, token).await?;
+    drain_storage_cleanup(meta, blob, &token.generation, lifetime).await
 }
 
 /// Offline commands and startup share the same generation, kernel-quiescence and claim recovery.
@@ -810,11 +867,22 @@ pub(crate) async fn finish_exclusive_storage_scan(
     generation: &cairn_types::storage::StorageToken,
     lifetime: Arc<dyn Send + Sync>,
 ) -> Result<(), String> {
+    require_unheld_storage(meta).await?;
     recover_multipart_staging_accounting(meta).await?;
     drain_exclusive_storage_cleanup(meta, blob, generation, lifetime).await
 }
 
 pub(crate) async fn drain_exclusive_storage_cleanup(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStore,
+    generation: &cairn_types::storage::StorageToken,
+    lifetime: Arc<dyn Send + Sync>,
+) -> Result<(), String> {
+    require_unheld_storage(meta).await?;
+    drain_storage_cleanup(meta, blob, generation, lifetime).await
+}
+
+async fn drain_storage_cleanup(
     meta: &dyn MetadataStore,
     blob: &dyn BlobStore,
     generation: &cairn_types::storage::StorageToken,

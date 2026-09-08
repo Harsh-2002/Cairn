@@ -8,6 +8,7 @@ use crate::storage::{
     StorageAdmission, StorageCleanup, StorageMutation, StorageToken, StorageWritePlan,
     StorageWriteTarget,
 };
+use crate::storage_baseline::*;
 use crate::time::Timestamp;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +16,7 @@ type R<T> = Result<T, MetaError>;
 
 #[derive(Clone, Default)]
 pub(super) struct Journal {
-    generation: Option<StorageToken>,
+    baseline: StorageBaselineState,
     intents: BTreeMap<StorageToken, (StorageWritePlan, bool)>,
     cleanups: BTreeMap<StorageToken, PendingCleanup>,
     exact_quota_debts: BTreeSet<String>,
@@ -35,7 +36,8 @@ fn invalid(message: &str) -> MetaError {
 }
 
 pub(super) fn begin(st: &mut State, generation: StorageToken) -> MutationOutcome {
-    st.storage.generation = Some(generation);
+    st.storage.baseline.generation = Some(generation);
+    st.storage.baseline.legacy_release_authorized = false;
     for row in st.storage.cleanups.values_mut() {
         row.claim = None;
     }
@@ -43,12 +45,13 @@ pub(super) fn begin(st: &mut State, generation: StorageToken) -> MutationOutcome
 }
 
 pub(super) fn prepare_restore(st: &mut State, generation: StorageToken) -> R<MutationOutcome> {
-    if st.storage.generation.as_ref() == Some(&generation) {
+    if st.storage.baseline.generation.as_ref() == Some(&generation) {
         return Err(invalid(
             "storage restore requires a fresh generation and recovery state",
         ));
     }
-    // The protocol-2 double only represents incomplete coverage, just like schema v37 startup.
+    st.storage.baseline.coverage_identity = None;
+    st.storage.baseline.completed_at = None;
     Ok(begin(st, generation))
 }
 
@@ -73,7 +76,7 @@ pub(super) fn apply(
             generation,
         } => {
             let mut applied = false;
-            if journal.generation.as_ref() == Some(&generation)
+            if journal.baseline.generation.as_ref() == Some(&generation)
                 && let Some((plan, cancelled)) = journal.intents.get_mut(&attempt)
                 && &plan.bucket == bucket
                 && plan.generation == generation
@@ -91,7 +94,7 @@ pub(super) fn apply(
                     &plan.bucket == bucket && &plan.generation == quiescence.generation()
                 })
                 .map(|(plan, _)| plan.clone());
-            let applied = if journal.generation.as_ref() == Some(quiescence.generation())
+            let applied = if journal.baseline.generation.as_ref() == Some(quiescence.generation())
                 && let Some(plan) = plan
             {
                 resolve(st, &mut journal, &plan)?;
@@ -112,7 +115,7 @@ pub(super) fn apply(
                     &plan.bucket == bucket && &plan.generation == quiescence.generation()
                 })
                 .map(|(plan, _)| plan.clone());
-            let applied = if journal.generation.as_ref() == Some(&current_generation)
+            let applied = if journal.baseline.generation.as_ref() == Some(&current_generation)
                 && &current_generation != quiescence.generation()
                 && let Some(plan) = plan
             {
@@ -124,7 +127,7 @@ pub(super) fn apply(
             MutationOutcome::StorageUpdated { applied }
         }
         StorageMutation::FinishCleanup { cleanup, now } => {
-            let applied = journal.generation.as_ref() == Some(&cleanup.generation)
+            let applied = journal.baseline.generation.as_ref() == Some(&cleanup.generation)
                 && &cleanup.bucket == bucket
                 && cleanup.lease_until >= now
                 && journal.cleanups.get(&cleanup.id).is_some_and(|row| {
@@ -157,12 +160,14 @@ pub(super) fn reserve_joint(
 
 pub(super) fn owns_publication(st: &State, plan: &StorageWritePlan) -> R<bool> {
     plan.validate()?;
-    Ok(st.storage.generation.as_ref() == Some(&plan.generation)
-        && st
-            .storage
-            .intents
-            .get(&plan.attempt)
-            .is_some_and(|(stored, cancelled)| stored == plan && !cancelled))
+    Ok(
+        st.storage.baseline.generation.as_ref() == Some(&plan.generation)
+            && st
+                .storage
+                .intents
+                .get(&plan.attempt)
+                .is_some_and(|(stored, cancelled)| stored == plan && !cancelled),
+    )
 }
 
 pub(super) fn discard_unacknowledged(st: &mut State, plan: &StorageWritePlan) {
@@ -182,11 +187,15 @@ fn reserve(
     bucket: &BucketName,
     plan: StorageWritePlan,
 ) -> R<StorageAdmission> {
+    if journal.baseline.legacy_accounting_hold {
+        return Err(invalid("storage baseline accounting is held"));
+    }
+
     plan.validate()?;
     if &plan.bucket != bucket {
         return Err(invalid("storage admission routing mismatch"));
     }
-    if journal.generation.as_ref() != Some(&plan.generation)
+    if journal.baseline.generation.as_ref() != Some(&plan.generation)
         || !st.buckets.contains_key(bucket.as_str())
         || journal.intents.contains_key(&plan.attempt)
     {
@@ -494,7 +503,7 @@ pub(super) fn retire_multipart(st: &mut State, session: &crate::meta::MultipartS
 }
 
 pub(super) fn recover(st: &mut State, generation: &StorageToken, limit: u32) -> R<MutationOutcome> {
-    if st.storage.generation.as_ref() != Some(generation) {
+    if st.storage.baseline.generation.as_ref() != Some(generation) {
         return Ok(MutationOutcome::StorageIntentBatch(Vec::new()));
     }
     let journal = &st.storage;
@@ -521,7 +530,7 @@ pub(super) fn claim(
         .filter(|duration| *duration > 0)
         .and_then(|duration| now.0.checked_add(duration))
         .ok_or_else(|| invalid("invalid storage cleanup lease"))?;
-    if st.storage.generation.as_ref() != Some(generation) {
+    if st.storage.baseline.generation.as_ref() != Some(generation) {
         return Ok(MutationOutcome::StorageCleanupBatch(Vec::new()));
     }
     let journal = &st.storage;
@@ -563,6 +572,365 @@ pub(super) fn claim(
         batch.push(cleanup);
     }
     Ok(MutationOutcome::StorageCleanupBatch(batch))
+}
+
+pub(super) fn baseline_state(st: &State) -> StorageBaselineState {
+    st.storage.baseline.clone()
+}
+pub(super) fn baseline_pending(st: &State) -> StorageBaselinePending {
+    StorageBaselinePending {
+        intents: !st.storage.intents.is_empty(),
+        intent_paths: !st.storage.intents.is_empty(),
+        exact_debt: !st.storage.cleanups.is_empty(),
+        native_quota_debt: st.multipart_cleanups.keys().any(|id| exact_quota(st, id)),
+        legacy_reservations: !st.multipart_reservations.is_empty(),
+        legacy_quota_debt: st.multipart_cleanups.keys().any(|id| !exact_quota(st, id)),
+    }
+}
+fn baseline_updated(status: StorageBaselineTransition) -> MutationOutcome {
+    MutationOutcome::StorageBaselineUpdated(status)
+}
+pub(super) fn baseline_begin(st: &mut State, token: StorageBaselineToken) -> R<MutationOutcome> {
+    let state = &mut st.storage.baseline;
+    if state.generation.as_ref() != Some(&token.generation) {
+        return Ok(baseline_updated(StorageBaselineTransition::Stale));
+    }
+    if state.matches(&token) {
+        return Ok(baseline_updated(if state.legacy_release_authorized {
+            StorageBaselineTransition::Stale
+        } else {
+            StorageBaselineTransition::AlreadyApplied
+        }));
+    }
+    state.coverage_identity = None;
+    state.completed_at = None;
+    state.baseline_id = Some(token.baseline_id);
+    state.legacy_accounting_hold = true;
+    state.legacy_release_authorized = false;
+    Ok(baseline_updated(StorageBaselineTransition::Applied))
+}
+
+pub(super) fn baseline_owners(st: &State, paths: &[StoragePath]) -> R<Vec<StoragePathOwnership>> {
+    if paths.len() > STORAGE_BASELINE_PAGE_LIMIT {
+        return Err(invalid("storage ownership page exceeds bound"));
+    }
+    let mut result = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.as_str().len() > 256 {
+            return Err(invalid("storage path exceeds bound"));
+        }
+        let mut owner = StoragePathOwnership {
+            path: path.clone(),
+            bucket: None,
+            authoritative: false,
+            intent: false,
+            cleanup: false,
+            legacy_debt: false,
+        };
+        let mut retain = |bucket: &BucketName, kind: u8| -> R<()> {
+            crate::storage::validate_storage_path(bucket, path)?;
+            if owner
+                .bucket
+                .as_ref()
+                .is_some_and(|previous| previous != bucket)
+            {
+                return Err(invalid("conflicting retained storage buckets"));
+            }
+            owner.bucket = Some(bucket.clone());
+            match kind {
+                0 => owner.authoritative = true,
+                1 => owner.intent = true,
+                2 => owner.cleanup = true,
+                3 => owner.legacy_debt = true,
+                _ => {}
+            }
+            Ok(())
+        };
+        for row in st
+            .versions
+            .values()
+            .filter(|row| row.storage_path.as_ref() == Some(path))
+        {
+            retain(&row.bucket, 0)?;
+        }
+        for ((upload, _), _) in st.parts.iter().filter(|(_, row)| &row.storage_path == path) {
+            let session = st
+                .multipart
+                .get(upload)
+                .ok_or_else(|| invalid("missing multipart authority parent"))?;
+            retain(&session.bucket, 0)?;
+        }
+        for (plan, _) in st
+            .storage
+            .intents
+            .values()
+            .filter(|(plan, _)| plan.paths.iter().any(|alias| &alias.path == path))
+        {
+            retain(&plan.bucket, 1)?;
+        }
+        for row in st.storage.cleanups.values() {
+            if &row.path == path {
+                retain(&row.bucket, 2)?;
+            }
+            if row.owner.as_ref() == Some(path) {
+                retain(&row.bucket, 4)?;
+            }
+        }
+        for row in st
+            .multipart_cleanups
+            .values()
+            .filter(|row| row.storage_path.as_ref() == Some(path))
+        {
+            retain(&row.bucket, 3)?;
+        }
+        if let Some(upload) = path
+            .as_str()
+            .strip_prefix(".staging/multipart/")
+            .and_then(|tail| tail.split_once('/').map(|(upload, _)| upload))
+        {
+            if let Some(session) = st.multipart.get(upload) {
+                retain(&session.bucket, 4)?;
+            }
+            for row in st
+                .multipart_cleanups
+                .values()
+                .filter(|row| row.upload_id.as_str() == upload)
+            {
+                retain(&row.bucket, 4)?;
+            }
+            for (plan, _) in st.storage.intents.values() {
+                if matches!(&plan.target, StorageWriteTarget::Part { upload_id, .. } | StorageWriteTarget::Completion { upload_id, .. } if upload_id.as_str() == upload)
+                {
+                    retain(&plan.bucket, 4)?;
+                }
+            }
+        }
+        result.push(owner);
+    }
+    Ok(result)
+}
+
+pub(super) fn baseline_classify(
+    st: &mut State,
+    bucket: BucketName,
+    token: StorageBaselineToken,
+    paths: Vec<StoragePath>,
+) -> R<MutationOutcome> {
+    if !st.storage.baseline.matches(&token) || st.storage.baseline.legacy_release_authorized {
+        return Ok(baseline_updated(StorageBaselineTransition::Stale));
+    }
+    if paths.is_empty() || paths.len() > STORAGE_BASELINE_PAGE_LIMIT {
+        return Err(invalid("invalid storage classification page size"));
+    }
+    let owners = baseline_owners(st, &paths)?;
+    let mut dispositions = Vec::with_capacity(paths.len());
+    for (path, owner) in paths.iter().zip(owners) {
+        crate::storage::validate_storage_path(&bucket, path)?;
+        if owner.bucket.as_ref().is_some_and(|owner| owner != &bucket) {
+            return Err(invalid("storage classification routing mismatch"));
+        }
+        if owner.authoritative {
+            dispositions.push(StorageBaselineDisposition::Authoritative);
+        } else if owner.intent {
+            dispositions.push(StorageBaselineDisposition::IntentOwned);
+        } else {
+            if !owner.cleanup {
+                let mut quota = None;
+                for row in st
+                    .storage
+                    .cleanups
+                    .values()
+                    .filter(|row| row.owner.as_ref() == Some(path))
+                {
+                    if let Some(debt) = &row.quota {
+                        if quota.as_ref().is_some_and(|previous| previous != debt) {
+                            return Err(invalid("conflicting native storage quota owners"));
+                        }
+                        quota = Some(debt.clone());
+                    }
+                }
+                let owner = quota.as_ref().map(|_| path.clone());
+                enqueue_owned(&mut st.storage, &bucket, path, quota, owner)?;
+            }
+            dispositions.push(StorageBaselineDisposition::CleanupRecorded);
+        }
+    }
+    Ok(MutationOutcome::StorageBaselineClassified(dispositions))
+}
+
+pub(super) fn baseline_authorize(
+    st: &mut State,
+    token: &StorageBaselineToken,
+) -> R<MutationOutcome> {
+    if !st.storage.baseline.matches(token) {
+        return Ok(baseline_updated(StorageBaselineTransition::Stale));
+    }
+    if baseline_pending(st).native_pending() {
+        return Ok(baseline_updated(StorageBaselineTransition::Blocked));
+    }
+    if st.storage.baseline.legacy_release_authorized {
+        return Ok(baseline_updated(StorageBaselineTransition::AlreadyApplied));
+    }
+    st.storage.baseline.legacy_release_authorized = true;
+    Ok(baseline_updated(StorageBaselineTransition::Applied))
+}
+
+pub(super) fn baseline_finalize(
+    st: &mut State,
+    token: StorageBaselineToken,
+    limit: u32,
+) -> R<MutationOutcome> {
+    if !st.storage.baseline.matches(&token) || !st.storage.baseline.legacy_release_authorized {
+        return Ok(baseline_updated(StorageBaselineTransition::Stale));
+    }
+    if baseline_pending(st).native_pending() {
+        return Ok(baseline_updated(StorageBaselineTransition::Blocked));
+    }
+    let limit = limit.clamp(1, 1000) as usize;
+    // The double scans its maps but retains only one bounded page, matching SQL row ownership.
+    let mut reservations = BTreeMap::new();
+    for row in st.multipart_reservations.values() {
+        reservations.insert((row.created_at, row.attempt_id.clone()), row.clone());
+        if reservations.len() > limit {
+            reservations.pop_last();
+        }
+    }
+    let mut released = 0;
+    for row in reservations.into_values() {
+        if !st.multipart.contains_key(row.upload_id.as_str()) {
+            return Err(invalid("missing legacy reservation parent"));
+        }
+        if st.multipart_reservations.remove(&row.attempt_id).is_some() {
+            released += 1;
+        }
+    }
+    let mut cleanups = BTreeMap::new();
+    for row in st
+        .multipart_cleanups
+        .values()
+        .filter(|row| !exact_quota(st, &row.id))
+    {
+        cleanups.insert((row.created_at, row.id.clone()), row.id.clone());
+        if cleanups.len() > limit - released {
+            cleanups.pop_last();
+        }
+    }
+    for id in cleanups.into_values() {
+        if st.multipart_cleanups.remove(&id).is_some() {
+            released += 1;
+        }
+    }
+    let pending = baseline_pending(st);
+    Ok(MutationOutcome::StorageBaselineLegacyPage {
+        released: released as u32,
+        remaining: pending.legacy_reservations || pending.legacy_quota_debt,
+    })
+}
+
+pub(super) fn baseline_complete(
+    st: &mut State,
+    token: StorageBaselineToken,
+    completed_at: Timestamp,
+) -> R<MutationOutcome> {
+    let state = &st.storage.baseline;
+    if !state.legacy_accounting_hold
+        && state.generation.as_ref() == Some(&token.generation)
+        && state.coverage_identity.as_ref() == Some(&token.baseline_id)
+    {
+        return Ok(baseline_updated(StorageBaselineTransition::AlreadyApplied));
+    }
+    if !state.matches(&token) || !state.legacy_release_authorized {
+        return Ok(baseline_updated(StorageBaselineTransition::Stale));
+    }
+    if baseline_pending(st).any() {
+        return Ok(baseline_updated(StorageBaselineTransition::Blocked));
+    }
+    if completed_at.0 < 0 {
+        return Err(invalid("invalid storage baseline completion time"));
+    }
+    let state = &mut st.storage.baseline;
+    state.coverage_identity = Some(token.baseline_id);
+    state.completed_at = Some(completed_at);
+    state.baseline_id = None;
+    state.legacy_accounting_hold = false;
+    state.legacy_release_authorized = false;
+    Ok(baseline_updated(StorageBaselineTransition::Applied))
+}
+
+pub(super) fn baseline_authority(
+    st: &State,
+    cursor: Option<&StorageAuthorityCursor>,
+    limit: u32,
+) -> R<StorageAuthorityPage> {
+    if st.versions.values().any(|row| row.id.is_empty()) {
+        return Err(invalid("invalid storage authority row identity"));
+    }
+    let mut cursor = cursor.cloned().unwrap_or_default();
+    if cursor.shard != 0
+        || cursor.last_id.len() > 256
+        || (cursor.kind == StorageAuthorityKind::Objects && cursor.last_part != 0)
+    {
+        return Err(invalid("invalid storage authority cursor"));
+    }
+    let limit = limit.clamp(1, STORAGE_BASELINE_PAGE_LIMIT as u32) as usize;
+    let mut items = Vec::with_capacity(limit);
+    if cursor.kind == StorageAuthorityKind::Objects {
+        let mut rows = BTreeMap::new();
+        for row in st.versions.values().filter(|row| row.id > cursor.last_id) {
+            rows.insert(row.id.clone(), row);
+            if rows.len() > limit + 1 {
+                rows.pop_last();
+            }
+        }
+        let more = rows.len() > limit;
+        for row in rows.into_values().take(limit) {
+            if let Some(path) = &row.storage_path {
+                crate::storage::validate_storage_path(&row.bucket, path)?;
+            }
+            cursor.last_id = row.id.clone();
+            items.push(StorageAuthority::Object(Box::new(row.clone())));
+        }
+        if more {
+            return Ok(StorageAuthorityPage {
+                items,
+                next: Some(cursor),
+            });
+        }
+        cursor.kind = StorageAuthorityKind::Parts;
+        cursor.last_id.clear();
+        cursor.last_part = 0;
+    }
+    let remaining = limit - items.len();
+    let rows: Vec<_> = st
+        .parts
+        .range((
+            std::ops::Bound::Excluded((cursor.last_id.clone(), cursor.last_part)),
+            std::ops::Bound::Unbounded,
+        ))
+        .take(remaining + 1)
+        .collect();
+    let more = rows.len() > remaining;
+    for ((upload, number), part) in rows.into_iter().take(remaining) {
+        let session = st
+            .multipart
+            .get(upload)
+            .ok_or_else(|| invalid("missing multipart authority parent"))?;
+        crate::storage::validate_storage_path(&session.bucket, &part.storage_path)?;
+        if !(1..=10000).contains(number) || *number != part.part_number {
+            return Err(invalid("invalid multipart authority geometry"));
+        }
+        cursor.last_id = upload.clone();
+        cursor.last_part = *number;
+        items.push(StorageAuthority::Part {
+            bucket: session.bucket.clone(),
+            upload_id: session.upload_id.clone(),
+            part: part.clone(),
+        });
+    }
+    Ok(StorageAuthorityPage {
+        items,
+        next: more.then_some(cursor),
+    })
 }
 
 #[cfg(test)]

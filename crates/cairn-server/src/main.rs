@@ -16,6 +16,7 @@
 
 mod adapter;
 mod background;
+mod baseline;
 mod cli_remote;
 mod config;
 mod error_page;
@@ -90,6 +91,11 @@ enum Command {
     /// Take an offline, validated single-SQLite snapshot into an empty DIR (ARCH 31.4).
     Backup {
         /// Destination directory for the snapshot (created if absent).
+        dir: PathBuf,
+    },
+    /// Create a safety snapshot, then complete an offline storage baseline (single SQLite only).
+    StorageBaseline {
+        /// Empty destination for a new safety snapshot, including when resuming a held baseline.
         dir: PathBuf,
     },
     /// Restore an offline, validated single-SQLite snapshot, then reconcile (ARCH 31.4).
@@ -201,8 +207,10 @@ fn main() -> ExitCode {
         }
     };
 
-    if matches!(&command, Command::Backup { .. } | Command::Restore { .. })
-        && let Err(error) = require_canonical_backup_topology(&cfg)
+    if matches!(
+        &command,
+        Command::Backup { .. } | Command::Restore { .. } | Command::StorageBaseline { .. }
+    ) && let Err(error) = require_canonical_backup_topology(&cfg)
     {
         eprintln!("{error}");
         return ExitCode::from(2);
@@ -248,6 +256,14 @@ fn main() -> ExitCode {
         ),
         Command::Migrate => migrate(cfg),
         Command::Backup { dir } => backup(cfg, &dir),
+        Command::StorageBaseline { dir } => baseline::run(
+            cfg,
+            &dir,
+            node_lock_guard
+                .as_ref()
+                .expect("storage-baseline owns node lock")
+                .clone(),
+        ),
         Command::Restore { dir } => restore(
             cfg,
             &dir,
@@ -323,6 +339,10 @@ fn integrity(cfg: Config, repair: bool, node_lock: Arc<node_lock::NodeLock>) -> 
                 return ExitCode::FAILURE;
             }
         };
+        if let Err(error) = stack::require_unheld_storage(meta.as_ref()).await {
+            eprintln!("integrity refused: {error}");
+            return ExitCode::FAILURE;
+        }
         let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone(), stack::maintenance_lease(&cairn_types::storage::StorageToken::generate(), node_lock.clone())).await {
             Ok(b) => b,
             Err(e) => {
@@ -1058,22 +1078,34 @@ async fn snapshot_sqlite_database(
     // maintenance operations stay serialized on its one Writer.
     let store = cairn_meta::open(source, &cairn_meta::OpenOptions::default())
         .map_err(|error| format!("failed to open source SQLite metadata store: {error}"))?;
-    let stats = store
-        .checkpoint()
-        .await
-        .map_err(|error| format!("failed to checkpoint source SQLite database: {error}"))?;
-    if stats.busy {
-        return Err(format!(
-            "source SQLite WAL is busy ({}/{} frames checkpointed); stop every reader/writer and \
-             retry the offline backup",
-            stats.checkpointed_frames, stats.log_frames
-        ));
+    let snapshot = async {
+        let stats = store
+            .checkpoint()
+            .await
+            .map_err(|error| format!("failed to checkpoint source SQLite database: {error}"))?;
+        if stats.busy {
+            return Err(format!(
+                "source SQLite WAL is busy ({}/{} frames checkpointed); stop every reader/writer and \
+                 retry the offline backup",
+                stats.checkpointed_frames, stats.log_frames
+            ));
+        }
+        store
+            .vacuum_into_snapshot(destination.to_owned())
+            .await
+            .map_err(|error| format!("SQLite snapshot failed: {error}"))
     }
-
-    store
-        .vacuum_into_snapshot(destination.to_owned())
+    .await;
+    // Baseline reopens this source after validating the safety snapshot. Always finish this
+    // Writer, including failure paths, so two canonical Writers never overlap.
+    let closed = store
+        .checkpoint_and_close()
         .await
-        .map_err(|error| format!("SQLite snapshot failed: {error}"))?;
+        .map_err(|error| format!("failed to close snapshot source Writer: {error}"));
+    snapshot?;
+    if closed?.busy {
+        return Err("snapshot source WAL is busy after backup; no baseline may begin".into());
+    }
     let snapshot_file = tokio::fs::OpenOptions::new()
         .read(true)
         .open(destination)
@@ -1579,88 +1611,60 @@ fn reject_overlapping_trees(
 
 /// Take an explicitly offline, internally-validated snapshot into `dir` (ARCH 31.4).
 fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
-    if let Err(error) = require_canonical_backup_topology(&cfg) {
-        eprintln!("{error}");
-        return ExitCode::from(2);
-    }
-    if let Err(error) = ensure_empty_snapshot_destination(dir) {
-        eprintln!("{error}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = reject_overlapping_trees(&cfg.data_dir, dir, "backup") {
-        eprintln!("{error}");
-        return ExitCode::FAILURE;
-    }
-
     let rt = match runtime(&cfg) {
         Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to start runtime: {e}");
+        Err(error) => {
+            eprintln!("failed to start runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
-    rt.block_on(async move {
-        let db_dest = dir.join(SNAPSHOT_DATABASE_FILE);
-        if let Err(error) = snapshot_sqlite_database(&cfg.db_path, &db_dest).await {
-            eprintln!("failed to snapshot database: {error}");
-            return ExitCode::FAILURE;
-        }
-        if let Err(error) = validate_snapshot_database(&db_dest) {
-            eprintln!("snapshot database validation failed: {error}");
-            return ExitCode::FAILURE;
-        }
-
-        // The node lock makes the source tree quiescent. Copy committed object blobs plus durable
-        // multipart parts; transient single-object `.staging/*.tmp` files are never metadata-
-        // referenced and remain excluded.
-        let blob_dest = dir.join(SNAPSHOT_BLOB_DIRECTORY);
-        let excluded = match database_artifact_names(&cfg.data_dir, &cfg.db_path) {
-            Ok(names) => names,
-            Err(error) => {
-                eprintln!("failed to identify database artifacts: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        match copy_blob_tree(&cfg.data_dir, &blob_dest, &excluded).await {
-            Ok(n) => {
-                let referenced = match verify_snapshot_blob_references(&db_dest, &blob_dest) {
-                    Ok(referenced) => referenced,
-                    Err(error) => {
-                        eprintln!("snapshot blob validation failed: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                if let Err(error) = sync_directory(dir).await {
-                    eprintln!("failed to sync snapshot contents before completion: {error}");
-                    return ExitCode::FAILURE;
-                }
-                let manifest = match build_snapshot_manifest(&db_dest).await {
-                    Ok(manifest) => manifest,
-                    Err(error) => {
-                        eprintln!("failed to build snapshot manifest: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                if let Err(error) = write_snapshot_manifest_last(dir, &manifest).await {
-                    eprintln!("failed to complete snapshot manifest: {error}");
-                    return ExitCode::FAILURE;
-                }
+    rt.block_on(async {
+        match create_safety_snapshot(&cfg, dir).await {
+            Ok((snapshot, copied_entries)) => {
                 println!(
-                    "backup complete: offline single-SQLite snapshot database={} \
-                     manifest={} ({n} blob entries, {referenced} referenced files verified) \
-                     blobs={}",
-                    db_dest.display(),
+                    "backup complete: offline single-SQLite snapshot database={} manifest={} \
+                     ({copied_entries} blob entries, {} referenced files verified) blobs={}",
+                    snapshot.database.display(),
                     dir.join(SNAPSHOT_MANIFEST_FILE).display(),
-                    blob_dest.display()
+                    snapshot.referenced_files,
+                    snapshot.blobs.display()
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("failed to copy blob tree: {e}");
+            Err(error) => {
+                eprintln!("backup failed: {error}");
                 ExitCode::FAILURE
             }
         }
     })
+}
+
+/// Reused by backup and baseline under the caller's retained node lock. This is automated
+/// snapshot/reference validation, not an operator restore drill or a pre-upgrade rollback image:
+/// opening the source may apply migrations. Every attempt requires a fresh empty destination.
+async fn create_safety_snapshot(
+    cfg: &Config,
+    dir: &std::path::Path,
+) -> Result<(ValidatedSnapshot, u64), String> {
+    require_canonical_backup_topology(cfg)?;
+    ensure_empty_snapshot_destination(dir)?;
+    reject_overlapping_trees(&cfg.data_dir, dir, "backup")?;
+    let database = dir.join(SNAPSHOT_DATABASE_FILE);
+    snapshot_sqlite_database(&cfg.db_path, &database).await?;
+    validate_snapshot_database(&database)?;
+    let blobs = dir.join(SNAPSHOT_BLOB_DIRECTORY);
+    let excluded = database_artifact_names(&cfg.data_dir, &cfg.db_path)
+        .map_err(|error| format!("failed to identify database artifacts: {error}"))?;
+    let copied_entries = copy_blob_tree(&cfg.data_dir, &blobs, &excluded)
+        .await
+        .map_err(|error| format!("failed to copy blob tree: {error}"))?;
+    verify_snapshot_blob_references(&database, &blobs)?;
+    sync_directory(dir)
+        .await
+        .map_err(|error| format!("failed to sync snapshot contents before completion: {error}"))?;
+    let manifest = build_snapshot_manifest(&database).await?;
+    write_snapshot_manifest_last(dir, &manifest).await?;
+    Ok((validate_snapshot(dir).await?, copied_entries))
 }
 
 /// Restore an offline single-SQLite snapshot, validating it before replacing any metadata.
@@ -1738,8 +1742,19 @@ fn restore(cfg: Config, dir: &std::path::Path, node_lock: Arc<node_lock::NodeLoc
 
         // Revalidate the target-owned staging inode immediately before the one metadata
         // linearization point. Publication also refuses if an old sidecar has reappeared.
+        let baseline_held = prepared.receipt.legacy_accounting_hold;
         if let Err(error) = publish_staged_database(prepared, &cfg.db_path).await {
             eprintln!("failed to restore database: {error}");
+            return ExitCode::FAILURE;
+        }
+        // The receipt already binds this hold through both publication checks under the node
+        // lock. A held image has no ordinary recovery work to start: reopening SQLite here would
+        // unnecessarily recreate WAL/SHM and launch a read pool before immediately refusing it.
+        if baseline_held {
+            eprintln!(
+                "restored snapshot was published but storage baseline is held; resume with \
+                 cairn storage-baseline <empty-backup-dir> before recovery"
+            );
             return ExitCode::FAILURE;
         }
 
@@ -1752,6 +1767,13 @@ fn restore(cfg: Config, dir: &std::path::Path, node_lock: Arc<node_lock::NodeLoc
                 return ExitCode::FAILURE;
             }
         };
+        if let Err(error) = stack::require_unheld_storage(&store).await {
+            eprintln!("restored snapshot was published but requires storage-baseline before recovery: {error}");
+            if let Err(error) = store.checkpoint_and_close().await {
+                eprintln!("failed to close held restored metadata: {error}");
+            }
+            return ExitCode::FAILURE;
+        }
         let oracle = store.reconcile_oracle();
         let blob = match cairn_blob::LocalBlobStore::open(
             cfg.data_dir.clone(),
@@ -1994,6 +2016,8 @@ struct PreparedDatabaseReceipt {
     sha256: String,
     schema_version: i64,
     generation: cairn_types::storage::StorageToken,
+    legacy_accounting_hold: bool,
+    baseline_id: Option<cairn_types::storage::StorageToken>,
 }
 
 async fn prepare_staged_database(
@@ -2018,6 +2042,14 @@ async fn prepare_staged_database(
     let generation = cairn_types::storage::StorageToken::generate();
     let preparation = async {
         stack::preflight_key_state(&[&store], &crypto, cfg).await?;
+        let mut states = store
+            .storage_baseline_states()
+            .await
+            .map_err(|error| format!("failed to read staged baseline hold: {error}"))?;
+        if states.len() != 1 {
+            return Err("staged database must have one storage baseline state".into());
+        }
+        let baseline_state = states.remove(0);
         match store
             .submit(cairn_types::Mutation::PrepareStorageRestore {
                 generation: generation.clone(),
@@ -2025,13 +2057,13 @@ async fn prepare_staged_database(
             .await
             .map_err(|error| format!("failed to reset staged storage ownership: {error}"))?
         {
-            cairn_types::MutationOutcome::Ack => Ok(()),
+            cairn_types::MutationOutcome::Ack => Ok(baseline_state),
             _ => Err("unexpected staged storage preparation acknowledgement".to_owned()),
         }
     }
     .await;
     let closed = close_staged_database(&mut staged, store).await;
-    preparation?;
+    let baseline_state = preparation?;
     closed?;
     sync_closed_database(staged.path()).await?;
     let conn = open_prepared_database(staged.path())?;
@@ -2050,6 +2082,8 @@ async fn prepare_staged_database(
         sha256,
         schema_version,
         generation,
+        legacy_accounting_hold: baseline_state.legacy_accounting_hold,
+        baseline_id: baseline_state.baseline_id,
     };
     validate_prepared_database(staged.path(), &receipt).await?;
     Ok(PreparedDatabase { staged, receipt })
@@ -2138,8 +2172,8 @@ async fn validate_prepared_database(
     let conn = open_prepared_database(path)?;
     validate_snapshot_connection(&conn)?;
     let prepared: bool = conn.query_row(
-        "SELECT (SELECT MAX(version) FROM schema_migrations)=?1 AND generation=?2 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM storage_cleanups WHERE claim_token IS NOT NULL OR claim_generation IS NOT NULL OR lease_until IS NOT NULL) FROM storage_recovery_state WHERE singleton=1",
-        rusqlite::params![receipt.schema_version, receipt.generation.as_str()],
+        "SELECT (SELECT MAX(version) FROM schema_migrations)=?1 AND generation=?2 AND coverage_state='incomplete' AND coverage_identity IS NULL AND baseline_completed_at IS NULL AND legacy_accounting_hold=?3 AND baseline_id IS ?4 AND legacy_release_authorized=0 AND NOT EXISTS (SELECT 1 FROM storage_cleanups WHERE claim_token IS NOT NULL OR claim_generation IS NOT NULL OR lease_until IS NOT NULL) FROM storage_recovery_state WHERE singleton=1",
+        rusqlite::params![receipt.schema_version, receipt.generation.as_str(), receipt.legacy_accounting_hold, receipt.baseline_id.as_ref().map(cairn_types::storage::StorageToken::as_str)],
         |row| row.get(0),
     ).map_err(|error| format!("failed to validate prepared storage ownership: {error}"))?;
     if !prepared {
@@ -3741,6 +3775,98 @@ mod tests {
         assert_eq!(
             std::fs::read(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap(),
             original_manifest
+        );
+    }
+
+    #[test]
+    fn held_restore_publishes_fresh_ownership_without_recovery_or_quota_release() {
+        use cairn_types::storage::StorageToken;
+        use cairn_types::storage_baseline::StorageBaselineToken;
+        use cairn_types::{MetadataStore, Mutation};
+        use rusqlite::types::Value;
+
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        let source = root.path().join("source.db");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            create_restore_source(&source, &snapshot.join("blobs")).await;
+            let store = cairn_meta::open(&source, &Default::default()).unwrap();
+            let generation = store.storage_baseline_states().await.unwrap()[0]
+                .generation
+                .clone()
+                .unwrap();
+            store
+                .submit(Mutation::BeginStorageBaseline {
+                    token: StorageBaselineToken {
+                        generation,
+                        baseline_id: StorageToken::generate(),
+                    },
+                })
+                .await
+                .unwrap();
+            store.checkpoint_and_close().await.unwrap();
+            snapshot_sqlite_database(&source, &database).await.unwrap();
+            let manifest = build_snapshot_manifest(&database).await.unwrap();
+            write_snapshot_manifest_last(&snapshot, &manifest)
+                .await
+                .unwrap();
+        });
+        drop(runtime);
+        let mut expected = restore_image_rows(&database);
+        let source_bytes = std::fs::read(&database).unwrap();
+        let manifest_bytes = std::fs::read(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap();
+        let cfg = Config {
+            data_dir: root.path().join("restored"),
+            db_path: root.path().join("restored.db"),
+            runtime_worker_threads: 2,
+            ..Config::default()
+        };
+        let node = std::sync::Arc::new(
+            super::node_lock::NodeLock::acquire(&cfg.data_dir, &cfg.db_path).unwrap(),
+        );
+        assert_eq!(
+            super::restore(cfg.clone(), &snapshot, node),
+            std::process::ExitCode::FAILURE
+        );
+        assert!(
+            super::present_sqlite_sidecars(&cfg.db_path)
+                .unwrap()
+                .is_empty(),
+            "held restore must leave the published receipt image closed without recreating sidecars"
+        );
+        let actual = restore_image_rows(&cfg.db_path);
+        let old_state = &mut expected.get_mut("storage_recovery_state").unwrap()[0];
+        let new_state = &actual["storage_recovery_state"][0];
+        assert_ne!(old_state[1], new_state[1]);
+        old_state[1] = new_state[1].clone();
+        old_state[2] = Value::Null;
+        old_state[3] = Value::Text("incomplete".into());
+        old_state[4] = Value::Null;
+        // v38 appends the held baseline id, hold and release authorization in this order.
+        assert_ne!(old_state[5], Value::Null);
+        assert_eq!(old_state[6], Value::Integer(1));
+        old_state[7] = Value::Integer(0);
+        for row in expected.get_mut("storage_cleanups").unwrap() {
+            row[4..7].fill(Value::Null);
+        }
+        assert_eq!(
+            actual, expected,
+            "held restore must not resolve intents or forgive quota"
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), source_bytes);
+        assert_eq!(
+            std::fs::read(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap(),
+            manifest_bytes
+        );
+        assert!(
+            cfg.data_dir
+                .join("bucket/00000000000000000000000000000000")
+                .exists()
         );
     }
 

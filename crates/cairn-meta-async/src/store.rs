@@ -311,6 +311,30 @@ async fn fetch_rows(
 
 #[async_trait::async_trait]
 impl MetadataStore for AsyncMetadataStore {
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<cairn_types::storage_baseline::StorageBaselineState>, MetaError> {
+        Ok(vec![crate::baseline::state(&**self.reader().await).await?])
+    }
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<cairn_types::storage_baseline::StorageBaselinePending, MetaError> {
+        crate::baseline::pending(&**self.reader().await).await
+    }
+    async fn storage_path_owners(
+        &self,
+        paths: &[StoragePath],
+    ) -> Result<Vec<cairn_types::storage_baseline::StoragePathOwnership>, MetaError> {
+        crate::baseline::owners(&**self.reader().await, paths).await
+    }
+    async fn enumerate_storage_authority(
+        &self,
+        cursor: Option<&cairn_types::storage_baseline::StorageAuthorityCursor>,
+        limit: u32,
+    ) -> Result<cairn_types::storage_baseline::StorageAuthorityPage, MetaError> {
+        crate::baseline::authority(&**self.reader().await, cursor, limit).await
+    }
+
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         self.writer.submit(mutation).await
     }

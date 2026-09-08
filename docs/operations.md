@@ -203,6 +203,12 @@ exclusive restart recovery. Shutdown drains this queue after HTTP and background
 including imports, stop and before the final WAL checkpoint. Full startup scans remain mandatory;
 protocol 2 does not yet enable journal-only startup.
 
+An interrupted explicit offline baseline remains stopped with legacy accounting held until the
+operator resumes `cairn storage-baseline <empty-backup-dir>`. This maintenance boundary also
+survives snapshot restore; ordinary startup and repair cannot clear it. The command validates a
+new safety snapshot before each run, but that validation does not perform a restore drill or
+authenticate every payload. See the baseline procedure in `backup-restore.md`.
+
 The blob namespace requires Linux 5.6 or newer with `openat2` support. The configured data root
 may itself be a mount; descendant symlinks and mounts are rejected. Keep one filesystem beneath
 that root. Do not change the namespace or use unsupported older writers behind Cairn's node lock.

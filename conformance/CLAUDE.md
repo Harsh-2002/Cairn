@@ -92,6 +92,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   Wrong recorded key bindings refuse restore into both fresh and populated targets before
   metadata publication; the target rows/bytes and original snapshot image/manifest stay unchanged. The
   failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
+  The fixed offline baseline arm injects legacy reservation/coarse debt after shutdown and requires
+  unknown root lock-like names to block classification without deleting bytes or releasing quota.
+  Held startup/repair refuse; a held snapshot restores conservatively, explicit baseline resume
+  clears only retired charges, and active encrypted parts/history remain usable. This command-error
+  fixture is distinct from process-kill and power-loss evidence.
 - `recovery_remote.py` — real Cairn destination and bounded HTTP fault proxy: lose a successful
   initiation/part/abort response, SIGKILL source, compare every snapshot table exactly and validate only specified recovery transitions on restore,
   verify unknown upload-ID incidents versus known-ID cleanup and exact native version redelivery.

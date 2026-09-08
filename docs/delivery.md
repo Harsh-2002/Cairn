@@ -46,7 +46,8 @@ and manifest remain unchanged. An old generation with
 sidecars is checkpointed through the canonical Writer and fully closed; its main file is synced and
 the exact sidecars are removed and parent-synced **before** atomic rename. Thus either side of the
 rename is independently reopenable after a crash, with fresh ownership already durable in the new
-image. Reconciliation follows while still locked. A
+image. A copied baseline hold survives preparation and blocks ordinary restore finalization until
+`storage-baseline` explicitly completes; otherwise reconciliation follows while still locked. A
 database may be directly inside the data root or outside it on the same filesystem, never under a
 deeper data-root directory that reconciliation could interpret as a bucket. The master key remains
 deliberately excluded and must be backed up out of band. The operator procedure and nested-path
@@ -199,7 +200,7 @@ buckets or multipart sessions with a cascading foreign key.
 
 | Table | Fields and constraints |
 |---|---|
-| storage_recovery_state | Singleton 1; nullable generation and coverage identity; coverage state `incomplete`/`complete`; nullable baseline completion timestamp. Phase 3C accepts only incomplete coverage. |
+| storage_recovery_state | Singleton 1; nullable generation and coverage identity; coverage state `incomplete`/`complete`; nullable baseline completion timestamp. v38 adds nullable `baseline_id`, boolean `legacy_accounting_hold`, and boolean `legacy_release_authorized`. A held run has incomplete coverage and an exact baseline identity; authorization is generation-bound. |
 | storage_write_intents | Attempt primary key, generation, routing bucket, validated plan JSON, cancellation boolean, creation timestamp. v37 adds nullable `upload_id`/`reservation_id`, backfilled from plans and validated against them. Indexed by generation/attempt, bucket/attempt and non-null upload/reservation identity with attempt. |
 | storage_intent_paths | Attempt/role primary key; role limited to temporary/final/index_spool; unique exact relative path. Only this bounded child table cascades from its intent. |
 | storage_cleanups | Cleanup primary key, unique exact path, retained bucket, optional quota-debt id; claim token/generation/lease are either all absent or all present. v37 adds nullable `quota_owner_path` linking unfinished aliases to their final part path. Pending, bucket, quota and non-null quota-owner indexes support bounded work. |
@@ -212,7 +213,9 @@ the charge remains until all linked exact cleanup claims are retired and no inte
 path. Legacy cleanup release cannot forgive protocol-2 debt. Admission, publication, reference
 removal and cleanup settlement use Writer savepoints with backend/double/shard parity (Section
 11.6). Reader/writer floors remain 2, flat writes and mandatory full startup scans remain, and
-coverage remains incomplete; these migrations do not complete Phase 3C or enable Phase 3D.
+v36/v37 alone do not establish coverage. v38 permits explicit offline baseline completion while
+retaining full scans. It holds all legacy charges until exact cleanup and namespace proof authorize
+bounded release; restore and fresh generations invalidate release authorization (Section 8.5.1).
 
 **Users.**
 

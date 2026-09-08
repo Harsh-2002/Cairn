@@ -906,6 +906,40 @@ fn fetch_rows(
 
 #[async_trait::async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn storage_baseline_states(
+        &self,
+    ) -> Result<Vec<cairn_types::storage_baseline::StorageBaselineState>, MetaError> {
+        self.with_read(|conn| Ok(vec![crate::baseline::state(conn)?]))
+            .await
+    }
+    async fn storage_baseline_pending(
+        &self,
+    ) -> Result<cairn_types::storage_baseline::StorageBaselinePending, MetaError> {
+        self.with_read(crate::baseline::pending).await
+    }
+    async fn storage_path_owners(
+        &self,
+        paths: &[StoragePath],
+    ) -> Result<Vec<cairn_types::storage_baseline::StoragePathOwnership>, MetaError> {
+        if paths.len() > cairn_types::storage_baseline::STORAGE_BASELINE_PAGE_LIMIT {
+            return Err(MetaError::Engine(
+                "storage ownership page exceeds bound".into(),
+            ));
+        }
+        let paths = paths.to_vec();
+        self.with_read(move |conn| crate::baseline::owners(conn, &paths))
+            .await
+    }
+    async fn enumerate_storage_authority(
+        &self,
+        cursor: Option<&cairn_types::storage_baseline::StorageAuthorityCursor>,
+        limit: u32,
+    ) -> Result<cairn_types::storage_baseline::StorageAuthorityPage, MetaError> {
+        let cursor = cursor.cloned();
+        self.with_read(move |conn| crate::baseline::authority(conn, cursor.as_ref(), limit))
+            .await
+    }
+
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         self.writer.submit(mutation).await
     }

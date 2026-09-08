@@ -10,7 +10,7 @@ use crate::storage::{
 use crate::{Bucket, MetadataStore, OwnershipMode, Timestamp, VersioningState};
 use std::sync::Arc;
 
-fn plan(bucket: &BucketName, generation: &StorageToken) -> PlannedStorageWrite {
+pub(super) fn plan(bucket: &BucketName, generation: &StorageToken) -> PlannedStorageWrite {
     PlannedStorageWrite::new(
         bucket.clone(),
         generation.clone(),
@@ -23,7 +23,7 @@ fn plan(bucket: &BucketName, generation: &StorageToken) -> PlannedStorageWrite {
     .unwrap()
 }
 
-async fn claim(
+pub(super) async fn claim(
     meta: &dyn MetadataStore,
     generation: &StorageToken,
     limit: u32,
@@ -45,7 +45,7 @@ async fn claim(
     batch
 }
 
-async fn update(
+pub(super) async fn update(
     meta: &dyn MetadataStore,
     bucket: &BucketName,
     operation: StorageMutation,
@@ -62,7 +62,7 @@ async fn update(
     );
 }
 
-async fn create_bucket(meta: &dyn MetadataStore, bucket: &BucketName) {
+pub(super) async fn create_bucket(meta: &dyn MetadataStore, bucket: &BucketName) {
     meta.submit(Mutation::CreateBucket(Box::new(Bucket {
         name: bucket.clone(),
         owner_id: UserId::generate(),
@@ -318,7 +318,10 @@ pub async fn assert_storage_journal(meta: &dyn MetadataStore) {
     assert_storage_completion(meta).await;
 }
 
-fn object_row(plan: &crate::storage::StorageWritePlan, owner: UserId) -> crate::ObjectVersionRow {
+pub(super) fn object_row(
+    plan: &crate::storage::StorageWritePlan,
+    owner: UserId,
+) -> crate::ObjectVersionRow {
     let (key, version_id, row_id) = match &plan.target {
         StorageWriteTarget::Object {
             key,
@@ -366,7 +369,7 @@ fn object_row(plan: &crate::storage::StorageWritePlan, owner: UserId) -> crate::
     }
 }
 
-fn put(row: crate::ObjectVersionRow) -> Mutation {
+pub(super) fn put(row: crate::ObjectVersionRow) -> Mutation {
     Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Default::default(),
@@ -375,7 +378,10 @@ fn put(row: crate::ObjectVersionRow) -> Mutation {
     }
 }
 
-async fn admit_object(meta: &dyn MetadataStore, plan: &crate::storage::StorageWritePlan) {
+pub(super) async fn admit_object(
+    meta: &dyn MetadataStore,
+    plan: &crate::storage::StorageWritePlan,
+) {
     assert_eq!(
         meta.submit(Mutation::Storage {
             bucket: plan.bucket.clone(),
@@ -534,7 +540,10 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     }
 }
 
-async fn create_upload(meta: &dyn MetadataStore, bucket: &BucketName) -> crate::UploadId {
+pub(super) async fn create_upload(
+    meta: &dyn MetadataStore,
+    bucket: &BucketName,
+) -> crate::UploadId {
     let owner = meta.get_bucket(bucket).await.unwrap().unwrap().owner_id;
     let upload = crate::UploadId::generate();
     let outcome = meta
@@ -570,7 +579,7 @@ async fn create_upload(meta: &dyn MetadataStore, bucket: &BucketName) -> crate::
     upload
 }
 
-fn part_plan(
+pub(super) fn part_plan(
     bucket: &BucketName,
     generation: &StorageToken,
     upload: &crate::UploadId,
@@ -589,7 +598,7 @@ fn part_plan(
     .clone()
 }
 
-fn reserve_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
+pub(super) fn reserve_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
     let StorageWriteTarget::Part {
         upload_id,
         part_number,
@@ -612,7 +621,7 @@ fn reserve_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
     }
 }
 
-fn publish_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
+pub(super) fn publish_part(plan: &crate::storage::StorageWritePlan) -> Mutation {
     let StorageWriteTarget::Part {
         upload_id,
         part_number,

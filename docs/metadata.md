@@ -169,6 +169,24 @@ retained bucket, broadcasts generation changes to every physical shard, and boun
 and cleanup batches across shards. SQLite, libSQL, Turso and the in-memory double preserve the
 same savepoint and typed applied/not-applied outcomes.
 
+Migration v38 adds the offline baseline identity, legacy-accounting hold and release authorization
+to the recovery singleton. Begin/resume invalidates coverage and holds legacy charges before
+classification; generation changes and restore invalidate release authorization while preserving
+the hold. Ordinary multipart reservation/cleanup release helpers refuse held accounting. Shard
+wrappers check every physical database before dispatching the first such release, so a partially
+started baseline cannot release an earlier unheld shard's charges. Native exact cleanup remains
+available, but physical write admission is refused while held.
+
+Baseline classification rechecks exact ownership in the Writer before recording ownerless cleanup.
+Path-owner queries are bounded and aligned, authoritative enumeration includes all historical
+versions and active parts, and pending-state queries use unconditional existence checks rather
+than eligible-claim pages. A generation/baseline-bound namespace proof authorizes bounded legacy
+release only after every native intent, alias, exact cleanup and native quota debt is absent.
+Each page repeats these predicates and counts actual releases. Completion clears the hold only
+when all reservations and cleanup accounting are gone; committed active parts remain charged.
+The SQL backends, double and shard routing preserve these semantics. Section 8.5.1 defines the
+filesystem proof and operational recovery boundary; journal-only startup remains disabled.
+
 The SQLite re-wrap worker's compare-and-swap updates and key-ring binding transaction also execute
 on that same writer connection through its serialized control seam. It never opens an ad-hoc source
 write connection: concurrent credential/config edits win their CAS, and an id→full-hash mismatch

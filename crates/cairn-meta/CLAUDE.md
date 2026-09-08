@@ -32,7 +32,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   quiescence resolution, bounded intent recovery and leased cleanup. Validate the normalized
   path/upload/reservation index against each persisted plan; mirror SQL and typed outcomes across
   both metadata crates and the in-memory double.
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 37 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 38 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
@@ -137,8 +137,23 @@ the in-memory double preserve these savepoint and typed outcome semantics. Cover
 incomplete and startup retains full scans; phase gates remain tracked in
 `docs/storage-evolution-plan.md`.
 
-`PrepareStorageRestore` is an exclusive staged-image Writer operation at schema v37. It requires
+`PrepareStorageRestore` is an exclusive staged-image Writer operation. It requires
 a fresh generation, atomically clears coverage identity/completion and cleanup claims, and
 preserves old intent generations, authoritative references, cleanup debts and multipart charges.
 Fan it out to every physical shard. It neither marks coverage complete nor enables journal
-recovery; unsupported source coverage is still rejected by read-only startup preflight.
+recovery. Restore clears release authorization and preserves a copied baseline HOLD and run id.
+
+Schema v38 adds a global legacy-accounting HOLD with exact generation/run authorization. The
+baseline first holds every physical shard; ordinary startup refuses any held shard before recovery.
+The four legacy release helpers enforce HOLD internally, and shard routing checks every state
+before its first release dispatch. Native exact cleanup remains valid; new storage admission does
+not. Bounded classification records durable exact debt before deletion. Authorization checks all
+intent/path/cleanup rows and all native quota debts with unconditional EXISTS; claimed or protected
+work still blocks it. Only a completed blob proof authorizes bounded legacy release while HOLD
+remains set. Completion requires all reservations and cleanup charges gone, while live part charges
+remain intact. A generation change clears authorization; restore also clears coverage and claims.
+Both preserve HOLD. Full startup scans and flat protocol-2 writes remain mandatory.
+`storage_baseline_states`, pending work, exact path owners, and authority pages are uncached safety
+reads. Authority pages cover every historical object row and live part, including orphan-parent
+errors. Path-owner reads fan out across all shards and retain deleted bucket/upload attribution;
+only genuinely ownerless staging paths use the stable `cairn-storage-orphans` route.

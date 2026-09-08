@@ -320,6 +320,117 @@ pub struct ReconcileReport {
     pub errors: u64,
 }
 
+/// Exclusive offline baseline inputs. Root exemptions are exact single-component file names;
+/// neither suffix patterns nor directories are exemptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBaselineOptions {
+    pub token: crate::storage_baseline::StorageBaselineToken,
+    pub batch_size: u32,
+    pub root_artifacts: Vec<std::ffi::OsString>,
+}
+
+/// Bounded-walk totals. No per-object inventory survives classification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageClassificationCounts {
+    pub files_scanned: u64,
+    pub referenced_files: u64,
+    pub journal_files: u64,
+    pub debts_recorded: u64,
+    pub directories_scanned: u64,
+}
+
+/// Receipt for one complete, non-destructive physical classification under a held baseline.
+/// The backend retains its opened root and actual maintenance ownership to prevent inode reuse
+/// or loss of node exclusion while verification still depends on this receipt.
+#[derive(Clone)]
+pub struct StorageClassificationReport {
+    options: StorageBaselineOptions,
+    root_device: u64,
+    root_inode: u64,
+    counts: StorageClassificationCounts,
+    _root_lifetime: Arc<dyn Send + Sync>,
+}
+
+impl std::fmt::Debug for StorageClassificationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageClassificationReport")
+            .field("options", &self.options)
+            .field("root_device", &self.root_device)
+            .field("root_inode", &self.root_inode)
+            .field("counts", &self.counts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageClassificationReport {
+    /// Backend completion seam, called only after every physical entry has been validated and
+    /// classified durably. A partial walk or unresolved metadata response must never call this.
+    #[doc(hidden)]
+    pub fn backend_completed(
+        options: StorageBaselineOptions,
+        root_device: u64,
+        root_inode: u64,
+        counts: StorageClassificationCounts,
+        root_lifetime: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            options,
+            root_device,
+            root_inode,
+            counts,
+            _root_lifetime: root_lifetime,
+        }
+    }
+
+    pub fn token(&self) -> &crate::storage_baseline::StorageBaselineToken {
+        &self.options.token
+    }
+
+    pub fn options(&self) -> &StorageBaselineOptions {
+        &self.options
+    }
+
+    pub fn root_identity(&self) -> (u64, u64) {
+        (self.root_device, self.root_inode)
+    }
+
+    pub fn counts(&self) -> StorageClassificationCounts {
+        self.counts
+    }
+}
+
+/// Successful reverse-reference and strict namespace proof for one completed classification.
+/// Authorization still rechecks the current held generation and all pending journal rows on the
+/// Writer. This is coverage evidence, not a content checksum or decryption proof.
+#[derive(Debug, Clone)]
+pub struct StorageBaselineProof {
+    classification: StorageClassificationReport,
+    authoritative_files: u64,
+}
+
+impl StorageBaselineProof {
+    /// Backend completion seam. Requires a matching root/run, successful bounded reverse probes,
+    /// no native pending work and a complete strict walk synced child-first through the root.
+    #[doc(hidden)]
+    pub fn backend_verified(
+        classification: StorageClassificationReport,
+        authoritative_files: u64,
+    ) -> Self {
+        Self {
+            classification,
+            authoritative_files,
+        }
+    }
+
+    pub fn token(&self) -> &crate::storage_baseline::StorageBaselineToken {
+        self.classification.token()
+    }
+
+    pub fn authoritative_files(&self) -> u64 {
+        self.authoritative_files
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::BlobCipher;

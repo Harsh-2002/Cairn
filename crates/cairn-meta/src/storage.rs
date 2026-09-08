@@ -19,25 +19,25 @@ fn invalid(message: &str) -> MetaError {
     MetaError::Engine(message.to_owned())
 }
 
-fn text(value: &str) -> Cell {
+pub(crate) fn text(value: &str) -> Cell {
     Cell::Text(value.to_owned())
 }
 
-fn string(row: &Row, index: usize) -> R<&str> {
+pub(crate) fn string(row: &Row, index: usize) -> R<&str> {
     match row.get(index) {
         Some(Cell::Text(value)) => Ok(value),
         _ => Err(invalid("invalid storage journal text")),
     }
 }
 
-fn integer(row: &Row, index: usize) -> R<i64> {
+pub(crate) fn integer(row: &Row, index: usize) -> R<i64> {
     match row.get(index) {
         Some(Cell::Integer(value)) => Ok(*value),
         _ => Err(invalid("invalid storage journal integer")),
     }
 }
 
-fn optional_string(row: &Row, index: usize) -> R<Option<&str>> {
+pub(crate) fn optional_string(row: &Row, index: usize) -> R<Option<&str>> {
     match row.get(index) {
         Some(Cell::Null) => Ok(None),
         Some(Cell::Text(value)) => Ok(Some(value)),
@@ -68,7 +68,7 @@ pub fn begin(db: &DB, generation: &StorageToken) -> R<MutationOutcome> {
     // not proof that a live process or outstanding kernel operation has stopped.
     x(
         db,
-        "UPDATE storage_recovery_state SET generation=?1 WHERE singleton=1",
+        "UPDATE storage_recovery_state SET generation=?1,legacy_release_authorized=0 WHERE singleton=1",
         vec![text(generation.as_str())],
     )?;
     x(
@@ -82,7 +82,7 @@ pub fn begin(db: &DB, generation: &StorageToken) -> R<MutationOutcome> {
 pub fn prepare_restore(db: &DB, generation: &StorageToken) -> R<MutationOutcome> {
     if x(
         db,
-        "UPDATE storage_recovery_state SET generation=?1,coverage_state='incomplete',coverage_identity=NULL,baseline_completed_at=NULL WHERE singleton=1 AND generation IS NOT ?1",
+        "UPDATE storage_recovery_state SET generation=?1,coverage_state='incomplete',coverage_identity=NULL,baseline_completed_at=NULL,legacy_release_authorized=0 WHERE singleton=1 AND generation IS NOT ?1",
         vec![text(generation.as_str())],
     )? != 1
     {
@@ -281,6 +281,8 @@ pub fn reserve(
     plan: StorageWritePlan,
     now: Timestamp,
 ) -> R<StorageAdmission> {
+    crate::baseline::ensure_unheld(db)?;
+
     plan.validate()?;
     if &plan.bucket != bucket {
         return Err(invalid("storage admission routing mismatch"));
@@ -620,7 +622,7 @@ pub fn enqueue(db: &DB, bucket: &BucketName, path: &StoragePath, quota: Option<&
     enqueue_owned(db, bucket, path, quota, None)
 }
 
-fn enqueue_owned(
+pub(crate) fn enqueue_owned(
     db: &DB,
     bucket: &BucketName,
     path: &StoragePath,
@@ -751,13 +753,13 @@ pub fn claim(
     Ok(MutationOutcome::StorageCleanupBatch(batch))
 }
 
-fn x(db: &DB, sql: &str, parameters: Vec<Cell>) -> R<u64> {
+pub(crate) fn x(db: &DB, sql: &str, parameters: Vec<Cell>) -> R<u64> {
     db.execute(sql, rusqlite::params_from_iter(parameters))
         .map(|changed| changed as u64)
         .map_err(crate::model::engine_err)
 }
 
-fn q(db: &DB, sql: &str, parameters: Vec<Cell>) -> R<Vec<Row>> {
+pub(crate) fn q(db: &DB, sql: &str, parameters: Vec<Cell>) -> R<Vec<Row>> {
     let mut statement = db.prepare_cached(sql).map_err(crate::model::engine_err)?;
     let columns = statement.column_count();
     statement
