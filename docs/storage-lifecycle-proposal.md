@@ -1,12 +1,12 @@
 # Storage lifecycle protocol 2 — architectural proposal
 
-**Status: proposed for human review; not implemented or activated.** This is the concrete
+**Status: approved by the operator on 2026-09-08; implementation in progress, not activated.** This is the concrete
 Phase 3C/3D proposal required by `storage-evolution-plan.md` and the approved implementation
 plan. `CONTRACT.md` remains human-owned and unchanged. Phase 3B retains flat placement.
 
 ## Decision requested
 
-Approve adding a durable Writer admission **before** ordinary object staging, and exact,
+The operator approved adding a durable Writer admission **before** ordinary object staging, and exact,
 durable filesystem cleanup accounting **after** authoritative reference removal. Preserve the
 existing file sync → rename → directory sync → checksum validation → metadata publication
 ordering. Multipart parts retain their existing in-place file/directory synchronization.

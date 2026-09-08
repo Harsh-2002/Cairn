@@ -61,7 +61,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   parent-directory durability coverage. Full startup reconciliation remains active. Existing
   older binaries cannot retroactively be made to reject newer state: rollback uses a verified
   snapshot, and unsupported old writers/external restore invalidate journal-coverage assumptions.
-- [ ] **3B: fanout comparison**. Compare flat paths with lazy
+- [x] **3B: fanout comparison** — merged in PR #87 (`bf17dfe`). Compare flat paths with lazy
   `bucket/<first-two-UUID-hex-digits>/<uuid>` in the laboratory, with identical counts and mixes.
   Measure directory creation, PUT/GET/delete, reconciliation and directory-fsync coalescing.
   It reduces neither inode count nor total scan work. Failure/inconclusive means no default
@@ -268,4 +268,12 @@ because controls drifted beyond the predeclared 20% span; KEEP flat. No default 
 or promotion PR follow. The shared campaign, including reduction and cleanup, has consumed
 390.191882 seconds (6m30s), with 542,654,464 bytes peak and no active process/data reservation.
 Raw owned run artifacts are removed; compact evidence is in `storage-fanout-2026-09.json`.
-Phase 3B final-commit CI and merge remain pending.
+Phase 3B final head `6f87421a3312cda7976f522fc1da0b4a506504bc` passed all 54 checks, with no
+posted review findings or open branch scanning alerts. PR #87 merged as `bf17dfe`; its branch
+and worktree are removed.
+
+The operator approved the exact `storage-lifecycle-proposal.md` protocol-2 proposal on
+2026-09-08. Phase 3C implementation is authorized: durable pre-stage Writer admission, exact
+cleanup debt and backend-I/O quiescence, while retaining full startup scans. Phase 3D activation
+remains gated by the approved coverage, crash/restore and performance checks. CONTRACT.md is
+unchanged.
