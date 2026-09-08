@@ -75,7 +75,13 @@ fn row(bucket: &BucketName, key: ObjectKey, id: String, size: usize) -> ObjectVe
     }
 }
 
-fn emit(value: serde_json::Value) {
+fn emit(mut value: serde_json::Value) {
+    value["unix_seconds"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("laboratory clock predates the Unix epoch")
+            .as_secs_f64()
+    );
     println!("{value}");
 }
 

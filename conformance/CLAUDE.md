@@ -319,6 +319,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   entry point. Use one campaign ledger across phases; fixed correctness fixtures run in CI, while
   actual measurements require an explicit prebuilt binary and owned `/SSD` root. Do not run older
   unconstrained drivers as a substitute or infer performance from the correctness fixtures.
+  `analyze.py` and `summarize.py` charge profile decoding/reduction to the same ledger. Keep
+  missing metrics and timing-sample loss visible; allow a profiled target to exit and its wrapper
+  to flush before group teardown. Phase heap alignment excludes adjacent load/teardown boundaries.
 - Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh` (the CI form). Most
   default `BIN` to `$ROOT/target/debug/cairn`, so they run from any cwd; a few (`run`, `share`,
   `rotation`, `concurrency`, `warp*`) want `target/debug/cairn` relative to the repo root.

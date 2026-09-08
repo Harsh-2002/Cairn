@@ -40,6 +40,11 @@ Run `--buckets 1` and distributed buckets separately. `--profile cpu` wraps the 
 `perf record -F 99 --call-graph dwarf`; `--profile heap` wraps it with heaptrack. S3 profiles attach
 to the owned server; client resource samples remain separate. Unprofiled throughput must come
 from a different invocation. Do not compare profiled and unprofiled rates as an optimization.
+The selected profiler launcher must honor `TMPDIR`: Heaptrack 1.5.0's packaged shell script
+hard-codes its FIFO under `/tmp` and needs an explicitly recorded local launcher adjustment
+before use in this campaign. S3 target shutdown is directed to the exact owned executable
+through a pidfd, allowing the wrapper to finish the trace before bounded group teardown.
+Process samples identify executables; timestamped phase records allow load/idle alignment.
 
 Three equal-duration load/idle cycles reuse one backend. The seeded byte generator is identical
 in both drivers. The metadata driver submits actual `PutObjectVersion` mutations through the
@@ -91,6 +96,19 @@ stops the child group at reserved headroom, `TMPDIR` points inside the owned art
 database/profile file is capped at 2 GiB. This is a cooperative lab workload limit, not a filesystem
 quota for arbitrary or hostile executables. Symlinks and unexpected mounts refuse admission;
 cleanup never follows a symlink or crosses a device.
+
+Decode a completed profile under the same budget (decoding alone remains INCONCLUSIVE):
+
+```sh
+python3 conformance/storage_lab/analyze.py --root /SSD/cairn-storage-campaign \
+  --run-id COMPLETED_RUN_ID --profile heap --allow-seconds 45
+python3 conformance/storage_lab/summarize.py --root /SSD/cairn-storage-campaign --device sdb1
+```
+
+Reduction preserves target/client CPU separately, phase memory samples, Writer sample loss,
+device counters and decoded heap timelines. Phase heap alignment excludes 250 ms at both
+edges because process-start clocks are approximate. Artifact decoding and reduction have
+their own bounded admissions; unavailable inputs do not become successful attribution.
 
 Children start in owned process groups behind an EOF-sensitive gate. The coordinator persists
 the leader's boot/PID/start identity before allowing exec. Teardown keeps the leader unreaped

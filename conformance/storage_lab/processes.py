@@ -132,6 +132,32 @@ class Child:
         if any(thread.is_alive() for thread in self.threads):
             raise Unavailable("owned process group did not quiesce; cleanup remains blocked")
 
+    def finish_profiled_target(self, executable, deadline):
+        """Let the target exit and the profiler flush before bounded group teardown."""
+        matches = []
+        for member in live_group_members(self.process.pid):
+            try:
+                if Path(f"/proc/{member['pid']}/exe").resolve(strict=True) == executable:
+                    matches.append(member)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+        if len(matches) != 1:
+            raise Unavailable("cannot identify one owned profiling target for graceful shutdown")
+        member = matches[0]
+        descriptor = os.pidfd_open(member["pid"])
+        try:
+            if identity(member["pid"]) != member:
+                raise Unavailable("profiling target changed before graceful shutdown")
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        finally:
+            os.close(descriptor)
+        while self.exited() is None:
+            if time.monotonic() >= deadline:
+                raise Unavailable("profiler did not finish after target shutdown; trace may be incomplete")
+            time.sleep(0.02)
+        if self.exited() != 0:
+            raise Unavailable("profiling wrapper failed after target shutdown")
+
 
 def live_group_members(group):
     members = []
@@ -151,6 +177,10 @@ def sample(group):
         root = Path(f"/proc/{member['pid']}")
         try:
             fields = {}
+            try:
+                fields["executable"] = str((root / "exe").resolve(strict=True))
+            except (FileNotFoundError, PermissionError):
+                fields["executable"] = None
             for name in ("status", "smaps_rollup", "io"):
                 try:
                     lines = (root / name).read_text().splitlines()
@@ -170,7 +200,7 @@ def sample(group):
             host[name] = Path("/proc", name).read_text()
         except OSError:
             host[name] = None
-    return {"monotonic": time.monotonic(), "processes": records, "host": host}
+    return {"monotonic": time.monotonic(), "unix_seconds": time.time(), "processes": records, "host": host}
 
 
 if __name__ == "__main__":

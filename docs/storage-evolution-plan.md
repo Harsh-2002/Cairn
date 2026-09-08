@@ -45,7 +45,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   Test tampering after validation, swapped pages, boundaries, downgrade/wrong-key refusal and
   bounded memory. Plain v1 gains no new initial authentication. Initial index I/O stays linear;
   this does not enable 5-TiB encoded objects. A new format needs a separate reviewed decision.
-- [ ] **2A: bounded diagnostic harness**. Shell launcher/Python coordinator and Rust layer drivers
+- [x] **2A: bounded diagnostic harness** — merged in PR #84 (`0373dc2`). Shell launcher/Python coordinator and Rust layer drivers
   under `conformance/storage_lab/`, outside production dependencies. Explicit prebuilt binaries,
   owned `/SSD` directory, persistent campaign ledger, bounded process groups and cleanup.
   Record hashes/revisions/configuration/tools/hardware and PASS/FAIL/INCONCLUSIVE/CANCELLED.
@@ -227,6 +227,19 @@ real signed S3 requests. Operation-capped fixtures deliberately produce INCONCLU
 than performance evidence. Fifteen Python regressions and both Rust driver tests pass, as do standalone Clippy,
 formatting, shellcheck, release-policy tests, actionlint 1.7.12 (verified release checksum),
 and the lab lockfile audit (one allowed pre-existing yanked-package warning). Full final-commit
-CI remains the integration gate. Production Rust and
-console sources are unchanged. The campaign still has **0 seconds / 0 bytes** of experiments;
-compilation, tool installation and fixed correctness fixtures are tracked separately.
+CI passed on final commit `cf5ec69`, with no posted review findings; PR #84 merged as `0373dc2`.
+Production Rust and console sources are unchanged. The merged branch/worktree are removed.
+Phase 2B's predeclared screen and later results live in
+[`storage-attribution-2026-09.md`](storage-attribution-2026-09.md). Compilation, tool installation
+and fixed correctness fixtures are tracked separately from experiments.
+
+Phase 2B recorded its experiment design at `cd5216a` and completed eight unprofiled baseline
+cases plus three decoded heap traces. CPU sampling was denied by host perf permissions;
+complete attribution remains INCONCLUSIVE and no production optimization or architecture
+change is justified by this screen. The charged report, failed attempts, ownership evidence
+and provenance are preserved in `docs/storage-attribution-2026-09.md` and its JSON companion.
+After data/profile/process cleanup, the cumulative campaign is **250.787718 seconds** and
+**219,529,216 bytes recorded peak**; 349.212282 unused baseline seconds carry forward. The
+persistent ledger is `/SSD/dev/cairn-storage-campaign/ledger.json`; it must not be reset.
+Local validation passes 21 Python regressions, two Rust driver tests, standalone Clippy,
+formatting and shellcheck. Integration remains pending final-commit CI and review.

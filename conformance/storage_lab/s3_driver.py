@@ -51,6 +51,7 @@ def distribution(samples):
 
 
 def emit(value):
+    value["unix_seconds"] = time.time()
     print(json.dumps(value), flush=True)
 
 
