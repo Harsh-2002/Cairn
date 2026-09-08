@@ -1,7 +1,7 @@
 # Protocol-2 lifecycle cost and recovery qualification
 
-Status: predeclared before measurements. Production implementation and correctness gates are in
-progress. Full startup reconciliation remains mandatory; this record does not authorize Phase 3D
+Status: correctness gates pass; the predeclared lifecycle-cost comparison is **INCONCLUSIVE**.
+The paired medians show substantial added small-object cost. Full startup reconciliation remains mandatory; this record does not authorize Phase 3D
 activation. The approved protocol is in `storage-lifecycle-proposal.md`.
 
 ## Comparison
@@ -61,12 +61,17 @@ The production tests exercise admitted plans across every metadata backend and s
 late blocking I/O/cancellation, exact multipart quota debt including scratch aliases, failed
 namespace synchronization, symlinks and same-filesystem bind mounts, claimed cleanup scan
 protection, publication ambiguity and fresh-generation recovery. The final local Rust gate passed
-1,403 default-feature and 1,429 all-feature tests (four/seven skipped), two doctests, formatting and
+1,407 default-feature and 1,433 all-feature tests (four/seven skipped), two doctests, formatting and
 both all-target Clippy configurations. Web lint/build, both npm audits, cargo audit and installer
 checks passed; 50 Python laboratory tests passed with two optional live fixtures skipped. The
 cleanup scheduler regressions additionally cover more than one page with the default hourly
 stale-upload interval, shutdown before claims and locked-file debt retention. The CI follow-up fixes also pass 15 deterministic soak-cleanup verifier tests and the rebuilt
-privileged pending-kernel-write fixture. Final-head CI and the measured revision/results remain pending.
+privileged pending-kernel-write fixture. All 54 CI checks pass for implementation revision
+`9c3539fd41687bdd194eb00418d6dcf301a3e917`, including the optional backends and CodeQL.
+The mixed-feature soak verified all 584 terminal multipart sessions clean within 30 seconds,
+with zero operation errors, byte mismatches or leak-shape violations. Its 29,160 operations
+over 181 seconds are advisory CI activity, not performance-comparison evidence.
+The measured results follow below; the final documentation-head CI remains required before merge.
 
 The privileged Linux io_uring fixture freezes only its own mounted ext4 image, observes an actual
 submitted write pending in the kernel, sends SIGKILL, and confirms node/file exclusion remains
@@ -81,3 +86,72 @@ It retains the driver's per-cycle 10,000-sample p99 gate; combining smaller cycl
 a pooled quantile. Its deterministic regressions reject failed runs and preserve drift, client
 saturation and insufficient-sample reasons. Measurements remain descriptive costs even if all
 availability checks pass; adoption is a separate decision.
+
+## Measured result
+
+Both prebuilt executables used default features, release optimization level 3, fat LTO, one
+codegen unit, panic abort, debug level 2 and no stripping. Build-time compiler: Rust 1.97.1
+(`8bab26f4f`, 2026-07-14). The experiment's automatic `rustc` probe failed because its toolchain
+manifest was unavailable; the build declaration and actual executable hashes are retained.
+The coordinator ran from `9c3539f`. Its recorded production-coalescer/source hashes describe that
+checkout for both arms; they do not identify the source inside the separately supplied executable.
+
+| Arm | Exact source revision | Executable SHA-256 |
+|---|---|---|
+| Baseline | `bf17dfe001e754d6e4041b05fc206f16f55d6584` | `26f061e0d37ef9ea342239a17824d7eb14c23de67ca27cec277e7eea1c99cbf5` |
+| Candidate | `9c3539fd41687bdd194eb00418d6dcf301a3e917` | `243c5a635382832b72727a4fdf67da829b169bf18b653b344b420d19e4b0e74f` |
+
+Host: four-core Intel i5-6500TE, Linux 7.0.0-29, ext4 on `/dev/sdb1` mounted at `/SSD`,
+Python 3.14.4. Disk cache is uncontrolled. Host device and pressure counters include unrelated
+activity. No owned build or correctness test ran during these measurements. No CPU/heap profiler
+was used. Available server metrics and device observations are retained; internal Writer stage
+samples, admission/queue attribution and allocator ownership are unavailable from this S3 run.
+No intrinsic metadata-engine bottleneck follows from the lifecycle rates.
+
+The table reports medians across five arms (each arm first reduces three cycle medians). The
+change column is the median of the five matched candidate/baseline ratios, so it need not equal
+the ratio of the displayed arm medians. Memory values are medians of each arm's maximum sampled
+phase-end values, not continuously observed peaks or retained-allocation evidence.
+
+| 4-KiB measure | Baseline | Candidate | Median paired change |
+|---|---:|---:|---:|
+| PUT p50 | 3.857 ms | 6.745 ms | +75.9% |
+| GET p50 | 0.907 ms | 0.957 ms | +8.0% |
+| DELETE p50 | 2.497 ms | 3.625 ms | +45.8% |
+| PUT/GET/DELETE transactions per second | 496.2 | 311.5 | -36.9% |
+| Server anonymous memory | 9,524 KiB | 9,832 KiB | +2.1% |
+| Server PSS | 23,053 KiB | 22,108 KiB | -4.0% |
+
+There were 22,451 successful baseline and 13,753 successful candidate transactions, with zero
+unexpected errors or byte mismatches in all ten arms. Individual cycles do not meet the p99
+sample gate; pooled counts do not reconstruct a pooled quantile. The largest protected baseline
+latency/rate control span was 6.35%, and observed Python client load never exceeded 0.537 CPU
+cores. Neither the declared drift nor client-saturation threshold tripped. The candidate's
+higher DELETE latency and lower throughput exceed the 10% protected-workload limit for a
+performance adoption. These are the measured costs of the approved correctness protocol; they
+are not an improvement claim or authorization for additional tuning.
+
+The single 1-MiB screening pair recorded PUT p50 27.951 → 31.364 ms (+12.2%), DELETE p50
+3.752 → 4.189 ms (+11.7%) and transaction throughput 91.90 → 81.38/s (-11.4%); GET p50
+8.995 → 8.942 ms. It completed 800/744 transactions without errors or byte mismatches. One pair
+and insufficient per-cycle tail samples cannot establish a stable streaming comparison.
+
+All six candidates observed zero committed intents and cleanup rows on the first post-idle
+read, taking 3.67–4.14 ms. This qualifies only the declared post-load cleanup boundary. It does
+not measure how long individual cleanups waited, establish steady-state reclamation cost, or
+qualify readiness with unfinished debt. Full startup scans remain mandatory. Phase 3D's offline
+baseline and restore validation are still required; journal-only startup is not activated.
+
+The rejected implementation revisions `537c2b3` and `0de5b69` were built but never measured.
+All twelve diagnostic arms passed; both comparisons retain **INCONCLUSIVE** qualification.
+The full [machine-readable evidence](storage-journal-2026-09.json) retains run IDs, every cycle,
+configuration, executable/harness provenance, ratios, missing observations and campaign history.
+Reduction IDs are `bdfa7098ad6549c8840f7b6086f1d6b1` (five pairs) and
+`4249946ad6db44b99c3d74e61ae98e26` (screen). No failed trial was discarded or repeated.
+Raw run directories, datasets, logs and samples were purged after export; compact results and
+the original cumulative ledger remain. Each arm reaped its owned process groups.
+
+Cumulative charged runtime after reduction, export and cleanup: **574.519391 seconds** of
+3,600; recorded campaign peak **571,154,432 bytes** of 100,000,000,000.
+This includes the earlier 390.191882 seconds; the allowance was not reset. Builds, fixed
+correctness tests and CI remain separately tracked.

@@ -332,3 +332,16 @@ both supersession and terminal abort, preserving the charge until every alias is
 The focused nine-case backend/topology and unchanged-claim contracts pass, together with all
 322 owning tests and both complete workspace Clippy configurations. Full workspace tests and
 new-head CI remain pending. Neither rejected candidate was measured; the campaign is unchanged.
+
+
+The final Phase 3C implementation at `9c3539fd41687bdd194eb00418d6dcf301a3e917` passes all
+54 CI checks, including CodeQL, all metadata backends and the original mixed-feature soak
+cleanup deadline (584/584 terminal sessions). The complete local gate passes 1,407 default and
+1,433 all-feature tests, two doctests, formatting and both Clippy configurations. The paired
+cost evidence is now in `storage-journal-2026-09.md` and its JSON: all twelve diagnostic arms
+pass, but performance qualification remains INCONCLUSIVE. At 4 KiB, paired PUT p50 increases
+75.9%, DELETE p50 increases 45.8%, and transaction throughput declines 36.9%; no p99 claim is
+supported. Every candidate's post-idle journal is empty. Full scans remain mandatory and Phase
+3D is unactivated. Raw experiment artifacts and processes are removed; cumulative costs and
+exact evidence are preserved in the report. Final documentation-head CI and PR #91 integration
+remain required before Phase 3D implementation starts.

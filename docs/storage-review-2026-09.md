@@ -2,7 +2,8 @@
 
 Scoped review of the approved Phase 3C implementation, against merged main `bf17dfe`.
 These are concrete architecture/reliability findings with local fixes and focused regressions.
-The complete gate and PR integration remain pending. The operator approved issue filing. No release or
+The complete gate passes for `9c3539f`; PR integration remains pending. The operator approved
+filing findings #88–#90. The additional async finding is still awaiting filing approval. No release or
 journal-startup activation is claimed. Existing GitHub issues were checked for duplicates.
 
 ## Finding #88: initialization follows staging descendants before namespace validation
@@ -110,3 +111,12 @@ terminal abort, rejects old and duplicate acknowledgements, retains quota until 
 and preserves valid claims on unchanged ownership across every backend and the double. The
 standalone lab's source-included coalescer regression now uses standard file-lock methods and
 passes its compile/tests without a new dependency. Final-head CI remains required.
+
+
+Final implementation validation at `9c3539f` passes all 54 CI checks, 1,407 local default-feature
+and 1,433 all-feature tests, two doctests, formatting and both Clippy configurations. The CI soak
+verifies 584/584 terminal multipart cleanups before the unchanged 30-second deadline, with zero
+operation errors, byte mismatches or leak-shape violations. All twelve bounded comparison arms
+pass correctness checks; the cost qualification remains INCONCLUSIVE and shows substantial
+small-object overhead (`storage-journal-2026-09.md`). Final documentation-head CI and merge
+remain pending. No journal-only startup or production packing/metadata replacement is enabled.
