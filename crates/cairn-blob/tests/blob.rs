@@ -33,6 +33,106 @@ fn opts(compression: Option<CompressionPolicy>, content_type: &str) -> StageOpti
 }
 
 #[tokio::test]
+async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
+    use aes_gcm::KeyInit;
+    use futures_util::StreamExt;
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let bucket = BucketName::parse("prepared-reader").unwrap();
+        let key = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
+        let cipher = if encrypted {
+            BlobCipher::AuthenticatedV3(SecretKey32::from_slice(&key).unwrap())
+        } else {
+            BlobCipher::KnownPlaintext
+        };
+        let options = StageOptions {
+            encryption: cipher.dek(),
+            ..opts(Some(CompressionPolicy::default()), "text/plain")
+        };
+        let original = vec![b'a'; 8193];
+        let staged = store
+            .stage(&bucket, body(original.clone()), options.clone())
+            .await
+            .unwrap();
+        let mut handle = store
+            .open_raw(
+                &staged.storage_path,
+                None,
+                cipher,
+                &staged.compression,
+                staged.size_logical,
+            )
+            .await
+            .unwrap();
+        assert!(handle.zero_copy.is_none());
+        // Give the replacement its own DEK; even the test must not reuse block nonces for a new
+        // encrypted write. An old reopen would read the replacement or fail authentication.
+        let replacement_key = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
+        let replacement = store
+            .stage(
+                &bucket,
+                body(vec![b'b'; original.len()]),
+                StageOptions {
+                    encryption: encrypted
+                        .then(|| SecretKey32::from_slice(&replacement_key).unwrap()),
+                    ..options
+                },
+            )
+            .await
+            .unwrap();
+        tokio::fs::rename(
+            dir.path().join(replacement.storage_path.as_str()),
+            dir.path().join(staged.storage_path.as_str()),
+        )
+        .await
+        .unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = handle.body.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, original);
+    }
+}
+
+#[tokio::test]
+async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
+    use futures_util::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path())
+        .await
+        .unwrap()
+        .with_small_read_max(2 * 1024 * 1024);
+    let len = 1024 * 1024 + 17;
+    let bound = store
+        .read_memory_bound(&CompressionDescriptor::Uncompressed, false, len)
+        .unwrap();
+    assert!(bound.buffer_bytes >= len);
+    assert!(bound.max_frame_bytes >= len);
+    let staged = store
+        .stage(
+            &BucketName::parse("read-bound").unwrap(),
+            body(vec![7; len as usize]),
+            StageOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut handle = store
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+            len,
+        )
+        .await
+        .unwrap();
+    let frame = handle.body.next().await.unwrap().unwrap();
+    assert_eq!(frame.len() as u64, len);
+    assert!(frame.len() as u64 <= bound.max_frame_bytes);
+}
+
+#[tokio::test]
 async fn encoded_preflight_rejects_before_staging_or_polling_body() {
     use aes_gcm::KeyInit;
     let dir = tempfile::tempdir().unwrap();

@@ -129,7 +129,9 @@ counters. It is cheap to construct and safe to run from many workers at once.
 ## Notes
 - `HttpS3Sink` hashes and then reopens each immutable logical source range for signed streaming.
   Objects above 64 MiB use sequential multipart requests; no whole-object payload buffer is kept.
-  Reserve the source decoder/index/frame allowance plus bounded control XML against the shared
+  Obtain source decoder/index/frame bounds from `BlobStore::read_memory_bound`; do not duplicate
+  CRNB geometry or index allocation arithmetic in this crate. Reserve that allowance plus bounded
+  control XML against the shared
   `CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`. Hold the permit through response processing and actual blocking-reader exit (including after
   cancellation). Cap completion XML at 16 MiB inside the 32 MiB control allowance; one
   deadline spans admission, hashing and every multipart request. Responses are capped at 8 KiB.

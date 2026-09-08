@@ -39,6 +39,17 @@ use zeroize::Zeroizing;
 /// fsync dir) is its invariant.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
+    /// Report this backend's read allocation/frame bounds from authoritative object metadata,
+    /// without opening the body or resolving a key. Callers reserve this allowance before
+    /// `open_raw_guarded`; the backend must keep it valid through probe, queued work and streaming.
+    /// Invalid or unsupported geometry fails before admission rather than lowering the bound.
+    fn read_memory_bound(
+        &self,
+        compression: &CompressionDescriptor,
+        encrypted: bool,
+        logical_len: u64,
+    ) -> Result<crate::blob::ReadMemoryBound, BlobError>;
+
     /// Stage a single object durably from a body stream, computing the plaintext MD5 and any
     /// requested checksums, applying compression, and enforcing the size ceiling. On `Ok` the
     /// blob is durable. Writes no metadata; does not verify client checksums.

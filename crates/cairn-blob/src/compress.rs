@@ -32,7 +32,7 @@ pub use cairn_types::bucket::CompressionAlgorithm;
 use cairn_types::error::BlobError;
 pub use cairn_types::object::CompressionDescriptor;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 
 const MAGIC: &[u8; 4] = b"CRNB";
@@ -55,6 +55,11 @@ const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 /// Maximum index bytes emitted or accepted before authentication. This limits encoded logical
 /// size according to block geometry; the raw-file object ceiling is independent.
 const MAX_INDEX_LEN: usize = 64 * 1024 * 1024;
+/// A whole number of nine-byte entries, just below 64 KiB.
+const INDEX_PAGE_ENTRIES: usize = 7281;
+const INDEX_PAGE_BYTES: usize = INDEX_PAGE_ENTRIES * INDEX_ENTRY_LEN;
+/// Codec workspace plus fixed reader/channel bookkeeping, separate from block/page buffers.
+const READER_FIXED_BYTES: u64 = 1024 * 1024;
 
 /// The AES-GCM nonce length (96 bits — the recommended GCM nonce size).
 const GCM_NONCE_LEN: usize = 12;
@@ -133,20 +138,6 @@ fn metadata_tag(dek: &[u8; 32], index: &[u8], trailer: &[u8]) -> [u8; METADATA_T
     mac.finalize().into_bytes().into()
 }
 
-fn verify_metadata_tag(
-    dek: &[u8; 32],
-    index: &[u8],
-    trailer: &[u8],
-    tag: &[u8],
-) -> Result<(), BlobError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(dek).expect("HMAC accepts any key length");
-    mac.update(METADATA_MAC_DOMAIN);
-    mac.update(index);
-    mac.update(trailer);
-    mac.verify_slice(tag)
-        .map_err(|_| BlobError::Corruption("encrypted blob metadata authentication failed".into()))
-}
-
 fn algo_code(a: CompressionAlgorithm) -> u8 {
     match a {
         CompressionAlgorithm::None => 0,
@@ -194,6 +185,79 @@ struct IndexEntry {
     phys_len: u32,
     logical_len: u32,
     compressed: bool,
+}
+
+impl IndexEntry {
+    fn parse(bytes: &[u8]) -> Result<Self, BlobError> {
+        let compressed = match bytes[8] {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(BlobError::Corruption(format!(
+                    "invalid compressed flag {other}"
+                )));
+            }
+        };
+        Ok(Self {
+            phys_len: u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            logical_len: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            compressed,
+        })
+    }
+}
+
+/// These summaries become trusted only after the complete index and trailer validate.
+struct IndexPageSummary {
+    fingerprint: [u8; 32],
+    physical_offset: u64,
+}
+
+fn trusted_geometry(
+    compression: &CompressionDescriptor,
+) -> Result<(CompressionAlgorithm, u64), BlobError> {
+    let (algorithm, block_size) = match *compression {
+        CompressionDescriptor::Uncompressed => (
+            CompressionAlgorithm::None,
+            crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
+        ),
+        CompressionDescriptor::Compressed {
+            algorithm,
+            block_size,
+        } => (algorithm, block_size),
+    };
+    if block_size == 0 || u64::from(block_size) > MAX_BLOCK_SIZE {
+        return Err(BlobError::Corruption(
+            "trusted block size is outside the supported range".into(),
+        ));
+    }
+    Ok((algorithm, u64::from(block_size)))
+}
+
+fn index_memory_bound(block_count: usize) -> u64 {
+    let pages = block_count.div_ceil(INDEX_PAGE_ENTRIES);
+    let entries = block_count.min(INDEX_PAGE_ENTRIES);
+    (pages * std::mem::size_of::<IndexPageSummary>()
+        + entries * (INDEX_ENTRY_LEN + std::mem::size_of::<u64>())) as u64
+}
+
+pub(crate) fn read_memory_bound(
+    compression: &CompressionDescriptor,
+    logical_len: u64,
+) -> Result<cairn_types::blob::ReadMemoryBound, BlobError> {
+    let (_, block_size) = trusted_geometry(compression)?;
+    let blocks = usize::try_from(logical_len.div_ceil(block_size))
+        .map_err(|_| BlobError::Corruption("block count overflows".into()))?;
+    index_len_for_blocks(blocks, MAX_INDEX_LEN)
+        .ok_or_else(|| BlobError::Corruption("index length exceeds the maximum".into()))?;
+    // Four queued frames, the delivered frame and overlapping range/decrypt/decompress buffers.
+    // The fixed allowance covers codec workspace and the small reader/channel bookkeeping.
+    // Index accounting uses the same page geometry and summary layout as the actual reader.
+    Ok(cairn_types::blob::ReadMemoryBound {
+        buffer_bytes: index_memory_bound(blocks)
+            + 10 * (block_size + GCM_TAG_LEN)
+            + READER_FIXED_BYTES,
+        max_frame_bytes: block_size,
+    })
 }
 
 fn compress_block(algo: CompressionAlgorithm, logical: &[u8]) -> (Vec<u8>, bool) {
@@ -450,8 +514,12 @@ pub struct CompressedReader<R: Read + Seek> {
     algo: CompressionAlgorithm,
     block_size: u64,
     logical_len: u64,
-    block_offsets: Vec<u64>,
-    index: Vec<IndexEntry>,
+    index_offset: u64,
+    index_len: usize,
+    pages: Vec<IndexPageSummary>,
+    page_bytes: Vec<u8>,
+    page_offsets: Vec<u64>,
+    cached_page: Option<usize>,
     /// `true` when the trailer version is [`VERSION_ENCRYPTED`]; reads then require a DEK.
     encrypted: bool,
     /// The raw 32-byte DEK supplied by the caller, if any.
@@ -537,15 +605,7 @@ impl<R: Read + Seek> CompressedReader<R> {
         // this on-disk trailer. Use them to bound and cross-check the block count before allocating
         // the unauthenticated index. Besides the absolute cap above, this rejects a corrupt large
         // file whose trailer invents more entries than the authoritative row can address.
-        let trusted_block_size = match compression {
-            CompressionDescriptor::Uncompressed => crate::DEFAULT_ENCRYPTED_BLOCK_SIZE as u64,
-            CompressionDescriptor::Compressed { block_size, .. } => u64::from(*block_size),
-        };
-        if trusted_block_size == 0 || trusted_block_size > MAX_BLOCK_SIZE {
-            return Err(BlobError::Corruption(
-                "trusted block size is outside the supported range".into(),
-            ));
-        }
+        let (expected_algo, trusted_block_size) = trusted_geometry(compression)?;
         let trusted_block_count = if expected_logical_len == 0 {
             0
         } else {
@@ -576,173 +636,119 @@ impl<R: Read + Seek> CompressedReader<R> {
                 "index and metadata tag do not exactly precede the trailer".into(),
             ));
         }
-        inner.seek(SeekFrom::Start(index_offset)).map_err(io)?;
-        let mut idx = vec![0u8; index_len];
-        inner.read_exact(&mut idx).map_err(io)?;
-
-        // V3 authenticates every byte whose semantics the reader will trust. Verification occurs
-        // before parsing the algorithm, logical geometry, or index entries. The small location
-        // fields used above are treated only as bounded offsets until this succeeds.
-        if authenticated_metadata {
-            let mut tag = [0u8; METADATA_TAG_LEN];
-            inner.seek(SeekFrom::Start(index_end)).map_err(io)?;
-            inner.read_exact(&mut tag).map_err(io)?;
-            let dek = dek.as_ref().expect("encrypted formats require a DEK");
-            verify_metadata_tag(dek.expose_secret(), &idx, &t, &tag)?;
-        }
-
+        // Geometry is still provisional here. Bind it to trusted metadata before allocating
+        // bounded page state; neither it nor a page summary escapes before final authentication.
         let algo = algo_from(t[5])?;
-        let block_size = u32::from_le_bytes(t[6..10].try_into().unwrap()) as u64;
+        let block_size = u64::from(u32::from_le_bytes(t[6..10].try_into().unwrap()));
         let logical_len = u64::from_le_bytes(t[10..18].try_into().unwrap());
-        // Bind every format's geometry to metadata before block-sized allocations. An equal
-        // block count alone permits one forged v1 block to be much larger than the trusted bound.
         if logical_len != expected_logical_len {
             return Err(BlobError::Corruption(
                 "blob logical length does not match its trusted metadata expectation".into(),
             ));
         }
-        let (expected_algo, expected_block_size) = match compression {
-            CompressionDescriptor::Uncompressed => (
-                CompressionAlgorithm::None,
-                crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
-            ),
-            CompressionDescriptor::Compressed {
-                algorithm,
-                block_size,
-            } => (*algorithm, *block_size),
-        };
-        if algo != expected_algo || block_size != u64::from(expected_block_size) {
+        if algo != expected_algo || block_size != trusted_block_size {
             return Err(BlobError::Corruption(
                 "blob compression metadata does not match its trusted metadata expectation".into(),
             ));
         }
-        let mut index = Vec::with_capacity(block_count);
-        let mut block_offsets = Vec::with_capacity(block_count);
-        let mut offset = 0u64;
-        for chunk in idx.chunks_exact(INDEX_ENTRY_LEN) {
-            let phys_len = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-            let logical = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            let compressed = match chunk[8] {
-                0 => false,
-                1 => true,
-                other => {
-                    return Err(BlobError::Corruption(format!(
-                        "invalid compressed flag {other}"
-                    )));
-                }
-            };
-            block_offsets.push(offset);
-            offset = offset
-                .checked_add(u64::from(phys_len))
-                .ok_or_else(|| BlobError::Corruption("block offset overflows".into()))?;
-            index.push(IndexEntry {
-                phys_len,
-                logical_len: logical,
-                compressed,
+        let mut mac = authenticated_metadata.then(|| {
+            let key = dek.as_ref().expect("encrypted formats require a DEK");
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.expose_secret())
+                .expect("HMAC accepts any key length");
+            mac.update(METADATA_MAC_DOMAIN);
+            mac
+        });
+        let mut pages = Vec::with_capacity(block_count.div_ceil(INDEX_PAGE_ENTRIES));
+        let mut page_bytes = vec![0u8; index_len.min(INDEX_PAGE_BYTES)];
+        let mut physical_offset = 0u64;
+        let mut logical_offset = 0u64;
+        let tag_len = if encrypted { GCM_TAG_LEN } else { 0 };
+        inner.seek(SeekFrom::Start(index_offset)).map_err(io)?;
+        for page_start in (0..index_len).step_by(INDEX_PAGE_BYTES) {
+            let n = (index_len - page_start).min(INDEX_PAGE_BYTES);
+            let bytes = &mut page_bytes[..n];
+            inner.read_exact(bytes).map_err(io)?;
+            if let Some(mac) = &mut mac {
+                mac.update(bytes);
+            }
+            pages.push(IndexPageSummary {
+                fingerprint: Sha256::digest(&*bytes).into(),
+                physical_offset,
             });
+            for chunk in bytes.chunks_exact(INDEX_ENTRY_LEN) {
+                let entry = IndexEntry::parse(chunk)?;
+                // Non-final blocks are full; only the final one may be partial. The trusted
+                // count already pins exactly how many entries must cover the logical length.
+                let expected = logical_len
+                    .checked_sub(logical_offset)
+                    .ok_or_else(|| {
+                        BlobError::Corruption("logical block geometry underflows".into())
+                    })?
+                    .min(block_size);
+                if expected == 0 || u64::from(entry.logical_len) != expected {
+                    return Err(BlobError::Corruption(
+                        "index block length does not match the fixed block geometry".into(),
+                    ));
+                }
+                logical_offset = logical_offset.checked_add(expected).ok_or_else(|| {
+                    BlobError::Corruption("logical block geometry overflows".into())
+                })?;
+                // Raw and compressed lengths are disjoint, including legacy v2's GCM tag.
+                // Enforce this before a later block read can allocate from a physical length.
+                let payload_len =
+                    u64::from(entry.phys_len)
+                        .checked_sub(tag_len)
+                        .ok_or_else(|| {
+                            BlobError::Corruption(
+                                "block is shorter than its authentication tag".into(),
+                            )
+                        })?;
+                let valid = if entry.compressed {
+                    payload_len > 0 && payload_len < expected
+                } else {
+                    payload_len == expected
+                };
+                if !valid {
+                    return Err(BlobError::Corruption(
+                        "block physical length contradicts its compression flag".into(),
+                    ));
+                }
+                physical_offset = physical_offset
+                    .checked_add(u64::from(entry.phys_len))
+                    .ok_or_else(|| BlobError::Corruption("block offset overflows".into()))?;
+            }
         }
-        // The blocks occupy exactly `[0, index_offset)` on disk, so the per-block physical lengths
-        // must sum to where the index begins. Enforcing it rejects an index whose `phys_len` entries
-        // point outside the block region AND bounds every `phys_len` by the file size — so a read
-        // can never be asked to allocate a multi-gigabyte `phys` buffer for a corrupt block (OOM
-        // guard; `phys_len` is a `u32` up to ~4 GiB and is otherwise unbounded).
-        if offset != index_offset {
+        if physical_offset != index_offset {
             return Err(BlobError::Corruption(
                 "block physical lengths do not fill the block region".into(),
             ));
         }
-        // Cross-validate the trailer's `logical_len` against the index BEFORE serving reads:
-        // `read_range` maps a logical offset to a block via `logical_len`/`block_size`, so a trailer
-        // claiming a logical length the index does not actually cover (e.g. `logical_len > 0` with
-        // `block_count == 0`) would index past `self.index` and panic. A non-empty blob must have a
-        // positive block size, exactly `ceil(logical_len / block_size)` blocks, and per-block logical
-        // lengths that sum to `logical_len`; an empty blob must have no blocks. Reject any mismatch as
-        // corruption so every value the reader trusts on read is established here.
-        if logical_len == 0 {
-            if block_count != 0 {
-                return Err(BlobError::Corruption(
-                    "empty blob with a non-zero block count".into(),
-                ));
-            }
-        } else {
-            if block_size == 0 {
-                return Err(BlobError::Corruption(
-                    "non-empty blob with a zero block size".into(),
-                ));
-            }
-            // Cap the block size: the read path calls `read_range` (and `zstd`/`lz4` decompression)
-            // with a length bounded by ONE block, so a corrupt trailer claiming a multi-gigabyte
-            // block size would make the *server* allocate that per read. The writer uses ≤256 KiB;
-            // this cap is generously above that and bounds every per-block allocation.
-            if block_size > MAX_BLOCK_SIZE {
-                return Err(BlobError::Corruption(
-                    "block size exceeds the maximum".into(),
-                ));
-            }
-            if logical_len.div_ceil(block_size) != block_count as u64 {
-                return Err(BlobError::Corruption(
-                    "block count does not cover the logical length".into(),
-                ));
-            }
-        }
-        let index_logical_sum: u64 = index.iter().map(|e| u64::from(e.logical_len)).sum();
-        if index_logical_sum != logical_len {
+        if logical_offset != logical_len {
             return Err(BlobError::Corruption(
                 "index logical lengths do not sum to the logical length".into(),
             ));
         }
-        // All non-final blocks are exactly `block_size`; only the final block may be shorter. This
-        // is both the writer's framing invariant and a legacy-v2 hardening check: an unauthenticated
-        // trailer cannot alter block geometry while still mapping ranges to different boundaries.
-        for (position, entry) in index.iter().enumerate() {
-            let expected = if position + 1 < block_count {
-                block_size
-            } else {
-                let preceding = (block_count as u64)
-                    .saturating_sub(1)
-                    .checked_mul(block_size)
-                    .ok_or_else(|| {
-                        BlobError::Corruption("logical block geometry overflows".into())
-                    })?;
-                logical_len.checked_sub(preceding).ok_or_else(|| {
-                    BlobError::Corruption("logical block geometry underflows".into())
-                })?
-            };
-            if u64::from(entry.logical_len) != expected {
-                return Err(BlobError::Corruption(
-                    "index block length does not match the fixed block geometry".into(),
-                ));
-            }
+        if let Some(mut mac) = mac {
+            let mut tag = [0u8; METADATA_TAG_LEN];
+            inner.read_exact(&mut tag).map_err(io)?;
+            mac.update(&t);
+            mac.verify_slice(&tag).map_err(|_| {
+                BlobError::Corruption("encrypted blob metadata authentication failed".into())
+            })?;
         }
-        // Every writer stores raw payloads exactly at logical length, or compressed payloads
-        // strictly shorter, plus a GCM tag when encrypted. Enforce this for all formats before
-        // read_range allocates from phys_len; a corrupt v1 file must not bypass memory admission.
-        let tag_len = if encrypted { GCM_TAG_LEN } else { 0 };
-        for entry in &index {
-            let payload_len = u64::from(entry.phys_len)
-                .checked_sub(tag_len)
-                .ok_or_else(|| {
-                    BlobError::Corruption("block is shorter than its authentication tag".into())
-                })?;
-            let logical_len = u64::from(entry.logical_len);
-            let valid = if entry.compressed {
-                payload_len > 0 && payload_len < logical_len
-            } else {
-                payload_len == logical_len
-            };
-            if !valid {
-                return Err(BlobError::Corruption(
-                    "block physical length contradicts its compression flag".into(),
-                ));
-            }
-        }
+        // Only now can the caller obtain the page fingerprints and starting physical offsets.
+        // One page plus its offsets is retained; the original index-sized buffers are gone.
         Ok(Self {
             inner,
             algo,
             block_size,
             logical_len,
-            block_offsets,
-            index,
+            index_offset,
+            index_len,
+            pages,
+            page_bytes,
+            page_offsets: Vec::with_capacity(block_count.min(INDEX_PAGE_ENTRIES)),
+            cached_page: None,
             encrypted,
             dek,
         })
@@ -760,6 +766,53 @@ impl<R: Read + Seek> CompressedReader<R> {
         self.block_size
     }
 
+    /// Re-read through the retained descriptor and authenticate the entire page before decoding
+    /// any entry. Cached bytes are already verified; no mutable trailer field is loaded again.
+    fn entry(&mut self, block: usize) -> Result<(IndexEntry, u64), BlobError> {
+        let page = block / INDEX_PAGE_ENTRIES;
+        let within = block % INDEX_PAGE_ENTRIES;
+        if self.cached_page != Some(page) {
+            // An interrupted/failed load must not leave a previous page marked usable while its
+            // buffer now contains a partial replacement.
+            self.cached_page = None;
+            let summary = self.pages.get(page).ok_or_else(|| {
+                BlobError::Corruption("block is outside the verified index".into())
+            })?;
+            let start = page * INDEX_PAGE_BYTES;
+            let n = (self.index_len - start).min(INDEX_PAGE_BYTES);
+            let bytes = &mut self.page_bytes[..n];
+            self.inner
+                .seek(SeekFrom::Start(self.index_offset + start as u64))
+                .map_err(crate::io_err)?;
+            self.inner.read_exact(bytes).map_err(crate::io_err)?;
+            let fingerprint: [u8; 32] = Sha256::digest(&*bytes).into();
+            if fingerprint != summary.fingerprint {
+                return Err(BlobError::Corruption(
+                    "index page changed after initial verification".into(),
+                ));
+            }
+            self.page_offsets.clear();
+            let mut offset = summary.physical_offset;
+            for chunk in bytes.chunks_exact(INDEX_ENTRY_LEN) {
+                let entry = IndexEntry::parse(chunk)?;
+                self.page_offsets.push(offset);
+                offset = offset
+                    .checked_add(u64::from(entry.phys_len))
+                    .ok_or_else(|| BlobError::Corruption("block offset overflows".into()))?;
+            }
+            self.cached_page = Some(page);
+        }
+        let offset = *self
+            .page_offsets
+            .get(within)
+            .ok_or_else(|| BlobError::Corruption("block is outside the verified page".into()))?;
+        let start = within * INDEX_ENTRY_LEN;
+        Ok((
+            IndexEntry::parse(&self.page_bytes[start..start + INDEX_ENTRY_LEN])?,
+            offset,
+        ))
+    }
+
     /// Decompress and return the logical bytes for `[offset, offset+len)`, decompressing only
     /// the overlapping blocks.
     pub fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, BlobError> {
@@ -772,9 +825,9 @@ impl<R: Read + Seek> CompressedReader<R> {
         let last = ((end - 1) / self.block_size) as usize;
         let mut out = Vec::with_capacity((end - offset) as usize);
         for b in first..=last {
-            let entry = &self.index[b];
+            let (entry, physical_offset) = self.entry(b)?;
             self.inner
-                .seek(SeekFrom::Start(self.block_offsets[b]))
+                .seek(SeekFrom::Start(physical_offset))
                 .map_err(io)?;
             let mut phys = vec![0u8; entry.phys_len as usize];
             self.inner.read_exact(&mut phys).map_err(io)?;
@@ -1037,7 +1090,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.read_range(0, 4096).unwrap(), data);
-        assert!(r.index.iter().all(|e| e.phys_len <= e.logical_len));
+        for block in 0..4 {
+            let (entry, _) = r.entry(block).unwrap();
+            assert!(entry.phys_len <= entry.logical_len);
+        }
     }
 
     #[test]
@@ -1695,6 +1751,239 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Small block geometry keeps three real index pages below a MiB of logical fixture data.
+    /// Alternate compressible and incompressible pages so swapping them changes their meaning.
+    fn paged_fixture(version: u8) -> (Vec<u8>, CompressedReader<Cursor<Vec<u8>>>) {
+        let block_size = 32;
+        let len = (2 * INDEX_PAGE_ENTRIES + 5) * block_size - 7;
+        let mut seed = 0x5eed_u64;
+        let data: Vec<u8> = (0..len)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if i / (block_size * INDEX_PAGE_ENTRIES) == 1 {
+                    (seed >> 32) as u8
+                } else {
+                    b'a'
+                }
+            })
+            .collect();
+        let key: [u8; 32] = Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng).into();
+        let algo = CompressionAlgorithm::Zstd;
+        let (blob, cipher) = match version {
+            VERSION_PLAIN => (
+                encode(algo, block_size as u32, &data),
+                BlobCipher::KnownPlaintext,
+            ),
+            VERSION_ENCRYPTED_V2 => (
+                encode_encrypted_v2(algo, block_size as u32, key, &data),
+                BlobCipher::LegacyV2(key.into()),
+            ),
+            VERSION_ENCRYPTED => (
+                encode_encrypted(algo, block_size as u32, key, &data),
+                BlobCipher::AuthenticatedV3(key.into()),
+            ),
+            _ => unreachable!(),
+        };
+        let reader = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            cipher,
+            &CompressionDescriptor::Compressed {
+                algorithm: algo,
+                block_size: block_size as u32,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
+        (data, reader)
+    }
+
+    #[test]
+    fn verified_pages_roundtrip_boundaries_and_bound_retained_index_memory() {
+        assert_eq!(INDEX_PAGE_BYTES, 65_529);
+        let max_blocks = MAX_INDEX_LEN / INDEX_ENTRY_LEN;
+        assert!(index_memory_bound(max_blocks) < 192 * 1024);
+        for version in [VERSION_PLAIN, VERSION_ENCRYPTED_V2, VERSION_ENCRYPTED] {
+            let (data, mut reader) = paged_fixture(version);
+            let page_logical = INDEX_PAGE_ENTRIES as u64 * reader.block_size();
+            assert_eq!(reader.pages.len(), 3);
+            assert_eq!(reader.index_len % INDEX_PAGE_BYTES, 5 * INDEX_ENTRY_LEN);
+            for (offset, len) in [
+                (0, 1),
+                (page_logical - 9, 19),
+                (2 * page_logical - 3, 11),
+                (data.len() as u64 - 17, 100),
+                (0, data.len() as u64),
+            ] {
+                let end = (offset + len).min(data.len() as u64);
+                assert_eq!(
+                    reader.read_range(offset, len).unwrap(),
+                    &data[offset as usize..end as usize]
+                );
+                let retained = reader.pages.capacity() * std::mem::size_of::<IndexPageSummary>()
+                    + reader.page_bytes.capacity()
+                    + reader.page_offsets.capacity() * std::mem::size_of::<u64>();
+                assert!(
+                    retained as u64 <= index_memory_bound(data.len().div_ceil(32)),
+                    "reader retained more than its advertised index bound"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_index_page_is_rejected_before_its_entries_are_interpreted() {
+        for version in [VERSION_PLAIN, VERSION_ENCRYPTED_V2, VERSION_ENCRYPTED] {
+            let (_, mut reader) = paged_fixture(version);
+            let offset = reader.index_offset as usize + INDEX_PAGE_BYTES;
+            reader.inner.get_mut()[offset + 8] = 2; // invalid flag, never reached by entry parsing
+            let error = reader
+                .read_range(INDEX_PAGE_ENTRIES as u64 * 32, 1)
+                .unwrap_err();
+            assert!(matches!(error, BlobError::Corruption(ref message)
+                if message.contains("index page changed")));
+            assert!(reader.cached_page.is_none());
+        }
+    }
+
+    #[test]
+    fn swapped_pages_cannot_reuse_another_pages_fingerprint_or_physical_offset() {
+        for version in [VERSION_PLAIN, VERSION_ENCRYPTED_V2, VERSION_ENCRYPTED] {
+            let (_, mut reader) = paged_fixture(version);
+            assert_ne!(reader.pages[0].fingerprint, reader.pages[1].fingerprint);
+            let start = reader.index_offset as usize;
+            let bytes = reader.inner.get_mut();
+            let first = bytes[start..start + INDEX_PAGE_BYTES].to_vec();
+            bytes.copy_within(
+                start + INDEX_PAGE_BYTES..start + 2 * INDEX_PAGE_BYTES,
+                start,
+            );
+            bytes[start + INDEX_PAGE_BYTES..start + 2 * INDEX_PAGE_BYTES].copy_from_slice(&first);
+            assert!(
+                matches!(reader.read_range(0, 1), Err(BlobError::Corruption(ref message))
+                if message.contains("index page changed"))
+            );
+        }
+    }
+
+    #[test]
+    fn evicted_page_is_verified_again_and_failed_load_does_not_poison_other_pages() {
+        let (data, mut reader) = paged_fixture(VERSION_ENCRYPTED);
+        let second_page = INDEX_PAGE_ENTRIES as u64 * 32;
+        assert_eq!(reader.read_range(0, 1).unwrap(), &data[..1]);
+        assert_eq!(
+            reader.read_range(second_page, 1).unwrap(),
+            &data[second_page as usize..][..1]
+        );
+        let first = reader.index_offset as usize;
+        reader.inner.get_mut()[first] ^= 1;
+        assert!(matches!(
+            reader.read_range(0, 1),
+            Err(BlobError::Corruption(_))
+        ));
+        assert!(reader.cached_page.is_none());
+        assert_eq!(
+            reader.read_range(second_page, 1).unwrap(),
+            &data[second_page as usize..][..1]
+        );
+    }
+
+    #[test]
+    fn final_partial_page_is_covered_by_structural_validation_and_v3_authentication() {
+        let (_, reader) = paged_fixture(VERSION_ENCRYPTED);
+        let logical_len = reader.logical_len;
+        let key = reader.dek.unwrap();
+        let compression = CompressionDescriptor::Compressed {
+            algorithm: CompressionAlgorithm::Zstd,
+            block_size: 32,
+        };
+        let last_page = reader.index_offset as usize + 2 * INDEX_PAGE_BYTES;
+        let original = reader.inner.into_inner();
+        for preserve_total in [false, true] {
+            let mut bytes = original.clone();
+            let first = u32::from_le_bytes(bytes[last_page..last_page + 4].try_into().unwrap());
+            bytes[last_page..last_page + 4].copy_from_slice(&(first - 1).to_le_bytes());
+            if preserve_total {
+                // Both compressed payload lengths remain structurally valid and their total is
+                // unchanged. Only whole-index authentication can reject this offset alteration.
+                let next = last_page + INDEX_ENTRY_LEN;
+                let length = u32::from_le_bytes(bytes[next..next + 4].try_into().unwrap());
+                bytes[next..next + 4].copy_from_slice(&(length + 1).to_le_bytes());
+            }
+            let result = CompressedReader::open_with_dek(
+                Cursor::new(bytes),
+                BlobCipher::AuthenticatedV3(key.clone()),
+                &compression,
+                logical_len,
+            );
+            let expected = if preserve_total {
+                "metadata authentication failed"
+            } else {
+                "physical lengths"
+            };
+            assert!(
+                matches!(result, Err(BlobError::Corruption(ref message)) if message.contains(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn page_reads_use_validated_geometry_without_reloading_mutated_trailer() {
+        let (data, mut reader) = paged_fixture(VERSION_ENCRYPTED);
+        let trailer = reader.inner.get_ref().len() - TRAILER_BYTES;
+        reader.inner.get_mut()[trailer..].fill(0);
+        let offset = data.len() as u64 - 7;
+        assert_eq!(
+            reader.read_range(offset, 7).unwrap(),
+            &data[offset as usize..]
+        );
+    }
+
+    #[test]
+    fn backend_container_read_bound_retains_format_limits_without_per_block_heap_growth() {
+        let compression = CompressionDescriptor::Compressed {
+            algorithm: CompressionAlgorithm::Zstd,
+            block_size: 1024,
+        };
+        let maximum = (MAX_INDEX_LEN / INDEX_ENTRY_LEN) as u64 * 1024;
+        let bound = read_memory_bound(&compression, maximum).unwrap();
+        assert!(bound.buffer_bytes < 2 * 1024 * 1024);
+        assert_eq!(bound.max_frame_bytes, 1024);
+        for invalid in [maximum + 1, u64::MAX] {
+            assert!(matches!(
+                read_memory_bound(&compression, invalid),
+                Err(BlobError::Corruption(_))
+            ));
+        }
+        for block_size in [0, u32::MAX] {
+            assert!(
+                read_memory_bound(
+                    &CompressionDescriptor::Compressed {
+                        algorithm: CompressionAlgorithm::Zstd,
+                        block_size,
+                    },
+                    0
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_codec_workspace_fits_the_backend_read_allowance() {
+        // zstd::bulk uses this same safe DCtx decompression operation. Its native context is
+        // outside Rust Vec capacity accounting, so pin its allowance across dependency updates.
+        for len in [1024, 256 * 1024, MAX_BLOCK_SIZE as usize] {
+            let data = vec![42; len];
+            let encoded = zstd::bulk::compress(&data, 3).unwrap();
+            let mut context = zstd::zstd_safe::DCtx::create();
+            let mut decoded = Vec::with_capacity(len);
+            context.decompress(&mut decoded, &encoded).unwrap();
+            assert_eq!(decoded.len(), len);
+            assert!(decoded.iter().all(|&byte| byte == 42));
+            assert!(context.sizeof() as u64 + 128 * 1024 < READER_FIXED_BYTES);
         }
     }
 }

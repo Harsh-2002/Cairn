@@ -1104,6 +1104,7 @@ async fn completing_replication_does_not_demote_a_newer_version() {
 #[derive(Default)]
 struct CapturingSink {
     bodies: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    read_bounds: std::sync::Mutex<Vec<cairn_types::blob::ReadMemoryBound>>,
     /// The `client_encrypted` classification each shipped object carried, so a test can pin that
     /// the sink is actually TOLD whether the plaintext it is about to put on the wire was
     /// encrypted at the client's request.
@@ -1128,6 +1129,13 @@ impl cairn_types::traits::ReplicationSink for CapturingSink {
     ) -> Result<(), cairn_types::error::ReplicationError> {
         use futures_util::StreamExt;
         let key = object.key.as_str().to_owned();
+        self.read_bounds
+            .lock()
+            .unwrap()
+            .push(cairn_types::blob::ReadMemoryBound {
+                buffer_bytes: object.source.buffer_bytes,
+                max_frame_bytes: object.source.max_frame_bytes,
+            });
         let mut body = (object.source.open)(
             cairn_types::blob::ByteRange {
                 offset: 0,
@@ -1158,6 +1166,39 @@ impl cairn_types::traits::ReplicationSink for CapturingSink {
     ) -> Result<(), cairn_types::error::ReplicationError> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn replication_source_uses_the_blob_backends_allocation_and_frame_bounds() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(CapturingSink::default());
+    let clock = TestClock::at_secs(1_000);
+    let data = b"one backend-owned frame";
+    put_with_outbox(
+        &meta,
+        &blobs,
+        "memory-bound",
+        "k",
+        data,
+        clock.now(),
+        clock.now(),
+    )
+    .await;
+    let expected = blobs
+        .read_memory_bound(
+            &cairn_types::CompressionDescriptor::Uncompressed,
+            false,
+            data.len() as u64,
+        )
+        .unwrap();
+    let report = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1);
+    assert_eq!(*router.0.read_bounds.lock().unwrap(), vec![expected]);
+    assert_eq!(router.0.bodies(), vec![("k".into(), data.to_vec())]);
 }
 
 /// A crypto double whose `open` always reports the sealing key as absent from the ring — the

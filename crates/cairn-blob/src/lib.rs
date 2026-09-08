@@ -498,13 +498,77 @@ async fn write_staged(
     }
 }
 
-/// Stream a read of `[offset, offset+len)` logical bytes from a blob file, decompressing (and,
-/// when `dek` is supplied, decrypting) only the overlapping blocks. Runs the blocking file work off
-/// the reactor and yields chunks.
-/// The blocking body of a streamed read: open the file and push chunks of `[offset, offset+len)`
-/// into `tx`, decompressing/decrypting per block when `compressed`. A send failure (the consumer
-/// dropped the body) ends the transfer early. Factored out of [`read_stream`] so the open + read
-/// happen only when the stream is actually polled.
+/// An encoded read keeps the descriptor and validated geometry obtained by its initial probe.
+/// Raw reads still defer their body open so an unpolled zero-copy fallback performs no extra I/O.
+enum StreamInput {
+    Raw(PathBuf),
+    Container(Box<CompressedReader<std::fs::File>>),
+}
+
+/// Probe output owns its memory reservation too: a completed blocking task can retain this
+/// result after its awaiting request is cancelled. Drop buffers before releasing that lease.
+struct ReadProbe {
+    logical_len: u64,
+    reuse_file: Option<std::fs::File>,
+    whole: Option<Bytes>,
+    prepared: Option<Box<CompressedReader<std::fs::File>>>,
+    _lease: Option<ReadBufferLease>,
+}
+
+/// Push a bounded logical range through a bounded channel. An encoded source is already fully
+/// validated; page loads use its original descriptor and verified summaries, without re-probing.
+fn stream_input(
+    input: StreamInput,
+    offset: u64,
+    len: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
+) -> Result<(), BlobError> {
+    use std::io::{Read, Seek, SeekFrom};
+    match input {
+        StreamInput::Container(mut reader) => {
+            let bs = reader.block_size();
+            let end = offset.saturating_add(len).min(reader.logical_len());
+            if offset >= end {
+                return Ok(());
+            }
+            let first = offset / bs;
+            let last = (end - 1) / bs;
+            for b in first..=last {
+                let bstart = b * bs;
+                let lo = offset.max(bstart);
+                let hi = end.min(bstart + bs);
+                let data = reader.read_range(lo, hi - lo)?;
+                if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        StreamInput::Raw(path) => {
+            let mut f = std::fs::File::open(path).map_err(io_err)?;
+            f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
+            let mut remaining = len;
+            let mut buf = vec![0u8; READ_CHUNK];
+            while remaining > 0 {
+                let want = remaining.min(READ_CHUNK as u64) as usize;
+                let n = f.read(&mut buf[..want]).map_err(io_err)?;
+                if n == 0 {
+                    break;
+                }
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                remaining -= n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Multipart part reads have no preceding response probe; prepare their reader once in the same
+/// blocking task that streams it. GET uses the prepared-reader handoff below instead.
 fn stream_blob(
     path: &Path,
     cipher: BlobCipher,
@@ -514,62 +578,28 @@ fn stream_blob(
     len: u64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
 ) -> Result<(), BlobError> {
-    use std::io::{Read, Seek, SeekFrom};
     let is_container =
         cipher.is_encrypted() || !matches!(compression, CompressionDescriptor::Uncompressed);
-    if is_container {
-        let f = std::fs::File::open(path).map_err(io_err)?;
-        let mut reader =
-            CompressedReader::open_with_dek(f, cipher, compression, expected_logical_len)?;
-        let bs = reader.block_size();
-        let end = offset.saturating_add(len).min(reader.logical_len());
-        if bs == 0 || offset >= end {
-            return Ok(());
-        }
-        let first = offset / bs;
-        let last = (end - 1) / bs;
-        for b in first..=last {
-            let bstart = b * bs;
-            let lo = offset.max(bstart);
-            let hi = end.min(bstart + bs);
-            let data = reader.read_range(lo, hi - lo)?;
-            if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
-                return Ok(());
-            }
-        }
+    let input = if is_container {
+        let file = std::fs::File::open(path).map_err(io_err)?;
+        StreamInput::Container(Box::new(CompressedReader::open_with_dek(
+            file,
+            cipher,
+            compression,
+            expected_logical_len,
+        )?))
     } else {
-        let mut f = std::fs::File::open(path).map_err(io_err)?;
-        f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
-        let mut remaining = len;
-        let mut buf = vec![0u8; READ_CHUNK];
-        while remaining > 0 {
-            let want = (remaining as usize).min(READ_CHUNK);
-            let n = f.read(&mut buf[..want]).map_err(io_err)?;
-            if n == 0 {
-                break;
-            }
-            if tx
-                .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                .is_err()
-            {
-                return Ok(());
-            }
-            remaining -= n as u64;
-        }
-    }
-    Ok(())
+        StreamInput::Raw(path.to_owned())
+    };
+    stream_input(input, offset, len, tx)
 }
 
-/// The lazy state of a streamed read: the open + read is deferred until the body is first polled,
-/// so a request that takes the kernel zero-copy fast path (and drops this body unpolled) performs
-/// no file open and releases its I/O permit immediately (Phase 2.5).
+/// The prepared input and reservations stay together through queued blocking work, including
+/// cancellation before the body is first polled or before the blocking task starts.
 enum StreamSrc {
     Pending(
         (
-            PathBuf,
-            BlobCipher,
-            CompressionDescriptor,
-            u64,
+            StreamInput,
             u64,
             u64,
             (tokio::sync::OwnedSemaphorePermit, Option<ReadBufferLease>),
@@ -579,48 +609,19 @@ enum StreamSrc {
 }
 
 fn read_stream(
-    path: PathBuf,
-    cipher: BlobCipher,
-    compression: CompressionDescriptor,
-    expected_logical_len: u64,
+    input: StreamInput,
     offset: u64,
     len: u64,
     permits: (tokio::sync::OwnedSemaphorePermit, Option<ReadBufferLease>),
 ) -> cairn_types::BlobStream {
-    let initial = StreamSrc::Pending((
-        path,
-        cipher,
-        compression,
-        expected_logical_len,
-        offset,
-        len,
-        permits,
-    ));
+    let initial = StreamSrc::Pending((input, offset, len, permits));
     Box::pin(futures_util::stream::unfold(initial, |state| async move {
         let mut rx = match state {
-            StreamSrc::Pending((
-                path,
-                cipher,
-                compression,
-                expected_logical_len,
-                offset,
-                len,
-                permits,
-            )) => {
+            StreamSrc::Pending((input, offset, len, permits)) => {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                 tokio::task::spawn_blocking(move || {
-                    // The permit is held for the whole transfer so it counts against the blob-I/O
-                    // bound (ARCH 7.4), then released when this task ends.
                     let (_permit, _lease) = permits;
-                    if let Err(e) = stream_blob(
-                        &path,
-                        cipher,
-                        &compression,
-                        expected_logical_len,
-                        offset,
-                        len,
-                        &tx,
-                    ) {
+                    if let Err(e) = stream_input(input, offset, len, &tx) {
                         let _ = tx.blocking_send(Err(e));
                     }
                 });
@@ -758,6 +759,27 @@ impl LocalBlobStore {
     }
 }
 
+/// Bound a coalesced read by the length already checked against metadata, even if a local writer
+/// grows the file after fstat. A fixed slice also avoids read_to_end's speculative capacity growth.
+fn read_small(reader: &mut impl std::io::Read, len: u64) -> Result<Bytes, BlobError> {
+    let size = usize::try_from(len)
+        .map_err(|_| BlobError::Corruption("small read length exceeds address space".into()))?;
+    let mut buf = vec![0u8; size];
+    let mut filled = 0;
+    while filled < size {
+        let n = match reader.read(&mut buf[filled..]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(io_err)?,
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(Bytes::from(buf))
+}
+
 impl LocalBlobStore {
     async fn open_raw_with_lease(
         &self,
@@ -792,61 +814,61 @@ impl LocalBlobStore {
         let probe_cipher = cipher.clone();
         let probe_compression = compression.clone();
         let probe_lease = lease.clone();
-        let (logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
-            move || -> Result<(u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
-                let _lease = probe_lease;
-                use std::io::{Read, Seek, SeekFrom};
-                let mut f = match std::fs::File::open(&probe_path) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(BlobError::NotFound);
-                    }
-                    Err(e) => return Err(io_err(e)),
-                };
-                let file_len = f.metadata().map_err(io_err)?.len();
-                // Plaintext framing is an authoritative metadata declaration. Validate its one
-                // independent physical invariant instead of sniffing the body: plaintext and
-                // logical lengths must match exactly. This catches the ordinary missing-DEK case
-                // (an encrypted/uncompressed CRNB file has framing overhead), yet preserves S3's
-                // arbitrary-byte contract when a legitimate plaintext object's bytes themselves
-                // happen to form a complete CRNB file.
-                if !is_container && file_len != expected_logical_len {
-                    plaintext_length_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(
-                        path = %probe_path.display(),
-                        file_len,
-                        expected_logical_len,
-                        "metadata-declared plaintext blob length mismatch"
-                    );
-                    return Err(BlobError::Corruption(
-                        "plaintext blob length does not match trusted metadata".into(),
-                    ));
+        let ReadProbe {
+            logical_len,
+            reuse_file,
+            whole,
+            prepared,
+            _lease: _probe_result_lease,
+        } = tokio::task::spawn_blocking(move || -> Result<ReadProbe, BlobError> {
+            let _lease = probe_lease;
+            let mut f = match std::fs::File::open(&probe_path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobError::NotFound);
                 }
-                if is_container {
-                    // Parse the header for the logical length; the fd is consumed by the reader and
-                    // not reused (compressed/encrypted blobs never take the kernel fast path).
-                    f.seek(SeekFrom::Start(0)).map_err(io_err)?;
-                    let logical = CompressedReader::open_with_dek(
-                        f,
-                        probe_cipher,
-                        &probe_compression,
-                        expected_logical_len,
-                    )?
-                    .logical_len();
-                    Ok((logical, None, None))
-                } else if file_len <= small_read_max {
-                    // Small uncompressed object: read it whole here (one open, one read). The range
-                    // is sliced from this buffer below — no second open, no streaming channel.
-                    let mut buf = Vec::with_capacity(file_len as usize);
-                    f.read_to_end(&mut buf).map_err(io_err)?;
-                    Ok((file_len, None, Some(Bytes::from(buf))))
-                } else {
-                    // Larger uncompressed object: the file length is the logical length, and the open
-                    // fd is reused as the zero-copy source below.
-                    Ok((file_len, Some(f), None))
-                }
-            },
-        )
+                Err(e) => return Err(io_err(e)),
+            };
+            let file_len = f.metadata().map_err(io_err)?.len();
+            // Plaintext framing is an authoritative metadata declaration. Validate its one
+            // independent physical invariant instead of sniffing the body: plaintext and
+            // logical lengths must match exactly. This catches the ordinary missing-DEK case
+            // (an encrypted/uncompressed CRNB file has framing overhead), yet preserves S3's
+            // arbitrary-byte contract when a legitimate plaintext object's bytes themselves
+            // happen to form a complete CRNB file.
+            if !is_container && file_len != expected_logical_len {
+                plaintext_length_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    path = %probe_path.display(),
+                    file_len,
+                    expected_logical_len,
+                    "metadata-declared plaintext blob length mismatch"
+                );
+                return Err(BlobError::Corruption(
+                    "plaintext blob length does not match trusted metadata".into(),
+                ));
+            }
+            let (logical_len, reuse_file, whole, prepared) = if is_container {
+                let reader = CompressedReader::open_with_dek(
+                    f,
+                    probe_cipher,
+                    &probe_compression,
+                    expected_logical_len,
+                )?;
+                (reader.logical_len(), None, None, Some(Box::new(reader)))
+            } else if file_len <= small_read_max {
+                (file_len, None, Some(read_small(&mut f, file_len)?), None)
+            } else {
+                (file_len, Some(f), None, None)
+            };
+            Ok(ReadProbe {
+                logical_len,
+                reuse_file,
+                whole,
+                prepared,
+                _lease,
+            })
+        })
         .await
         .map_err(|e| BlobError::Io(e.to_string()))??;
 
@@ -904,15 +926,11 @@ impl LocalBlobStore {
             // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
             // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
             let permit = self.acquire_io_owned().await?;
-            let body = read_stream(
-                file_path.clone(),
-                cipher,
-                compression.clone(),
-                expected_logical_len,
-                offset,
-                len,
-                (permit, lease.clone()),
-            );
+            let input = match prepared {
+                Some(reader) => StreamInput::Container(reader),
+                None => StreamInput::Raw(file_path.clone()),
+            };
+            let body = read_stream(input, offset, len, (permit, lease.clone()));
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
             // fd the probe opened. Encrypted blobs are always block-formatted (`is_container`), so
             // `reuse_file` is `None` for them and the kernel never sees ciphertext.
@@ -939,6 +957,24 @@ impl LocalBlobStore {
 
 #[async_trait]
 impl BlobStore for LocalBlobStore {
+    fn read_memory_bound(
+        &self,
+        compression: &CompressionDescriptor,
+        encrypted: bool,
+        logical_len: u64,
+    ) -> Result<cairn_types::blob::ReadMemoryBound, BlobError> {
+        if encrypted || !matches!(compression, CompressionDescriptor::Uncompressed) {
+            return compress::read_memory_bound(compression, logical_len);
+        }
+        // The raw path can retain one coalesced small object, or a read buffer plus four queued
+        // chunks and the delivered chunk. Account for an explicitly enlarged small-read cutoff.
+        let whole = logical_len.min(self.small_read_max);
+        Ok(cairn_types::blob::ReadMemoryBound {
+            buffer_bytes: whole.max(6 * READ_CHUNK as u64).saturating_add(128 * 1024),
+            max_frame_bytes: whole.max(READ_CHUNK as u64),
+        })
+    }
+
     async fn stage(
         &self,
         bucket: &BucketName,
@@ -1898,76 +1934,115 @@ mod tests {
                 .await
                 .unwrap()
                 .with_small_read_max(0);
-            let data = Bytes::from(vec![7; 64 * 1024]);
-            let size = data.len() as u64;
-            let staged = store
-                .stage(
-                    &BucketName::parse("bkt").unwrap(),
-                    Box::pin(futures_util::stream::iter([Ok(data)])),
-                    StageOptions::default(),
-                )
-                .await
-                .unwrap();
+            for compression in [None, Some(CompressionPolicy::default())] {
+                let data = Bytes::from(vec![7; 64 * 1024]);
+                let size = data.len() as u64;
+                let staged = store
+                    .stage(
+                        &BucketName::parse("bkt").unwrap(),
+                        Box::pin(futures_util::stream::iter([Ok(data)])),
+                        StageOptions {
+                            compression,
+                            content_type: "text/plain".into(),
+                            ..StageOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
 
-            for cancel_probe in [true, false] {
-                let owner = Arc::new(());
-                let weak = Arc::downgrade(&owner);
-                let lease = ReadBufferLease::new(owner);
-                let (release, blocker) = if cancel_probe {
-                    let blocking = occupy_blocking_thread().await;
-                    {
-                        let read = store.open_raw_guarded(
-                            &staged.storage_path,
-                            None,
-                            BlobCipher::KnownPlaintext,
-                            &CompressionDescriptor::Uncompressed,
-                            size,
-                            lease,
-                        );
-                        futures_util::pin_mut!(read);
-                        std::future::poll_fn(|cx| {
-                            assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
-                            std::task::Poll::Ready(())
-                        })
-                        .await;
-                    }
-                    blocking
-                } else {
-                    let mut handle = store
-                        .open_raw_guarded(
-                            &staged.storage_path,
-                            None,
-                            BlobCipher::KnownPlaintext,
-                            &CompressionDescriptor::Uncompressed,
-                            size,
-                            lease,
-                        )
-                        .await
-                        .unwrap();
-                    let blocking = occupy_blocking_thread().await;
-                    {
-                        let next = handle.body.next();
-                        futures_util::pin_mut!(next);
-                        std::future::poll_fn(|cx| {
-                            assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
-                            std::task::Poll::Ready(())
-                        })
-                        .await;
-                    }
-                    drop(handle);
-                    blocking
-                };
-                // Release before asserting so a failing regression cannot strand the runtime.
-                let retained = weak.upgrade().is_some();
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                tokio::task::spawn_blocking(|| ()).await.unwrap();
-                assert!(
-                    retained,
-                    "cancelled read released reservation before blocking task exited"
-                );
-                assert!(weak.upgrade().is_none(), "finished read leaked reservation");
+                for cancel_probe in [true, false] {
+                    let owner = Arc::new(());
+                    let weak = Arc::downgrade(&owner);
+                    let lease = ReadBufferLease::new(owner);
+                    let (release, blocker) = if cancel_probe {
+                        let blocking = occupy_blocking_thread().await;
+                        {
+                            let read = store.open_raw_guarded(
+                                &staged.storage_path,
+                                None,
+                                BlobCipher::KnownPlaintext,
+                                &staged.compression,
+                                size,
+                                lease,
+                            );
+                            futures_util::pin_mut!(read);
+                            std::future::poll_fn(|cx| {
+                                assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+                                std::task::Poll::Ready(())
+                            })
+                            .await;
+                        }
+                        blocking
+                    } else {
+                        let mut handle = store
+                            .open_raw_guarded(
+                                &staged.storage_path,
+                                None,
+                                BlobCipher::KnownPlaintext,
+                                &staged.compression,
+                                size,
+                                lease,
+                            )
+                            .await
+                            .unwrap();
+                        let blocking = occupy_blocking_thread().await;
+                        {
+                            let next = handle.body.next();
+                            futures_util::pin_mut!(next);
+                            std::future::poll_fn(|cx| {
+                                assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+                                std::task::Poll::Ready(())
+                            })
+                            .await;
+                        }
+                        drop(handle);
+                        blocking
+                    };
+                    // Release before asserting so a failing regression cannot strand the runtime.
+                    let retained = weak.upgrade().is_some();
+                    release.send(()).unwrap();
+                    blocker.await.unwrap();
+                    tokio::task::spawn_blocking(|| ()).await.unwrap();
+                    assert!(
+                        retained,
+                        "cancelled read released reservation before blocking task exited"
+                    );
+                    assert!(weak.upgrade().is_none(), "finished read leaked reservation");
+                }
             }
         });
+    }
+
+    #[test]
+    fn small_read_never_exceeds_the_probed_length_even_when_backing_bytes_grow() {
+        let mut file = std::io::Cursor::new(b"trusted appended after fstat");
+        assert_eq!(read_small(&mut file, 7).unwrap().as_ref(), b"trusted");
+        assert_eq!(file.position(), 7);
+        // Preserve the existing short-read handling when an external writer truncates instead.
+        let mut short = std::io::Cursor::new(b"short");
+        assert_eq!(read_small(&mut short, 20).unwrap().as_ref(), b"short");
+    }
+
+    #[test]
+    fn small_read_retries_interrupted_io_within_the_same_bound() {
+        struct InterruptOnce {
+            inner: std::io::Cursor<&'static [u8]>,
+            interrupted: bool,
+        }
+        impl std::io::Read for InterruptOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                std::io::Read::read(&mut self.inner, buf)
+            }
+        }
+        let mut source = InterruptOnce {
+            inner: std::io::Cursor::new(b"retry and stop"),
+            interrupted: false,
+        };
+        assert_eq!(read_small(&mut source, 5).unwrap().as_ref(), b"retry");
+        assert_eq!(source.inner.position(), 5);
     }
 }

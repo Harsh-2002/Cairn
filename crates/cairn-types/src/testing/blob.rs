@@ -91,6 +91,19 @@ impl InMemoryBlobStore {
 
 #[async_trait::async_trait]
 impl BlobStore for InMemoryBlobStore {
+    fn read_memory_bound(
+        &self,
+        _compression: &CompressionDescriptor,
+        _encrypted: bool,
+        logical_len: u64,
+    ) -> Result<crate::blob::ReadMemoryBound, BlobError> {
+        // This double copies the requested range into a single frame; it has no CRNB decoder.
+        Ok(crate::blob::ReadMemoryBound {
+            buffer_bytes: logical_len.saturating_add(128 * 1024),
+            max_frame_bytes: logical_len.max(1),
+        })
+    }
+
     async fn stage(
         &self,
         bucket: &BucketName,
