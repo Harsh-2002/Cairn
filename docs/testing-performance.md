@@ -157,3 +157,18 @@ The ordinary CI driver runs tiny versions of this whole pipeline. Only a separat
 complete paired comparison with the predeclared controls may produce a packing threshold
 proposal; production object placement and native backup remain unchanged. See
 [the packing comparison](storage-packing-measurement-2026-09.md).
+
+The standalone populated-metadata laboratory uses the real canonical FULL Writer and WAL pool.
+Its fixed 100-row CLI fixture, including history, delete markers, multipart accounting and fresh
+reopen, runs in CI alongside mutation-family and coordinator regressions. Capacity measurements
+require a separately admitted 100,000-row hot/distributed comparison with complete Writer stage
+and resource evidence; neither the tiny fixture nor raw KV throughput qualifies an engine. See
+[the predeclared metadata capacity evaluation](storage-metadata-capacity-2026-09.md).
+
+A qualifying canonical hot-bucket result permits the isolated transactional Fjall comparison.
+Both engines use the same trace/runner with a persisted seed recipe, fresh-process arms, exact
+quota checks and checked close. The ordinary CI suite includes failed-member rollback, native
+journal I/O failure, commit-boundary SIGKILL and wrong-resume-identity fixtures. The adapter is
+outside the production workspace and refuses unsupported operations. See
+[the conditional comparison contract](storage-metadata-alternative-2026-09.md); no tiny fixture,
+process-kill test or isolated gain establishes production migration/backup/power-loss parity.
