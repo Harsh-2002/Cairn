@@ -157,3 +157,10 @@ The ordinary CI driver runs tiny versions of this whole pipeline. Only a separat
 complete paired comparison with the predeclared controls may produce a packing threshold
 proposal; production object placement and native backup remain unchanged. See
 [the packing comparison](storage-packing-measurement-2026-09.md).
+
+The standalone populated-metadata laboratory uses the real canonical FULL Writer and WAL pool.
+Its fixed 100-row CLI fixture, including history, delete markers, multipart accounting and fresh
+reopen, runs in CI alongside mutation-family and coordinator regressions. Capacity measurements
+require a separately admitted 100,000-row hot/distributed comparison with complete Writer stage
+and resource evidence; neither the tiny fixture nor raw KV throughput qualifies an engine. See
+[the predeclared metadata capacity evaluation](storage-metadata-capacity-2026-09.md).

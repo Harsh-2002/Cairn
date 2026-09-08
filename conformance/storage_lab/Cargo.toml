@@ -14,6 +14,10 @@ path = "src/fanout.rs"
 name = "cairn-packing-lab"
 path = "src/packing.rs"
 
+[[bin]]
+name = "cairn-metadata-capacity-lab"
+path = "src/metadata_capacity.rs"
+
 [dependencies]
 cairn-blob = { path = "../../crates/cairn-blob" }
 cairn-meta = { path = "../../crates/cairn-meta" }

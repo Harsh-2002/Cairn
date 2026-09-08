@@ -210,3 +210,17 @@ same packing allowance; incomplete or drifting measurements cannot select a thre
 [`storage-packing-measurement-2026-09.md`](../../docs/storage-packing-measurement-2026-09.md).
 The existing `LAB_TEST_PACKING_DRIVER` also enables its tiny complete-pipeline CI fixtures;
 those cannot qualify the predeclared performance matrix.
+
+## Populated metadata capacity
+
+`run.sh metadata-capacity` drives an explicit prebuilt `cairn-metadata-capacity-lab` binary and
+charges the same campaign before preparing two 100,000-version populations. It uses the canonical
+FULL SQLite Writer and read pool, scattered bounded mutation rings, exact quota/journal/outbox
+checks, bounded family histograms, Writer thread CPU and serialized-stage observations. The fixed
+hot/distributed 4/32/128 concurrency controls and conditional engine criterion are recorded in
+[`storage-metadata-capacity-2026-09.md`](../../docs/storage-metadata-capacity-2026-09.md).
+Build with `cargo build --locked --release --manifest-path conformance/storage_lab/Cargo.toml
+--bin cairn-metadata-capacity-lab`. `LAB_TEST_METADATA_DRIVER` enables the fixed 100-row CLI
+fixture in CI. That fixture verifies the driver and fresh reopen; it is not a capacity result.
+The engine capability comparison is in
+[`storage-metadata-capabilities-2026-09.md`](../../docs/storage-metadata-capabilities-2026-09.md).
