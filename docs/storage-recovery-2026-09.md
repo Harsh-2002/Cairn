@@ -51,5 +51,34 @@ RSS is not an allocation or leak diagnosis. Processes restart, but filesystem ca
 The one-shot 100/1,000-object screen cannot support a scaling law, five-pair adoption decision,
 large-store recovery bound or power-loss claim. The eight-object fixture is only a correctness test.
 
-No recovery-cost results have been collected yet. Campaign consumption before this screen is
-574.519391 seconds, with 571,154,432 bytes recorded peak and no active experiment reservation.
+## Recorded result
+
+The single screen passed its correctness checks at source
+`cc542fd279d5b43ff6c255684e1518a2353fd807`. Both cases preserved every authoritative object row,
+GET-verified every object after baseline and again after fresh restore, removed all 64 legacy
+aliases, and completed with no pending journal or quota work. The full evidence, command output,
+process samples, binary/source hashes and export procedure are in
+[`storage-recovery-2026-09.json`](storage-recovery-2026-09.json).
+
+| Objects | Backup CLI wall (s) | Baseline CLI wall (s) | Restore CLI wall (s) | Full-scan start to readiness (s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.12 | 0.15 | 0.13 | 0.079 |
+| 1,000 | 0.79 | 0.82 | 0.81 | 0.106 |
+
+CLI wall times above are GNU time observations with 0.01-second resolution. The coordinator's
+end-to-end baseline wall times were **0.385 seconds** and **1.028 seconds**, including launch,
+sampling and teardown overhead as well as the command's mandatory safety snapshot. Baseline
+maximum RSS was 16,112 and 18,816 KiB respectively. These operations ran on different explicitly
+described states; subtracting or dividing their times does not establish an optimization gain.
+
+Command used the predeclared seed 24301 and 180-second reservation, with the prebuilt default-feature
+release binary: `opt-level=3`, fat LTO, one codegen unit, `panic=abort`, `debug=2`, `strip=false`,
+Rust 1.97.1 (`8bab26f4f`, 2026-07-14). No retry or increased allowance was used. The screen consumed
+16.610133 seconds including finalization; evidence export and owned-artifact removal added
+1.016646 seconds. Cumulative campaign consumption is **592.146171 / 3,600 seconds**, with
+**571,154,432 bytes recorded peak**. All measurement processes, datasets, snapshots and raw
+artifacts are removed; compact evidence and the persistent ledger remain.
+
+The diagnostic result is **PASS**. Activation remains **INCONCLUSIVE; KEEP full startup scans**.
+This small, single-run screen does not change the earlier Phase 3C decision or establish a
+large-store recovery bound, scaling law, tail latency, allocation bound or power-loss guarantee.

@@ -404,3 +404,13 @@ coverage. The live harness now closes every observation/injection connection exp
 observes the production cleanup worker before taking the cost fixture offline. These are fixed
 correctness fixtures, not campaign measurements. The predeclared cost screen and final-head CI
 remain pending; campaign consumption is still 574.519391 seconds and 571,154,432 bytes peak.
+
+The predeclared 100/1,000-object recovery-cost screen passed at implementation commit `cc542fd`.
+Baseline command wall times including its safety snapshot were 0.15/0.82 seconds as observed by
+GNU time, or 0.385/1.028 seconds including coordinator launch/observation/teardown. Every source
+and restored object was byte-verified and authoritative rows stayed unchanged. These descriptive
+one-shot observations do not qualify journal-only startup; full scans remain enabled. Evidence
+and limits are in `storage-recovery-2026-09.md` and its JSON. The screen plus export/cleanup used
+17.626779 seconds; cumulative consumption is **592.146171 seconds / 571,154,432 bytes recorded
+peak**, with no active process/data reservation or raw measurement artifacts. Final-head CI and
+merge remain pending.
