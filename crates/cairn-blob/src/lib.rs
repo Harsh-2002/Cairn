@@ -23,6 +23,8 @@ mod encode;
 pub mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;
+#[cfg(unix)]
+mod reconcile;
 #[cfg(feature = "io-uring")]
 mod uring;
 // The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
@@ -1352,39 +1354,45 @@ async fn reconcile_inner(
     now: Timestamp,
 ) -> Result<ReconcileReport, BlobError> {
     let mut report = ReconcileReport::default();
-    // Collect bucket directories first (names only — bounded by the bucket count, not the
-    // keyspace) so they can be reconciled concurrently while the staging area is handled inline.
-    let mut bucket_dirs: Vec<(PathBuf, String)> = Vec::new();
     let mut entries = tokio::fs::read_dir(data_root).await.map_err(io_err)?;
-    while let Some(entry) = entries.next_entry().await.map_err(io_err)? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !entry.file_type().await.map_err(io_err)?.is_dir() {
-            continue;
-        }
-        if name == STAGING {
-            reconcile_staging(&entry.path(), oracle, opts, now, &mut report).await?;
-            continue;
-        }
-        bucket_dirs.push((entry.path(), name));
-    }
-
     // Reconcile buckets with bounded concurrency. The oracle is a borrowed `&dyn`, so the
     // futures are not `'static` and cannot move into a detached `JoinSet`; a `FuturesUnordered`
     // capped at `parallelism` gives the same bounded-concurrency, bounded-memory behaviour while
-    // keeping the borrow. Each bucket still batches its membership checks internally, so the live
-    // working set is at most `parallelism * batch_size` paths.
+    // keeping the borrow. Bucket enumeration streams too; each worker retains bounded bucket/leaf
+    // pages, so the working set is O(parallelism * batch_size), independent of total bucket count.
     let parallelism = opts.parallelism.max(1);
     let batch_size = opts.batch_size.max(1);
     let mut inflight: futures_util::stream::FuturesUnordered<_> =
         futures_util::stream::FuturesUnordered::new();
-    let mut iter = bucket_dirs.into_iter();
     loop {
         while inflight.len() < parallelism {
-            let Some((path, name)) = iter.next() else {
+            let Some(entry) = entries.next_entry().await.map_err(io_err)? else {
                 break;
             };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                report.errors += 1;
+                continue;
+            };
+            let kind = entry.file_type().await.map_err(io_err)?;
+            if kind.is_symlink() {
+                report.errors += 1;
+                continue;
+            }
+            if !kind.is_dir() {
+                continue;
+            }
+            if name == STAGING {
+                reconcile_staging(&entry.path(), oracle, opts, now, &mut report).await?;
+                continue;
+            }
+            if BucketName::parse(&name).is_err() {
+                report.errors += 1;
+                continue;
+            }
+            #[cfg(unix)]
+            use reconcile::bucket as reconcile_bucket;
             inflight.push(reconcile_bucket(
-                path,
+                entry.path(),
                 name,
                 oracle,
                 batch_size,
@@ -1414,6 +1422,7 @@ fn merge_report(into: &mut ReconcileReport, part: ReconcileReport) {
 /// Reconcile one per-bucket directory, reclaiming blobs no metadata row references, then pruning
 /// the directory if reconciliation left it empty. Returns its own report so callers can run it
 /// concurrently and fold the counts. Memory stays bounded: at most `batch_size` paths are held.
+#[cfg(not(unix))]
 async fn reconcile_bucket(
     dir: PathBuf,
     bucket: String,
@@ -1472,6 +1481,7 @@ async fn reconcile_bucket(
 
 /// Remove `dir` if it is empty, reporting whether it was pruned. A non-empty directory, or one a
 /// race repopulated, is left in place; a missing directory counts as not pruned.
+#[cfg(not(unix))]
 async fn prune_if_empty(dir: &Path) -> Result<bool, BlobError> {
     let mut rd = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -1601,6 +1611,7 @@ async fn reconcile_live_multipart_session(
 /// as an orphan (it may be an in-flight PUT whose metadata row has not yet committed, ARCH 9). A
 /// margin of `0` (tests) or a path that cannot be stat-ed (already deleted, racing) is treated as
 /// not-young so the caller proceeds. The inverse of [`staging_artifact_expired`]'s age check.
+#[cfg(not(unix))]
 async fn blob_too_young(path: &Path, margin_secs: i64, now: Timestamp) -> bool {
     if margin_secs <= 0 {
         return false;
@@ -1878,6 +1889,7 @@ mod tests {
 
     /// `prune_if_empty` removes only an empty directory, leaves a populated one, and treats a
     /// missing directory as not pruned.
+    #[cfg(not(unix))]
     #[tokio::test]
     async fn prune_if_empty_only_removes_empty() {
         let dir = tempfile::tempdir().unwrap();

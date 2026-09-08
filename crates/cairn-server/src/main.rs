@@ -924,20 +924,10 @@ fn migrate(cfg: Config) -> ExitCode {
     }
 }
 
-/// Read the highest applied migration version from the database file.
+/// Validate schema/storage compatibility and read the highest applied migration version.
 fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
     ensure_regular_file_no_symlink(db_path, "SQLite database")?;
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
-    conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .map_err(|e| e.to_string())
+    cairn_meta::validate_database_compatibility(db_path).map_err(|e| e.to_string())
 }
 
 /// The backup/restore format currently has one deliberately narrow topology contract.
@@ -1868,6 +1858,7 @@ async fn stage_snapshot_database(
     destination: &std::path::Path,
     manifest: &SnapshotManifest,
 ) -> Result<StagedDatabase, String> {
+    schema_version(source)?;
     validate_target_database_entry(destination)?;
     let parent = destination
         .parent()
@@ -2780,6 +2771,38 @@ mod tests {
             error.contains("size mismatch") || error.contains("SHA-256 mismatch"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_unsupported_storage_protocol_before_target_staging() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (snapshot, mut manifest) = create_complete_empty_snapshot(workspace.path()).await;
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE storage_protocol SET minimum_writer=2", [])
+            .unwrap();
+        drop(connection);
+        // Rebind the deliberately incompatible bytes: rejection must come from the protocol
+        // check, not from a stale manifest digest.
+        let (size, hash) = super::file_fingerprint(&database).await.unwrap();
+        manifest.metadata.database_size = size;
+        manifest.metadata.database_sha256 = hash;
+        std::fs::write(
+            snapshot.join(SNAPSHOT_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let target = workspace.path().join("target/new.db");
+        let error = stage_snapshot_database(&database, &target, &manifest)
+            .await
+            .unwrap_err();
+        assert!(error.contains("storage protocol"), "{error}");
+        assert!(!target.parent().unwrap().exists());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("storage protocol"), "{error}");
     }
 
     #[tokio::test]

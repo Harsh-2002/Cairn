@@ -11,6 +11,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   the safe rustix-backed `open_readonly_nofollow`/`open_lock_file_nofollow` and
   `try_lock_exclusive` syscall seams used by snapshot input and node-local command exclusion. The
   failpoint seams live here.
+- `reconcile.rs` — bounded POSIX flat/two-hex-leaf traversal; descriptor-relative no-follow cleanup,
+  exact membership counts, conservative unknown-layout handling and parent-fsynced pruning.
 - `timing.rs` — bounded multipart permit/assembly/durability observations, mirrored by the server
   metrics tick; includes interrupted stages and reports sample eviction.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
@@ -150,3 +152,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   the scrubber so full-object supplementary checksum algorithms use the ingest implementations.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`
   (8–10), SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.
+
+New writes remain flat. POSIX reconciliation recognizes only the approved nested UUID grammar,
+keeps bounded bucket/leaf pages and one leaf cursor per worker, and preserves/reports unknown paths and symlinks.
+Bucket enumeration is streamed too. File unlink batches sync their directory; pruning syncs the
+parent before reporting success. Full startup scans remain active; no journal coverage is asserted.

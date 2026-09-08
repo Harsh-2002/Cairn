@@ -122,7 +122,7 @@ above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v34 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  is v35 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
   `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
   scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
   bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
@@ -167,3 +167,8 @@ preserve the typed applied result. Recovery invalidates tokens before new worker
 
 Schema v34 adds writer-maintained current-visible `bucket_stats.objects`; overview counts read
 these roll-ups without scanning object versions. Migration backfills existing databases once.
+
+Schema v35 adds `storage_protocol` compatibility state (reader/writer 1, flat placement,
+full-scan recovery). Startup validates schema/protocol support before PRAGMAs, migrations,
+sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
+without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.

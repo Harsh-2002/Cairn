@@ -2,7 +2,7 @@
 //! connection at startup, before any request is served, and are recorded so they apply
 //! exactly once and in order.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// An ordered migration: a monotonically increasing version, a name, and its SQL.
 struct Migration {
@@ -852,6 +852,22 @@ UPDATE bucket_stats SET objects = (
 );
 "#,
     },
+    Migration {
+        version: 35,
+        name: "storage protocol compatibility",
+        sql: r#"
+-- Compatibility is authoritative metadata, not an operator feature flag. This build still
+-- places flat files and performs full reconciliation; later protocols must raise their floors.
+CREATE TABLE storage_protocol (
+    singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+    minimum_reader INTEGER NOT NULL CHECK (minimum_reader>=1),
+    minimum_writer INTEGER NOT NULL CHECK (minimum_writer>=1),
+    write_layout TEXT NOT NULL,
+    recovery_mode TEXT NOT NULL
+);
+INSERT INTO storage_protocol VALUES (1, 1, 1, 'flat', 'full-scan');
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -859,8 +875,66 @@ pub(crate) fn latest_version() -> i64 {
     MIGRATIONS.last().map_or(0, |migration| migration.version)
 }
 
+fn incompatible(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(message.into()),
+    )
+}
+
+/// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
+/// Old binaries without this check remain unsafe downgrade targets (ARCH 11.3).
+pub(crate) fn validate_compatibility(conn: &Connection) -> rusqlite::Result<i64> {
+    let has_migrations: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    let applied = if has_migrations {
+        conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else {
+        0
+    };
+    if !(0..=latest_version()).contains(&applied) {
+        return Err(incompatible(format!(
+            "unsupported metadata schema version {applied}; this binary supports through {}",
+            latest_version()
+        )));
+    }
+    let has_protocol: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_protocol')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_protocol != (applied >= 35) {
+        return Err(incompatible(
+            "storage protocol state does not match the applied schema",
+        ));
+    }
+    if has_protocol {
+        let state = conn.query_row(
+            "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol WHERE singleton=1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+        ).optional()?;
+        if !state.is_some_and(|(reader, writer, layout, recovery)| {
+            reader == 1 && writer == 1 && layout == "flat" && recovery == "full-scan"
+        }) {
+            return Err(incompatible(
+                "unsupported or missing storage protocol state",
+            ));
+        }
+    }
+    Ok(applied)
+}
+
 /// Run all pending migrations on the write connection, recording each as applied.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    let applied = validate_compatibility(conn)?;
     // A v25 upgrade destroys legacy plaintext bearer capabilities. This must be enabled before the
     // UPDATE/table rebuild so deleted b-tree cells are zeroed rather than left in free pages.
     conn.execute_batch("PRAGMA secure_delete=ON;")?;
@@ -870,11 +944,6 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             name       TEXT NOT NULL,
             applied_at INTEGER NOT NULL
         );",
-    )?;
-    let applied: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |r| r.get(0),
     )?;
     for m in MIGRATIONS {
         if m.version <= applied {
@@ -934,6 +1003,70 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_rejects_future_schema_or_protocol_before_maintenance() {
+        for change in [
+            "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
+            "UPDATE storage_protocol SET minimum_reader=2",
+            "UPDATE storage_protocol SET minimum_writer=2",
+            "UPDATE storage_protocol SET write_layout='fanout-v1'",
+            "UPDATE storage_protocol SET recovery_mode='journal'",
+            "DELETE FROM storage_protocol",
+            "DROP TABLE storage_protocol",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("metadata.db");
+            let conn = Connection::open(&path).unwrap();
+            run_migrations(&conn).unwrap();
+            conn.execute_batch(change).unwrap();
+            conn.execute_batch(
+                "INSERT INTO share_capability_sanitation VALUES (1); PRAGMA secure_delete=OFF;",
+            )
+            .unwrap();
+            assert!(run_migrations(&conn).is_err(), "accepted {change}");
+            let secure_delete: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                secure_delete, 0,
+                "migration runner changed PRAGMAs before rejection"
+            );
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                crate::open(&path, &crate::OpenOptions::default()).is_err(),
+                "startup accepted {change}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "rejected startup changed the database for {change}"
+            );
+            let conn = Connection::open(&path).unwrap();
+            assert!(
+                share_sanitation_pending(&conn).unwrap(),
+                "rejected startup ran maintenance"
+            );
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete", "rejected startup enabled WAL");
+        }
+    }
+
+    #[test]
+    fn storage_protocol_migration_is_idempotent_and_keeps_full_scans() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(validate_compatibility(&conn).unwrap(), latest_version());
+        run_migrations(&conn).unwrap();
+        let state: (i64, i64, String, String) = conn.query_row(
+            "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        ).unwrap();
+        assert_eq!(state, (1, 1, "flat".into(), "full-scan".into()));
+    }
 
     #[test]
     fn migration_v34_backfills_visible_counts_and_is_idempotent() {

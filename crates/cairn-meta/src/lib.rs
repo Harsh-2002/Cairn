@@ -40,6 +40,22 @@ pub fn latest_schema_version() -> i64 {
     schema::latest_version()
 }
 
+/// Read an existing database's schema/storage compatibility without running maintenance.
+///
+/// Used by offline snapshot validation and by the all-shard startup preflight. A missing database
+/// is an error; callers creating a new node may skip paths that do not yet exist.
+///
+/// # Errors
+/// Returns an error on unreadable, malformed or unsupported metadata/protocol state.
+pub fn validate_database_compatibility(path: &Path) -> Result<i64, MetaError> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(model::engine_err)?;
+    schema::validate_compatibility(&connection).map_err(model::engine_err)
+}
+
 /// Tuning knobs for opening the store (ARCH 28).
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
@@ -109,6 +125,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // `analysis_limit` bounds the cost of the periodic `PRAGMA optimize` so it can never become a
     // writer stall.
     let write_conn = Connection::open(db_path).map_err(map)?;
+    schema::validate_compatibility(&write_conn).map_err(map)?;
     write_conn
         .execute_batch(&format!(
             "PRAGMA journal_mode=WAL;

@@ -32,9 +32,17 @@ decision that is **fixed at first init** and cannot be changed later.
    root admin and resumes the background loops (replication drain, lifecycle, WAL checkpoint, scrub).
 5. Verify: `cairn validate-config` (or watch the startup log), then `GET /readyz` → `ready`.
 
-**Migrations are forward-only.** There is no automatic down-migration. A newer schema version is not
-readable by an older binary — which is why the pre-upgrade snapshot is the rollback mechanism, not a
-schema downgrade.
+**Migrations are forward-only.** There is no automatic down-migration. Starting with the
+storage-protocol v35 safeguard, startup rejects unsupported newer schemas or protocol state before
+Cairn changes PRAGMAs, runs migrations/sanitation or starts its Writer. SQLite, libSQL and Turso
+perform this check; sharded SQLite preflights every existing shard before migrating any shard.
+Snapshot validation also checks compatibility before staging target data.
+
+**Already released older binaries may open and mutate newer data.** The new guard cannot retrofit
+protection into them. Use a verified pre-upgrade snapshot for downgrade; do not try the previous
+binary against upgraded data to see whether it refuses. Schema v35 records minimum reader/writer
+protocol 1, flat writes and full-scan recovery. Missing, malformed or unsupported state fails closed.
+It does not activate a recovery journal or change object placement.
 
 ### Zero-downtime upgrades
 
@@ -54,9 +62,11 @@ Rollback is **restore-from-snapshot**, not schema downgrade:
    (`cairn restore <dir>` places the database + blobs and runs reconciliation).
 3. Start the **previous** binary.
 
-Rolling back *without* a snapshot is only safe if the newer binary applied **no** new migration
-(check the release notes / `cairn migrate` reports the applied schema version). If a migration ran,
-the older binary cannot open the database — restore the snapshot.
+An unchanged schema number alone does not establish backward compatibility: storage framing and
+writer/recovery semantics also matter. The supported downgrade procedure uses a verified
+pre-upgrade snapshot. An unsupported older writer or an external restore invalidates any future
+journal-coverage assumption; a full reconciliation and a newly completed offline baseline would be
+required before trusting journal recovery. Current startup continues to perform the full scan.
 
 ## 4. Decisions fixed at first init (cannot be changed in place)
 
