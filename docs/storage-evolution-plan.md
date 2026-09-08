@@ -449,3 +449,13 @@ inline comments and open branch code-scanning alerts were empty. Phase 4C's comp
 comparison implementation passes the full local gate, 70 packing tests and 84 Python tests
 with every live fixture enabled. Its ninety-arm, five-pair comparison is predeclared; no packing
 measurement or threshold decision has run yet.
+
+2026-09-09: Phase 4C's bounded comparison completed with an **INCONCLUSIVE / KEEP files**
+decision. Eleven of ninety planned arms completed before the first 1-MiB packed arm's fixed
+120-second deadline. No repeated pairs or global streaming controls completed, and no threshold
+was selected. Raw outcomes, process observations and the failed deadline are archived in
+[the packing evaluation](storage-packing-measurement-2026-09.md). Comparison plus evidence export
+charged 326.493302 seconds; the campaign then stood at 918.639472 seconds and 1,778,102,272 peak
+bytes, with no active reservation or temporary dataset. Full local validation passed before the
+run; final-commit CI/integration remains required. This closes the bounded experiment with an
+explicit inconclusive decision, not a performance pass.

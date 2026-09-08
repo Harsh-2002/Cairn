@@ -2,7 +2,7 @@
 
 This is an isolated raw-record laboratory decision, not a production format, configuration or
 S3 performance change. The coordinator is `conformance/storage_lab/packing_measure.py`. No
-measurement result is recorded here yet. Build and fixed correctness tests are separate from the
+threshold was selected: the bounded run below is INCONCLUSIVE. Build and fixed correctness tests are separate from the
 shared campaign. Run only after the collection/snapshot implementation and this preregistration
 have passed review and the campaign is explicitly started.
 
@@ -128,3 +128,47 @@ The integrated local gate passes 1,466 default and 1,492 all-feature workspace t
 Clippy configurations, two doctests, all 80 Rust laboratory tests and all 84 Python tests with
 every live fixture enabled. Web build/lint/audits, Rust audits, installer, shell and workflow
 checks pass. These validations precede measurements; no threshold has been selected.
+
+## Recorded outcome — retain dedicated files
+
+Run `e651c93553c34d6c98a08835060556ed` used optimized source
+`a5f390441a5cebf77f22a127d20bd58915916d2a`, Rust 1.97.1, opt-level 3, thin LTO,
+debug information and no stripping or RUSTFLAGS. The admitted discovery confirmed `/SSD` on
+`/dev/sdb1`, ext4. The complete machine/build identities, configurations, outcomes and process
+observations are retained in [the measurement record](storage-packing-measurement-2026-09.json)
+and its hash-verified [raw evidence archive](storage-packing-measurement-2026-09.raw.tar.gz).
+
+**INCONCLUSIVE; KEEP files.** Eleven arms completed. The first 1-MiB packed arm reached its
+fixed 120-second driver deadline; its terminal deadline record is preserved. The comparison
+stopped as preregistered, before any unknown-length or 2-MiB controls and before any repeated
+pairs. No automatic retry, threshold selection or production packing follows this result.
+The timeout record does not identify the unfinished phase, so it cannot establish a particular
+collection, readback or restore bottleneck.
+
+The completed first-pair values below are descriptive diagnostics only. They do not provide
+five-pair medians, control-drift coverage, tail percentiles or a qualifying threshold.
+
+| Known record size | Files primary seconds | Packed primary seconds | Completed pairs |
+| --- | ---: | ---: | ---: |
+| 1 KiB | 3.3290 | 0.9632 | 1 |
+| 4 KiB | 3.3511 | 0.9205 | 1 |
+| 16 KiB | 3.5704 | 1.3660 | 1 |
+| 64 KiB | 3.9497 | 3.2475 | 1 |
+| 256 KiB | 5.7532 | 10.7614 | 1 |
+| 1 MiB | 12.7502 | unavailable: arm deadline | 0 |
+
+Every completed arm verified all 1,024 initial objects and 512 final survivors, all 512 ranges,
+exact overwrite/delete counts, fresh restored/reopened survivors and zero pending writes/debts.
+Each completed packed arm copied live records and retired source segments. These correctness
+checks do not turn an incomplete performance matrix into a pass. At 1 KiB, even this single
+pair's range time increased from 0.0624 to 0.1515 seconds; isolated primary improvements alone
+would not meet the protected-workload policy.
+
+The comparison charged **325.135765 seconds**, including teardown and finalization. Archival,
+content-hash verification and removal of the exact owned artifact directory charged another
+**1.357537 seconds**. Campaign consumption after this export was **918.639472 / 3,600 seconds**,
+with recorded peak footprint **1,778,102,272 / 100,000,000,000 bytes**. Every owned process and
+dataset was quiesced/removed; the active reservation is empty. The raw archive preserves all
+71 artifact files, including the incomplete arm, before their temporary originals were removed.
+Production remains one file per object with full-scan recovery. A future experiment needs a new
+preregistration and explicit remaining allowance; it cannot relabel this attempt as successful.
