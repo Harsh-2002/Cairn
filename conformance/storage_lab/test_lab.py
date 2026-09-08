@@ -174,7 +174,7 @@ class MeasurementTests(unittest.TestCase):
             campaign = Campaign(Path(temporary) / "campaign", create=True, require_ssd=False)
             args = argparse.Namespace(root=str(campaign.root), binary=os.environ["LAB_TEST_SERVER"],
                 commit="correctness-fixture", build_settings="debug correctness fixture; no performance claim",
-                layer="s3", concurrency=4, buckets=1, size=1024, seed=0x5eed,
+                layer="s3", concurrency=1, buckets=2, size=1024, seed=0x5eed,
                 seconds=1, idle=0, cycles=3, max_ops=6, profile="none", allow_seconds=60,
                 phase="baseline", primary_metric="byte-exact fixture", protected="cleanup")
             try:
@@ -183,6 +183,7 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual(run_case(args, campaign), 2)
                 result = json.loads(next(campaign.root.glob("*.result.json")).read_text())
                 self.assertEqual(len(result["cycles"]), 3)
+                self.assertTrue(all(cycle["bucket_transactions"] == [1, 1] for cycle in result["cycles"]))
                 self.assertTrue(result["cleaned_data_and_processes"])
                 self.assertIsNone(campaign.ledger["active"])
             finally:

@@ -73,6 +73,7 @@ def run(config):
             nonlocal admitted
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             samples = [[], [], []]
+            bucket_counts = [0] * config["buckets"]
             try:
                 while time.monotonic() < deadline:
                     with lock:
@@ -80,25 +81,30 @@ def run(config):
                             break
                         sequence = admitted
                         admitted += 1
-                    path = f"/lab-{index % config['buckets']:04}/worker-{index:04}-{sequence % 16:02}"
+                    bucket = sequence % config["buckets"]
+                    path = f"/lab-{bucket:04}/worker-{index:04}-{sequence % 16:02}"
                     for column, (method, body) in enumerate((("PUT", data), ("GET", b""), ("DELETE", b""))):
                         before = time.monotonic()
                         result = request(connection, method, path, body)
                         if method == "GET" and result != data:
                             raise RuntimeError("S3 checksum/length mismatch")
                         samples[column].append(time.monotonic() - before)
-                return samples
+                    bucket_counts[bucket] += 1
+                return samples, bucket_counts
             finally:
                 connection.close()
 
         combined = [[], [], []]
+        bucket_counts = [0] * config["buckets"]
         with concurrent.futures.ThreadPoolExecutor(config["concurrency"]) as pool:
-            for samples in pool.map(worker, range(config["concurrency"])):
+            for samples, counts in pool.map(worker, range(config["concurrency"])):
                 for column, values in zip(combined, samples):
                     column.extend(values)
+                bucket_counts = [total + count for total, count in zip(bucket_counts, counts)]
         elapsed = time.monotonic() - start
         emit({"kind": "cycle", "cycle": cycle, "elapsed": elapsed,
               "operation_names": ["put", "get", "delete"],
+              "bucket_transactions": bucket_counts,
               "successful_transactions": len(combined[0]), "transactions_per_second": len(combined[0]) / elapsed,
               "operation_cap_reached": admitted >= cap, "operations": [distribution(values) for values in combined]})
         del combined, samples

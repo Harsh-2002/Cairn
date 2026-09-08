@@ -242,6 +242,7 @@ async fn run(config: Config) -> Result<(), Error> {
         "unavailable": ["application_cache_live_bytes", "blob_internal_stage_timings", "runtime_active_tasks", "in_flight_buffer_bytes"]}),
     );
     let data = Bytes::from(payload(config.size, config.seed));
+    let buckets = Arc::new(buckets);
     for cycle in 0..config.cycles {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(config.seconds);
@@ -250,27 +251,30 @@ async fn run(config: Config) -> Result<(), Error> {
         let mut tasks = tokio::task::JoinSet::new();
         emit(json!({"kind": "phase", "cycle": cycle, "phase": "load"}));
         for worker in 0..config.concurrency {
-            let (blob, meta, bucket, data, admitted) = (
+            let (blob, meta, buckets, data, admitted) = (
                 blob.clone(),
                 meta.clone(),
-                buckets[worker % buckets.len()].clone(),
+                buckets.clone(),
                 data.clone(),
                 admitted.clone(),
             );
             let size = config.size;
             tasks.spawn(async move {
                 let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+                let mut bucket_counts = vec![0_u64; buckets.len()];
                 while Instant::now() < deadline {
                     let sequence = admitted.fetch_add(1, Ordering::Relaxed);
                     if sequence >= cap {
                         break;
                     }
+                    let bucket_index = sequence as usize % buckets.len();
+                    let bucket = &buckets[bucket_index];
                     let elapsed = if let Some(store) = &blob {
-                        blob_operation(store, &bucket, data.clone()).await?
+                        blob_operation(store, bucket, data.clone()).await?
                     } else {
                         meta_operation(
                             meta.as_ref().ok_or("missing metadata driver")?,
-                            &bucket,
+                            bucket,
                             worker,
                             sequence + cycle as u64 * cap,
                             size,
@@ -280,16 +284,22 @@ async fn run(config: Config) -> Result<(), Error> {
                     for (column, seconds) in samples.iter_mut().zip(elapsed) {
                         column.push(seconds);
                     }
+                    bucket_counts[bucket_index] += 1;
                 }
-                Ok::<_, Error>(samples)
+                Ok::<_, Error>((samples, bucket_counts))
             });
         }
         let mut all = [Vec::new(), Vec::new(), Vec::new()];
+        let mut bucket_counts = vec![0_u64; buckets.len()];
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         while !tasks.is_empty() {
             tokio::select! {
                 result = tasks.join_next() => {
-                    if let Some(result) = result { for (target, samples) in all.iter_mut().zip(result??) { target.extend(samples); } }
+                    if let Some(result) = result {
+                        let (samples, counts) = result??;
+                        for (target, samples) in all.iter_mut().zip(samples) { target.extend(samples); }
+                        for (target, count) in bucket_counts.iter_mut().zip(counts) { *target += count; }
+                    }
                 }
                 _ = tick.tick(), if meta.is_some() => {
                     if let Some(store) = &meta {
@@ -308,6 +318,7 @@ async fn run(config: Config) -> Result<(), Error> {
         emit(
             json!({"kind": "cycle", "cycle": cycle, "elapsed": elapsed, "successful_transactions": all[0].len(),
             "operation_names": if config.layer == "blob" { ["stage", "read", "delete"] } else { ["put", "read", "list"] },
+            "bucket_transactions": bucket_counts,
             "transactions_per_second": all[0].len() as f64 / elapsed,
             "operation_cap_reached": admitted.load(Ordering::Relaxed) >= cap,
             "operations": all.iter_mut().map(|samples| distribution(samples)).collect::<Vec<_>>()}),
@@ -357,8 +368,8 @@ mod tests {
             run(Config {
                 root: fixture.path().join("data"),
                 layer: layer.into(),
-                concurrency: 4,
-                buckets: 1,
+                concurrency: 1,
+                buckets: 2,
                 size: 1024,
                 seed: 0x5eed,
                 seconds: 1,
@@ -368,6 +379,32 @@ mod tests {
             })
             .await
             .unwrap();
+            for number in 0..2 {
+                let bucket = BucketName::parse(&format!("lab-{number:04}")).unwrap();
+                if layer == "blob" {
+                    assert!(fixture.path().join("data").join(bucket.as_str()).is_dir());
+                } else {
+                    let store = cairn_meta::open(
+                        &fixture.path().join("data/metadata.db"),
+                        &cairn_meta::OpenOptions::default(),
+                    )
+                    .unwrap();
+                    assert!(
+                        !store
+                            .list_current(
+                                &bucket,
+                                &ListQuery {
+                                    limit: 16,
+                                    ..Default::default()
+                                }
+                            )
+                            .await
+                            .unwrap()
+                            .items
+                            .is_empty()
+                    );
+                }
+            }
         }
     }
 }

@@ -288,6 +288,8 @@ def run_case(args, campaign):
             raise Unavailable("insufficient completed load/idle cycles")
         if any(cycle["operation_cap_reached"] or cycle["successful_transactions"] == 0 for cycle in cycles):
             raise Unavailable("operation cap or insufficient samples prevented equal load cycles")
+        if any(len(cycle.get("bucket_transactions", [])) != args.buckets or not all(cycle["bucket_transactions"]) for cycle in cycles):
+            raise Unavailable("not every configured bucket received successful transactions")
         if args.profile != "none":
             # Collection is evidence availability, not an attribution conclusion. Decoding and
             # correlating stacks is a separate charged invocation in the results phase.

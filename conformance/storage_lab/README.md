@@ -49,6 +49,8 @@ first workload is an attribution fixture, not the complete Phase 5 metadata eval
 Blob transactions stage, fully read/verify and delete an actual raw object. S3 transactions issue
 signed PUT/GET/DELETE on one persistent connection per worker, without retries. Successful
 transactions/second refers to these three-operation units, not individual S3 requests/second.
+Operation sequences rotate across all configured buckets even when there are fewer workers than
+buckets; per-bucket success counts are recorded and incomplete coverage cannot pass.
 The blob driver's stage time includes encoding/filesystem/durability waits and is not isolated
 fsync time. No compression/encryption claim follows from the initial raw-object workload.
 
