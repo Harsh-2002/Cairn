@@ -21,6 +21,7 @@ crates/cairn-types/fuzz/artifacts/
 /web/tsconfig.tsbuildinfo
 
 /data
+/cairn.env
 *.db
 *.db-wal
 *.db-shm

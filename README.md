@@ -1,233 +1,117 @@
 # Cairn
 
-Self-hosted, S3-compatible object storage.
+Self-hosted, S3-compatible object storage with an embedded web console.
 
-Cairn speaks the S3 API, stores object data as plain files on a normal filesystem, and keeps all
-metadata in an embedded SQLite database. There is no external database, clustering layer, or separate
-storage daemon to run. Point any S3 client at it, or use the built-in web console. It runs as one
-binary, and a distroless container image is also published.
+Cairn runs as one binary. It stores object data in filesystem files and metadata in embedded
+SQLite, with no external database or storage service to operate. It is designed for a single
+node; asynchronous bucket replication provides copies on other hosts.
 
-Cairn is for people who want to host their own object storage on a homelab machine, a VPS, or a small
-production node, with the S3 API and a console but without operating a distributed system.
+[![Cairn web console](https://harsh-2002.github.io/Cairn/screenshots/overview-dashboard.webp)](https://harsh-2002.github.io/Cairn/)
 
-Releases are CI-gated and publish static `linux/amd64` and `linux/arm64` binaries with a `SHA256SUMS`
-manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. The release workflow provides
-Cosign signatures, an SPDX dependency SBOM and SLSA build-provenance attestations; see
-[`SECURITY.md`](./SECURITY.md#verifying-release-artifacts) for verification.
+## What it supports
 
-## The console
-
-The S3 wire protocol is a commodity; the console is the reason to pick Cairn. It ships inside the
-same binary — nothing extra to deploy.
-
-[![The Cairn console — Overview](https://harsh-2002.github.io/Cairn/screenshots/overview-dashboard.webp)](https://harsh-2002.github.io/Cairn/)
-
-<sup>Storage, compression and per-bucket usage across the node.</sup>
-
-|  |  |
-|---|---|
-| [![Bucket browser](https://harsh-2002.github.io/Cairn/screenshots/bucket-browser.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-browser.webp) | [![Object preview](https://harsh-2002.github.io/Cairn/screenshots/object-preview.webp)](https://harsh-2002.github.io/Cairn/screenshots/object-preview.webp) |
-| **Bucket browser** — preview, download, tag, copy, share or delete any object. | **In-place preview** — images, video, audio, PDF, Markdown, JSON, CSV and text, without downloading. |
-| [![Bucket policy](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-access.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-access.webp) | [![Data protection](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-data-protection.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-data-protection.webp) |
-| **Access** — a validated bucket-policy editor, object ownership, Block Public Access. | **Data protection** — encryption at rest, Object Lock, lifecycle rules. |
-| [![Temporary credentials](https://harsh-2002.github.io/Cairn/screenshots/credentials-temporary.webp)](https://harsh-2002.github.io/Cairn/screenshots/credentials-temporary.webp) | [![Metrics](https://harsh-2002.github.io/Cairn/screenshots/metrics-charts.webp)](https://harsh-2002.github.io/Cairn/screenshots/metrics-charts.webp) |
-| **Credentials** — mint short-lived scoped keys with a policy builder that explains them. | **Metrics** — requests, errors, throughput and latency from Cairn's own stored series. |
-
-More screens on the [project site](https://harsh-2002.github.io/Cairn/#).
-
-## Features
-
-- S3 API: buckets and objects, byte-range and conditional reads, checksums (CRC32, CRC32C,
-  CRC64NVME, SHA-1, SHA-256), multipart upload, copy, bulk delete, and v1/v2 plus version listings.
-  Versioning, tagging, CORS, lifecycle expiration, object lock (WORM), and presigned URLs. SigV4
-  (header and streaming-chunked) and Bearer authentication. The aws CLI and the standard AWS SDKs
-  work against it.
-- Web console: on its own port, manage buckets and users; browse, upload, download and share
-  objects; preview images, video, audio, PDFs, Markdown, JSON, CSV and text in place without
-  downloading them; mint access keys scoped by a policy; view storage, compression, and replication status;
-  jump anywhere with a command palette; and see when a newer release is available (an hourly,
-  opt-out check).
-- Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
-  credentials, mintable through the AWS-STS wire surface (`AssumeRole`, `GetSessionToken`) served on
-  the S3 port or through the management API.
-- Durability: writes are staged, fsynced, atomically renamed, and acknowledged after a single
-  metadata commit. On restart Cairn reconciles and reclaims any orphaned data. Acknowledged writes
-  survive power loss.
-- Security: native TLS, AES-256-GCM encryption of secrets at rest with online master-key rotation,
-  and server-side object encryption: per-bucket SSE-S3, an `aws:kms` request surface (label-only, see
-  Scope), optional mandatory-encryption enforcement, and transparent encryption of all objects at rest
-  (`CAIRN_ENCRYPT_AT_REST`).
-- Storage efficiency: optional per-bucket block compression, with range reads that touch only the
-  blocks they need.
-- Operations: Prometheus metrics (with a ready-to-import [dashboard](dashboards/) for an external
-  monitoring stack), liveness and readiness endpoints, structured logs, asynchronous
-  bucket replication to another node or S3 endpoint, webhook event notifications, one-shot streaming
-  import/migration of buckets and objects from another S3-compatible store (MinIO/Garage/R2/AWS/another
-  Cairn) into this node, and a CLI for bootstrap, config validation, integrity checks, and backup and
-  restore.
+- **S3:** multipart uploads, range reads, checksums, versioning, presigned URLs, tagging, CORS,
+  lifecycle expiration and Object Lock. See the [S3 compatibility matrix](docs/s3-api-matrix.md).
+- **Console:** manage buckets, users and policies; upload, preview and share objects; inspect
+  usage, metrics and replication.
+- **Security:** native TLS, bucket policies, scoped temporary credentials, SSE-S3 and transparent
+  object encryption at rest (`CAIRN_ENCRYPT_AT_REST=true`). The `aws:kms` interface uses key labels
+  backed by the node's master-key ring; it does not integrate with an external KMS or provide
+  independent cryptographic isolation between key IDs.
+- **Storage and operations:** block compression, durable writes, asynchronous replication,
+  webhooks, S3 import, integrity checks, backup/restore and Prometheus metrics.
 
 ## Install
 
-The install script sets Cairn up on a host or with Docker, and updates an existing installation when
-you run it again:
+Requires Linux 5.6+ with `openat2` support and a local filesystem that supports durable file and
+directory synchronization. Docker uses the host's kernel.
+
+The installer sets up Docker or a host service, generates credentials and a master key, and can
+configure TLS. Running it again updates the installation:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Harsh-2002/Cairn/main/install.sh | sudo sh
 ```
 
-It detects Docker and offers it (or installs the binary with a systemd or OpenRC service), generates
-the master key and admin credentials, can enable TLS, and stores data in a Docker named volume or
-under `/var/lib/cairn`. The Docker setup lives in `/opt/cairn` so you can edit the compose file. Run
-`sh install.sh --help` for options such as `--docker`, `--host`, `--update`, and `--uninstall`.
+See the [operations guide](docs/operations.md) for deployment details and
+[release verification](SECURITY.md#verifying-release-artifacts) for signatures, checksums and provenance.
 
-## Quickstart
+## Try it locally with Docker
 
-To set it up by hand with Docker instead:
+Create a master-key file **once** and keep it with this installation. The command refuses to
+replace an existing file:
 
 ```sh
-docker build -t cairn .
+(umask 077; set -C; printf 'CAIRN_MASTER_KEY=%s\n' "$(openssl rand -hex 32)" > cairn.env)
 
 docker run -d --name cairn \
-  -p 7373:7373 -p 7374:7374 \
-  -v cairn-data:/data \
-  -e CAIRN_MASTER_KEY="$(openssl rand -hex 32)" \
-  cairn serve
+  -p 127.0.0.1:7373:7373 -p 127.0.0.1:7374:7374 \
+  -v cairn-data:/data --env-file ./cairn.env \
+  ghcr.io/harsh-2002/cairn:latest
 ```
 
-- S3 API on `:7373`. Point any S3 client at `http://localhost:7373`.
-- Web console on `:7374`. Open `http://localhost:7374` in a browser.
-- Default login is `cairn` / `cairnadmin`. Override it with `CAIRN_ROOT_ACCESS_KEY` and
-  `CAIRN_ROOT_SECRET_KEY` before exposing a node. Liveness is at `/healthz`, readiness at `/readyz`,
-  and Prometheus metrics at `/metrics`, all on the S3 port.
+Open [the console](http://localhost:7374) and sign in with the local-development credentials
+`cairn` / `cairnadmin`. The S3 endpoint is `http://localhost:7373`.
 
-Smoke-test with the AWS CLI (configure it with the access key and secret above, any region):
+With the AWS CLI installed, try an upload and download:
 
 ```sh
+export AWS_ACCESS_KEY_ID=cairn AWS_SECRET_ACCESS_KEY=cairnadmin AWS_DEFAULT_REGION=us-east-1
 aws --endpoint-url http://localhost:7373 s3 mb s3://demo
-echo 'hello cairn' | aws --endpoint-url http://localhost:7373 s3 cp - s3://demo/hi.txt
+printf 'hello cairn\n' | aws --endpoint-url http://localhost:7373 s3 cp - s3://demo/hi.txt
 aws --endpoint-url http://localhost:7373 s3 cp s3://demo/hi.txt -
 ```
 
-`CAIRN_MASTER_KEY` is a 32-byte hex key that seals every secret at rest. Generate it once, keep it
-constant for the life of your data, and store it outside the database backup. Without it, a fixed
-development key is used, which is not safe for production.
+Reuse `cairn.env` whenever you recreate the container with `cairn-data`. Keep the master key
+outside the database backup and out of version control. For network deployment, set
+`CAIRN_ROOT_ACCESS_KEY` and `CAIRN_ROOT_SECRET_KEY` before first startup, configure TLS, and restrict
+access to the management port. Follow the [operations guide](docs/operations.md).
 
-To run without Docker, build the `cairn` binary from source and run `cairn serve` with the same
-environment. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the toolchain.
+## Configuration and operation
 
-## Configuration
-
-Configuration is environment-only. Every setting is a `CAIRN_*` variable, validated on startup with
-`cairn validate-config`. There is no config file and there are no flags. Common variables:
+Cairn reads `CAIRN_*` environment variables; `cairn validate-config` checks them before startup.
+Docker's `--env-file` supplies those variables; Cairn itself does not read a configuration file.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CAIRN_DATA_DIR` | `./data` | Root of staging and per-bucket object files |
-| `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same filesystem as the data) |
-| `CAIRN_MASTER_KEY` | dev key | 32-byte hex key sealing secrets at rest; set it in production |
-| `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 API listener |
-| `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Console and management API; set `off` to run headless |
-| `CAIRN_REGION` | `us-east-1` | Region label and SigV4 scope |
-| `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | unset | Enable built-in TLS when both are set |
-| `CAIRN_MASTER_KEY_RING` | unset | Key ring for online master-key rotation |
+| `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 listener |
+| `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Console/API listener; `off` for headless |
+| `CAIRN_DATA_DIR` | `./data` | Object storage root |
+| `CAIRN_DB_PATH` | `./data/cairn.db` | Metadata database |
+| `CAIRN_MASTER_KEY` | Development key | Set a persistent 32-byte hex master key |
+| `CAIRN_ENCRYPT_AT_REST` | `false` | Encrypt newly written objects without requiring client SSE headers |
+| `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | Unset | Native TLS certificate and private key |
 
-The full reference is in [`docs/configuration.md`](./docs/configuration.md). CLI subcommands:
-`cairn serve` (default), `validate-config`, `bootstrap`, `integrity [--repair]`, `backup`, and
-`restore`.
+The container sets its data root and database to `/data` and `/data/cairn.db`.
+Health (`/healthz`), readiness (`/readyz`) and metrics (`/metrics`) use the S3 port.
 
-## Deploying
+- [All configuration settings](docs/configuration.md)
+- [Backup and restore](docs/backup-restore.md) · [Upgrades and rollback](docs/upgrade-rollback.md)
+- [Replication](docs/replication.md) · [Import from another S3 store](docs/migration.md)
+- [Troubleshooting](docs/troubleshooting.md) · [Scaling limits](docs/scaling-limits.md)
 
-- Two listeners. Expose the S3 port to clients, and keep the console and management port on a trusted
-  interface, firewalled, or disabled with `CAIRN_WEB_ADDR=off`. Do not expose a plaintext interface to
-  an untrusted network.
-- TLS. Terminate TLS at Cairn (set the cert and key paths; `SIGHUP` reloads) or at a reverse proxy in
-  front.
-- Redundancy. Put the data filesystem on redundant storage such as ZFS, RAID, or a replicated block
-  volume. For cross-host redundancy, run a second node and enable bucket replication to it.
-- Backups. Use `cairn backup` and `cairn restore`. See [`docs/backup-restore.md`](./docs/backup-restore.md).
+Replication is asynchronous and can lag. Use backups and appropriate underlying disk redundancy
+for your durability requirements.
 
-Operator guides: [`docs/operations.md`](./docs/operations.md),
-[`docs/deployment-kubernetes.md`](./docs/deployment-kubernetes.md),
-[`docs/upgrade-rollback.md`](./docs/upgrade-rollback.md),
-[`docs/scaling-limits.md`](./docs/scaling-limits.md),
-[`docs/disaster-recovery.md`](./docs/disaster-recovery.md), and
-[`docs/troubleshooting.md`](./docs/troubleshooting.md).
+## Build and contribute
 
-## Performance
+See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, a local build/run walkthrough and the
+required checks. Build the React console before the Rust binary so it is embedded correctly.
 
-A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, using MinIO's own
-[`warp`](https://github.com/minio/warp) benchmark. Both run single-node, single-drive, over plaintext
-HTTP; each figure is the median of three runs.
+The [engineering specification](docs/CLAUDE.md) describes the architecture and invariants;
+[CONTRACT.md](CONTRACT.md) records architectural constraints.
+[Open issues](https://github.com/Harsh-2002/Cairn/issues) track work and bug reports.
 
-Throughput (higher is better; `obj/s` for small objects, `MiB/s` for large):
+## Performance and planned work
 
-| Operation | Object size | Cairn | MinIO | Ratio |
-|---|---|--:|--:|---|
-| PUT   | 4 KiB | **1696 obj/s**  | 1308 obj/s  | Cairn 1.30× |
-| PUT   | 8 MiB | 115 MiB/s       | **128 MiB/s** | MinIO 1.12× |
-| GET   | 4 KiB | **3431 obj/s**  | 1815 obj/s  | Cairn 1.89× |
-| GET   | 8 MiB | **1463 MiB/s**  | 801 MiB/s   | Cairn 1.83× |
-| STAT   | 4 KiB | **3494 obj/s**  | 1824 obj/s  | Cairn 1.92× |
-| DELETE | 4 KiB | **7442 obj/s**  | 5236 obj/s  | Cairn 1.42× |
-| LIST   | 4 KiB | **21183 obj/s** | 10288 obj/s | Cairn 2.06× |
-| MIXED  | 1 MiB | **285 MiB/s**   | 271 MiB/s   | Cairn 1.05× |
+[Benchmarks and reproduction commands](docs/benchmarks.md) include workload, hardware and
+measurement limits. Optional io_uring writes, plaintext sendfile and kTLS encryption offload are
+experimental and disabled in standard builds; see [the I/O reference](docs/data-plane.md#76-the-read-data-path-and-zero-copy).
 
-Resource use while serving the same workload (lower is better):
-
-| | Mean CPU | Peak memory |
-|---|--:|--:|
-| **Cairn** | 76% | **106 MB** |
-| MinIO | 88% | 1072 MB |
-
-Absolute numbers depend on the host and vary between runs; the ratio is what to read. Reproduce it
-with the harness CI runs on every push (`bench-compare`):
-
-```sh
-BIN=target/release/cairn bash conformance/bench_compare.sh
-```
-
-A separate [100 GB mirrored replication exercise](./docs/benchmarks.md#bidirectional-replication-and-compressed-allocation-2026-09-09)
-verified 241,124 full-version reads across two processes, including overwrite/delete propagation
-and restart catch-up. This used a shared development host and client-side hashing; its throughput
-figures are separate from the MinIO comparison above, and it did not measure per-GET tail latency.
-
-## Scope
-
-Cairn is single-node by design: one process, one data filesystem, one metadata database. Cross-host
-redundancy comes from asynchronous bucket replication, which is eventually consistent with observable
-lag, rather than from clustering. Drive redundancy is left to the storage underneath. Server-side encryption is supported — SSE-S3
-(per-bucket AES-256 default encryption, optionally mandatory), an `aws:kms` request surface for SDK
-compatibility (the key id is a validated label over the same node master key, not independent key
-material, so it is not cryptographic tenant isolation), and optional transparent encryption of every
-object at rest (`CAIRN_ENCRYPT_AT_REST`). A dedicated external KMS with distinct per-key material is
-not implemented. The target is homelab and small-to-mid production workloads that want the S3 API and
-a console without running a distributed system.
-
-## Roadmap
-
-Remaining work is tracked in [`docs/delivery.md`](./docs/delivery.md) (Phase 15). API, configuration
-and compatibility requirements will be specified for each feature before implementation.
-
-- Integration with an external KMS (distinct per-key material and tenant isolation); the current
-  `aws:kms` surface is a label over the node master key, and transparent encryption of all objects at
-  rest already ships (`CAIRN_ENCRYPT_AT_REST`).
-- Lifecycle transition to a remote cold tier, with a restore-from-cold workflow.
-- Zero-copy reads with kernel TLS; the existing plaintext sendfile path is experimental and
-  disabled by default.
-
-Already implemented: release signing, SPDX SBOM generation and SLSA build-provenance attestations
-([verification guide](./SECURITY.md#verifying-release-artifacts)). The optional io_uring backend is also
-implemented, but remains experimental and disabled by default.
-
-## Documentation
-
-The engineering specification and operator guides are in [`docs/`](./docs); start at
-[`docs/CLAUDE.md`](./docs/CLAUDE.md) for the index. [`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md)
-lists which S3 operations are supported, partial, or out of scope.
+[Planned work](docs/delivery.md#32-phased-implementation-roadmap) includes external KMS integration,
+remote cold-tier transition/restore and zero-copy HTTPS reads.
 
 ## License
 
-Apache-2.0 ([`LICENSE`](./LICENSE)). The license is permanent; there is no enterprise edition or
-open-core split. Governance and maintenance are described in [`GOVERNANCE.md`](./GOVERNANCE.md). See
-[`SECURITY.md`](./SECURITY.md) for the security policy, [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
-for community expectations, and [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the developer workflow.
+[Apache-2.0](LICENSE). See [governance](GOVERNANCE.md), the [security policy](SECURITY.md) and the
+[code of conduct](CODE_OF_CONDUCT.md).
