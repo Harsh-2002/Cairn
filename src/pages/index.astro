@@ -10,10 +10,17 @@ const docs = `${repo}/blob/main/docs`;
 
 const install = "curl -fsSL https://raw.githubusercontent.com/Harsh-2002/Cairn/main/install.sh | sudo sh";
 
+const envFile = `(umask 077; set -C
+  printf '%s\\n' \\
+    "CAIRN_MASTER_KEY=$(openssl rand -hex 32)" \\
+    "CAIRN_ROOT_ACCESS_KEY=cairn" \\
+    "CAIRN_ROOT_SECRET_KEY=$(openssl rand -hex 24)" \\
+    > cairn.env
+)`;
+
 const dockerRun = `docker run -d --name cairn \\
-  -p 7373:7373 -p 7374:7374 \\
-  -v cairn-data:/data \\
-  -e CAIRN_MASTER_KEY="$(openssl rand -hex 32)" \\
+  -p 127.0.0.1:7373:7373 -p 127.0.0.1:7374:7374 \\
+  -v cairn-data:/data --env-file ./cairn.env \\
   ghcr.io/harsh-2002/cairn:latest`;
 
 const compose = `services:
@@ -22,32 +29,30 @@ const compose = `services:
     container_name: cairn
     restart: unless-stopped
     ports:
-      - "7373:7373"   # S3 API
-      - "7374:7374"   # console + API
+      - "127.0.0.1:7373:7373"   # S3 + native administration
+      - "127.0.0.1:7374:7374"   # optional web console
     volumes:
       - cairn-data:/data
+    env_file:
+      - ./cairn.env
     environment:
-      # Required — openssl rand -hex 32
-      CAIRN_MASTER_KEY: "REPLACE_WITH_A_32_BYTE_HEX_KEY"
+      CAIRN_REGION: "us-east-1"
 
-      # Optional (defaults shown)
-      # CAIRN_ROOT_ACCESS_KEY: "cairn"        # admin key
-      # CAIRN_ROOT_SECRET_KEY: "cairnadmin"   # admin secret
-      # CAIRN_REGION: "us-east-1"             # region label
-      # CAIRN_ENCRYPT_AT_REST: "true"         # encrypt at rest
+      # Optional overrides
+      # CAIRN_ENCRYPT_AT_REST: "true"         # off by default
       # CAIRN_S3_DOMAIN: "s3.example.com"     # virtual-host style
       # CAIRN_TLS_CERT_PATH: "/certs/tls.crt" # TLS (set both)
       # CAIRN_TLS_KEY_PATH: "/certs/tls.key"
-      # CAIRN_WEB_ADDR: "off"                 # headless
+      # CAIRN_CONSOLE_ADDR: "off"             # API-only operation
+      # CAIRN_API_PUBLIC_URL: "https://s3.example.com"
+      # CAIRN_CONSOLE_PUBLIC_URL: "https://console.example.com"
 volumes:
   cairn-data:`;
 
-const awsConfig = `aws configure set aws_access_key_id cairn
-aws configure set aws_secret_access_key cairnadmin
-aws configure set region us-east-1`;
+const awsConfig = "aws configure --profile cairn";
 
 const awsUse = `# A short alias for the endpoint
-alias s3="aws --endpoint-url http://localhost:7373"
+alias s3="aws --profile cairn --endpoint-url http://localhost:7373"
 
 s3 mb s3://demo                        # create a bucket
 s3 cp ./report.pdf s3://demo/          # upload a file
@@ -74,24 +79,24 @@ const envs = [
     desc: "The root administrator's secret. Override it before exposing a node.",
   },
   {
-    name: "CAIRN_LISTEN_ADDR",
+    name: "CAIRN_API_ADDR",
     def: "0.0.0.0:7373",
-    desc: "Where the S3 API binds — it also serves /healthz, /readyz, /metrics and the AWS-STS mint.",
+    desc: "S3 and native administration at /api/v1, plus health, readiness, metrics, STS and API share links.",
   },
   {
-    name: "CAIRN_WEB_ADDR",
+    name: "CAIRN_CONSOLE_ADDR",
     def: "0.0.0.0:7374",
-    desc: "Where the web console and management API bind. Set to off / none / disabled to run headless.",
+    desc: "The console, browser sessions and forced-download share links. Set to off / none / disabled for API-only operation; native administration stays available.",
   },
   {
     name: "CAIRN_DATA_DIR",
-    def: "/data",
-    desc: "Root of the object (blob) storage. Must share a filesystem with the metadata database.",
+    def: "./data",
+    desc: "Root of object storage; /data in the container. Must share a filesystem with the metadata database.",
   },
   {
     name: "CAIRN_DB_PATH",
-    def: "/data/cairn.db",
-    desc: "The SQLite metadata file — the single source of truth. Back it up together with the data directory.",
+    def: "./data/cairn.db",
+    desc: "The SQLite metadata file; /data/cairn.db in the container. Use the offline backup procedure for metadata and object data together.",
   },
   {
     name: "CAIRN_REGION",
@@ -114,14 +119,24 @@ const envs = [
     desc: "Base domain for virtual-host-style addressing (bucket.domain); unset serves path-style only.",
   },
   {
-    name: "CAIRN_PUBLIC_BASE_URL",
+    name: "CAIRN_API_PUBLIC_URL",
     def: "unset",
-    desc: "External base URL used when generating links behind an ingress or reverse proxy.",
+    desc: "External API origin for S3 presigned URLs and API share links. Must differ from the console origin.",
+  },
+  {
+    name: "CAIRN_CONSOLE_PUBLIC_URL",
+    def: "unset",
+    desc: "External console origin for download shares. Set both public origins behind a reverse proxy; this does not enable a disabled console.",
+  },
+  {
+    name: "CAIRN_TRUSTED_PROXIES",
+    def: "unset",
+    desc: "Exact proxy IPs or CIDRs allowed to supply forwarding headers. Required when a proxy terminates HTTPS for console sessions.",
   },
   {
     name: "CAIRN_META_SYNCHRONOUS",
     def: "full",
-    desc: "full survives power loss; normal is ~1.7× faster on writes but may lose the last few acknowledged writes on power loss. Neither ever corrupts.",
+    desc: "full makes acknowledged writes durable across power loss. normal reduces synchronization but may lose recent acknowledged writes after power loss.",
   },
   {
     name: "CAIRN_ALLOW_INSECURE",
@@ -137,7 +152,7 @@ const features = [
   },
   {
     h: "Web console",
-    p: "Manage buckets and users on its own port. Browse, upload, download, and share objects. Mint access keys scoped by a policy. Watch storage, compression, and replication status. Jump anywhere with a command palette, and see when a newer release is available.",
+    p: "Manage buckets and users on its own port. Browse, upload, preview, and share objects. Public download links can use the console while the API stays private; uploads and inline previews need the separate API origin. Disabling the console leaves native administration available through the API and CLI.",
   },
   {
     h: "Access control",
@@ -157,27 +172,17 @@ const features = [
   },
   {
     h: "Operations",
-    p: "Prometheus metrics, liveness and readiness endpoints, and structured logs. Asynchronous bucket replication to another node or S3 endpoint. Webhook event notifications. One-shot streaming import from another S3-compatible store — MinIO, Garage, R2, AWS, or another Cairn. A CLI for bootstrap, config validation, integrity checks, and backup and restore.",
+    p: "Prometheus metrics, liveness and readiness endpoints, structured logs, and a built-in Docker health check. Asynchronous bucket replication, webhooks, and streaming import from MinIO, Garage, R2, AWS or another Cairn. Native administration and S3 share one API endpoint; the CLI also handles offline backup, restore and storage baselines.",
   },
 ];
 
-const bench = [
-  ["PUT", "4 KiB", "1696 obj/s", "1308 obj/s", "Cairn 1.30×", "cairn"],
-  ["PUT", "8 MiB", "115 MiB/s", "128 MiB/s", "MinIO 1.12×", "minio"],
-  ["GET", "4 KiB", "3431 obj/s", "1815 obj/s", "Cairn 1.89×", "cairn"],
-  ["GET", "8 MiB", "1463 MiB/s", "801 MiB/s", "Cairn 1.83×", "cairn"],
-  ["STAT", "4 KiB", "3494 obj/s", "1824 obj/s", "Cairn 1.92×", "cairn"],
-  ["DELETE", "4 KiB", "7442 obj/s", "5236 obj/s", "Cairn 1.42×", "cairn"],
-  ["LIST", "4 KiB", "21183 obj/s", "10288 obj/s", "Cairn 2.06×", "cairn"],
-  ["MIXED", "1 MiB", "285 MiB/s", "271 MiB/s", "Cairn 1.05×", "cairn"],
-];
 ---
 
 <Base>
   {/* 1 — Hero */}
   <section class="hero wrap">
     <h1>
-      Self-hosted, S3-compatible<br /> object storage.<span class="caret" aria-hidden="true"></span>
+      Self-hosted, S3-compatible<br /> object storage.
     </h1>
     <p class="lead">
       Cairn speaks the S3 API, stores objects as plain files on a normal filesystem, and keeps all
@@ -203,15 +208,15 @@ const bench = [
       <div>
         <dt>Plain files on disk</dt>
         <dd>
-          Object data is ordinary files on whatever filesystem you choose — nothing proprietary to
-          unpack if you ever walk away.
+          Object data lives in ordinary filesystem files. Compression and encryption are handled by
+          Cairn; use S3 or the CLI to export the original object bytes.
         </dd>
       </div>
       <div>
         <dt>Embedded SQLite metadata</dt>
         <dd>
-          All metadata in one database file, the single commit point for every write. Back it up,
-          copy it, reason about it.
+          All metadata in one database file, with a single commit point for visible writes. Back up
+          metadata and object data together using the offline backup command.
         </dd>
       </div>
       <div>
@@ -245,45 +250,18 @@ const bench = [
   <Screenshots />
 
   {/* 6 — Performance */}
-  <Section eyebrow="Performance" title="Measured against MinIO">
+  <Section eyebrow="Performance" title="Measure the workload you run">
     <p>
-      A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, both single-node
-      and single-drive over plaintext HTTP, using MinIO&apos;s own <code>warp</code> benchmark. Each
-      figure is the median of three runs. Absolute numbers depend on the host; the ratio is what to
-      read.
+      Cairn's benchmark suite covers small-object rates, large-object bandwidth, metadata queries,
+      and sustained replication. A repeatable MinIO <code>warp</code> comparison runs both servers
+      on the same host with the same workload. Results depend on the hardware, build, object sizes,
+      encryption, compression, and durability settings.
     </p>
-
-    <div class="table-scroll">
-      <table class="bench">
-        <thead>
-          <tr>
-            <th scope="col">Op</th>
-            <th scope="col">Size</th>
-            <th scope="col" class="num">Cairn</th>
-            <th scope="col" class="num">MinIO</th>
-            <th scope="col">Ratio</th>
-          </tr>
-        </thead>
-        <tbody>
-          {
-            bench.map(([op, size, cairn, minio, ratio, win]) => (
-              <tr>
-                <td class="mono">{op}</td>
-                <td class="mono">{size}</td>
-                <td class={`num mono ${win === "cairn" ? "win" : ""}`}>{cairn}</td>
-                <td class={`num mono ${win === "minio" ? "win" : ""}`}>{minio}</td>
-                <td class="mono ratio">{ratio}</td>
-              </tr>
-            ))
-          }
-        </tbody>
-      </table>
-    </div>
-
     <p>
-      Serving the same workload, Cairn peaked at <strong class="mono">106 MB</strong> of memory to
-      MinIO&apos;s <span class="mono">1072 MB</span> — about a tenth — at
-      <span class="mono">76%</span> mean CPU versus <span class="mono">88%</span>.
+      The <a class="link" href={`${docs}/benchmarks.md`}>benchmark record</a> includes measurements,
+      limitations, and reproduction commands. The <a class="link" href={`${docs}/scaling-limits.md`}>
+      scaling guide</a> explains the single-node and single-writer limits to consider when sizing a
+      deployment.
     </p>
   </Section>
 
@@ -327,8 +305,8 @@ const bench = [
     <ul class="scope">
       <li>
         Cross-host redundancy comes from <strong>asynchronous bucket replication</strong> — eventually
-        consistent, with observable lag — not from clustering. There is no consensus, sharding, or
-        erasure coding.
+        consistent, with observable lag — not from clustering. There is no consensus, cross-host
+        sharding, or erasure coding.
       </li>
       <li>
         <strong>Drive redundancy is left to the storage underneath</strong>: ZFS, RAID, or a
@@ -350,29 +328,43 @@ const bench = [
   {/* 8 — Get started / deploy */}
   <Section eyebrow="Get started" title="Deploy Cairn" id="get-started">
     <p>
-      One command sets Cairn up on a host or with Docker, and updates an existing install when you run
-      it again. The installer asks which you want, or take <code>--host</code> or
-      <code>--docker --yes</code> to skip the prompt; <code>--uninstall</code> removes it and keeps
-      your data.
+      Requires Linux 5.6+ with <code>openat2</code> support and durable file and directory
+      synchronization. Docker uses the host's kernel. The installer sets up a host service or Docker,
+      generates credentials and a master key, and updates an existing install when run again.
+      It keeps both ports on loopback unless you explicitly expose them.
     </p>
     <CodeBlock code={install} />
 
     <h3 class="deploy__h">Run the container directly</h3>
     <p>
-      The image ships a nonroot <code>/data</code> and defaults to <code>serve</code>. The only
-      variable you need to set is the master key.
+      Create <code>cairn.env</code> once to save a master key and administrator credentials. This
+      command refuses to overwrite an existing file. Reuse the same file whenever you recreate the
+      container with its data volume, and keep it out of version control.
+    </p>
+    <CodeBlock code={envFile} />
+    <p>
+      The image runs as nonroot, stores data in <code>/data</code>, and includes a readiness health
+      check. Start it with the saved environment file:
     </p>
     <CodeBlock code={dockerRun} />
 
     <h3 class="deploy__h">Or with Docker Compose</h3>
     <p>
-      Copy this, set a real <code>CAIRN_MASTER_KEY</code>, and run <code>docker compose up -d</code>.
-      The optional variables are commented with their defaults — uncomment what you need.
+      Use the same <code>cairn.env</code> alongside this file and run <code>docker compose up -d</code>.
+      Optional overrides are commented; certificate paths also need corresponding volume mounts.
     </p>
     <CodeBlock label="docker-compose.yml" code={compose} />
     <p class="note">
-      The S3 API is then on <code>:7373</code> and the web console on <code>:7374</code>. Default login
-      is <code>cairn</code> / <code>cairnadmin</code> — override it before exposing a node.
+      Open <code>http://localhost:7374</code> and sign in with access key <code>cairn</code> and the
+      secret saved in <code>cairn.env</code>. S3 and native administration use
+      <code>http://localhost:7373</code>. These examples publish both ports on loopback.
+    </p>
+    <p class="note">
+      For remote access, configure TLS and distinct API and console origins using the
+      <a class="link" href={`${docs}/operations.md#api-and-console-ingress`}>ingress guide</a>.
+      Restrict <code>/api/v1</code> at the API ingress if S3 is public but administration is private.
+      Existing installations should follow the
+      <a class="link" href={`${docs}/upgrade-rollback.md`}>upgrade and rollback guide</a> before updating.
     </p>
   </Section>
 
@@ -381,8 +373,9 @@ const bench = [
     <p>
       Cairn is configured entirely by <code>CAIRN_*</code> environment variables — no config file, no
       server flags — so a deployment is reproducible whether it runs on a host or in a container.
-      Every variable has a default and an invalid one fails fast at startup with a clear message. The
-      one you should set for a real node is <code>CAIRN_MASTER_KEY</code>; the rest are optional.
+      Invalid values and unknown names fail fast at startup. Set a persistent
+      <code>CAIRN_MASTER_KEY</code> and a non-default <code>CAIRN_ROOT_SECRET_KEY</code> for a real
+      node. <code>cairn validate-config</code> checks the environment before starting the server.
     </p>
     <div class="table-scroll">
       <table class="envtable">
@@ -407,9 +400,15 @@ const bench = [
       </table>
     </div>
     <p class="note">
-      That&apos;s the common set. There are roughly fifty knobs in all — replication, lifecycle,
-      webhooks, KMS allow-listing, metadata sharding, runtime and durability tuning. See the full{" "}
+      That&apos;s the common set. Replication, lifecycle, webhooks, KMS allow-listing, metadata
+      sharding, runtime and durability tuning are covered in the full{" "}
       <a class="link" href={`${docs}/configuration.md`}><code>CAIRN_*</code> reference</a>.
+    </p>
+    <p class="note">
+      Upgrading an earlier installation? Retired listener and public-URL names are rejected. Follow
+      the <a class="link" href={`${docs}/upgrade-rollback.md#api-and-console-configuration-migration`}>
+      configuration migration</a>. The Cairn CLI uses <code>--api-endpoint</code> or
+      <code>CAIRN_API_ENDPOINT</code> for both administration and S3 operations.
     </p>
   </Section>
 
@@ -417,15 +416,15 @@ const bench = [
   <Section eyebrow="Usage" title="Use it with the AWS CLI">
     <p>
       Because Cairn speaks the S3 API, the <code>aws</code> CLI and the AWS SDKs work against it
-      unmodified — you just point them at the endpoint. Configure a profile once (the default
-      credentials shown; use your own in production):
+      unmodified — you just point them at the endpoint. Configure a named profile with the access
+      key and secret from your installer or <code>cairn.env</code>, and region <code>us-east-1</code>:
     </p>
     <CodeBlock code={awsConfig} />
-    <p>Then every S3 command works as usual:</p>
+    <p>Use that profile for bucket and object commands:</p>
     <CodeBlock code={awsUse} />
     <p class="note">
-      Everything the SDKs expect is here — multipart for large objects, byte-range reads, versioning,
-      tagging, and presigned URLs. See the <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API
+      Multipart uploads, byte-range reads, versioning, tagging, and presigned URLs are supported.
+      See the <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API
       support matrix</a> for the exact surface.
     </p>
   </Section>
@@ -436,16 +435,22 @@ const bench = [
       Cairn is calendar-versioned. A release is tagged <code>vYYYY.MM.DD</code>, and exactly one
       release is ever active: cutting one publishes today&apos;s tag, attaches the static
       <code>linux/amd64</code> and <code>linux/arm64</code> binaries with a <code>SHA256SUMS</code>
-      manifest, pushes the multi-arch container image as <code>:latest</code>, and retires every prior
-      release and tag. A release is a deliberate, manual act, gated on a green CI run for the exact
-      commit it ships.
+      manifest, promotes the signed multi-arch image to its version tag and <code>:latest</code>, and
+      retires strictly older calendar-versioned releases and tags. A release is a deliberate, manual
+      act, gated on a green CI run for the exact commit it ships.
+    </p>
+    <p>
+      Binaries and checksums have keyless signatures; the binaries and container image carry build
+      provenance. Every release includes an SPDX software bill of materials and an immutable image
+      digest. See <a class="link" href={`${repo}/blob/main/SECURITY.md#verifying-release-artifacts`}>
+      artifact verification</a> before deploying.
     </p>
     <p>
       Why keep only one active version? Cairn is single-node, self-hosted infrastructure — not a
       library other code compiles against — so there is no dependency graph pinning old versions and
       no back-catalogue of stale binaries to pick the wrong one from. One line moves forward: the
       latest release is the supported release. The version is baked into the binary and reported by
-      <code>cairn --version</code> and the console footer, and always equals the tag it shipped in; a
+      <code>cairn --version</code> and the console's node details, and always equals the tag it shipped in; a
       local build reports a <code>-dev</code> string so it is never mistaken for a release. Each node
       checks for a newer version hourly and surfaces a hint in the console — best-effort, and off if
       you set <code>CAIRN_UPDATE_CHECK_ENABLED=false</code>.
@@ -482,25 +487,6 @@ const bench = [
     line-height: 1.08;
     letter-spacing: -0.03em;
     margin-bottom: var(--space-4);
-  }
-  .caret {
-    display: inline-block;
-    width: 0.55ch;
-    height: 1.05em;
-    margin-left: 0.15ch;
-    translate: 0 0.14em;
-    background: var(--fg);
-    animation: blink 1.05s steps(1) infinite;
-  }
-  @keyframes blink {
-    50% {
-      opacity: 0;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .caret {
-      animation: none;
-    }
   }
   .lead {
     font-size: var(--step-1);
@@ -549,7 +535,7 @@ const bench = [
     gap: var(--space-5);
   }
 
-  /* benchmark table */
+  /* horizontally contained configuration table */
   .table-scroll {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -557,48 +543,6 @@ const bench = [
     border: 1px solid var(--hairline);
     border-radius: var(--radius);
   }
-  table.bench {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.9rem;
-    min-width: 30rem;
-  }
-  .bench th,
-  .bench td {
-    padding: 0.5rem 0.85rem;
-    text-align: left;
-    border-bottom: 1px solid var(--hairline);
-    white-space: nowrap;
-  }
-  .bench thead th {
-    font-size: var(--step--1);
-    font-weight: 500;
-    color: var(--fg-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    background: var(--bg-subtle);
-  }
-  .bench tbody tr:last-child td {
-    border-bottom: 0;
-  }
-  .bench .num {
-    text-align: right;
-  }
-  .bench .win {
-    color: var(--fg);
-    font-weight: 500;
-  }
-  .bench td:not(.win).num {
-    color: var(--fg-muted);
-  }
-  .bench .ratio {
-    /* The copy says "the ratio is what to read", so it earns --fg-muted (7.7:1),
-       not --fg-faint which the token system reserves for non-essential metadata.
-       The bolded winning throughput (.win) still outranks it. */
-    color: var(--fg-muted);
-    font-size: 0.85rem;
-  }
-
   .scope {
     margin-top: var(--space-3);
   }

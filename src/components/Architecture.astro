@@ -7,28 +7,28 @@ import Section from "./Section.astro";
 const layers = [
   {
     tier: "Clients",
-    nodes: ["S3 SDKs", "aws CLI", "Console", "presigned URLs"],
-    desc: "Any unmodified S3 client. Requests are signed with SigV4 or carry a Bearer token; the console drives the same API over its session.",
+    nodes: ["S3 SDKs", "aws CLI", "Cairn CLI", "Console", "share links"],
+    desc: "S3 and native administration use SigV4 or Bearer credentials. The console uses a browser session for management and signed API URLs for object transfers.",
   },
   {
     tier: "Listeners",
-    nodes: [":7373 — S3 data plane", ":7374 — console + /api/v1", "/healthz · /readyz · /metrics", "AWS-STS"],
-    desc: "Two ports, one process. Health, metrics and the STS mint answer on :7373 ahead of the concurrency limiter.",
+    nodes: [":7373 — S3 + /api/v1", ":7374 — optional console", "/healthz · /readyz · /metrics", "AWS-STS"],
+    desc: "One API listener and an optional console listener. Both expose the same administrator-gated management handlers. Sessions and public download shares use the console; health, metrics and STS use the API port.",
   },
   {
     tier: "Request pipeline",
     nodes: ["authenticate", "authorize — policy · ACL · BPA · ownership", "S3 handler + lifecycle", "chunked decoder", "SSE seal / open"],
-    desc: "Each request is authenticated, then run through a real policy-evaluation engine, then handled. Bodies stream; server-side encryption seals on write and opens on read, and fails closed.",
+    desc: "S3 requests pass through policy, ACL and ownership checks; native administration requires an administrator. Bodies stream, and server-side encryption seals on write and opens on read, failing closed.",
   },
   {
     tier: "Metadata",
     nodes: ["Writer — group-commit", "WAL read pool", "read-through cache", "SQLite (WAL)"],
-    desc: "All writes funnel through one group-committing writer — the single linearization point. Reads come off a WAL connection pool; a bounded cache fronts both.",
+    desc: "Metadata mutations go through one group-committing writer. Object publication commits here after the bytes are durable. Reads use a WAL connection pool and a bounded read-through cache.",
   },
   {
     tier: "Object bytes",
     nodes: ["BlobStore", "plain files (POSIX)", "block compression", "reconciliation"],
-    desc: "Object data is ordinary files on the filesystem. Writes stage, fsync, and rename into place; a bounded reconciliation reclaims orphaned blobs on restart.",
+    desc: "Every physical write requires durable Writer admission before staging, fsync and rename. Exact cleanup claims reclaim superseded or orphaned paths; full startup reconciliation remains mandatory.",
   },
   {
     tier: "Background",
@@ -52,7 +52,7 @@ const steps = [
 
 <Section eyebrow="Architecture" title="How it works">
   <p>
-    Cairn is one process with two listeners and two durable stores — no clustering layer, no external
+    Cairn is one process with an API listener, an optional console, and two durable stores — no clustering layer, no external
     database, no separate storage daemon. A request flows straight down the stack: authenticated,
     authorized, and handled, then committed. Reads come off a WAL pool; every write goes through a
     single group-committing writer, so the database has exactly one linearization point. Each store
@@ -83,9 +83,9 @@ const steps = [
 
   <p class="arch__lead">
     Durability is an ordered contract. Object bytes are staged and fsynced <em>before</em> the
-    metadata transaction that references them, and that commit is the single point where a write
-    becomes real — so an acknowledged write has already survived power loss. On restart, Cairn
-    reconciles and reclaims anything a crash left behind.
+    metadata transaction that publishes them. With the default fully synchronous metadata setting,
+    an acknowledged write is durable across power loss. On restart, Cairn reconciles unfinished
+    storage work and reclaims orphaned paths.
   </p>
 
   <div class="writepath" role="list" aria-label="Durable write path, in order">
@@ -106,8 +106,9 @@ const steps = [
     }
   </div>
   <p class="writepath__note">
-    The metadata commit (step 6) is the linearization point: nothing before it is acknowledged, and
-    nothing after it can lose the object.
+    Durable Writer admission precedes step 1. The publication commit (step 6) makes the object
+    visible; subsequent cleanup is retried independently. Protect against disk or host failure with
+    appropriate underlying storage, backups and replication.
   </p>
 </Section>
 

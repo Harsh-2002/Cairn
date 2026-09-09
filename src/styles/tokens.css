@@ -1,6 +1,6 @@
 /* ============================================================================
    Cairn landing page — design system.
-   Typography-only, strictly monochrome, light/dark. No color accent, no images.
+   Typography-led, strictly monochrome, light/dark, with a console screenshot gallery.
    Hierarchy is built from size -> weight -> tracking/case -> whitespace, plus a
    monospace "second voice" for identifiers, endpoints, versions, and commands.
    ============================================================================ */
@@ -277,7 +277,7 @@ hr {
 }
 
 /* Content is visible by default — never gated on a JS scroll-reveal (that ships blank to crawlers,
-   headless renderers, and reduced-motion). The page's life comes from the caret, link underlines,
+   headless renderers, and reduced-motion). The page's life comes from link underlines,
    and invert-on-hover, not from hiding-then-revealing sections. */
 
 /* Global reduced-motion safety net. */

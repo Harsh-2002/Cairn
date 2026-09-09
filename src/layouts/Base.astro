@@ -54,7 +54,7 @@ const jsonLd = {
     <meta name="twitter:card" content="summary" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
-    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
+    <script is:inline type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
 
     {/* Blocking, pre-paint: stamp the theme on <html> before the first paint so there is no
         flash of the wrong theme. Reads the saved choice, else the OS preference. is:inline keeps
