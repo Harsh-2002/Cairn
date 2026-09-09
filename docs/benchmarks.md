@@ -481,7 +481,10 @@ loop and is **not** planned.
 > `aarch64-unknown-linux-musl` (a `cmsghdr`/`msghdr` struct-layout mismatch), so build the fast-io
 > path for `aarch64-unknown-linux-gnu` (or x86_64). The shipped release binaries are default-features
 > (no `fast-io`), so this does not affect releases. On a kernel where the kTLS ULP probe fails (seen on
-> kernel 7.0), TLS connections fall back to userspace rustls — the designed graceful degradation.
+> kernel 7.0), TLS connections use userspace rustls. A per-connection offload failure after a
+> successful probe closes that connection; it cannot safely resume the consumed rustls stream.
+> kTLS record encryption is implemented, but it does not make this plaintext sendfile benchmark
+> a measurement of zero-copy HTTPS.
 
 ### How to run
 
@@ -507,7 +510,7 @@ BIN=/tmp/cairn-fastio BASELINE_BIN=/tmp/cairn-base OBJ_SIZE=64MiB DURATION=30s \
 - A trustworthy absolute number needs real hardware; on a small/shared box the **A/B ratio** and the
   engage rate are the durable signals. The CPU window brackets only the GET phase (objects are
   pre-staged outside it), so PUT/compression cost does not contaminate the read measurement.
-- This path is **plaintext only**; zero-copy over HTTPS needs the (not-yet-built) kTLS takeover, so
+- This path is **plaintext only**; zero-copy over HTTPS needs the unimplemented sendfile-to-kTLS integration, so
   benchmark over `http://`, not `https://`.
 
 ## Maintained visible counts: bounded query comparison (2026-09-08)

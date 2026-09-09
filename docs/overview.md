@@ -207,7 +207,7 @@ This is the bridge from the baseline to the production system. Each finding stat
 
 **F-13 [MED] Async file I/O is not free in Rust.** Stable Tokio file I/O runs on a blocking pool. **Cairn:** isolate and bound that pool, stream with backpressure, and offer io_uring for the data plane (Section 7).
 
-**F-14 [MED -> elevated] Zero-copy reads are not free in Rust, and for production they matter.** The earlier draft accepted a userspace copy because it assumed a proxy and a LAN. For a production MinIO replacement that may serve TLS itself and large objects at high rate, the read path should be able to avoid the copy. **Cairn:** a zero-copy read fast path using sendfile or splice, and awareness of kernel-TLS so that even TLS-terminated reads can stay zero-copy where the platform supports it, with a portable buffered streaming path as the default (Section 7, Section 21).
+**F-14 [MED -> elevated] Zero-copy reads are not free in Rust, and for production they matter.** The earlier draft accepted a userspace copy because it assumed a proxy and a LAN. For a production MinIO replacement that may serve TLS itself and large objects at high rate, the read path should be able to avoid the copy. **Cairn:** an optional plaintext sendfile path and separate kTLS record-encryption offload, with buffered streaming as the default. Zero-copy HTTPS reads remain unimplemented (Section 7, Section 21).
 
 ### 5.5 Security
 

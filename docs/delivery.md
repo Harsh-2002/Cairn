@@ -145,17 +145,10 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 
 **Phase 14, conformance, benchmarks, and documentation.** The cross-client conformance suite and the community conformance suite green for the supported surface in continuous integration, the benchmarks with published numbers and the characterised write ceiling, and the operator documentation derived from the configuration and operations sections. Accepts when the clients and the suite pass in continuous integration, the benchmark numbers are recorded, and backup and restore including the repair mode are exercised end to end. This phase is the production release gate.
 
-**Phase 15, remaining work and implemented extensions.** External KMS integration with distinct
-per-key material, lifecycle transition to a remote cold tier with an explicit restore workflow,
-kernel-TLS zero-copy reads, and the protective version-deletion control remain future work.
-Their API, configuration and compatibility requirements must be specified before implementation;
-the trait boundaries do not establish that the protocol and control layers need no changes.
-The optional io_uring blob backend and plaintext sendfile path are implemented, experimental and
-disabled by default; kernel-TLS takeover is not implemented (ARCH 7.6). Transparent at-rest
-encryption (CAIRN_ENCRYPT_AT_REST), the label-only aws:kms surface with part-level multipart
-encryption, and composite multipart checksums have shipped (ARCH 27). Release signing, SPDX SBOM
-generation and SLSA build-provenance attestations are implemented in the release workflow
-(Section 31.6), not pending roadmap items.
+**Phase 15, remaining work.** External KMS integration with distinct per-key material,
+lifecycle transition to a remote cold tier with an explicit restore workflow, zero-copy HTTPS
+reads using sendfile over kTLS, and the protective version-deletion control remain future work.
+Their API, configuration and compatibility requirements must be specified before implementation.
 
 ---
 
@@ -164,10 +157,10 @@ generation and SLSA build-provenance attestations are implemented in the release
 
 | Decision | Summary | Drivers |
 |---|---|---|
-| Runtime | A multi-threaded asynchronous runtime in the initial scope, with the blob path able to escalate to io_uring behind the blob interface. | Portability and ecosystem now; the fastest disk path available later without protocol changes. |
+| Runtime | Tokio by default, with an optional experimental io_uring staging-write backend. | Keep the established default; evaluate the alternative against workload-specific measurements. |
 | Metadata concurrency | One serialized, group-committing writer task plus a pool of read-only WAL connections. | Matches SQLite's real model, eliminates write contention, scales reads, and raises small-write throughput via batching. |
 | Durability sequence | Stage, fsync the file, rename, fsync the directory, validate, commit metadata, then reclaim. | Crash consistency; a committed row never references a non-durable blob, fixing the reference design's missing directory fsync. |
-| Read path | Buffered streaming by default; experimental plaintext file-to-socket fast path behind a feature. Kernel-TLS takeover is deferred. | Production read performance for large objects while keeping a portable default and isolating platform-specific unsafe code. |
+| Read path | Buffered streaming by default; experimental plaintext sendfile and kTLS record encryption behind a feature. Zero-copy HTTPS is deferred. | Production read performance for large objects while keeping a portable default and isolating platform-specific unsafe code. |
 | Storage model | Preserve the reference model: opaque-identifier blobs, metadata as source of truth, temp-then-rename, reconciliation, signed public reads. | The model is correct and is what makes versioning and the rest accrete in metadata rather than on disk. |
 | Abstraction boundary | Blob store, metadata store, authenticator, authorization engine, replication sink, and supporting interfaces as the spine. | Unit-testability with in-memory doubles and swappable backends, including the cold tier and a future metadata engine. |
 | Metadata engine | The mature C SQLite compiled in for the initial scope, behind the metadata interface so a pure-Rust SQLite can replace it later. | Maturity and full SQL today; honours the preference for a Rust-native engine without blocking on its readiness. |
