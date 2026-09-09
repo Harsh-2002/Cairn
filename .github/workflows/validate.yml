@@ -1,0 +1,1192 @@
+name: Validation
+on:
+  workflow_call:
+    inputs:
+      revision:
+        required: true
+        type: string
+      profile:
+        required: true
+        type: string
+      base:
+        required: false
+        type: string
+        default: ''
+    outputs:
+      results:
+        description: Checked job results
+        value: ${{ jobs.validation-result.outputs.results }}
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+jobs:
+  policy:
+    name: workflow policy
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - run: python3 tests/release_policy.py
+    - run: python3 -m unittest discover -s tests -p test_ci.py -v
+    - run: shellcheck -s bash .github/scripts/ci-jobs.sh
+    - run: bash .github/scripts/ci-jobs.sh actionlint
+  docs:
+    name: documentation
+    runs-on: ubuntu-24.04
+    needs:
+    - policy
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+        fetch-depth: 0
+    - run: python3 .github/scripts/docs_check.py
+      env:
+        BASE_REVISION: ${{ inputs.base }}
+  web-bundle:
+    name: shared console bundle
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - policy
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+    - run: npm ci --prefix web
+    - run: npm run lint --prefix web
+    - run: npm run test:performance --prefix web
+    - run: npm audit --prefix web --omit=dev --audit-level=moderate
+    - run: npm audit --prefix web --audit-level=high
+    - run: npm run build --prefix web
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: web-dist
+        path: web/dist
+        retention-days: 1
+        if-no-files-found: error
+  storage-lab:
+    name: storage laboratory safety and driver regressions
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        build-web: 'false'
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - name: Test laboratory accounting and actual layer fixtures
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" storage-lab
+    if: ${{ inputs.profile == 'full' }}
+  build:
+    name: build cairn (shared binary)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - run: cargo build --bin cairn
+    - run: strip target/debug/cairn
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: cairn-bin
+        path: target/debug/cairn
+        retention-days: 1
+        if-no-files-found: error
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  rust-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Install pinned cargo-audit
+      env:
+        AUDIT_URL: https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+        AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-1
+    - run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-2
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - policy
+  installer:
+    name: installer lint + generation regressions
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - run: shellcheck -s sh install.sh tests/install.sh
+    - run: sh tests/install.sh
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - policy
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        components: rustfmt, clippy
+        web-artifact: web-dist
+    - run: cargo fmt --all --check
+    - run: cargo clippy --workspace --all-targets -- -D warnings
+    - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+        - x86_64-unknown-linux-gnu
+        - x86_64-unknown-linux-musl
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Install musl tools
+      if: endsWith(matrix.target, 'musl')
+      run: sudo apt-get update && sudo apt-get install -y musl-tools=1.2.4-2
+    - uses: ./.github/actions/setup
+      with:
+        targets: ${{ matrix.target }}
+        web-artifact: web-dist
+    - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+      with:
+        tool: cargo-nextest@0.9.140
+        checksum: true
+        fallback: none
+    - name: Test
+      env:
+        TARGET: ${{ matrix.target }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" workspace-tests
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  test-all-features:
+    name: test (all features)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      with:
+        tool-cache: false
+        large-packages: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+      with:
+        tool: cargo-nextest@0.9.140
+        checksum: true
+        fallback: none
+    - run: cargo nextest run --workspace --all-features
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  conformance:
+    name: boto3 conformance
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
+      run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+    if: ${{ inputs.profile == 'full' }}
+  routing:
+    name: routing fall-through guard
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: An unparseable bucket/key must never re-route to the bucket or root handler
+      run: BIN=target/debug/cairn PY=python3 bash conformance/routing.sh
+    if: ${{ inputs.profile == 'full' }}
+  listing:
+    name: listing / pagination / versioning semantics
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Delimiter/CommonPrefixes, real token-fed pagination loops, delete markers + undelete
+      run: BIN=target/debug/cairn PY=python3 bash conformance/listing.sh
+    if: ${{ inputs.profile == 'full' }}
+  multipart:
+    name: multipart session-state error codes
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: "Low-level create/upload-part/complete \u2014 exact NoSuchUpload/InvalidPart/InvalidPartOrder/EntityTooSmall, and a terminating ListMultipartUploads loop"
+      run: BIN=target/debug/cairn PY=python3 bash conformance/multipart.sh
+    if: ${{ inputs.profile == 'full' }}
+  objects:
+    name: object payload / headers / range
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: System headers + aws-chunked normalization, copy directives, exact 206/416 ranges, encoded keys, DeleteObjects
+      run: BIN=target/debug/cairn PY=python3 bash conformance/objects.sh
+    if: ${{ inputs.profile == 'full' }}
+  buckets:
+    name: bucket surface + config subresources
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Name validation, DeleteBucket 204/409/404, every subresource PUT->GET->DELETE (bucket survives), real CORS preflight
+      run: BIN=target/debug/cairn PY=python3 bash conformance/buckets.sh
+    if: ${{ inputs.profile == 'full' }}
+  authz:
+    name: tenant isolation + SigV4 / presigned / anonymous auth
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Cross-tenant AccessDenied (before NoSuchKey), SigV4 failure modes, presigned expiry, Block Public Access
+      run: BIN=target/debug/cairn PY=python3 bash conformance/authz.sh
+    if: ${{ inputs.profile == 'full' }}
+  lifecycle:
+    name: lifecycle scanner enforcement
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: "Prove the scanner ACTS \u2014 expires only matching keys, stays in its bucket, ignores Disabled, delete-marker on versioned"
+      run: BIN=target/debug/cairn PY=python3 bash conformance/lifecycle.sh
+    if: ${{ inputs.profile == 'full' }}
+  checksums:
+    name: modern-SDK flexible checksums
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Assert checksums are computed, stored, and echoed on PUT/GET/HEAD (ARCH 21.1)
+      run: BIN=target/debug/cairn PY=python3 bash conformance/checksums.sh
+    if: ${{ inputs.profile == 'full' }}
+  encryption:
+    name: real-SDK SSE object-body conformance
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Assert SSE-S3/aws:kms/at-rest/mandatory/multipart wire contract + on-disk ciphertext + fail-closed (ARCH 27)
+      run: BIN=target/debug/cairn PY=python3 bash conformance/encryption.sh
+    if: ${{ inputs.profile == 'full' }}
+  scrub:
+    name: integrity scrub (bit-rot detection)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Corrupt a blob (plaintext / at-rest / SSE-S3 / compressed); assert the scrub detects each
+      run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
+    if: ${{ inputs.profile == 'full' }}
+  object-lock:
+    name: object lock / WORM
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: COMPLIANCE/GOVERNANCE retention + legal hold enforced via the AWS SDK
+      run: BIN=target/debug/cairn PY=python3 bash conformance/object_lock.sh
+    if: ${{ inputs.profile == 'full' }}
+  notifications:
+    name: webhook event notifications
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Event-notification delivery + HMAC signing (management web console listener on)
+      run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
+    if: ${{ inputs.profile == 'full' }}
+  sts:
+    name: STS temporary credentials
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Mint + enforce scoped session credentials over a real SDK (management web console listener on)
+      run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
+    if: ${{ inputs.profile == 'full' }}
+  sts-xml:
+    name: STS XML wire surface (AssumeRole + GetSessionToken)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: A real SDK STS client mints + consumes creds via the AWS-STS XML form POST
+      run: BIN=target/debug/cairn PY=python3 bash conformance/sts_xml.sh
+    if: ${{ inputs.profile == 'full' }}
+  console-session:
+    name: console session-cookie auth
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: Disjoint listeners + httpOnly cookie + origin-bound console S3 transfer
+      run: BIN=target/debug/cairn bash conformance/console_session.sh
+    if: ${{ inputs.profile == 'full' }}
+  error-pages:
+    name: browser error-page negotiation (ARCH 25.1.1)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: HTML for browsers, byte-identical XML for every machine client
+      run: BIN=target/debug/cairn bash conformance/error_pages.sh
+    if: ${{ inputs.profile == 'full' }}
+  backup-restore:
+    name: backup / restore / integrity e2e
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: Snapshot fidelity + durable metadata and encrypted multipart recovery
+      run: BIN=target/debug/cairn bash conformance/backup_restore.sh
+    - name: Fault proxy opaque-body and response-header regressions
+      run: python3 conformance/test_recovery_remote.py
+    - name: Remote multipart response loss, durable cleanup and offline restore
+      run: BIN=target/debug/cairn python3 conformance/recovery_remote.py --cleanup-lease
+    if: ${{ inputs.profile == 'full' }}
+  fast-io-conformance:
+    name: fast-io sendfile conformance + keep-alive engagement
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - run: cargo build --bin cairn --features fast-io
+    - name: Full boto3 lifecycle through the sendfile fast path
+      run: CAIRN_FASTIO_MIN_BYTES=0 BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+    - name: Sendfile keep-alive engagement
+      run: BIN=target/debug/cairn bash conformance/sendfile_keepalive.sh
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  mesh:
+    name: 5-node full-mesh replication
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: Full-mesh convergence + integrity across five nodes
+      run: BIN=target/debug/cairn PY=python3 bash conformance/mesh.sh
+    if: ${{ inputs.profile == 'full' }}
+  rotation:
+    name: master-key rotation e2e (#29)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
+      run: BIN=target/debug/cairn PY=python3 bash conformance/rotation.sh
+    if: ${{ inputs.profile == 'full' }}
+  share:
+    name: object sharing e2e
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: Persistent share tokens + SigV4 presigned URLs, end to end
+      run: BIN=target/debug/cairn bash conformance/share.sh
+    if: ${{ inputs.profile == 'full' }}
+  concurrency:
+    name: concurrency contention (single-key races)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
+      run: BIN=target/debug/cairn PY=python3 N=32 bash conformance/concurrency.sh
+    if: ${{ inputs.profile == 'full' }}
+  crash-consistency:
+    name: crash consistency (F-4)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - name: Arm the durability fault seam, crash in the window, assert reconcile reclaims
+      run: bash conformance/crash_consistency.sh
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  crash-multipoint:
+    name: durability multi-point crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - name: Crash at every blob-commit seam (PutObject + multipart); assert reconcile reclaims each orphan
+      run: BIN=target/debug/cairn PY=python3 bash conformance/crash_multipoint.sh
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  soak:
+    name: replication soak (multi-host)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: "Two-node replication soak \u2014 sustained PUTs, byte-identical verify, RSS leak check"
+      run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
+    if: ${{ inputs.profile == 'full' }}
+  replication-chaos:
+    name: replication chaos (fault injection)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Break replication on purpose (target down, source SIGKILL, rapid overwrite); assert no data loss
+      run: BIN=target/debug/cairn PY=python3 bash conformance/replication_chaos.sh
+    if: ${{ inputs.profile == 'full' }}
+  stress:
+    name: stress + stability (throughput, escalation, leak)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - name: Drive warp + concurrency ramp; assert zero errors, alive, no RSS leak
+      run: BIN=target/debug/cairn DURATION=8s LEVELS="8 32 128 256" ESC_DURATION=6s LEAK_PCT=50 bash conformance/stress.sh
+    if: ${{ inputs.profile == 'full' }}
+  stress-encrypted:
+    name: encrypted-path stress (A/B plaintext vs at-rest)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: A/B plaintext vs encrypted under warp; assert byte-exact crypto + stability
+      run: BIN=target/debug/cairn PY=python3 DURATION=8s CONCURRENT=8 bash conformance/stress_encrypted.sh
+    if: ${{ inputs.profile == 'full' }}
+  stress-multipart:
+    name: concurrent multipart stress (barrier Complete, fail-closed, races)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Barrier-fire concurrent multipart Completes; assert byte-exact + fail-closed + races
+      run: BIN=target/debug/cairn PY=python3 bash conformance/stress_multipart.sh
+    if: ${{ inputs.profile == 'full' }}
+  stress-adversarial:
+    name: adversarial limits under load (chunked decoder, quota, pagination, STS, bulk delete)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Drive the limit + abuse paths concurrently; assert exact codes and no bypass
+      run: BIN=target/debug/cairn PY=python3 bash conformance/stress_adversarial.sh
+    if: ${{ inputs.profile == 'full' }}
+  stress-replication:
+    name: replication under sustained load (two nodes, two master keys)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Replicate under constant load across a master-key boundary; assert byte-exact + drain
+      run: BIN=target/debug/cairn PY=python3 bash conformance/stress_replication.sh
+    if: ${{ inputs.profile == 'full' }}
+  soak-features:
+    name: mixed-feature soak (constant load, leak shape)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Hold a mixed-feature workload constant; assert correctness + no steady-state climb
+      run: BIN=target/debug/cairn PY=python3 bash conformance/soak_features.sh
+    if: ${{ inputs.profile == 'full' }}
+  blob-limits:
+    name: blob store limits (out-of-space, huge, many)
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
+      run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
+    if: ${{ inputs.profile == 'full' }}
+  fuzz-smoke:
+    name: fuzz smoke (decoder, xml, policy, compress, ids)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      with:
+        toolchain: nightly-2026-07-28
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz --version 0.13.2 --locked
+    - name: Fuzz smoke (nightly build)
+      env:
+        RUSTUP_TOOLCHAIN: nightly-2026-07-28
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" fuzz-smoke
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - policy
+  benches:
+    name: benchmarks compile
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - run: cargo bench --workspace --no-run
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      with:
+        tool-cache: false
+        large-packages: false
+    - uses: ./.github/actions/setup
+      with:
+        components: llvm-tools-preview
+        web-artifact: web-dist
+    - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+      with:
+        tool: cargo-llvm-cov@0.8.7
+        checksum: true
+        fallback: none
+    - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: coverage
+        path: lcov.info
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  cleanup:
+    name: delete shared binary artifact
+    needs:
+    - conformance
+    - routing
+    - listing
+    - multipart
+    - objects
+    - buckets
+    - authz
+    - lifecycle
+    - checksums
+    - encryption
+    - scrub
+    - object-lock
+    - notifications
+    - sts
+    - sts-xml
+    - console-session
+    - error-pages
+    - backup-restore
+    - rotation
+    - share
+    - concurrency
+    - soak
+    - replication-chaos
+    - mesh
+    - stress
+    - stress-encrypted
+    - stress-multipart
+    - stress-adversarial
+    - stress-replication
+    - soak-features
+    - blob-limits
+    - storage-lab
+    - web-bundle
+    - build
+    - lint
+    - test
+    - test-all-features
+    - fast-io-conformance
+    - crash-consistency
+    - crash-multipoint
+    - benches
+    - coverage
+    - large-replication
+    if: ${{ always() && inputs.profile == 'full' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Delete the cairn-bin artifact
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+        IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" cleanup
+  large-replication:
+    name: encrypted large-object replication (>2 GiB and >5 GiB)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - name: Free disk space for multipart staging and MinIO replicas
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      with:
+        tool-cache: false
+        large-packages: false
+    - uses: ./.github/actions/setup
+      with:
+        web-artifact: web-dist
+    - run: cargo build --release --bin cairn
+    - name: Real encrypted >2 GiB and >5 GiB replication to Cairn and MinIO
+      run: BIN=target/release/cairn LARGE_ENCRYPT=true LARGE_REPORT=replication-large.json bash conformance/replication_large.sh
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: replication-large-results
+        path: replication-large.json
+        retention-days: 14
+        if-no-files-found: warn
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - web-bundle
+  codeql:
+    if: ${{ inputs.profile == 'full' }}
+    needs:
+    - policy
+    uses: ./.github/workflows/codeql.yml
+    with:
+      revision: ${{ inputs.revision }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+  validation-result:
+    name: validation-result
+    if: ${{ always() }}
+    needs:
+    - policy
+    - docs
+    - web-bundle
+    - storage-lab
+    - build
+    - rust-audit
+    - installer
+    - lint
+    - test
+    - test-all-features
+    - conformance
+    - routing
+    - listing
+    - multipart
+    - objects
+    - buckets
+    - authz
+    - lifecycle
+    - checksums
+    - encryption
+    - scrub
+    - object-lock
+    - notifications
+    - sts
+    - sts-xml
+    - console-session
+    - error-pages
+    - backup-restore
+    - fast-io-conformance
+    - mesh
+    - rotation
+    - share
+    - concurrency
+    - crash-consistency
+    - crash-multipoint
+    - soak
+    - replication-chaos
+    - stress
+    - stress-encrypted
+    - stress-multipart
+    - stress-adversarial
+    - stress-replication
+    - soak-features
+    - blob-limits
+    - fuzz-smoke
+    - benches
+    - coverage
+    - cleanup
+    - large-replication
+    - codeql
+    runs-on: ubuntu-24.04
+    outputs:
+      results: ${{ steps.result.outputs.results }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - id: result
+      run: python3 .github/scripts/ci.py complete
+      env:
+        PROFILE: ${{ inputs.profile }}
+        NEEDS_JSON: ${{ toJSON(needs) }}

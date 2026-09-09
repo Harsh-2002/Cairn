@@ -1,43 +1,52 @@
 name: setup
-description: Build the embedded React web console (web/dist), set up the Rust toolchain, and restore the cargo build cache.
-
+description: Set up Rust and optionally build or download the embedded console.
 inputs:
   targets:
     description: Comma-separated rustup targets to install (e.g. x86_64-unknown-linux-musl).
     required: false
-    default: ""
+    default: ''
   components:
     description: Comma-separated rustup components to install (e.g. rustfmt, clippy).
     required: false
-    default: ""
-
+    default: ''
+  web-artifact:
+    description: Console artifact from this validation run
+    required: false
+    default: ''
+  build-web:
+    description: Build the console when no artifact is supplied
+    required: false
+    default: 'true'
 runs:
   using: composite
   steps:
-    - name: Set up Node
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-      with:
-        # Vite 8 requires Node >= 20.19; 22 LTS gives headroom.
-        node-version: "22.23.2"
-        # Cache the npm download cache, keyed on the web console lockfile, so `npm ci` is fast run-to-run.
-        cache: npm
-        cache-dependency-path: web/package-lock.json
-    # The server binary embeds web/dist via rust-embed, so the real web console must be built before any Rust
-    # compile. (A build.rs scaffolds a placeholder so `cargo build` never *fails* without this, but
-    # the web console tests and shipped binaries need the real bundle.)
-    - name: Build the embedded management web console
-      shell: bash
-      working-directory: web
-      run: |
-        npm ci
-        npm run build
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-      with:
-        toolchain: "1.97.1"
-        targets: ${{ inputs.targets }}
-        components: ${{ inputs.components }}
-    # Restore the cargo registry + target dir across runs so the compile jobs are incremental rather
-    # than cold every time. Keyed per-job by the action, so each profile/target keeps its own cache.
-    - name: Restore the cargo build cache
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+  - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+    if: ${{ inputs.web-artifact != '' }}
+    with:
+      name: ${{ inputs.web-artifact }}
+      path: web/dist
+  - name: Set up Node
+    uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+    with:
+      node-version: 22.23.2
+      cache: npm
+      cache-dependency-path: web/package-lock.json
+    if: ${{ inputs.web-artifact == '' && inputs.build-web == 'true' }}
+  - name: npm ci
+    shell: bash
+    working-directory: web
+    run: npm ci
+    if: ${{ inputs.web-artifact == '' && inputs.build-web == 'true' }}
+  - name: npm run build
+    shell: bash
+    working-directory: web
+    run: npm run build
+    if: ${{ inputs.web-artifact == '' && inputs.build-web == 'true' }}
+  - name: Set up Rust
+    uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+    with:
+      toolchain: 1.97.1
+      targets: ${{ inputs.targets }}
+      components: ${{ inputs.components }}
+  - name: Restore the cargo build cache
+    uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32

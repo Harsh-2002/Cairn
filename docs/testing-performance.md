@@ -4,6 +4,10 @@
 
 ## 29. Testing and S3 conformance
 
+CI selects documentation-only or full validation and verifies matching PR results after merging.
+The exact profiles, release gate and scheduled benchmark policy are specified in
+[Section 31.7](delivery.md#317-ci-validation-and-result-reuse).
+
 The testing strategy is built to prove three things: that the S3 contract holds for real clients across the whole expanded surface, that the storage invariant survives crashes, and that the subtle parsers and the authorization engine are correct on adversarial input. The layers below build up to that.
 
 ### 29.1 Unit tests

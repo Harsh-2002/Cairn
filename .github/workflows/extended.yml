@@ -1,0 +1,52 @@
+name: Extended checks
+on:
+  schedule:
+  - cron: 17 3 * * 1
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: extended-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+jobs:
+  bench-compare:
+    if: github.ref == 'refs/heads/main'
+    name: warp head-to-head vs MinIO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Free disk space for multipart staging and MinIO replicas
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      with:
+        tool-cache: false
+        large-packages: false
+    - uses: ./.github/actions/setup
+    - run: cargo build --release --bin cairn
+    - name: Cairn vs MinIO side-by-side (warp)
+      run: BIN=target/release/cairn BENCH_CSV=bench.csv BENCH_JSON=bench.json bash conformance/bench_compare.sh
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: bench-compare-results
+        path: 'bench.csv
+
+          bench.json'
+        retention-days: 14
+        if-no-files-found: warn
+  codeql:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/codeql.yml
+    with:
+      revision: ${{ github.sha }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read

@@ -50,8 +50,10 @@ External-monitoring dashboard (OpenObserve, generated): [`dashboards/`](./dashbo
 
 ## Build, test, and the gate
 
-The binary is `cairn` (`cargo build --bin cairn`). Treat the following as the **definition of done**;
-it mirrors `.github/workflows/ci.yml` and must be green before any change is finished:
+The binary is `cairn` (`cargo build --bin cairn`). The following is the **full validation gate**
+for code, build, dependency, automation and mixed changes. CI uses `.github/workflows/validate.yml`
+and must be green before the change is finished. Ordinary documentation-only PRs use local-link,
+anchor, shell-example and workflow-policy checks instead (ARCH 31.7):
 
 ```sh
 cargo fmt --all --check
@@ -142,7 +144,7 @@ above remain the source of truth.
 - **Durability is the contract** (ARCH 8): stage → fsync file → rename → fsync dir → validate hashes
   → commit the metadata transaction (the single linearization point) → reclaim superseded blobs.
   Don't reorder these steps.
-- Every fix lands with a regression test in the owning crate, and the full gate is green, before it
+- Every fix lands with a regression test in the owning crate, and the applicable validation gate is green, before it
   is "done". Match the surrounding code's style, comment density, and idioms.
 
 ## Running locally & gotchas

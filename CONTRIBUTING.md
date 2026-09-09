@@ -48,6 +48,11 @@ Install the additional Rust check tools with `cargo install --locked cargo-nexte
 the installer checks also need ShellCheck. Run focused tests in the crate you changed while
 iterating, for example `cargo nextest run -p cairn-blob`.
 
+Code, dependency, build and automation changes use the full gate below. Ordinary documentation-only
+PRs use link, anchor, shell-example and workflow-policy checks instead. CI verifies matching PR
+results after merging; it reruns full validation only when reuse cannot be established. See
+[the CI policy](docs/delivery.md#317-ci-validation-and-result-reuse).
+
 The complete repository gate is:
 
 ```sh
@@ -66,6 +71,10 @@ shellcheck -s sh install.sh tests/install.sh && sh tests/install.sh
 runs all-feature Clippy, the web build and installer checks; web lint and dependency audits still
 need the commands above. See `make help` for focused targets and
 [conformance guidance](conformance/CLAUDE.md) for the live-server CI harnesses.
+
+For automation edits, also run `python3 tests/release_policy.py`,
+`python3 -m unittest discover -s tests -p test_ci.py`, ShellCheck on the changed shell scripts,
+and the checksum-pinned `actionlint` used by the workflow.
 
 ## Making a change
 

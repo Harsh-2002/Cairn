@@ -108,6 +108,43 @@ assumptions and [`operations.md`](./operations.md) for prerequisites.
 
 The user-facing version is **baked into the binary at build time** and is the single string reported by both `cairn --version` and `GET /system` (hence the console footer). The invariant is that this string equals the release it ships in: the release workflow computes the `vYYYY.MM.DD` value **once** and threads it into both the binaries — as the `CAIRN_RELEASE_VERSION` build variable, which `crates/cairn-server/build.rs` writes to an `OUT_DIR` file that the binary `include_str!`s into the `CAIRN_VERSION` constant — and the git tag, so the two can never disagree and there is no date-rollover race between the two jobs. A local build sets no such variable and instead reports `x.y.z-dev+g<short-sha>`, so a development binary is never mistaken for a release. The version is delivered through a build-output file rather than a `cargo::rustc-env` variable on purpose: a `CAIRN_`-prefixed `rustc-env` also lands in the runtime environment of `cargo run` and `cargo test`, where the server's strict `CAIRN_*` configuration parser (`deny_unknown_fields`, ARCH 28) would reject it as an unknown key. A `tests/version.rs` integration test drives the real binary and asserts the reported version is a qualified release-or-dev string and never the bare crate version — the regression guard for this contract. **Cutting a release therefore includes one verification step: confirm `cairn --version` on a downloaded release asset equals the published tag.**
 
+
+### 31.7 CI validation and result reuse
+
+`CI` runs on PR updates, pushes to `main`, and manual validation dispatches. PRs select either
+`docs` or `full`: only ordinary Markdown under `docs/` and the root README, contributor, governance,
+security and conduct guides qualify for `docs`. Agent instructions, the contract, executable or
+symlinked files, mixed changes and unknown paths select `full`. Documentation checks cover local
+links, incoming heading links and shell-example syntax; workflow policy checks run in both profiles.
+Every other change receives the complete correctness suite, including GNU/musl tests, optional
+features, audits, CodeQL, crash tests, bounded soaks and large encrypted replication.
+
+The final `required` job checks every selected result, including unexpected skips, before recording
+its versioned JSON receipt. A push to `main` can reuse a successful PR run only when its merged PR,
+head/base identities, tested merge tree, workflow policy and required job results match. A docs
+receipt additionally requires successful `main` validation for its base. The verifier checks
+GitHub's run and attempt metadata and the artifact digest; it parses bounded data and never executes
+PR artifacts. Receipts are retained for 90 days. Missing, expired, ambiguous or mismatched evidence
+selects fresh full validation. A manual `CI` dispatch on `main` always forces full validation.
+
+This maintainer-approved reuse policy retains a green CI verdict for the exact merged SHA while
+avoiding duplicate tests on identical source. Release dispatch still requires that exact-SHA verdict;
+it does not run the suite again. Release binaries and signed artifacts are built afresh and remain
+bound to the release commit under Section 31.6. PR test binaries are never promoted to releases.
+
+The console is installed, linted, audited and built once per full validation, then its bundle is
+shared with Rust build jobs. Default conformance jobs share one server binary; distinct target,
+feature and coverage builds remain separate. Temporary binaries/bundles expire after one day and
+are deleted at run completion where token permissions permit. Only superseded runs of the same PR
+are cancelled; validations of distinct `main` commits do not cancel one another.
+
+`Extended checks` runs weekly on Monday at 03:17 UTC or by manual dispatch. It runs the comparative
+MinIO benchmark and CodeQL on `main`; the encrypted 2 GiB/5 GiB replication correctness harness stays
+in ordinary full validation. CodeQL uses an explicit workflow instead of duplicate default-setup
+scans. `main` requires PRs, the GitHub Actions `required` check and an up-to-date base; force pushes
+and branch deletion are disallowed. An authorized bootstrap/direct push has no reusable PR evidence
+and therefore receives full validation.
+
 ---
 
 

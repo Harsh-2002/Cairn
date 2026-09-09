@@ -4,13 +4,23 @@ Read root [`CLAUDE.md`](../CLAUDE.md), [`CONTRACT.md`](../CONTRACT.md), and deli
 changing this directory. A release remains a deliberate human `workflow_dispatch`; agents must not
 tag, publish, dispatch, delete, or retire a release.
 
+## CI routing
+
+`ci.yml` selects docs/full validation or verifies a matching PR receipt on a main push;
+`validate.yml` owns the checks and `required` is the only branch-protection check. Missing evidence
+runs full validation. Manual CI dispatch on main forces a full run. See delivery ARCH 31.7.
+Keep comments short and single-line; new workflow run steps call one command, with longer logic
+in `.github/scripts/`. Update `validation-jobs.json` with the validation job set; its regression
+test rejects missing jobs and unexpected skips. Do not turn performance-only scheduling changes
+into removal of correctness coverage: large encrypted replication remains a required full-profile job.
+
 ## Release trust boundary
 
 `release.yml` has no workflow-wide permission. Its job permissions are an allow-list:
 
 | Job | Authority | Required input |
 |---|---|---|
-| `verify-ci` | `actions: read` | exact `github.sha` CI result |
+| `verify-ci` | `actions: read` | exact `github.sha` CI result (fresh validation or verified PR receipt) |
 | `binaries`, `release-assets`, `image-build` | read-only or none | repository source and pinned tools |
 | `stage-image` | `packages: write` | checksum-verified OCI archive and recorded subject digest |
 | `sign-image` | OIDC, attestation, package write | run-unique candidate tag plus image-build SLSA predicate |

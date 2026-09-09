@@ -373,18 +373,18 @@ dedicated hardware (e.g. the arm64 testbed) for representative throughput.
 > `REGRESS_PCT` or treat single-run swings as noise. The error-count / liveness / RSS-leak assertions
 > are robust regardless and are what the PASS/FAIL verdict hinges on.
 
-## 7. Head-to-head vs MinIO (`conformance/bench_compare.sh`, per-commit CI)
+## 7. Head-to-head vs MinIO (`conformance/bench_compare.sh`, scheduled/manual)
 
-Runs once on **every commit** (the `bench-compare` CI job — via the `pull_request` trigger on a branch
-under review, via `push` on `main`) to answer one question continuously: *for each S3
+Runs weekly or manually in `Extended checks` to answer one question continuously: *for each S3
 operation, how does Cairn compare to MinIO on the same machine?* The harness boots **both** servers on
 one host — Cairn from the built binary, MinIO from a **pinned** release binary
 (`RELEASE.2025-09-07T16-13-09Z`, `dl.min.io`) — single-node/single-drive, plaintext HTTP, and drives
 an identical `warp` v1.0.0 matrix against each **sequentially** (only one server under load at a time;
 `warp` itself burns ~1 core). Matrix (CI-sized, ~15-20 min): `PUT`/`GET` at 4 KiB + 8 MiB, and
 `STAT`/`DELETE`/`LIST`/`MIXED` at one representative size. Env-tunable (`DURATION`,
-`CONCURRENT`, `REPEATS`, and `CELLS_ENV` to replace the whole matrix); a manual/nightly run uses
+`CONCURRENT`, `REPEATS`, and `CELLS_ENV` to replace the whole matrix); a longer manual run uses
 `REPEATS=3` for a median.
+The encrypted 2 GiB/5 GiB replication regression remains in full PR validation.
 
 Output: a **job-summary markdown table** plus `bench.csv` / `bench.json` uploaded as an artifact for
 over-time tracking. The parser reads the **measured** operation, not warp's prepare-PUT (a subtle trap:
