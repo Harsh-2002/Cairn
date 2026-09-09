@@ -96,6 +96,15 @@ GitHub Releases and GHCR are separate services, so no least-privilege workflow c
 
 The remaining platform trust root is GitHub's hosted runner: unlike an OCI base, a hosted-runner filesystem has no repository-selectable content digest. Workflows therefore name `ubuntu-24.04` instead of the moving `ubuntu-latest`, checksum the downloaded high-impact tools (Zig, Syft, ORAS, Cosign, and GitHub CLI), and use the runner's preinstalled `curl`, `tar`, `sha256sum`, `jq`, shell, Git/rustup, compiler/linker, and Docker daemon only as bootstrap/system tools. A deployment that requires a fully content-addressed build environment must supply a hardened, immutable self-hosted runner; the permission split and subject manifests remain required there.
 
+GitHub attestation storage requires its supported workflow build type,
+`https://actions.github.io/buildtypes/workflow/v1`. The predicate records the exact workflow
+repository, ref and path as external parameters, and GitHub repository/runner identity plus
+Cairn's recipe, release/target parameters and tool/binary details as internal parameters.
+The source dependency names the workflow ref and binds its exact commit digest. Every release
+consumer checks this envelope and the complete Cairn claims before mutation. Regression tests
+execute both actual JQ producers and all eight consumers against valid and altered predicates;
+the installer reads the verified release version from `internalParameters.cairn.parameters`.
+
 The standalone installer consumes that evidence before changing an installation. Host binaries require
 both a signed `SHA256SUMS` manifest with one exact selected filename and a valid binary signature.
 Container installs require `IMAGE-DIGEST`, its keyless signature, and SLSA provenance binding the

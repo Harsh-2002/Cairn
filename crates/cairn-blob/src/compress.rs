@@ -1639,11 +1639,13 @@ mod tests {
     /// GCM's nonce-uniqueness requirement holds without storing nonces on disk.
     #[test]
     fn block_nonce_is_deterministic_and_distinct() {
-        let dek = [5u8; 32];
+        let dek: [u8; 32] = Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng).into();
+        let mut other_dek = dek;
+        other_dek[0] ^= 1;
         assert_eq!(block_nonce(&dek, 0), block_nonce(&dek, 0));
         assert_ne!(block_nonce(&dek, 0), block_nonce(&dek, 1));
         // A different key yields a different nonce for the same block index.
-        assert_ne!(block_nonce(&dek, 0), block_nonce(&[6u8; 32], 0));
+        assert_ne!(block_nonce(&dek, 0), block_nonce(&other_dek, 0));
     }
 
     #[test]

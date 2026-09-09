@@ -541,10 +541,19 @@ for job in (
 # may consume artifacts from an earlier attempt of the same run, never another run or a future
 # attempt.
 provenance_common_markers = (
+    '--arg build_type "https://actions.github.io/buildtypes/workflow/v1"',
+    '--arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"',
+    '--arg repository_id "$GITHUB_REPOSITORY_ID"',
+    '--arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID"',
+    ".buildDefinition.buildType == $build_type",
+    '.buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}',
+    '(.buildDefinition.internalParameters | keys == ["cairn", "github"])',
+    '.buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}',
+    '(.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])',
     '--arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}"',
     '--arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/"',
     '--arg max_attempt "$GITHUB_RUN_ATTEMPT"',
-    '--arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}"',
+    '--arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main"',
     ".buildDefinition.resolvedDependencies == [",
     "{uri: $source, digest: {gitCommit: $sha}}",
     ".runDetails.builder == {id: $builder}",
@@ -554,14 +563,14 @@ provenance_common_markers = (
     "<= ($max_attempt | tonumber)",
 )
 binary_provenance_markers = (
-    '--arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries"',
-    ".buildDefinition.buildType == $build_type",
-    ".buildDefinition.externalParameters == {target: $target, version: $version}",
+    '--arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries"',
+    ".buildDefinition.internalParameters.cairn.recipe == $recipe",
+    ".buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}",
     'rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"',
 )
 image_provenance_markers = (
-    '--arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build"',
-    ".buildDefinition.buildType == $build_type",
+    '--arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build"',
+    ".buildDefinition.internalParameters.cairn.recipe == $recipe",
     'image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version',
 )
 expected_provenance_claims = {
@@ -870,7 +879,7 @@ if "sign-assets" in blocks:
         '= "commit ${GITHUB_SHA}"',
         '= "version ${VERSION}"',
         '= "target ${target}"',
-        ".buildDefinition.externalParameters == {target: $target, version: $version}",
+        ".buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}",
         ".buildDefinition.resolvedDependencies == [",
         'cmp -- "${source_dir}/${file_name}" "rel/${file_name}"',
         'cmp -- "${source_dir}/${file_name}.provenance.json"',
@@ -907,7 +916,7 @@ if "sign-assets" in blocks:
         )
         metadata_commit = sign_assets_block.index('= "commit ${GITHUB_SHA}"')
         binary_predicate = sign_assets_block.index(
-            ".buildDefinition.externalParameters == {target: $target, version: $version}"
+            ".buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}"
         )
         binary_compare = sign_assets_block.index(
             'cmp -- "${source_dir}/${file_name}" "rel/${file_name}"'

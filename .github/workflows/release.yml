@@ -146,19 +146,28 @@ jobs:
             printf 'commit %s\nversion %s\ntarget %s\n' \
               "$GITHUB_SHA" "$VERSION" "$TARGET" > "${file_name}.metadata"
             jq -n \
-              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+              --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --arg repository_id "$GITHUB_REPOSITORY_ID" \
+              --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+              --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
               --arg builder_id "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
               --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
-              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
               --arg sha "$GITHUB_SHA" \
               --arg target "$TARGET" \
               --arg version "$VERSION" \
               '{
                 buildDefinition: {
                   buildType: $build_type,
-                  externalParameters: {target: $target, version: $version},
+                  externalParameters: {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}},
                   internalParameters: {
-                    rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
+                    github: {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"},
+                    cairn: {
+                      recipe: $recipe,
+                      parameters: {target: $target, version: $version},
+                      details: {rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"}
+                    }
                   },
                   resolvedDependencies: [{uri: $source, digest: {gitCommit: $sha}}]
                 },
@@ -211,17 +220,26 @@ jobs:
             test "$(sed -n '2p' "rel/${file_name}.metadata")" = "version ${VERSION}"
             test "$(sed -n '3p' "rel/${file_name}.metadata")" = "target ${target}"
             jq -e \
-              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+              --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --arg repository_id "$GITHUB_REPOSITORY_ID" \
+              --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+              --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
               --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
               --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
               --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
               --arg sha "$GITHUB_SHA" \
               --arg target "$target" \
               --arg version "$VERSION" '
               .buildDefinition.buildType == $build_type
-              and .buildDefinition.externalParameters == {target: $target, version: $version}
-              and .buildDefinition.internalParameters == {
+              and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+              and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+              and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+              and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+              and .buildDefinition.internalParameters.cairn.recipe == $recipe
+              and .buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters.cairn.details == {
                 rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
               }
               and .buildDefinition.resolvedDependencies == [
@@ -360,10 +378,14 @@ jobs:
           amd64_sha="$(cut -d' ' -f1 artifacts/cairn-binary-amd64/cairn-linux-amd64.sha256)"
           arm64_sha="$(cut -d' ' -f1 artifacts/cairn-binary-arm64/cairn-linux-arm64.sha256)"
           jq -n \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder_id "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" \
@@ -372,10 +394,15 @@ jobs:
             '{
               buildDefinition: {
                 buildType: $build_type,
-                externalParameters: {
-                  image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+                externalParameters: {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}},
+                internalParameters: {
+                  github: {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"},
+                  cairn: {
+                    recipe: $recipe,
+                    parameters: {image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version},
+                    details: {binarySubjects: {amd64: $amd64, arm64: $arm64}}
+                  }
                 },
-                internalParameters: {binarySubjects: {amd64: $amd64, arm64: $arm64}},
                 resolvedDependencies: [{uri: $source, digest: {gitCommit: $sha}}]
               },
               runDetails: {
@@ -440,29 +467,38 @@ jobs:
           actual="$(tar -xOf image/cairn-image.tar "blobs/sha256/${digest_hex}" | sha256sum | awk '{print $1}')"
           test "$actual" = "$digest_hex"
           jq -e \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
             --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" '
             .buildDefinition.buildType == $build_type
-            and .buildDefinition.externalParameters == {
+            and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+            and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+            and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+            and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+            and .buildDefinition.internalParameters.cairn.recipe == $recipe
+            and .buildDefinition.internalParameters.cairn.parameters == {
               image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
             }
-            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (.buildDefinition.internalParameters.cairn.details | keys == ["binarySubjects"])
             and (
-              .buildDefinition.internalParameters.binarySubjects
+              .buildDefinition.internalParameters.cairn.details.binarySubjects
               | keys == ["amd64", "arm64"]
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.amd64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.amd64
               | test("^[0-9a-f]{64}$")
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.arm64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.arm64
               | test("^[0-9a-f]{64}$")
             )
             and .buildDefinition.resolvedDependencies == [
@@ -531,29 +567,38 @@ jobs:
           test "$(cat image/IMAGE-DIGEST)" = "$STAGED_DIGEST"
           (cd image && sha256sum -c IMAGE-METADATA.sha256)
           jq -e \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
             --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" '
             .buildDefinition.buildType == $build_type
-            and .buildDefinition.externalParameters == {
+            and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+            and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+            and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+            and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+            and .buildDefinition.internalParameters.cairn.recipe == $recipe
+            and .buildDefinition.internalParameters.cairn.parameters == {
               image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
             }
-            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (.buildDefinition.internalParameters.cairn.details | keys == ["binarySubjects"])
             and (
-              .buildDefinition.internalParameters.binarySubjects
+              .buildDefinition.internalParameters.cairn.details.binarySubjects
               | keys == ["amd64", "arm64"]
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.amd64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.amd64
               | test("^[0-9a-f]{64}$")
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.arm64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.arm64
               | test("^[0-9a-f]{64}$")
             )
             and .buildDefinition.resolvedDependencies == [
@@ -643,17 +688,26 @@ jobs:
             test "$(sed -n '2p' "${source_dir}/${file_name}.metadata")" = "version ${VERSION}"
             test "$(sed -n '3p' "${source_dir}/${file_name}.metadata")" = "target ${target}"
             jq -e \
-              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+              --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --arg repository_id "$GITHUB_REPOSITORY_ID" \
+              --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+              --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
               --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
               --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
               --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
               --arg sha "$GITHUB_SHA" \
               --arg target "$target" \
               --arg version "$VERSION" '
               .buildDefinition.buildType == $build_type
-              and .buildDefinition.externalParameters == {target: $target, version: $version}
-              and .buildDefinition.internalParameters == {
+              and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+              and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+              and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+              and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+              and .buildDefinition.internalParameters.cairn.recipe == $recipe
+              and .buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters.cairn.details == {
                 rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
               }
               and .buildDefinition.resolvedDependencies == [
@@ -698,21 +752,30 @@ jobs:
           amd64_sha="$(sha256sum rel/cairn-linux-amd64 | awk '{print $1}')"
           arm64_sha="$(sha256sum rel/cairn-linux-arm64 | awk '{print $1}')"
           jq -e \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
             --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" \
             --arg amd64 "$amd64_sha" \
             --arg arm64 "$arm64_sha" '
             .buildDefinition.buildType == $build_type
-            and .buildDefinition.externalParameters == {
+            and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+            and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+            and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+            and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+            and .buildDefinition.internalParameters.cairn.recipe == $recipe
+            and .buildDefinition.internalParameters.cairn.parameters == {
               image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
             }
-            and .buildDefinition.internalParameters == {
+            and .buildDefinition.internalParameters.cairn.details == {
               binarySubjects: {amd64: $amd64, arm64: $arm64}
             }
             and .buildDefinition.resolvedDependencies == [
@@ -810,17 +873,26 @@ jobs:
           while read -r arch target; do
             file_name="cairn-linux-${arch}"
             jq -e \
-              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+              --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --arg repository_id "$GITHUB_REPOSITORY_ID" \
+              --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+              --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
               --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
               --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
               --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
               --arg sha "$GITHUB_SHA" \
               --arg target "$target" \
               --arg version "$VERSION" '
               .buildDefinition.buildType == $build_type
-              and .buildDefinition.externalParameters == {target: $target, version: $version}
-              and .buildDefinition.internalParameters == {
+              and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+              and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+              and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+              and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+              and .buildDefinition.internalParameters.cairn.recipe == $recipe
+              and .buildDefinition.internalParameters.cairn.parameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters.cairn.details == {
                 rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
               }
               and .buildDefinition.resolvedDependencies == [
@@ -846,21 +918,30 @@ jobs:
           amd64_sha="$(sha256sum rel/cairn-linux-amd64 | awk '{print $1}')"
           arm64_sha="$(sha256sum rel/cairn-linux-arm64 | awk '{print $1}')"
           jq -e \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
             --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" \
             --arg amd64 "$amd64_sha" \
             --arg arm64 "$arm64_sha" '
             .buildDefinition.buildType == $build_type
-            and .buildDefinition.externalParameters == {
+            and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+            and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+            and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+            and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+            and .buildDefinition.internalParameters.cairn.recipe == $recipe
+            and .buildDefinition.internalParameters.cairn.parameters == {
               image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
             }
-            and .buildDefinition.internalParameters == {
+            and .buildDefinition.internalParameters.cairn.details == {
               binarySubjects: {amd64: $amd64, arm64: $arm64}
             }
             and .buildDefinition.resolvedDependencies == [
@@ -1146,29 +1227,38 @@ jobs:
           test "$(cat image/IMAGE-DIGEST)" = "$STAGED_DIGEST"
           (cd image && sha256sum -c IMAGE-METADATA.sha256)
           jq -e \
-            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg build_type "https://actions.github.io/buildtypes/workflow/v1" \
+            --arg repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg repository_owner_id "$GITHUB_REPOSITORY_OWNER_ID" \
+            --arg recipe "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
             --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
             --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
             --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/heads/main" \
             --arg sha "$GITHUB_SHA" \
             --arg image "$IMAGE" \
             --arg version "$VERSION" '
             .buildDefinition.buildType == $build_type
-            and .buildDefinition.externalParameters == {
+            and .buildDefinition.externalParameters == {workflow: {repository: $repository, ref: "refs/heads/main", path: ".github/workflows/release.yml"}}
+            and (.buildDefinition.internalParameters | keys == ["cairn", "github"])
+            and .buildDefinition.internalParameters.github == {event_name: "workflow_dispatch", repository_id: $repository_id, repository_owner_id: $repository_owner_id, runner_environment: "github-hosted"}
+            and (.buildDefinition.internalParameters.cairn | keys == ["details", "parameters", "recipe"])
+            and .buildDefinition.internalParameters.cairn.recipe == $recipe
+            and .buildDefinition.internalParameters.cairn.parameters == {
               image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
             }
-            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (.buildDefinition.internalParameters.cairn.details | keys == ["binarySubjects"])
             and (
-              .buildDefinition.internalParameters.binarySubjects
+              .buildDefinition.internalParameters.cairn.details.binarySubjects
               | keys == ["amd64", "arm64"]
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.amd64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.amd64
               | test("^[0-9a-f]{64}$")
             )
             and (
-              .buildDefinition.internalParameters.binarySubjects.arm64
+              .buildDefinition.internalParameters.cairn.details.binarySubjects.arm64
               | test("^[0-9a-f]{64}$")
             )
             and .buildDefinition.resolvedDependencies == [

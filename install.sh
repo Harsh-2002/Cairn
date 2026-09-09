@@ -350,7 +350,7 @@ verified_image() (
   vi_versions=$("$VERIFY_GH" attestation verify "oci://$vi_image" --repo "$REPO" \
     --cert-identity "$RELEASE_IDENTITY" --cert-oidc-issuer "$RELEASE_ISSUER" \
     --source-digest "$vi_commit" --predicate-type https://slsa.dev/provenance/v1 \
-    --format json --jq '.[].verificationResult.statement.predicate.buildDefinition.externalParameters.version') \
+    --format json --jq '.[].verificationResult.statement.predicate.buildDefinition.internalParameters.cairn.parameters.version') \
     || die "container provenance verification failed (GitHub/registry authentication may be required)"
   printf '%s\n' "$vi_versions" | grep -F -x -- "$vi_tag" >/dev/null \
     || die "container provenance does not name the requested release"

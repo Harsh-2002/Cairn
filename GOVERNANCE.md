@@ -21,7 +21,7 @@ is, how it is maintained, and the commitments that make it safe to build on.
 
 - Cairn is **pre-1.0** and maintainer-led. Development happens in the open on
   [GitHub](https://github.com/Harsh-2002/Cairn); `main` is always the source of truth.
-- Every change must pass the full CI gate before merge (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- Every change must pass its applicable CI gate before merge (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)
   and [`docs/delivery.md`](./docs/delivery.md) §31). Security and data-durability fixes take priority.
 - Releases are **calendar-versioned** (`vYYYY.MM.DD`) and CI-gated: a release is only cut from a commit whose CI is
   green, and exactly one release is active at a time. See [Releases & verification](#releases--verification).
@@ -66,8 +66,9 @@ docker pull ghcr.io/harsh-2002/cairn:latest
 docker image inspect ghcr.io/harsh-2002/cairn:latest --format '{{.Architecture}} {{.Os}}'
 ```
 
-> Artifact **signing** (cosign/Sigstore) and SBOM attestation are planned hardening, not yet in the
-> release pipeline; the `SHA256SUMS` manifest is the current integrity anchor.
+Releases include **keyless signatures** (cosign/Sigstore), an SPDX dependency SBOM and SLSA build
+provenance for the binaries and container image. Verify these using the instructions in
+[`SECURITY.md`](./SECURITY.md#verifying-release-artifacts).
 
 ## Community
 

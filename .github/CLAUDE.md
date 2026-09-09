@@ -35,6 +35,12 @@ out source, compile, or execute artifact content. They compare fixed metadata ag
 validate the SLSA v1 predicates produced by the unprivileged build jobs before attesting those
 exact subjects.
 
+Provenance uses GitHub's supported `https://actions.github.io/buildtypes/workflow/v1`
+build type. Workflow identity stays in `externalParameters.workflow`; exact Cairn recipes,
+release/target parameters and tool/binary details live in `internalParameters.cairn`. Every
+consumer validates both layers. Run `python3 -m unittest discover -s tests -p test_release_provenance.py`
+to exercise the actual JQ producers and all eight consumer filters, including altered-claim refusals.
+
 Release mutation is one concurrency group with `cancel-in-progress: false`, so a newer dispatch
 never interrupts an in-flight run that may already have mutated one side of the release. GitHub
 retains at most one pending run in a concurrency group and may replace an older pending dispatch;

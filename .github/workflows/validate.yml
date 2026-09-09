@@ -33,6 +33,7 @@ jobs:
         ref: ${{ inputs.revision }}
         persist-credentials: false
     - run: python3 tests/release_policy.py
+    - run: python3 -m unittest discover -s tests -p test_release_provenance.py
     - run: python3 -m unittest discover -s tests -p test_ci.py -v
     - run: shellcheck -s bash .github/scripts/ci-jobs.sh
     - run: bash .github/scripts/ci-jobs.sh actionlint

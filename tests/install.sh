@@ -237,7 +237,8 @@ for expected in \
   '--repo Harsh-2002/Cairn' \
   '--cert-identity https://github.com/Harsh-2002/Cairn/.github/workflows/release.yml@refs/heads/main' \
   '--cert-oidc-issuer https://token.actions.githubusercontent.com' \
-  '--predicate-type https://slsa.dev/provenance/v1'; do
+  '--predicate-type https://slsa.dev/provenance/v1' \
+  '--jq .[].verificationResult.statement.predicate.buildDefinition.internalParameters.cairn.parameters.version'; do
   case " $* " in *" $expected "*) ;; *) exit 1 ;; esac
 done
 case "$TEST_CASE" in bad-provenance) exit 1 ;; wrong-release) printf '%s\n' v2020.01.01 ;; *) printf '%s\n' v2026.09.06 ;; esac
