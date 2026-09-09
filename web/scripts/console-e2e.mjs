@@ -190,6 +190,29 @@ async function inspectRoute({ path, heading, title }) {
   }
 }
 
+async function clickElement(expression) {
+  const point = await evaluate(`(() => {
+    const element = ${expression};
+    element.scrollIntoView({ block: "center" });
+    const box = element.getBoundingClientRect();
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  })()`);
+  await command("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, ...point });
+  await command("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, ...point });
+}
+
+async function clickText(selector, text) {
+  const match = `[...document.querySelectorAll(${JSON.stringify(selector)})].find(el => el.textContent.trim() === ${JSON.stringify(text)})`;
+  await waitFor(`!!(${match})`, `${text} control`);
+  await clickElement(`(${match})`);
+}
+
+async function selectLabeled(label, option) {
+  await clickElement(`document.getElementById([...document.querySelectorAll("label")].find(el => el.textContent === ${JSON.stringify(label)}).htmlFor)`);
+  await clickText('[role="option"]', option);
+  await waitFor('!document.querySelector(\'[role="listbox"]\')', "selection menu closed");
+}
+
 let viewportWidth = 1440;
 let bucketName;
 let userId;
@@ -284,6 +307,30 @@ try {
     await request("DELETE", `/buckets/${bucketName}/objects/shares/${share.id}`);
   }
   process.stdout.write("Browser uploads and console downloads passed with API requests blocked during download\n");
+
+  // A copied URL must describe the currently selected delivery/method, not a previous result.
+  await inspectRoute({ path: `/buckets/${bucketName}/browser`, heading: bucketName, title: bucketName });
+  await waitFor(`!!document.querySelector('button[aria-label="Actions for active.html"]')`, "object actions");
+  await clickElement(`document.querySelector('button[aria-label="Actions for active.html"]')`);
+  await clickText('[role="menuitem"]', "Share");
+  await clickText("button", "Create share link");
+  await waitFor('!!document.querySelector("input[readonly]")?.value', "console share URL");
+  const consoleLink = await evaluate('document.querySelector("input[readonly]").value');
+  if (new URL(consoleLink).origin !== new URL(baseUrl).origin) throw new Error("Default share must download through console");
+  await selectLabeled("Delivery", "View in browser");
+  await waitFor('!document.querySelector("input[readonly]")', "previous download link cleared");
+  await clickText("button", "Create share link");
+  await waitFor('!!document.querySelector("input[readonly]")?.value', "API share URL");
+  const apiLink = await evaluate('document.querySelector("input[readonly]").value');
+  if (new URL(apiLink).origin !== endpointStatus.api_url) throw new Error("Inline share must target API");
+  await selectLabeled("Expires", "1 hour");
+  await waitFor('!document.querySelector("input[readonly]")', "previous expiry link cleared");
+  await clickText('[role="tab"]', "S3 link");
+  await clickText("button", "Create presigned URL");
+  await waitFor('!!document.querySelector("input[readonly]")?.value', "presigned GET URL");
+  await selectLabeled("Type", "Upload (PUT)");
+  await waitFor('!document.querySelector("input[readonly]")', "previous GET URL cleared");
+  process.stdout.write("Share dialog clears URLs when delivery, expiry or S3 method changes\n");
 
   if (browserErrors.length) {
     throw new Error(`browser errors: ${browserErrors.join(" | ")}`);

@@ -1,6 +1,6 @@
 // Share one object two ways (ARCH 15.8):
 //  • "Share link" (default): a persistent, revocable Cairn share — pick a duration
-//    or "Never expires", view-in-browser vs force-download, get a data-origin link.
+//    or "Never expires", view-in-browser vs force-download, get an API or console link.
 //  • "S3 link": a standard SigV4 presigned URL (download or upload), interoperable
 //    with any S3 tool, backed by a scoped temporary session and capped at 12 hours.
 
@@ -58,16 +58,20 @@ export function ShareDialog({
   const [pDisposition, setPDisposition] = useState<ShareDisposition>("attachment");
   const [pFilename, setPFilename] = useState("");
   const [pBusy, setPBusy] = useState(false);
-  const [pLink, setPLink] = useState<{ url: string; expiresAtMs: number | null } | null>(null);
+  const [pLink, setPLink] = useState<{ url: string; expiresAtMs: number | null; options: string } | null>(null);
 
   // --- presigned "S3 link" tab ---
   const [sMethod, setSMethod] = useState<"GET" | "PUT">("GET");
   const [sExpiry, setSExpiry] = useState(String(SECS.hour));
   const [sContentType, setSContentType] = useState("");
   const [sBusy, setSBusy] = useState(false);
-  const [sLink, setSLink] = useState<{ url: string; expiresAtMs: number } | null>(null);
+  const [sLink, setSLink] = useState<{ url: string; expiresAtMs: number; options: string } | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+
+  // A completed or in-flight response belongs only to the exact options submitted.
+  const pOptions = JSON.stringify([bucket, objectKey, versionId, pExpiry, pDisposition, pFilename]);
+  const sOptions = JSON.stringify([bucket, objectKey, versionId, sMethod, sExpiry, sContentType]);
 
   useEffect(() => {
     setPExpiry("86400");
@@ -83,6 +87,7 @@ export function ShareDialog({
 
   async function createShareLink() {
     setPBusy(true);
+    setPLink(null);
     setError(null);
     try {
       const res = await api.createShare(bucket, {
@@ -99,6 +104,7 @@ export function ShareDialog({
       setPLink({
         url: res.url,
         expiresAtMs: res.expires_at_ms,
+        options: pOptions,
       });
       toast.success("Share link created");
     } catch (e) {
@@ -110,6 +116,7 @@ export function ShareDialog({
 
   async function createPresigned() {
     setSBusy(true);
+    setSLink(null);
     setError(null);
     try {
       const res = await api.presignShare(bucket, {
@@ -126,7 +133,7 @@ export function ShareDialog({
         content_type:
           sMethod === "PUT" && sContentType.trim() ? sContentType.trim() : null,
       });
-      setSLink({ url: res.url, expiresAtMs: res.expires_at_ms });
+      setSLink({ url: res.url, expiresAtMs: res.expires_at_ms, options: sOptions });
       toast.success("Presigned URL created");
     } catch (e) {
       setError(errorMessage(e, "Could not create the presigned URL."));
@@ -210,7 +217,7 @@ export function ShareDialog({
               {pBusy ? "Creating…" : "Create share link"}
             </Button>
 
-            {pLink ? (
+            {pLink?.options === pOptions ? (
               <div className="space-y-2">
                 <CopyField label="Share link" value={pLink.url} />
                 <p className="text-[13px] text-muted-foreground">
@@ -295,7 +302,7 @@ export function ShareDialog({
               {sBusy ? "Creating…" : "Create presigned URL"}
             </Button>
 
-            {sLink ? (
+            {sLink?.options === sOptions ? (
               <div className="space-y-2">
                 <CopyField
                   label={sMethod === "PUT" ? "Upload URL" : "Download URL"}
