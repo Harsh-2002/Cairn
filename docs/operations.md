@@ -24,8 +24,8 @@ without starting: `cairn validate-config`.
 
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
-| S3 API listener | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 data plane, plus `/healthz`, `/readyz`, `/metrics`, and signed `/share/` share URLs. |
-| Web console listener | `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Management console (root path) + management API (`/api/v1`). Set `off`/`none`/empty to run headless. |
+| S3 API listener | `CAIRN_API_ADDR` | `0.0.0.0:7373` | S3 and native `/api/v1` administration, plus `/healthz`, `/readyz`, `/metrics`, and signed `/share/` share URLs. |
+| Web console listener | `CAIRN_CONSOLE_ADDR` | `0.0.0.0:7374` | Console, browser management API (`/api/v1`) and forced-download shares. Set `off`/`none`/empty to run headless. |
 | Data directory | `CAIRN_DATA_DIR` | `./data` | Root of staging + per-bucket blobs. |
 | Database path | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same FS as data); direct child of the data root or outside it, never in a deeper data-root directory. |
 | Region | `CAIRN_REGION` | `us-east-1` | Location label + SigV4 scope. |
@@ -122,10 +122,10 @@ Two first-class shapes:
 2. **Behind a terminating reverse proxy** on a trusted interface. The proxy must pass the
    authorization, range, conditional, and S3-specific headers through unchanged and must
    **stream** rather than buffer large bodies (otherwise Cairn's backpressure is defeated). Set
-   `CAIRN_PUBLIC_BASE_URL` for correct generated URLs behind ingress.
+   `CAIRN_API_PUBLIC_URL` for correct generated URLs behind ingress.
 
 For Caddy on a shared Docker network, proxy the console hostname to `cairn:7374` and a separate
-S3 hostname to `cairn:7373`. Set `CAIRN_PUBLIC_BASE_URL` to the S3 hostname. Set
+API hostname to `cairn:7373`. Set `CAIRN_API_PUBLIC_URL` to that origin and `CAIRN_CONSOLE_PUBLIC_URL` to the console origin. Set
 `CAIRN_TRUSTED_PROXIES` to Caddy's actual, stable container IP on that network, not its public or
 host-LAN address. Caddy's HTTP upstream preserves Host and sets `X-Forwarded-*`; remove incoming
 `Forwarded` with `header_up -Forwarded` to avoid conflicting provenance. A console login rejected
@@ -135,14 +135,14 @@ container so it receives the new configuration.
 
 Never expose the plaintext interface to an untrusted network.
 
-Cairn binds **two listeners**: the S3 data plane (`CAIRN_LISTEN_ADDR`, default `:7373`) and the
-web console + management API (`CAIRN_WEB_ADDR`, default `:7374`). Expose the S3 port to clients;
-keep the console/management port on a trusted interface, firewalled off, or disabled entirely with
-`CAIRN_WEB_ADDR=off`.
+Cairn binds **two listeners**: the S3 data plane (`CAIRN_API_ADDR`, default `:7373`) and the
+web console + management API (`CAIRN_CONSOLE_ADDR`, default `:7374`). The API port also exposes native administration with explicit credentials.
+Keep the console port on a trusted interface, firewalled off, or disabled entirely with
+`CAIRN_CONSOLE_ADDR=off`.
 
 The one-command installer is deliberately stricter than the raw server defaults: a fresh host
 configuration binds both listeners to `127.0.0.1`, and generated Compose port mappings publish both
-ports on `127.0.0.1`. This remains true when TLS is configured. Use `--expose-s3` to make the S3
+ports on `127.0.0.1`. This remains true when TLS is configured. Use `--expose-api` to make the S3
 listener public and, independently, `--expose-console` only when the management surface must be
 reachable outside the host. If either public exposure is selected without `--tls-cert` and
 `--tls-key`, the install also requires `--acknowledge-public-http`; `--yes` never implies that
@@ -151,18 +151,18 @@ acknowledgement. For example:
 ```sh
 # Public HTTPS S3; console remains loopback-only.
 sudo sh install.sh --host --yes --tls-cert /etc/tls/cert.pem \
-  --tls-key /etc/tls/key.pem --expose-s3
+  --tls-key /etc/tls/key.pem --expose-api
 
 # Public plaintext S3 on an explicitly trusted network; console remains loopback-only.
-sudo sh install.sh --docker --yes --expose-s3 --acknowledge-public-http
+sudo sh install.sh --docker --yes --expose-api --acknowledge-public-http
 ```
 
 The release artifact is one fully static binary (`musl`) containing the server, the management
 web console, and the CLI; it runs in a `scratch`/distroless container.
 
 The image includes a health check that runs `cairn healthcheck` against `/readyz` every 30 seconds.
-It follows `CAIRN_LISTEN_ADDR` automatically: the default is port 7373, while
-`CAIRN_LISTEN_ADDR=0.0.0.0:9000` makes it probe port 9000 inside the container. Publishing
+It follows `CAIRN_API_ADDR` automatically: the default is port 7373, while
+`CAIRN_API_ADDR=0.0.0.0:9000` makes it probe port 9000 inside the container. Publishing
 `9000:7373` instead leaves the internal probe on 7373. IPv6, headless mode and native TLS are
 supported; TLS uses the configured certificate as an exact local pin. No `curl`, shell, credentials
 or separate health-port variable is needed. Success is quiet; failure details appear in Docker's
@@ -685,3 +685,44 @@ with a verified immutable digest. A customized project without exactly one `cair
 rejected rather than rewritten speculatively. Releases without `IMAGE-DIGEST` and matching
 provenance cannot be installed through this path. See `../SECURITY.md` for trust identities and
 bootstrap assumptions.
+
+## API and console ingress
+
+Set public origins separately from bind addresses:
+
+```sh
+export CAIRN_API_ADDR=0.0.0.0:7373
+export CAIRN_CONSOLE_ADDR=0.0.0.0:7374
+export CAIRN_API_PUBLIC_URL=https://cairn-s3.ctl.qzz.io
+export CAIRN_CONSOLE_PUBLIC_URL=https://cairn.ctl.qzz.io
+```
+
+A Caddy configuration on the shared Docker network:
+
+```caddyfile
+cairn.ctl.qzz.io {
+    reverse_proxy cairn:7374 {
+        header_up -Forwarded
+    }
+}
+cairn-s3.ctl.qzz.io {
+    reverse_proxy cairn:7373 {
+        header_up -Forwarded
+    }
+}
+```
+
+Set `CAIRN_TRUSTED_PROXIES` to the actual stable proxy peer IP/network. Preserve Host and forwarded
+scheme/client provenance; do not merge the two origins. Recreate the container after environment
+changes. The installer accepts `--api-public-url` and `--console-public-url` to render these values.
+
+For API-only deployment, set `CAIRN_CONSOLE_ADDR=off`; AWS CLI and `cairn overview --api-endpoint`
+continue to use the API endpoint. For public S3 with private administration, restrict `/api/v1` and
+`/api/v1/*` at the API proxy as well as restricting the console port. A port firewall alone cannot
+separate native administration from S3 on the same listener.
+
+For private API with public downloads, publish the console hostname and allow public GET/HEAD
+requests only to `/share/*`; apply your normal operator access restriction to the console UI and
+`/api/v1/*`. Share recipients do not need API access. Browser uploads and inline previews still
+require API access from the operator's network. Console download links stop working when the
+console listener is disabled; API shares remain available.

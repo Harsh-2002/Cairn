@@ -48,5 +48,6 @@
   "coverage": "full",
   "cleanup": "full",
   "large-replication": "full",
-  "codeql": "full"
+  "codeql": "full",
+  "console-browser": "full"
 }

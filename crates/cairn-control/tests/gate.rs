@@ -69,8 +69,10 @@ async fn harness() -> Harness {
         clock.clone() as Arc<dyn Clock>,
         SystemInfo {
             version: "test".to_owned(),
-            s3_addr: "127.0.0.1:7373".to_owned(),
-            web_addr: "127.0.0.1:7374".to_owned(),
+            api_addr: "127.0.0.1:7373".to_owned(),
+            console_addr: "127.0.0.1:7374".to_owned(),
+            api_public_url: None,
+            console_public_url: None,
             tls: false,
             data_dir: std::env::temp_dir(),
             started_at: std::time::Instant::now(),
@@ -1188,8 +1190,8 @@ async fn system_reports_identity_and_disk() {
     assert_eq!(resp.status, StatusCode::OK);
     let v = json(&resp);
     assert_eq!(v["version"], "test");
-    assert_eq!(v["s3_addr"], "127.0.0.1:7373");
-    assert_eq!(v["web_addr"], "127.0.0.1:7374");
+    assert_eq!(v["api_addr"], "127.0.0.1:7373");
+    assert_eq!(v["console_addr"], "127.0.0.1:7374");
     assert_eq!(v["tls"], false);
     assert!(!v["data_dir"].as_str().unwrap().is_empty());
     assert!(v["uptime_secs"].as_u64().is_some());

@@ -171,11 +171,11 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   quota, versioning, and events all apply exactly as a normal upload.
 
 ## Notes
-- **Two listeners.** S3 + `/share/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_LISTEN_ADDR`
-  (:7373); console + `/api/v1` + SSE on `CAIRN_WEB_ADDR` (:7374; `off`/`none` for headless). Infra
+- **Two listeners.** S3 + native `/api/v1` + `/share/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_API_ADDR`
+  (:7373); console + `/api/v1` + SSE + forced-download `/share/…` on `CAIRN_CONSOLE_ADDR` (:7374; `off`/`none` for headless). Infra
   endpoints use a fixed four-request budget independent of the application limiter and fail fast
   when full; metrics is capped at two of those lanes so scrapes cannot starve readiness. These are
-  disjoint route matrices: neither listener falls through to the other plane.
+  explicit route matrices: sessions/events are console-only; native administration requires explicit credentials.
 - **Crypto fails closed; `unsafe` is forbidden.** `#![forbid(unsafe_code)]` on every build except
   `fast-io`, which relaxes to `deny` for the SAFETY-commented syscall blocks. Never widen this.
 - **Startup refuses to bind a public address with insecure dev defaults** (built-in dev master key
@@ -216,3 +216,5 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 Schema/storage compatibility is validated before metadata maintenance. Sharded SQLite preflights
 every existing file before opening any Writer; snapshots and restore staging use the same read-only
 SQLite guard. This does not make previously released older binaries safe downgrade targets.
+
+`endpoints.rs` resolves public origins for diagnostics and link minting. Configure `CAIRN_API_PUBLIC_URL` and `CAIRN_CONSOLE_PUBLIC_URL` behind ingress; only direct loopback requests infer the opposite port. Retired environment names are errors. Console download content is always an attachment, never active inline content.

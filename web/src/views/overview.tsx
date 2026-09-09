@@ -133,7 +133,7 @@ export function Overview() {
 
           {/* items-start so each card sizes to its own content — the Compression card is much
               shorter than Node, and stretching it to match left a large empty void. */}
-          <div className="grid items-start gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
             {/* Node card: identity and health facts for this instance. */}
             <Card className="gap-4">
               <CardHeader className="gap-1">
@@ -155,22 +155,33 @@ export function Overview() {
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
-                    <dt className="shrink-0 text-muted-foreground">S3 API</dt>
+                    <dt className="shrink-0 text-muted-foreground">API bind</dt>
                     <dd className="min-w-0 truncate font-mono text-[13px]">
-                      {sys.s3_addr}
+                      {sys.api_addr}
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
-                    <dt className="shrink-0 text-muted-foreground">Console</dt>
+                    <dt className="shrink-0 text-muted-foreground">Console bind</dt>
                     <dd className="min-w-0 text-right">
                       <span className="block truncate font-mono text-[13px]">
-                        {sys.web_addr}
+                        {sys.console_addr}
                       </span>
                       <span className="block text-xs text-muted-foreground">
                         configured address
                       </span>
                     </dd>
                   </div>
+                  {[
+                    ["API public URL", sys.api_public_url],
+                    ["Console public URL", sys.console_public_url],
+                  ].map(([label, url]) => (
+                    <div key={label} className="flex flex-wrap items-baseline justify-between gap-2">
+                      <dt className="text-muted-foreground">{label}</dt>
+                      <dd className={cn("min-w-0 text-[13px]", url ? "break-all font-mono" : "text-muted-foreground")}>
+                        {url ?? "Inferred from request when possible"}
+                      </dd>
+                    </div>
+                  ))}
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">TLS</dt>
                     <dd>

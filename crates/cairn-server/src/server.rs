@@ -32,14 +32,14 @@ struct ListenerPlan {
 }
 
 fn listener_plan(config: &Config) -> std::io::Result<ListenerPlan> {
-    let control_addr = config.web_listen_addr().map_err(|error| {
+    let control_addr = config.console_listen_addr().map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid control listener configuration: {error}"),
         )
     })?;
     Ok(ListenerPlan {
-        data_addr: config.listen_addr,
+        data_addr: config.api_addr,
         control_addr,
     })
 }
@@ -229,9 +229,8 @@ pub async fn serve(
     })?;
     let listener = TcpListener::bind(plan.data_addr).await?;
     let local = listener.local_addr()?;
-    // The control listener is a second, optional socket with a disjoint route matrix. `None`
-    // (`CAIRN_WEB_ADDR` empty/off) runs headless: no management socket is bound, and the data
-    // listener's immutable role still rejects the management namespace.
+    // The console listener is optional. Headless mode removes browser sessions and assets;
+    // native administration remains available on the API socket.
     let web_listener = match plan.control_addr {
         Some(addr) => Some(TcpListener::bind(addr).await?),
         None => None,
@@ -292,7 +291,7 @@ pub async fn serve(
     let background = crate::background::spawn(state.stack.clone(), &config, shutdown_rx.clone());
     tracing::info!(s3_api = %local, web_console = ?web_local, tls = tls_rx.is_some(), "cairn listening");
 
-    // Run the disjoint data and (optionally) control accept loops concurrently. Their roles are
+    // Run the API and optional console accept loops concurrently. Their roles are
     // values captured at wiring time, not a per-request decision.
     let listeners = async {
         let api = accept_loop(
@@ -300,7 +299,7 @@ pub async fn serve(
             state.clone(),
             tls_rx.clone(),
             ktls_ready,
-            ListenerRole::Data,
+            ListenerRole::Api,
             shutdown_rx.clone(),
         );
         match web_listener {
@@ -310,7 +309,7 @@ pub async fn serve(
                     state.clone(),
                     tls_rx,
                     ktls_ready,
-                    ListenerRole::Control,
+                    ListenerRole::Console,
                     shutdown_rx.clone(),
                 );
                 let (api_report, web_report) = tokio::join!(api, web);
@@ -573,7 +572,7 @@ async fn serve_tls(
     // a plaintext HTTP request (`G`/`P`/… are all != 0x16). The S3 data-plane listener
     // (the data role) deliberately skips this and stays TLS-only: redirecting a SigV4 request
     // would require first accepting its `Authorization`/presigned credentials over cleartext.
-    if role.is_control() {
+    if role.is_console() {
         // Bound the wait for the first byte: a client that connects and never sends one must not pin
         // this task (an unauthenticated slow-loris). A genuine TLS or HTTP client sends immediately,
         // so a short cap is invisible to real traffic and drops idle/hostile sockets.
@@ -775,7 +774,7 @@ async fn serve_plaintext(
     // The sendfile fast path runs only on the S3 data-plane listener: the web console listener serves console
     // assets at paths that must be matched before S3 routing, so it always goes straight to hyper.
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
-    if role.is_data() {
+    if role.is_api() {
         let mut fast_shutdown = conn_shutdown.clone();
         match crate::fast_get::try_sendfile_get(
             stream,
@@ -901,7 +900,7 @@ async fn handle(
         %peer,
     );
 
-    let infra = role.is_data()
+    let infra = role.is_api()
         && method == Method::GET
         && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
     // Load-shed and timeout are the two failures a person is most likely to meet under load, and
@@ -1064,22 +1063,20 @@ fn content_length(headers: &hyper::HeaderMap) -> u64 {
 /// series, so it is collapsed to a coarse family. The listener role is part of the classification:
 /// the same path can be an S3 bucket on the data listener and a rejected console path on control.
 pub(crate) fn classify_route(role: ListenerRole, path: &str) -> &'static str {
-    match role {
-        ListenerRole::Data => match path {
-            "/healthz" => "healthz",
-            "/readyz" => "readyz",
-            "/metrics" => "metrics",
-            _ if adapter::is_control_path(path) => "rejected",
-            _ if path.starts_with("/share/") => "share",
-            _ => "s3",
-        },
-        ListenerRole::Control => {
-            if adapter::is_control_path(path) {
-                "api"
-            } else {
-                "web"
-            }
+    if role.is_api() {
+        match path {
+            "/healthz" => return "healthz",
+            "/readyz" => return "readyz",
+            "/metrics" => return "metrics",
+            _ => {}
         }
+    }
+    match adapter::listener_route(role, &Method::GET, path) {
+        adapter::ListenerRoute::Management => "api",
+        adapter::ListenerRoute::PublicShare => "share",
+        adapter::ListenerRoute::ConsoleAsset => "web",
+        adapter::ListenerRoute::S3 => "s3",
+        adapter::ListenerRoute::NotFound => "rejected",
     }
 }
 
@@ -1103,8 +1100,12 @@ pub(crate) fn classify_operation(
     path: &str,
     query: &str,
 ) -> Option<(String, String)> {
-    if role.is_control() {
-        return adapter::is_control_path(path).then(|| ("Management".to_owned(), String::new()));
+    match adapter::listener_route(role, method, path) {
+        adapter::ListenerRoute::Management => {
+            return Some(("Management".to_owned(), String::new()));
+        }
+        adapter::ListenerRoute::S3 => {}
+        _ => return None,
     }
 
     // Not-counted families. Mirror `classify_route`'s buckets so the two stay consistent.
@@ -2004,14 +2005,14 @@ mod delete_label_tests {
     #[test]
     fn headless_listener_plan_has_no_control_plane() {
         let mut config = Config {
-            web_addr: "off".to_owned(),
+            console_addr: "off".to_owned(),
             ..Config::default()
         };
         let plan = listener_plan(&config).expect("headless plan");
-        assert_eq!(plan.data_addr, config.listen_addr);
+        assert_eq!(plan.data_addr, config.api_addr);
         assert_eq!(plan.control_addr, None);
 
-        config.web_addr = "127.0.0.1:7374".to_owned();
+        config.console_addr = "127.0.0.1:7374".to_owned();
         let plan = listener_plan(&config).expect("two-listener plan");
         assert_eq!(plan.control_addr, Some("127.0.0.1:7374".parse().unwrap()));
     }
@@ -2055,55 +2056,58 @@ mod delete_label_tests {
         // On the web-console listener, a root-served asset like the favicon must NOT be charted as a
         // path-style S3 bucket named "favicon.svg" (the bug a fresh node made obvious).
         assert_eq!(
-            classify_operation(ListenerRole::Control, &get, "/favicon.svg", ""),
+            classify_operation(ListenerRole::Console, &get, "/favicon.svg", ""),
             None
         );
         // The SPA shell / any other root path on the console listener is likewise not S3.
         assert_eq!(
-            classify_operation(ListenerRole::Control, &get, "/anything", ""),
+            classify_operation(ListenerRole::Console, &get, "/anything", ""),
             None
         );
         // Management calls are still charted on the console listener.
         assert_eq!(
-            classify_operation(ListenerRole::Control, &get, "/api/v1/buckets", ""),
+            classify_operation(ListenerRole::Console, &get, "/api/v1/buckets", ""),
             Some(("Management".to_owned(), String::new()))
         );
         // On the S3 data-plane listener the same path is a real path-style S3 op, unchanged.
         assert_eq!(
-            classify_operation(ListenerRole::Data, &get, "/photos", ""),
+            classify_operation(ListenerRole::Api, &get, "/photos", ""),
             Some(("ListObjects".to_owned(), "photos".to_owned()))
         );
         assert_eq!(
-            classify_operation(ListenerRole::Data, &get, "/favicon.svg", ""),
+            classify_operation(ListenerRole::Api, &get, "/favicon.svg", ""),
             Some(("ListObjects".to_owned(), "favicon.svg".to_owned()))
         );
         // Segment lookalikes remain S3 names on data; only the exact versioned namespace is blocked.
         assert_eq!(
-            classify_operation(ListenerRole::Data, &get, "/api/v10", ""),
+            classify_operation(ListenerRole::Api, &get, "/api/v10", ""),
             Some(("GetObject".to_owned(), "api".to_owned()))
         );
         assert_eq!(
-            classify_operation(ListenerRole::Data, &get, "/api/v1/buckets", ""),
-            None
+            classify_operation(ListenerRole::Api, &get, "/api/v1/buckets", ""),
+            Some(("Management".to_owned(), String::new()))
         );
     }
 
     #[test]
     fn route_metrics_follow_the_listener_matrix() {
-        assert_eq!(classify_route(ListenerRole::Data, "/"), "s3");
-        assert_eq!(classify_route(ListenerRole::Control, "/"), "web");
+        assert_eq!(classify_route(ListenerRole::Api, "/"), "s3");
+        assert_eq!(classify_route(ListenerRole::Console, "/"), "web");
+        assert_eq!(classify_route(ListenerRole::Api, "/api/v1/buckets"), "api");
         assert_eq!(
-            classify_route(ListenerRole::Data, "/api/v1/buckets"),
-            "rejected"
-        );
-        assert_eq!(
-            classify_route(ListenerRole::Control, "/api/v1/buckets"),
+            classify_route(ListenerRole::Console, "/api/v1/buckets"),
             "api"
         );
-        assert_eq!(classify_route(ListenerRole::Data, "/api/v10"), "s3");
-        assert_eq!(classify_route(ListenerRole::Control, "/api/v10"), "web");
-        assert_eq!(classify_route(ListenerRole::Data, "/healthz"), "healthz");
-        assert_eq!(classify_route(ListenerRole::Control, "/healthz"), "web");
+        assert_eq!(classify_route(ListenerRole::Api, "/api/v10"), "s3");
+        assert_eq!(
+            classify_route(ListenerRole::Console, "/api/v10"),
+            "rejected"
+        );
+        assert_eq!(classify_route(ListenerRole::Api, "/healthz"), "healthz");
+        assert_eq!(
+            classify_route(ListenerRole::Console, "/healthz"),
+            "rejected"
+        );
     }
 }
 

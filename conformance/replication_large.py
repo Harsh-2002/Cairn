@@ -201,8 +201,8 @@ def main():
             for name in ("source", "cairn"):
                 data = work / name
                 setting = dict(base_env, CAIRN_DATA_DIR=str(data), CAIRN_DB_PATH=str(data / "cairn.db"),
-                    CAIRN_MASTER_KEY=secrets.token_hex(32), CAIRN_LISTEN_ADDR=f"127.0.0.1:{ports[name]}",
-                    CAIRN_WEB_ADDR=f"127.0.0.1:{ports[name + '-ui']}", CAIRN_LOG_LEVEL="error", CAIRN_ENCRYPT_AT_REST=encrypt,
+                    CAIRN_MASTER_KEY=secrets.token_hex(32), CAIRN_API_ADDR=f"127.0.0.1:{ports[name]}",
+                    CAIRN_CONSOLE_ADDR=f"127.0.0.1:{ports[name + '-ui']}", CAIRN_LOG_LEVEL="error", CAIRN_ENCRYPT_AT_REST=encrypt,
                     CAIRN_REQUEST_TIMEOUT_SECS=str(deadline), CAIRN_ALLOW_INTERNAL_ENDPOINTS="true",
                     CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP="true",
                     CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS=str(deadline), CAIRN_REPLICATION_BUFFER_BUDGET_BYTES=str(128 * MIB),

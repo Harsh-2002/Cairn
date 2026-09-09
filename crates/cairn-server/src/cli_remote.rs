@@ -1,6 +1,6 @@
 //! The remote-administration CLI client (ARCH 24.2).
 //!
-//! This module is a thin HTTP client over the running server's two disjoint surfaces:
+//! This module is a thin HTTP client over the running server's API endpoint:
 //!
 //!  * the **management JSON API** under `/api/v1` (ARCH 22) — admin-gated, authenticated with a
 //!    first-party Bearer token `Authorization: Bearer <access>.<secret>` (ARCH 14.4); and
@@ -29,10 +29,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 
-/// The default management endpoint (embedded console + `/api/v1`).
-pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7374";
-/// The default S3 data-plane endpoint.
-pub const DEFAULT_S3_ENDPOINT: &str = "http://127.0.0.1:7373";
+/// The default API endpoint (native administration and S3).
+pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7373";
 
 // ---------------------------------------------------------------------------------------
 // Subcommand tree
@@ -42,22 +40,14 @@ pub const DEFAULT_S3_ENDPOINT: &str = "http://127.0.0.1:7373";
 /// when absent, the corresponding `CAIRN_*` environment variable.
 #[derive(Debug, Clone, Args)]
 pub struct RemoteOpts {
-    /// The management endpoint base URL (the listener that serves `/api/v1`).
-    #[arg(long, env = "CAIRN_ENDPOINT", default_value = DEFAULT_ENDPOINT, global = true)]
-    pub endpoint: String,
-    /// The S3 data-plane endpoint used by object commands and relative share URLs.
-    #[arg(
-        long,
-        env = "CAIRN_S3_ENDPOINT",
-        default_value = DEFAULT_S3_ENDPOINT,
-        global = true
-    )]
-    pub s3_endpoint: String,
+    /// The API endpoint used for both administration and S3 operations.
+    #[arg(long = "api-endpoint", env = "CAIRN_API_ENDPOINT", default_value = DEFAULT_ENDPOINT, global = true)]
+    pub api_endpoint: String,
     /// The access-key identifier, passed as one exact string.
     #[arg(long, env = "CAIRN_ACCESS_KEY", global = true)]
     pub access_key: Option<String>,
     /// The secret key, passed as one exact string.
-    #[arg(long, env = "CAIRN_SECRET_KEY", global = true)]
+    #[arg(long, env = "CAIRN_SECRET_KEY", hide_env_values = true, global = true)]
     pub secret_key: Option<String>,
     /// Emit machine-readable JSON instead of the concise human summary.
     #[arg(long, global = true)]
@@ -155,6 +145,12 @@ pub enum ImportCmd {
     },
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ShareDelivery {
+    Api,
+    ConsoleDownload,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ShareCmd {
     /// Create a persistent, revocable share link for an object.
@@ -169,6 +165,9 @@ pub enum ShareCmd {
         /// Never expire (works until revoked).
         #[arg(long, conflicts_with = "expires")]
         forever: bool,
+        /// Serve the share through the API or as a console download.
+        #[arg(long, value_enum, default_value = "api")]
+        delivery: ShareDelivery,
         /// Force download instead of viewing inline.
         #[arg(long)]
         download: bool,
@@ -370,7 +369,7 @@ pub enum ReplicationTargetCmd {
     Add {
         /// The source bucket.
         bucket: String,
-        /// The destination endpoint base URL (distinct from the connection `--endpoint`).
+        /// The destination endpoint base URL (distinct from the connection `--api-endpoint`).
         #[arg(long = "target-endpoint")]
         endpoint: String,
         /// The SigV4 signing region for the destination.
@@ -564,8 +563,6 @@ struct OverviewResp {
 struct ClientConfig {
     /// The management endpoint base URL without a trailing slash.
     endpoint: String,
-    /// The S3 data-plane endpoint base URL without a trailing slash.
-    s3_endpoint: String,
     /// The full Bearer token value (`<access>.<secret>`), or `None` when credentials are absent.
     token: Option<String>,
     /// Whether to emit raw JSON.
@@ -576,12 +573,10 @@ impl ClientConfig {
     /// Resolve the options into a client config: trim the endpoint's trailing slash and, when both
     /// halves are present, join the access key and secret into the Bearer token.
     fn resolve(opts: &RemoteOpts) -> Self {
-        let endpoint = opts.endpoint.trim_end_matches('/').to_owned();
-        let s3_endpoint = opts.s3_endpoint.trim_end_matches('/').to_owned();
+        let endpoint = opts.api_endpoint.trim_end_matches('/').to_owned();
         let token = bearer_token(opts.access_key.as_deref(), opts.secret_key.as_deref());
         Self {
             endpoint,
-            s3_endpoint,
             token,
             json: opts.json,
         }
@@ -596,7 +591,7 @@ impl ClientConfig {
     fn object_url(&self, bucket: &str, key: &str) -> String {
         format!(
             "{}/{}/{}",
-            self.s3_endpoint,
+            self.endpoint,
             pct_encode_segment(bucket),
             pct_encode_path(key)
         )
@@ -833,6 +828,10 @@ fn print_json_body(body: &[u8]) {
 /// Run a remote-admin command. Spins a small current-thread tokio runtime (the CLI is one-shot, so
 /// a multi-thread pool would be wasteful) and drives the single async request to completion.
 pub fn run(opts: &RemoteOpts, command: RemoteCommand) -> ExitCode {
+    if let Err(error) = crate::config::reject_retired_environment() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     let cfg = ClientConfig::resolve(opts);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1590,6 +1589,7 @@ async fn share(client: &HttpClient, cfg: &ClientConfig, cmd: ShareCmd) -> Result
             key,
             expires,
             forever,
+            delivery,
             download,
             filename,
             version,
@@ -1608,7 +1608,8 @@ async fn share(client: &HttpClient, cfg: &ClientConfig, cmd: ShareCmd) -> Result
             let body = serde_json::json!({
                 "key": key,
                 "expires_in_secs": expires_in_secs,
-                "disposition": if download { "attachment" } else { "inline" },
+                "delivery": if matches!(delivery, ShareDelivery::ConsoleDownload) { "console_download" } else { "api" },
+                "disposition": if download || matches!(delivery, ShareDelivery::ConsoleDownload) { "attachment" } else { "inline" },
                 "filename": filename,
                 "version_id": version,
             })
@@ -1703,14 +1704,10 @@ fn print_share_url(resp: &HttpResponse, cfg: &ClientConfig) -> Result<(), String
     }
     let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
     if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
-        // New servers return an absolute data-origin URL. Retain compatibility with an older
-        // relative response, but resolve it against the S3 endpoint rather than the control origin.
-        if let Some(path) = url.strip_prefix('/') {
-            let base = cfg.s3_endpoint.trim_end_matches('/');
-            println!("{base}/{path}");
-        } else {
-            println!("{url}");
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err("server returned a non-absolute share URL".into());
         }
+        println!("{url}");
     }
     Ok(())
 }
@@ -1809,20 +1806,23 @@ async fn api_send(
 mod tests {
     use super::*;
 
-    fn opts(
-        endpoint: &str,
-        s3_endpoint: &str,
-        ak: Option<&str>,
-        sk: Option<&str>,
-        json: bool,
-    ) -> RemoteOpts {
+    fn opts(endpoint: &str, ak: Option<&str>, sk: Option<&str>, json: bool) -> RemoteOpts {
         RemoteOpts {
-            endpoint: endpoint.to_owned(),
-            s3_endpoint: s3_endpoint.to_owned(),
+            api_endpoint: endpoint.to_owned(),
             access_key: ak.map(str::to_owned),
             secret_key: sk.map(str::to_owned),
             json,
         }
+    }
+
+    #[test]
+    fn help_hides_secret_environment_values() {
+        let command = RemoteOpts::augment_args(clap::Command::new("remote"));
+        let secret = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "secret_key")
+            .expect("secret-key option");
+        assert!(secret.is_hide_env_values_set());
     }
 
     #[test]
@@ -1844,48 +1844,29 @@ mod tests {
 
     #[test]
     fn config_resolve_trims_trailing_slash_and_builds_token() {
-        let cfg = ClientConfig::resolve(&opts(
-            "http://h:7374/",
-            "http://h:7373/",
-            Some("ak"),
-            Some("sk"),
-            true,
-        ));
-        assert_eq!(cfg.endpoint, "http://h:7374");
-        assert_eq!(cfg.s3_endpoint, "http://h:7373");
+        let cfg = ClientConfig::resolve(&opts("http://h:7373/", Some("ak"), Some("sk"), true));
+        assert_eq!(cfg.endpoint, "http://h:7373");
         assert_eq!(cfg.token.as_deref(), Some("ak.sk"));
         assert!(cfg.json);
     }
 
     #[test]
     fn config_resolve_without_creds_has_no_token() {
-        let cfg = ClientConfig::resolve(&opts(
-            "http://127.0.0.1:7374",
-            "http://127.0.0.1:7373",
-            None,
-            None,
-            false,
-        ));
+        let cfg = ClientConfig::resolve(&opts("http://127.0.0.1:7373", None, None, false));
         assert_eq!(cfg.token, None);
         assert!(!cfg.json);
     }
 
     #[test]
     fn api_url_inserts_versioned_prefix() {
-        let cfg = ClientConfig::resolve(&opts(
-            DEFAULT_ENDPOINT,
-            DEFAULT_S3_ENDPOINT,
-            None,
-            None,
-            false,
-        ));
+        let cfg = ClientConfig::resolve(&opts(DEFAULT_ENDPOINT, None, None, false));
         assert_eq!(
             cfg.api_url("/buckets"),
-            "http://127.0.0.1:7374/api/v1/buckets"
+            "http://127.0.0.1:7373/api/v1/buckets"
         );
         assert_eq!(
             cfg.api_url("/users/u1/quota"),
-            "http://127.0.0.1:7374/api/v1/users/u1/quota"
+            "http://127.0.0.1:7373/api/v1/users/u1/quota"
         );
     }
 
@@ -1902,13 +1883,7 @@ mod tests {
 
     #[test]
     fn object_url_is_path_style_and_encodes() {
-        let cfg = ClientConfig::resolve(&opts(
-            "https://control.example.com",
-            "https://s3.example.com",
-            None,
-            None,
-            false,
-        ));
+        let cfg = ClientConfig::resolve(&opts("https://s3.example.com", None, None, false));
         assert_eq!(
             cfg.object_url("photos", "a/b c.jpg"),
             "https://s3.example.com/photos/a/b%20c.jpg"

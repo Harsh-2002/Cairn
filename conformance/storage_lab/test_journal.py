@@ -45,7 +45,7 @@ def reports():
                 'server_configuration': {'CAIRN_META_SYNCHRONOUS': 'full', 'CAIRN_META_BACKEND': 'sqlite',
                                          'CAIRN_META_SHARDS': '1', 'CAIRN_DATA_DIR': f'/fixture/{token}',
                                          'CAIRN_DB_PATH': f'/fixture/{token}/meta.db',
-                                         'CAIRN_LISTEN_ADDR': f'127.0.0.1:{10000 + pair * 2 + side}',
+                                         'CAIRN_API_ADDR': f'127.0.0.1:{10000 + pair * 2 + side}',
                                          'CAIRN_BLOB_IO_POOL_SIZE': '64'}})
             ledger.append({'id': token, 'phase': 'recovery', 'status': 'PASS'})
     combined = arms[0] + arms[1]

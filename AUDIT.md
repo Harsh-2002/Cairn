@@ -34,7 +34,8 @@ true before relying on it**, the same way you'd distrust a stale comment.
 Cairn is a self-hosted, S3-compatible object storage server written in Rust, single-node by design.
 Object bytes are plain files on disk; all metadata (buckets, objects, ACLs, policies, credentials,
 lifecycle rules) lives in an embedded SQLite database behind one group-committing `Writer`. Two
-listeners: an S3 data-plane port and a web console/management-API port. Auth is SigV4 (header +
+listeners: an API port (S3, native administration, STS) and a console port (browser administration
+and forced-download public shares). Auth is SigV4 (header +
 streaming-chunked) and Bearer tokens, plus STS-style AssumeRole/GetSessionToken for short-lived scoped
 credentials. Secrets at rest are sealed with an AES-256-GCM master key (rotatable via a key ring). It
 supports per-bucket SSE-S3, `CAIRN_ENCRYPT_AT_REST`, SSE-KMS (label-only, not real per-tenant
@@ -148,8 +149,10 @@ path or a precise explanation of why it's reachable.
   (`guarded_http_connector`) — look specifically for any caller that builds its own client/connector.
 - Replication — credential scope, whether the stream itself is encrypted/authenticated, partial-object
   visibility on the target under partial failure.
-- Management API vs S3 API separation — `CAIRN_WEB_ADDR=off` actually removes the attack surface (not
-  just hides a route); management endpoints require separate authz from S3 credentials.
+- API/console separation — `CAIRN_CONSOLE_ADDR=off` removes the browser socket, sessions and assets;
+  native `/api/v1` administration remains on the API port with explicit administrator credentials.
+  Check cookie rejection on the API port, console-only session/events routes, and forced attachment
+  headers on console shares. Closing the console port does not disable native administration.
 - CORS — **ground truth (2026-07-29): scoped correctly.** `crates/cairn-protocol/src/service.rs` only
   echoes `Access-Control-Allow-Origin` when the request matches a bucket's *stored* CORS rule (exact
   match, configured literal `"*"`, or a single-wildcard prefix/suffix pattern); no unconditional

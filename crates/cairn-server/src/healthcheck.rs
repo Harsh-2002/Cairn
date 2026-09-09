@@ -38,7 +38,7 @@ pub fn run(cfg: &Config) -> ExitCode {
 
 fn probe_address(mut addr: SocketAddr) -> Result<SocketAddr, &'static str> {
     if addr.port() == 0 {
-        return Err("CAIRN_LISTEN_ADDR must use a fixed port for health checks");
+        return Err("CAIRN_API_ADDR must use a fixed port for health checks");
     }
     if addr.ip().is_unspecified() {
         addr.set_ip(match addr {
@@ -50,7 +50,7 @@ fn probe_address(mut addr: SocketAddr) -> Result<SocketAddr, &'static str> {
 }
 
 async fn probe(cfg: &Config, deadline: Duration) -> Result<(), &'static str> {
-    let addr = probe_address(cfg.listen_addr)?;
+    let addr = probe_address(cfg.api_addr)?;
     let tls = cfg.tls_cert_path.as_deref().map(tls_client).transpose()?;
     tokio::time::timeout(deadline, async {
         // A node-local CLI probe of the literal bind address, not an API-supplied outbound URL.
@@ -260,8 +260,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut configured = None;
         figment::Jail::expect_with(|jail| {
-            jail.set_env("CAIRN_LISTEN_ADDR", format!("0.0.0.0:{}", addr.port()));
-            jail.set_env("CAIRN_WEB_ADDR", "off");
+            jail.set_env("CAIRN_API_ADDR", format!("0.0.0.0:{}", addr.port()));
+            jail.set_env("CAIRN_CONSOLE_ADDR", "off");
             configured = Some(Config::load().unwrap());
             Ok(())
         });
@@ -284,7 +284,7 @@ mod tests {
     async fn closed_or_stalled_listener_fails_within_the_probe_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = Config {
-            listen_addr: listener.local_addr().unwrap(),
+            api_addr: listener.local_addr().unwrap(),
             ..Config::default()
         };
         // Accepting TCP alone is not healthy; this peer never supplies an HTTP response.
@@ -325,7 +325,7 @@ mod tests {
                     .unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let cfg = Config {
-                    listen_addr: listener.local_addr().unwrap(),
+                    api_addr: listener.local_addr().unwrap(),
                     tls_cert_path: Some(if matching { cert } else { other }),
                     tls_key_path: Some(key),
                     ..Config::default()
@@ -399,7 +399,7 @@ mod tests {
                 .with_cert_resolver(Arc::new(MismatchedKey(Arc::new(certified))));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let cfg = Config {
-                listen_addr: listener.local_addr().unwrap(),
+                api_addr: listener.local_addr().unwrap(),
                 tls_cert_path: Some(
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/tls_a.crt"),
                 ),

@@ -23,7 +23,7 @@
 # Exit status: 0 only if mismatches == 0 AND the source RSS did not grow past the leak threshold;
 # non-zero on any infrastructure failure or assertion failure.
 set -euo pipefail
-export CAIRN_WEB_ADDR=off  # multi-node harness: no web console listener (would collide on the default web console port)
+export CAIRN_CONSOLE_ADDR=off  # multi-node harness: no web console listener (would collide on the default web console port)
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/cairn}"
@@ -76,7 +76,7 @@ wait_healthy() {
 note "starting node-1 (replication target) on 127.0.0.1:$PORT1"
 T_BOOT="$(
   env CAIRN_DATA_DIR="$DATA1/data" CAIRN_DB_PATH="$DATA1/data/cairn.db" \
-      CAIRN_LISTEN_ADDR="127.0.0.1:$PORT1" CAIRN_MASTER_KEY="$KEY1" \
+      CAIRN_API_ADDR="127.0.0.1:$PORT1" CAIRN_MASTER_KEY="$KEY1" \
       CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}" \
       "$BIN" bootstrap
 )" || fail "node-1 bootstrap failed"
@@ -85,7 +85,7 @@ T_SECRET="$(echo "$T_BOOT" | awk '/Secret Access Key/ {print $NF}')"
 [ -n "$T_AKID" ] && [ -n "$T_SECRET" ] || fail "could not parse node-1 credentials"
 
 env CAIRN_DATA_DIR="$DATA1/data" CAIRN_DB_PATH="$DATA1/data/cairn.db" \
-    CAIRN_LISTEN_ADDR="127.0.0.1:$PORT1" CAIRN_MASTER_KEY="$KEY1" \
+    CAIRN_API_ADDR="127.0.0.1:$PORT1" CAIRN_MASTER_KEY="$KEY1" \
     CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}" \
     "$BIN" serve >"$DATA1/server.log" 2>&1 &
 SRV1=$!
@@ -94,7 +94,7 @@ SRV1=$!
 note "starting node-2 (source, replicates to node-1) on 127.0.0.1:$PORT2"
 S_BOOT="$(
   env CAIRN_DATA_DIR="$DATA2/data" CAIRN_DB_PATH="$DATA2/data/cairn.db" \
-      CAIRN_LISTEN_ADDR="127.0.0.1:$PORT2" CAIRN_MASTER_KEY="$KEY2" \
+      CAIRN_API_ADDR="127.0.0.1:$PORT2" CAIRN_MASTER_KEY="$KEY2" \
       CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}" \
       "$BIN" bootstrap
 )" || fail "node-2 bootstrap failed"
@@ -103,7 +103,7 @@ S_SECRET="$(echo "$S_BOOT" | awk '/Secret Access Key/ {print $NF}')"
 [ -n "$S_AKID" ] && [ -n "$S_SECRET" ] || fail "could not parse node-2 credentials"
 
 env CAIRN_DATA_DIR="$DATA2/data" CAIRN_DB_PATH="$DATA2/data/cairn.db" \
-    CAIRN_LISTEN_ADDR="127.0.0.1:$PORT2" CAIRN_MASTER_KEY="$KEY2" \
+    CAIRN_API_ADDR="127.0.0.1:$PORT2" CAIRN_MASTER_KEY="$KEY2" \
     CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}" \
     CAIRN_REPLICATION_ENDPOINT="http://127.0.0.1:$PORT1" \
     CAIRN_REPLICATION_ACCESS_KEY="$T_AKID" \

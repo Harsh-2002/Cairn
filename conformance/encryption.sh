@@ -47,8 +47,8 @@ stop_srv() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true; [ -n "$SRV" ] && 
 D1="$DATA/d1"
 export CAIRN_DATA_DIR="$D1/data"
 export CAIRN_DB_PATH="$D1/data/cairn.db"
-export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_API_ADDR="127.0.0.1:$PORT"
+export CAIRN_CONSOLE_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_KMS_KEY_IDS="$KEY_ID"
 unset CAIRN_ENCRYPT_AT_REST || true
 
@@ -73,7 +73,7 @@ stop_srv
 D2="$DATA/d2"
 export CAIRN_DATA_DIR="$D2/data"
 export CAIRN_DB_PATH="$D2/data/cairn.db"
-export CAIRN_WEB_ADDR=off
+export CAIRN_CONSOLE_ADDR=off
 export CAIRN_ENCRYPT_AT_REST=true
 unset CAIRN_KMS_KEY_IDS || true
 

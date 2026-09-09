@@ -163,9 +163,13 @@ pub struct SystemInfo {
     /// The server version — the build-injected `CAIRN_VERSION` (calendar release or `-dev` marker).
     pub version: String,
     /// The S3 API listener address as configured.
-    pub s3_addr: String,
+    pub api_addr: String,
     /// The web-console listener address as configured (may be `off`).
-    pub web_addr: String,
+    pub console_addr: String,
+    /// Configured public API origin, when explicitly set.
+    pub api_public_url: Option<String>,
+    /// Configured public console origin, when explicitly set.
+    pub console_public_url: Option<String>,
     /// Whether TLS is enabled on the S3 listener.
     pub tls: bool,
     /// The data directory (also the statvfs target for disk figures).
@@ -555,8 +559,10 @@ impl ControlService {
             &wire::SystemResp {
                 version: self.system.version.clone(),
                 uptime_secs: self.system.started_at.elapsed().as_secs(),
-                s3_addr: self.system.s3_addr.clone(),
-                web_addr: self.system.web_addr.clone(),
+                api_addr: self.system.api_addr.clone(),
+                console_addr: self.system.console_addr.clone(),
+                api_public_url: self.system.api_public_url.clone(),
+                console_public_url: self.system.console_public_url.clone(),
                 tls: self.system.tls,
                 data_dir: self.system.data_dir.display().to_string(),
                 disk_total_bytes,

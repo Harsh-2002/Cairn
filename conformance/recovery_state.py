@@ -317,7 +317,7 @@ def main():
         work = Path(directory)
         primary, restored, snapshot = (work / name for name in ("primary", "restored", "snapshot"))
         base_env = {k: v for k, v in os.environ.items() if not k.startswith("CAIRN_") and k != "FAILPOINTS"}
-        base_env.update(CAIRN_MASTER_KEY=secrets.token_hex(32), CAIRN_WEB_ADDR="off",
+        base_env.update(CAIRN_MASTER_KEY=secrets.token_hex(32), CAIRN_CONSOLE_ADDR="off",
                         CAIRN_META_BACKEND="sqlite", CAIRN_META_SHARDS="1",
                         CAIRN_ENCRYPT_AT_REST="true", CAIRN_LOG_LEVEL="error",
                         CAIRN_REPLICATION_ENDPOINT=f"http://127.0.0.1:{sink.server_port}",
@@ -329,7 +329,7 @@ def main():
         with socket.socket() as reserve:
             reserve.bind(("127.0.0.1", 0))
             port = reserve.getsockname()[1]
-        base_env["CAIRN_LISTEN_ADDR"] = f"127.0.0.1:{port}"
+        base_env["CAIRN_API_ADDR"] = f"127.0.0.1:{port}"
 
         def env(data, **extra):
             return dict(base_env, CAIRN_DATA_DIR=str(data), CAIRN_DB_PATH=str(data / "cairn.db"), **extra)

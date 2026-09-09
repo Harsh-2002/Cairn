@@ -48,7 +48,7 @@ const FAST_LINGER: Duration = Duration::from_secs(2);
 const FAST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The plaintext `sendfile` takeover is only wired on the S3/data listener.
-const FAST_PATH_LISTENER_ROLE: ListenerRole = ListenerRole::Data;
+const FAST_PATH_LISTENER_ROLE: ListenerRole = ListenerRole::Api;
 
 /// The result of the fast-path connection loop.
 pub enum Fast {
@@ -381,6 +381,12 @@ pub async fn try_sendfile_get(
             Some((p, q)) => (p.to_owned(), q.to_owned()),
             None => (head.target.clone(), String::new()),
         };
+        if crate::adapter::listener_route(FAST_PATH_LISTENER_ROLE, &http::Method::GET, &path)
+            != crate::adapter::ListenerRoute::S3
+            || matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics")
+        {
+            return fallback(stream, buf, "not_object");
+        }
         // An unparseable bucket/key is not a fast-path GET; hand the buffered head to hyper, which
         // renders the proper 400 through the normal adapter path.
         let Ok((bucket, key)) = route_path(&path) else {
@@ -662,7 +668,7 @@ mod tests {
 
     #[test]
     fn metrics_classification_is_pinned_to_the_data_listener() {
-        assert_eq!(FAST_PATH_LISTENER_ROLE, ListenerRole::Data);
+        assert_eq!(FAST_PATH_LISTENER_ROLE, ListenerRole::Api);
         assert_eq!(
             crate::server::classify_route(FAST_PATH_LISTENER_ROLE, "/photos/cat.jpg"),
             "s3"

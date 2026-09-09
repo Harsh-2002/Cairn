@@ -41,7 +41,7 @@ both remote) and per-object checksum-verification ledgers are future work.
 
 ## 3. Run an import (management API)
 
-The endpoints live on the console/API listener (`CAIRN_WEB_ADDR`, default `:7374`), under `/api/v1`,
+The endpoints live on the API listener (`CAIRN_API_ADDR`, default `:7373`) and the console management surface, under `/api/v1`,
 and require an administrator Bearer token (`<access-key>.<secret>`).
 
 Optionally, list the buckets a set of source credentials can see before committing to a job — this is
@@ -49,7 +49,7 @@ what the console's **Fetch buckets** step calls. The secret signs a single `List
 sealed, stored, logged, or echoed:
 
 ```sh
-curl -s -X POST http://127.0.0.1:7374/api/v1/imports/source/buckets \
+curl -s -X POST http://127.0.0.1:7373/api/v1/imports/source/buckets \
   -H 'Authorization: Bearer cairn.cairnadmin' \
   -H 'content-type: application/json' \
   -d '{
@@ -65,7 +65,7 @@ Create a job (an empty `buckets` list means "every bucket the source credentials
 `dest` defaults to its `source` name):
 
 ```sh
-curl -s -X POST http://127.0.0.1:7374/api/v1/imports \
+curl -s -X POST http://127.0.0.1:7373/api/v1/imports \
   -H 'Authorization: Bearer cairn.cairnadmin' \
   -H 'content-type: application/json' \
   -d '{
@@ -86,8 +86,8 @@ testing only, `"insecure_skip_verify": true`).
 Watch progress:
 
 ```sh
-curl -s 'http://127.0.0.1:7374/api/v1/imports?limit=100' -H 'Authorization: Bearer cairn.cairnadmin' # list page
-curl -s http://127.0.0.1:7374/api/v1/imports/<job>  -H 'Authorization: Bearer cairn.cairnadmin'   # detail
+curl -s 'http://127.0.0.1:7373/api/v1/imports?limit=100' -H 'Authorization: Bearer cairn.cairnadmin' # list page
+curl -s http://127.0.0.1:7373/api/v1/imports/<job>  -H 'Authorization: Bearer cairn.cairnadmin'   # detail
 ```
 
 The detail shows the job state, aggregate `objects_done/objects_total` and byte counters, and a
@@ -100,8 +100,8 @@ stable because the cursor carries both creation time and job id.
 Cancel or resume:
 
 ```sh
-curl -s -X DELETE http://127.0.0.1:7374/api/v1/imports/<job>        -H 'Authorization: Bearer cairn.cairnadmin'
-curl -s -X POST   http://127.0.0.1:7374/api/v1/imports/<job>/resume -H 'Authorization: Bearer cairn.cairnadmin'
+curl -s -X DELETE http://127.0.0.1:7373/api/v1/imports/<job>        -H 'Authorization: Bearer cairn.cairnadmin'
+curl -s -X POST   http://127.0.0.1:7373/api/v1/imports/<job>/resume -H 'Authorization: Bearer cairn.cairnadmin'
 ```
 
 A cancel stops cleanly at the next page boundary; a resume re-runs from the stored per-bucket cursors,

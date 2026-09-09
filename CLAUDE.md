@@ -112,8 +112,8 @@ above remain the source of truth.
 - **Configuration is environment-only.** Everything is `CAIRN_*` env vars parsed by strict Figment
   (`deny_unknown_fields`) — no config file, no CLI flags. Add new knobs to
   `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH 28).
-- **Two listeners.** S3 data plane on `:7373` (`CAIRN_LISTEN_ADDR`); web console + `/api/v1` on
-  `:7374` (`CAIRN_WEB_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
+- **Two listeners.** S3 + native `/api/v1` administration on `:7373` (`CAIRN_API_ADDR`); web console + session-authenticated `/api/v1` and forced-download shares on
+  `:7374` (`CAIRN_CONSOLE_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
   served on the S3 port under a small dedicated infrastructure concurrency budget. The AWS-STS surface (AssumeRole /
   GetSessionToken, `cairn-server/src/sts.rs`, `CAIRN_STS_ENABLED`) is a form POST on the S3 port.
 - **All writes go through the single `Writer`** (group-commit, savepoint-isolated batches) in

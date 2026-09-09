@@ -17,12 +17,14 @@ separate npm project, excluded from the cargo workspace; see `../../web/CLAUDE.m
 - **A real `npm run build` is the only thing that satisfies the gate.** The placeholder shell
   references NO `assets/` bundles by design, so `index_referenced_bundles_are_embedded` still FAILS
   on a placeholder — build the web console first (`cd web && npm run build`) before relying on the binary.
+- `rust-embed` uses `debug-embed`: debug and release binaries both contain the assets and can run
+  without the build checkout. Rebuild after changing `web/dist`; use Vite for frontend development.
 - `spa_shell()` **panics** if no `index.html` is embedded — impossible after a successful build, but
   it means an empty `web/dist` surfaces as a panic, not a compile error.
 - Consumed by `cairn-server/src/adapter.rs`: on the web console listener only, `/` and embedded assets are
-  served BEFORE S3 routing so a bucket named `assets` can't shadow `/assets/...`; any other path
-  falls through to S3 routing. Don't add routing logic here — this crate only resolves bytes.
+  served before object routing so a bucket named `assets` cannot shadow `/assets/...`; unknown
+  console paths return 404. Don't add routing logic here — this crate only resolves bytes.
 - Keep the surface tiny: no HTTP, no auth, no state. It maps a request path to embedded bytes; the
-  server owns response building, the two listeners, and the `/web`→`/` back-compat redirect.
+  server owns response building, the two listeners, and explicit management and download routes.
 - Spec: `../../docs/control-plane.md` (ARCH 23). Visual system: `../../docs/design.md`,
   `../../docs/product.md`. See the root `../../CLAUDE.md` for the gate and workspace-wide rules.

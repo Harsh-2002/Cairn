@@ -2,6 +2,16 @@
 set -euo pipefail
 
 case "${1:?CI task required}" in
+  musl-tools)
+    # musl comes from Ubuntu; unrelated runner repositories must not block its installation.
+    apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any)
+    sudo apt-get "${apt_sources[@]}" update
+    sudo apt-get "${apt_sources[@]}" install -y musl-tools=1.2.4-2
+    ;;
+  console-browser)
+    chmod +x target/debug/cairn
+    BIN=target/debug/cairn BROWSER=1 python3 conformance/api_console.py
+    ;;
   storage-lab)
     chmod +x target/debug/cairn
     shellcheck -s sh conformance/storage_lab/run.sh

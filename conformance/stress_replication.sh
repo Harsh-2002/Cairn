@@ -189,7 +189,7 @@ PYEOF
 common_env() { # <data-dir> <s3-port> <web-addr> <master-key>
   printf '%s\n' \
     "CAIRN_DATA_DIR=$1/data" "CAIRN_DB_PATH=$1/data/cairn.db" \
-    "CAIRN_LISTEN_ADDR=127.0.0.1:$2" "CAIRN_WEB_ADDR=$3" "CAIRN_MASTER_KEY=$4" \
+    "CAIRN_API_ADDR=127.0.0.1:$2" "CAIRN_CONSOLE_ADDR=$3" "CAIRN_MASTER_KEY=$4" \
     "CAIRN_REGION=us-east-1" "CAIRN_ALLOW_INSECURE=true" \
     "CAIRN_LOG_LEVEL=${CAIRN_LOG_LEVEL:-error}" \
     "CAIRN_REQUEST_TIMEOUT_SECS=${CAIRN_REQUEST_TIMEOUT_SECS:-600}" \

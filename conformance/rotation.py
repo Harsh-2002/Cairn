@@ -113,7 +113,7 @@ def base_env(extra):
     for k in ("CAIRN_MASTER_KEY", "CAIRN_MASTER_KEY_RING", "CAIRN_MASTER_KEY_ACTIVE_ID"):
         e.pop(k, None)
     e.update({
-        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{PORT}", "CAIRN_WEB_ADDR": f"127.0.0.1:{UIPORT}",
+        "CAIRN_API_ADDR": f"127.0.0.1:{PORT}", "CAIRN_CONSOLE_ADDR": f"127.0.0.1:{UIPORT}",
         "CAIRN_DATA_DIR": RDATA, "CAIRN_DB_PATH": os.path.join(RDATA, "cairn.db"),
         "CAIRN_REGION": REGION, "CAIRN_ROOT_ACCESS_KEY": AK, "CAIRN_ROOT_SECRET_KEY": SK,
         "CAIRN_META_SHARDS": str(SHARDS), "CAIRN_META_BACKEND": "sqlite",
