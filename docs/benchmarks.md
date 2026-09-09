@@ -558,3 +558,93 @@ production throughput were not profiled. No reduced disk-write claim follows. Th
 arms took under five seconds including fixture setup, with a 1-MiB input per arm. Temporary test
 code and data were removed after the comparison; this table retains the results without adding a
 permanent benchmark or repeating the large load campaign.
+
+
+## Bidirectional replication and compressed allocation (2026-09-09)
+
+A one-off scale exercise tested release build `000eeb0da612d12ab59dd45bb307b68e68cddcc5`
+(binary SHA-256 `1eaaa17cb4091e8701a239ffe6648069d2b6d127d353b731a37de891da704b9d`).
+Two processes shared the development host's CPU and ext4 SSD, using separate data/control ports,
+independent databases and master keys, SQLite FULL durability, four replication workers per node,
+a one-second replication interval and 16 client workers. This is not an isolated-host, WAN or
+MinIO comparison, and the console's responsiveness was not tested.
+
+The workload wrote **50,000,000,000 unique logical bytes**, targeting **100,000,000,000 mirrored
+logical bytes**: 120,000 small originals (4/16/64 KiB) and 466 large originals, principally
+1/32/256 MiB. Compression-off, Zstd and LZ4 buckets used 256-KiB blocks and bidirectional rules.
+Initial keys had disjoint origin prefixes. Synthetic content repeated deterministic random or
+half-zero blocks, with per-object/per-MiB identity tags; it was not independent random entropy
+for every byte. Simultaneous conflicting writes to the same key were not tested.
+
+The fixed run completed within a 60-minute runtime and 100-GB allocated-space budget, with
+12 GiB reserved for in-flight work and shutdown. A preliminary port preflight stopped before any
+server or object write; the workload then ran once on a fresh port pair. Both nodes shut down
+cleanly after verification.
+
+| Result | Measurement |
+|---|---:|
+| Original data objects / unique bytes | 120,466 / 50,000,000,000 |
+| Full HTTP version reads, both nodes | 241,124 |
+| Full-body SHA-256 verified bytes, including extra versions | 100,007,768,056 |
+| Content mismatches / terminal replication failures | 0 / 0 |
+| Final pending / claimed / failed, each node | 0 / 0 / 0 |
+| Original population time | 819.785 s |
+| Additional baseline convergence time | 735.765 s |
+| Full readback and client SHA-256 verification | 850.682 s |
+| Entire exercise, including shutdown | 2,542.389 s (42.37 min) |
+| Highest sampled whole-run allocation | 59,091,075,072 B |
+| Whole-run allocation after shutdown | 57,033,072,640 B |
+
+After baseline convergence, 60 opposite-origin overwrites and 30 delete markers propagated.
+One populated peer was stopped while the survivor accepted 18 new objects; catch-up after restart
+took 34.813 seconds including the convergence observation window. Another 18 writes propagated
+in the reverse direction. Exact current listings, complete version/marker sets, latest-version
+flags, marker 404 identities and full bodies matched on both nodes. The final outboxes contained
+only the expected 60,298 / 60,294 originating operations, with no replica-origin cascade.
+Both metadata databases passed `quick_check`.
+
+### Allocation fix and existing data
+
+Default staging previously retained unwritten preallocation beyond compressed EOF. The fix trims
+only to actual descriptor EOF after buffered writes drain and before the existing durability sync;
+errors prevent publication and queued jobs retain their I/O ownership (ARCH 7.5, 8.2).
+An old-binary fixture stored an 8-MiB logical payload in a 1,052,330-byte file occupying 8,388,608
+allocated bytes. An ordinary S3 replacement with the fixed binary had the same file length but
+occupied 1,052,672 bytes. Four full readbacks matched; deleting the exact old version reclaimed
+its inode through normal cleanup. Upgrading alone does not reclaim old versions' excess allocation;
+see [troubleshooting](./troubleshooting.md#compressed-file-length-is-small-but-disk-allocation-remains-large).
+
+Across all 241,124 retained data-version files, EOF lengths summed to 55,931,733,730 bytes and
+allocated blocks to 56,572,760,064 bytes. Every file matched its metadata length, and the maximum
+allocation above any file's EOF was 7,904 bytes. The earlier incomplete run had about 34 GB of
+allocation above EOF. Its different replica population prevents a like-for-like whole-run speed
+comparison; no throughput improvement from this fix is claimed.
+
+### Throughput, latency and observation limits
+
+Full readback plus hashing averaged **117.6 MB/s** across the mixed workload. During small-object
+readback, ten non-overlapping one-minute windows measured **370–386 requests/s**. The sampled
+large-read interval moved about 93.1 GB in 217.2 seconds, approximately **429 MB/s**. These are
+client-observed throughput figures with 16 workers, not individual request latency.
+
+The driver did **not** retain per-GET elapsed times or time to first byte, so GET p50/p95/p99 and
+consistent tail latency are unproven. Small-upload SDK timings, while replication was active,
+were approximately 43 ms median, 95 ms p95 and 150–152 ms p99 across the three compression
+settings; these include SDK overhead and exclude separately timed input-hash preparation.
+
+Sampled process RSS peaked at 1,166.6 / 1,069.0 MiB; WAL file lengths at 985,578,192 / 730,743,832
+bytes. Pending lag peaked at 359 / 443 seconds. Pending age excludes claimed work, so zero pending
+lag alone does not establish convergence. These observations do not establish leak freedom or
+attribute a CPU/SQLite bottleneck. No hardware-specific throughput or latency SLO follows.
+
+There were 1,973 resource samples. Four `du` samples encountered the driver's transient SQLite
+journal after it disappeared; the final quiescent disk measurement succeeded. An auxiliary raw
+`compressed_files` counter counted non-null descriptors, including `Uncompressed`; analysis
+corrected it to 80,374 per node from parsed descriptors. It was not used by any pass/fail check.
+Raw run artifacts and the one-off driver are retained with the operator's test data, outside Git;
+this record does not add that driver to the supported CI harnesses.
+
+The fix also passed the full local gate: 1,470 workspace tests (5 skipped), doctests, both Clippy
+variants, formatting, Rust/npm audits, console lint/build and installer checks. Regression coverage
+includes trim failure, cancellation ownership and plaintext/encrypted single-object/multipart
+containers across the three compression settings.

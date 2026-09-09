@@ -26,6 +26,26 @@ investigation there.
 | Console/web console won't load, S3 works | web console listener off or firewalled | `CAIRN_WEB_ADDR`; the second listener bound | The console + management API are on `:7374` by default; `CAIRN_WEB_ADDR=off` runs headless. |
 | A phantom bucket name in Metrics | (fixed) console asset miscounted | — | Resolved in current builds; upgrade if you see it. |
 
+## Compressed file length is small, but disk allocation remains large
+
+Compare file length with allocated blocks (`stat` and `du`); the recorded physical blob size is
+its file length, not a promise about filesystem block allocation. Some rounding and extent
+metadata overhead is normal. Before commit `000eeb0`, default staging could retain `KEEP_SIZE`
+preallocation based on the logical input length after compression produced a much smaller file.
+Dropping cached pages does not release those reserved disk blocks.
+
+Builds containing the fix release unused allocation beyond actual staged EOF before the existing
+file sync. This affects new writes and multipart assembly; upgrading does not rewrite existing
+published files. A normal S3 rewrite with the same body creates a correctly allocated new version.
+The old version retains its allocation until that exact version is permanently deleted, subject
+to retention and Object Lock. Verify the replacement before deciding to discard old history;
+normal Writer-owned cleanup then reclaims the old inode. Do not truncate published files directly
+or modify their metadata to reclaim space. A rewrite changes version identity; there is no new
+in-place, version-preserving repair command.
+
+The [scale validation](./benchmarks.md#bidirectional-replication-and-compressed-allocation-2026-09-09)
+records an old-to-new rewrite fixture and the completed replication retest.
+
 ## Diagnostics you can always run
 
 - **Integrity / reconciliation:** `cairn integrity` (reclaim orphan blobs) and `cairn integrity --repair`
