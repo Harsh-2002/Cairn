@@ -179,6 +179,10 @@ def check_headless():
         client_env.update(CAIRN_API_ENDPOINT=api, CAIRN_ACCESS_KEY=env["CAIRN_ROOT_ACCESS_KEY"], CAIRN_SECRET_KEY=env["CAIRN_ROOT_SECRET_KEY"])
         result = subprocess.run([BIN, "overview", "--json"], env=client_env, check=True, capture_output=True)
         assert "buckets" in json.loads(result.stdout)
+        for command in ["overview", "object", "share"]:
+            result = subprocess.run([BIN, command, "--help"], env=client_env, check=True, capture_output=True)
+            assert b"CAIRN_SECRET_KEY" in result.stdout
+            assert client_env["CAIRN_SECRET_KEY"].encode() not in result.stdout + result.stderr
         for old in ["CAIRN_ENDPOINT", "CAIRN_S3_ENDPOINT"]:
             result = subprocess.run([BIN, "overview"], env={**client_env, old: "do-not-print-this"}, capture_output=True)
             assert result.returncode != 0 and b"CAIRN_API_ENDPOINT" in result.stderr

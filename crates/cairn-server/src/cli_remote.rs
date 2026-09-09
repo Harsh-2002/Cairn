@@ -47,7 +47,7 @@ pub struct RemoteOpts {
     #[arg(long, env = "CAIRN_ACCESS_KEY", global = true)]
     pub access_key: Option<String>,
     /// The secret key, passed as one exact string.
-    #[arg(long, env = "CAIRN_SECRET_KEY", global = true)]
+    #[arg(long, env = "CAIRN_SECRET_KEY", hide_env_values = true, global = true)]
     pub secret_key: Option<String>,
     /// Emit machine-readable JSON instead of the concise human summary.
     #[arg(long, global = true)]
@@ -1813,6 +1813,16 @@ mod tests {
             secret_key: sk.map(str::to_owned),
             json,
         }
+    }
+
+    #[test]
+    fn help_hides_secret_environment_values() {
+        let command = RemoteOpts::augment_args(clap::Command::new("remote"));
+        let secret = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "secret_key")
+            .expect("secret-key option");
+        assert!(secret.is_hide_env_values_set());
     }
 
     #[test]
