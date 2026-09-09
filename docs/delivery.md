@@ -160,7 +160,9 @@ it does not run the suite again. Release binaries and signed artifacts are built
 bound to the release commit under Section 31.6. PR test binaries are never promoted to releases.
 
 The console is installed, linted, audited and built once per full validation, then its bundle is
-shared with Rust build jobs. Default conformance jobs share one server binary; distinct target,
+shared with Rust build jobs. Assets are embedded in both debug and release binaries, so the shared
+conformance binary runs without the build checkout or a runtime `web/dist` directory. Default
+conformance jobs share one server binary; distinct target,
 feature and coverage builds remain separate. Temporary binaries/bundles expire after one day and
 are deleted at run completion where token permissions permit. Only superseded runs of the same PR
 are cancelled; validations of distinct `main` commits do not cancel one another.

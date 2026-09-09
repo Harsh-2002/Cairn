@@ -47,6 +47,7 @@ const INDEX: &str = "index.html";
 /// ```
 pub fn asset(path: &str) -> Option<(String, Cow<'static, [u8]>)> {
     let trimmed = path.trim_start_matches('/');
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
     let lookup = if trimmed.is_empty() { INDEX } else { trimmed };
 
     let file = Assets::get(lookup)?;
@@ -84,6 +85,15 @@ mod tests {
     }
 
     #[test]
+    fn debug_and_release_assets_are_embedded_in_the_binary() {
+        let (_, body) = asset("index.html").expect("index.html is embedded");
+        assert!(
+            matches!(body, Cow::Borrowed(_)),
+            "assets must be compiled into the binary, not read from the build checkout"
+        );
+    }
+
+    #[test]
     fn empty_and_root_path_resolve_to_index() {
         let (_, root) = asset("").expect("empty path resolves to index");
         let (_, slash) = asset("/").expect("slash resolves to index");
@@ -108,6 +118,8 @@ mod tests {
     #[test]
     fn leading_slash_is_tolerated() {
         assert!(asset("/index.html").is_some());
+        assert!(asset("./index.html").is_some());
+        assert!(asset("../index.html").is_none());
     }
 
     /// The shell must reference its hashed JS/CSS bundles, and every asset it
