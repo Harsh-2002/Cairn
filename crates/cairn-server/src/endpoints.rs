@@ -29,7 +29,10 @@ impl Origin {
             .host()
             .trim_start_matches('[')
             .trim_end_matches(']');
-        if raw_host.is_empty() {
+        if raw_host.is_empty()
+            || (authority.host().starts_with('[')
+                && raw_host.parse::<std::net::Ipv6Addr>().is_err())
+        {
             return None;
         }
         let host = raw_host
@@ -266,6 +269,7 @@ mod tests {
             "https://u:p@a",
             "https://a:99999",
             "https://a:0",
+            "https://[invalid]",
             " https://a",
         ] {
             assert!(Origin::parse(bad).is_none(), "{bad}");

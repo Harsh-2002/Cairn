@@ -492,7 +492,7 @@ The indexes that carry the load are the unique index over bucket, key, and versi
 | GetObjectTagging, PutObjectTagging, DeleteObjectTagging | Yes | |
 | GetObjectAttributes | Yes | |
 | Presigned GET and PUT | Yes | SigV4 query form. |
-| Signed public-read URL | Yes | A Cairn extension, not an S3 operation. |
+| Persistent public-read URL | Yes | Cairn capability extension: API delivery permits inline or attachment; console delivery always forces a binary download (ARCH 22). |
 | STS AssumeRole, GetSessionToken | Yes | AWS-STS `Action=` form POST on the S3 data-plane root, minting temporary session credentials sealed under the master key. GetSessionToken inherits the caller's effective access; AssumeRole records RoleArn/RoleSessionName for audit only, and an inline session Policy is admin-only. On by default; disabled with `CAIRN_STS_ENABLED=false`. |
 | Object-level SSE-S3 (`x-amz-server-side-encryption: AES256`) | Yes | Accepted on writes and echoed on reads, with the per-object data-encryption key sealed under the master key; a per-bucket default-encryption setting applies it to new uploads that carry no SSE header. |
 | Object-level SSE-KMS (`x-amz-server-side-encryption: aws:kms`) | Yes | Accepted on single-part and multipart writes (including at `CreateMultipartUpload`) and on the bucket default; the key id is echoed on reads and the optional allow-list (`CAIRN_KMS_KEY_IDS`) gates writes, failing closed at initiate. Label-only: every DEK is sealed under the master key regardless of the key id — the key id is a label, not distinct key material or external-KMS isolation. |

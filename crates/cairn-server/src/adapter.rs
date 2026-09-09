@@ -1103,9 +1103,15 @@ async fn session_endpoint(
 /// Strip header-injection and quoting characters from a download filename before it goes into
 /// `Content-Disposition`.
 fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n'))
-        .collect()
+    let name: String = s
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '"' | '\\' | '/'))
+        .collect();
+    if name.trim().is_empty() || matches!(name.as_str(), "." | "..") {
+        "download".to_owned()
+    } else {
+        name
+    }
 }
 
 /// A 256-bit opaque token (two v4 UUIDs of hex), URL-safe and unguessable. Persistent-share
@@ -2554,6 +2560,15 @@ mod tests {
         }
         assert!(!management_payload_valid(&[], body, true));
         assert!(management_payload_valid(&[], b"", false));
+    }
+
+    #[test]
+    fn share_download_filenames_are_safe_and_nonempty() {
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+        assert_eq!(sanitize_filename("a/b\\c\r\n\t\".html"), "abc.html");
+        for name in ["", " ", ".", "..", "\r\n\t\"/\\"] {
+            assert_eq!(sanitize_filename(name), "download");
+        }
     }
 
     #[test]
