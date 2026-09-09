@@ -235,8 +235,8 @@ async function handleResponse<T>(res: Response): Promise<T> {
 
   if (!res.ok) {
     const p = payload as { error?: string; message?: string } | null;
-    const msg = p?.error || p?.message || `request failed (${res.status})`;
-    throw new ApiError(msg, res.status);
+    const msg = p?.message || p?.error || `request failed (${res.status})`;
+    throw new ApiError(msg, res.status, p?.error);
   }
   return payload as T;
 }

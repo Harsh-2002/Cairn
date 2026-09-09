@@ -53,10 +53,10 @@ pub struct RemoteOpts {
         global = true
     )]
     pub s3_endpoint: String,
-    /// The Bearer access-key id (the part before the dot in the token).
+    /// The access-key identifier, passed as one exact string.
     #[arg(long, env = "CAIRN_ACCESS_KEY", global = true)]
     pub access_key: Option<String>,
-    /// The Bearer secret (the part after the dot in the token).
+    /// The secret key, passed as one exact string.
     #[arg(long, env = "CAIRN_SECRET_KEY", global = true)]
     pub secret_key: Option<String>,
     /// Emit machine-readable JSON instead of the concise human summary.
@@ -607,7 +607,9 @@ impl ClientConfig {
 /// present, so an incomplete pair never produces a half-formed header.
 fn bearer_token(access: Option<&str>, secret: Option<&str>) -> Option<String> {
     match (access, secret) {
-        (Some(a), Some(s)) if !a.is_empty() && !s.is_empty() => Some(format!("{a}.{s}")),
+        (Some(a), Some(s)) if !a.is_empty() && !s.is_empty() => {
+            Some(cairn_auth::encode_bearer_token(a, s))
+        }
         _ => None,
     }
 }

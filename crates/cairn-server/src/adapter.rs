@@ -297,7 +297,7 @@ pub async fn handle(
     {
         let response = json_status(
             403,
-            r#"{"error":"forbidden","message":"console sign-in requires a same-origin request"}"#,
+            r#"{"error":"ConsoleOriginMismatch","message":"Console sign-in origin does not match this server. Check that the reverse proxy preserves Host, forwards the HTTPS scheme, and connects from an IP in CAIRN_TRUSTED_PROXIES."}"#,
         );
         return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
@@ -982,9 +982,8 @@ async fn session_endpoint(
             if req.access_key.is_empty() || req.secret_key.is_empty() {
                 return json_status(400, r#"{"error":"access_key and secret_key are required"}"#);
             }
-            // The console credential IS the Bearer token `<access_key>.<secret_key>`; validate it
-            // through the same auth chain the API uses by synthesizing the header it expects.
-            let token = format!("{}.{}", req.access_key, req.secret_key);
+            // Encode both credential strings losslessly, then use the API's ordinary auth chain.
+            let token = cairn_auth::encode_bearer_token(&req.access_key, &req.secret_key);
             let auth_headers = vec![
                 ("authorization".to_owned(), format!("Bearer {token}")),
                 ("host".to_owned(), transport.host.to_owned()),
@@ -1018,7 +1017,7 @@ async fn session_endpoint(
                 }
                 AuthOutcome::Authenticated(_) => json_status(
                     403,
-                    r#"{"error":"That credential is not an administrator. Only an admin can use the console."}"#,
+                    r#"{"error":"AdministratorRequired","message":"This account is not an administrator. Sign in with an administrator access key and secret key."}"#,
                 ),
                 _ => json_status(401, r#"{"error":"Access key or secret key is incorrect."}"#),
             }
@@ -3020,6 +3019,144 @@ mod tests {
         let cleared = clear_session_cookie(false);
         assert!(cleared.contains("Max-Age=0"));
         assert!(cleared.starts_with("cairn_session=;"));
+    }
+
+    #[tokio::test]
+    async fn console_root_credentials_preserve_strings_and_refresh_on_startup() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config {
+            data_dir: dir.path().join("data"),
+            db_path: dir.path().join("data/cairn.db"),
+            ..crate::config::Config::default()
+        };
+        let node =
+            Arc::new(crate::node_lock::NodeLock::acquire(&cfg.data_dir, &cfg.db_path).unwrap());
+        let stack = crate::stack::build(&cfg, node).await.unwrap();
+        let crypto: Arc<dyn cairn_types::traits::Crypto> = stack.crypto.clone();
+        let clock: Arc<dyn cairn_types::traits::Clock> = Arc::new(cairn_crypto::SystemClock::new());
+        let host = "console.example.test";
+        let source = ClientSource::Direct("127.0.0.1".parse().unwrap());
+        for (access, secret) in [
+            ("cairn", "cairnadmin"),
+            ("first.last@example.test", "secret.with.dots"),
+            (
+                "first.last@example.test",
+                "new 'single' and \"double\" quotes ",
+            ),
+            (" 'admin' ", " \"secret\" with spaces;\\$ "),
+        ] {
+            cfg.root_access_key = access.to_owned();
+            cfg.root_secret_key = secret.into();
+            crate::stack::ensure_root_admin(&stack.meta, &crypto, &clock, &cfg)
+                .await
+                .unwrap();
+            let body = Bytes::from(
+                serde_json::json!({"access_key": access, "secret_key": secret}).to_string(),
+            );
+            let response = session_endpoint(
+                &stack,
+                &Method::POST,
+                &body,
+                None,
+                SessionTransport {
+                    host,
+                    source,
+                    direct_secure: false,
+                    cookie_secure: true,
+                },
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let cookie = response.headers()["set-cookie"].to_str().unwrap();
+            assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"));
+            let token = session_cookie_token(&[("cookie".into(), cookie.into())]).unwrap();
+            let headers = vec![("authorization".into(), format!("Bearer {token}"))];
+            let view = RequestView {
+                method: "GET",
+                path: "/api/v1/session",
+                query: "",
+                headers: &headers,
+                host,
+                source,
+                secure_transport: false,
+            };
+            let AuthOutcome::Authenticated(principal) = stack.auth.authenticate(&view).await else {
+                panic!("the returned cookie must authenticate the configured identity");
+            };
+            assert_eq!(principal.access_key_id, access);
+            assert_eq!(principal.role, Role::Administrator);
+            let wrong_body = Bytes::from(
+                serde_json::json!({"access_key": access, "secret_key": format!("{secret}wrong")})
+                    .to_string(),
+            );
+            let wrong = session_endpoint(
+                &stack,
+                &Method::POST,
+                &wrong_body,
+                None,
+                SessionTransport {
+                    host,
+                    source,
+                    direct_secure: false,
+                    cookie_secure: true,
+                },
+            )
+            .await;
+            assert_eq!(wrong.status(), 401);
+            assert!(!wrong.headers().contains_key("set-cookie"));
+        }
+        let member_access = "member.name@example.test";
+        let member_secret = "member.secret";
+        let sealed = crypto.seal(member_secret.as_bytes()).unwrap();
+        let now = clock.now();
+        stack
+            .meta
+            .submit(cairn_types::meta::Mutation::CreateUser(Box::new(
+                cairn_types::meta::UserRecord {
+                    user: cairn_types::meta::User {
+                        id: cairn_types::UserId::generate(),
+                        display_name: "member".into(),
+                        access_key_id: member_access.into(),
+                        sigv4_access_key_id: Some(member_access.into()),
+                        role: Role::Member,
+                        is_active: true,
+                        quota_bytes: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    bearer_secret_hash: cairn_auth::hash_bearer_secret(member_secret),
+                    sigv4_secret_ciphertext: Some(sealed.ciphertext),
+                    sigv4_secret_nonce: Some(sealed.nonce.0),
+                },
+            )))
+            .await
+            .unwrap();
+        let member_body = Bytes::from(
+            serde_json::json!({
+                "access_key": member_access, "secret_key": member_secret,
+            })
+            .to_string(),
+        );
+        let denied = session_endpoint(
+            &stack,
+            &Method::POST,
+            &member_body,
+            None,
+            SessionTransport {
+                host,
+                source,
+                direct_secure: false,
+                cookie_secure: true,
+            },
+        )
+        .await;
+        assert_eq!(denied.status(), 403);
+        assert!(!denied.headers().contains_key("set-cookie"));
+        let body = denied.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "AdministratorRequired");
     }
 
     #[test]

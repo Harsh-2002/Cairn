@@ -82,16 +82,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (accessKey: string, secretKey: string) => {
     try {
-      await api.createSession(accessKey.trim(), secretKey);
+      await api.createSession(accessKey, secretKey);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         throw new ApiError("Access key or secret key is incorrect.", 401);
-      }
-      if (e instanceof ApiError && e.status === 403) {
-        throw new ApiError(
-          "That credential works, but it is not an administrator. Only the root admin can use the console.",
-          403,
-        );
       }
       throw e;
     }

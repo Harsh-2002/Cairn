@@ -1,7 +1,5 @@
 // Sign-in screen for the admin console. Renders standalone (no AppShell):
-// the management API authenticates with a Bearer token of the form
-// `<access-key>.<secret>`, which the auth provider assembles and verifies
-// against an admin-gated endpoint before letting the session in.
+// the server validates the two credential strings and issues an httpOnly session cookie.
 
 import {
   useEffect,
@@ -30,15 +28,13 @@ export function Login() {
   const from =
     (location.state as { from?: string } | null)?.from ?? "/overview";
 
-  const [accessKey, setAccessKey] = useState("");
-  const [secretKey, setSecretKey] = useState("");
   const [showSecret, setShowSecret] = useState(false);
   const [capsOn, setCapsOn] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const accessKeyId = useId();
-  const secretKeyId = useId();
+  const accessKeyId = "cairn-username";
+  const secretKeyId = "cairn-current-password";
   const capsHintId = useId();
 
   const accessKeyRef = useRef<HTMLInputElement>(null);
@@ -57,15 +53,20 @@ export function Login() {
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (busy) return;
+    // Password managers can fill the DOM without firing React change events. Read the actual
+    // form controls and preserve both strings, including whitespace and punctuation.
+    const form = new FormData(e.currentTarget);
+    const id = form.get("username");
+    const secret = form.get("password");
     setError(null);
-    const id = accessKey.trim();
-    if (!id || !secretKey) {
+    if (typeof id !== "string" || typeof secret !== "string" || !id || !secret) {
       setError("Enter your access key and secret key.");
       return;
     }
     setBusy(true);
     try {
-      await login(id, secretKey);
+      await login(id, secret);
       navigate(from, { replace: true });
     } catch (err) {
       setError(errorMessage(err, "Could not sign in."));
@@ -97,17 +98,24 @@ export function Login() {
           </p>
         </CardHeader>
         <CardContent>
-          <form onSubmit={onSubmit} className="space-y-4" noValidate>
+          <form
+            id="cairn-login"
+            method="post"
+            action="/api/v1/session"
+            autoComplete="on"
+            onSubmit={onSubmit}
+            className="space-y-4"
+            noValidate
+          >
             <FieldError>{error}</FieldError>
 
             <div className="space-y-2">
               <Label htmlFor={accessKeyId}>Access key</Label>
               <Input
                 id={accessKeyId}
+                name="username"
                 ref={accessKeyRef}
                 type="text"
-                value={accessKey}
-                onChange={(e) => setAccessKey(e.target.value)}
                 placeholder="Your admin access key"
                 autoComplete="username"
                 autoCapitalize="off"
@@ -121,9 +129,8 @@ export function Login() {
               <div className="relative">
                 <Input
                   id={secretKeyId}
+                  name="password"
                   type={showSecret ? "text" : "password"}
-                  value={secretKey}
-                  onChange={(e) => setSecretKey(e.target.value)}
                   onKeyDown={onSecretModifier}
                   onKeyUp={onSecretModifier}
                   placeholder="Your admin secret key"

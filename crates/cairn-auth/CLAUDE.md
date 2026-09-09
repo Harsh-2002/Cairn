@@ -16,7 +16,7 @@ do) is `cairn-authz`** — this crate depends on it only to parse the identity p
   (the signer reuses the verifier primitives, so a minted URL is what `aws s3 presign` produces).
   Header verification takes an `expected_service` (`"s3"` | `"sts"`) and a `payload_hash_override`
   (the STS path hashes the buffered form body itself).
-- `bearer.rs` — `Bearer <id>.<secret>` parse + fast-hash; `hash_session_token`.
+- `bearer.rs` — legacy and lossless versioned Bearer encode/parse + fast-hash; `hash_session_token`.
 - `chunked.rs` — streaming chunk-signature primitives; the rolling chain is **verified by the ingest
   decoder in `cairn-protocol`**, seeded by the `ChunkSigningContext` `verify_header` returns.
 - `cache.rs` — `AuthCache`: sealed-credential + parsed-policy memoization, epoch + TTL invalidated.

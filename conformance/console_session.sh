@@ -81,6 +81,8 @@ ok "whoami without a cookie is 401"
 st="$(code -D "$HEADERS" -X POST -H 'Content-Type: application/json' \
   -d "{\"access_key\":\"$AK\",\"secret_key\":\"$SK\"}" "$WEB/api/v1/session")"
 [ "$st" = "403" ] || fail "origin-less login should be 403, got $st (body: $(cat "$BODY"))"
+jq -e '.error == "ConsoleOriginMismatch" and (.message | contains("CAIRN_TRUSTED_PROXIES"))' "$BODY" >/dev/null ||
+  fail "origin rejection must explain proxy configuration, not claim credentials were checked"
 grep -qi '^set-cookie:.*cairn_session' "$HEADERS" &&
   fail "origin-less login unexpectedly set a session cookie"
 st="$(code -D "$HEADERS" -X POST -H 'Content-Type: application/json' -H "Origin: $S3" \
