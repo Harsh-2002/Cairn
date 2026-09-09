@@ -43,6 +43,18 @@ The management API authenticates with the same credential mechanisms as the rest
 
 ### 23.1 What it is and how it ships
 
+Console sign-in preserves both credential strings exactly. A `403 ConsoleOriginMismatch` means
+the browser origin did not match the verified external control origin, before credentials were
+checked; a `403 AdministratorRequired` means valid credentials resolved to a non-administrator.
+The console displays the server's specific message and must not infer either cause from HTTP 403
+alone. Invalid credentials remain HTTP 401. Proxy origin checks and administrator admission are
+independent checks and neither is relaxed to make sign-in succeed.
+
+The sign-in form exposes stable username/password names and IDs with `username` and
+`current-password` autocomplete hints. Submission reads the current form-control values, including
+password-manager fills that emit no input/change event. Credential fields remain uncontrolled so
+session-probe completion, error messages and password-visibility toggles cannot erase autofill.
+
 The management web console is a single-page application built with the React framework and its standard build toolchain, and it is compiled into the Cairn binary at build time so that a Cairn deployment is one binary that already contains its own management interface, with no separate web console service to deploy, host, or version-match. The built static assets, the markup, the script bundles, and the styles produced by the web console build are embedded into the binary through a compile-time asset-embedding mechanism that bakes the asset directory into the executable, and the server serves them from memory. This is the operator's stated requirement that the web console be installed and compiled into the binary itself and that management be possible through either the web console or the CLI, and it is satisfied by making the web console a build-time artifact of the same binary.
 
 ### 23.2 The build pipeline

@@ -6,6 +6,12 @@
 
 ### 28.1 Surface and conventions
 
+`CAIRN_ROOT_ACCESS_KEY` and `CAIRN_ROOT_SECRET_KEY` are opaque UTF-8 strings. Their environment
+values are preserved exactly, including dots, quote characters and whitespace; values resembling
+numbers, booleans or arrays are not reinterpreted as configuration syntax. Shell or Compose quoting
+delimits the value before it reaches Cairn. Literal quote characters that remain in the environment
+are part of the credential, not another quoting layer to remove.
+
 Server configuration comes entirely from **environment variables** in the `CAIRN_*` namespace, overlaid on the built-in defaults and validated on load so that an invalid configuration fails fast with a clear message rather than at first use. Cairn deliberately has **no configuration file and no server command-line flags**: a single, explicit environment surface keeps a deployment reproducible — identical whether run directly on a host or in a container — and avoids the precedence ambiguity of layering flags over a file over the environment. (The CLI subcommands accept their own flags, as any command-line tool does; this constraint concerns the server's own configuration, not the CLI.) The table below names settings logically; each maps to a `CAIRN_<SETTING>` variable. The settings continue the operational vocabulary an operator coming from a comparable server would expect. Note that **per-bucket replication targets and rules are primarily stored S3 resource state** — set through the management API, the web console, or the CLI (Section 20), with destination credentials sealed at rest under the master key — while a default or fallback target can still be configured through the `CAIRN_REPLICATION_*` environment variables and `CAIRN_REPLICATION_TARGETS`, used for any source bucket that has no stored target.
 
 The standalone installer's deployment policy is intentionally stricter than the raw defaults

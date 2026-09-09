@@ -2766,9 +2766,11 @@ fn bootstrap(cfg: Config) -> ExitCode {
         println!("Root administrator ready — the single default admin for this node.\n");
         println!("  Bearer (web console + management API):");
         println!(
-            "    Authorization: Bearer {}.{}",
-            cfg.root_access_key,
-            cfg.root_secret_key.expose_secret()
+            "    Authorization: Bearer {}",
+            cairn_auth::encode_bearer_token(
+                &cfg.root_access_key,
+                cfg.root_secret_key.expose_secret()
+            )
         );
         println!("\n  SigV4 (S3 SDKs / aws-cli):");
         println!("    Access Key Id:     {}", cfg.root_access_key);

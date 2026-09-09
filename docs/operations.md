@@ -124,6 +124,15 @@ Two first-class shapes:
    **stream** rather than buffer large bodies (otherwise Cairn's backpressure is defeated). Set
    `CAIRN_PUBLIC_BASE_URL` for correct generated URLs behind ingress.
 
+For Caddy on a shared Docker network, proxy the console hostname to `cairn:7374` and a separate
+S3 hostname to `cairn:7373`. Set `CAIRN_PUBLIC_BASE_URL` to the S3 hostname. Set
+`CAIRN_TRUSTED_PROXIES` to Caddy's actual, stable container IP on that network, not its public or
+host-LAN address. Caddy's HTTP upstream preserves Host and sets `X-Forwarded-*`; remove incoming
+`Forwarded` with `header_up -Forwarded` to avoid conflicting provenance. A console login rejected
+with `ConsoleOriginMismatch` requires correcting this proxy identity, Host or scheme; changing
+the root password does not fix it. After changing Compose environment values, recreate the Cairn
+container so it receives the new configuration.
+
 Never expose the plaintext interface to an untrusted network.
 
 Cairn binds **two listeners**: the S3 data plane (`CAIRN_LISTEN_ADDR`, default `:7373`) and the

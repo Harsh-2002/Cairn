@@ -1,10 +1,12 @@
 // Focused browser regressions. Served only by console-performance.mjs, never embedded in Cairn.
 import { act, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { Buckets } from "../../src/views/buckets";
 import { useResource, type Resource } from "../../src/lib/use-resource";
-import { api } from "../../src/lib/api";
+import { ApiError, api, errorMessage } from "../../src/lib/api";
+import { AuthProvider, useAuth } from "../../src/providers/auth-provider";
+import { Login } from "../../src/views/login";
 import "../../src/globals.css";
 
 declare global {
@@ -15,6 +17,107 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
+}
+
+async function testConsoleLogin() {
+  const originalFetch = window.fetch;
+  let auth!: ReturnType<typeof useAuth>;
+  let status = 403;
+  let response = { error: "ConsoleOriginMismatch", message: "Check the reverse proxy HTTPS scheme." };
+  let submitted: unknown;
+  window.fetch = async (_input, init) => {
+    if (init?.method !== "POST") return new Response("{}", { status: 401 });
+    submitted = JSON.parse(String(init.body));
+    return new Response(JSON.stringify(response), { status });
+  };
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  function Probe() { auth = useAuth(); return null; }
+  try {
+    await act(async () => root.render(<MemoryRouter><AuthProvider><Probe /></AuthProvider></MemoryRouter>));
+    const access = " first.last@example.test ";
+    const secret = " 'single' and \"double\".quotes $ ";
+    for (const denied of [
+      { status: 403, error: "ConsoleOriginMismatch", message: "Check the reverse proxy HTTPS scheme." },
+      { status: 403, error: "AdministratorRequired", message: "This account is not an administrator." },
+      { status: 403, error: "forbidden", message: "console sign-in requires a same-origin request" },
+      { status: 401, error: "unauthorized", message: "Access key or secret key is incorrect." },
+    ]) {
+      status = denied.status;
+      response = denied;
+      let failure: unknown;
+      await act(async () => { try { await auth.login(access, secret); } catch (e) { failure = e; } });
+      assert(failure instanceof ApiError && failure.status === status, "login preserves failure status");
+      assert(errorMessage(failure, "Could not sign in.").toLowerCase().includes(denied.message.toLowerCase()), "login displays the actual server reason");
+      assert(!auth.authed, "a denied login never authenticates the console");
+      assert(JSON.stringify(submitted) === JSON.stringify({ access_key: access, secret_key: secret }), "login sends both strings without trimming or splitting");
+    }
+    status = 200;
+    await act(async () => auth.login(access, secret));
+    assert(auth.authed, "successful login authenticates the console");
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    window.fetch = originalFetch;
+  }
+}
+
+async function testLoginAutofill() {
+  const originalFetch = window.fetch;
+  const probe = deferred<Response>();
+  let submitted: unknown;
+  let attempts = 0;
+  let status = 403;
+  window.fetch = async (_input, init) => {
+    if (init?.method !== "POST") return probe.promise;
+    attempts++;
+    submitted = JSON.parse(String(init.body));
+    return new Response(JSON.stringify({
+      error: "ConsoleOriginMismatch", message: "Check the reverse proxy HTTPS scheme.",
+    }), { status });
+  };
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => root.render(
+      <MemoryRouter initialEntries={["/login"]}><AuthProvider><Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/overview" element={<p>Signed in</p>} />
+      </Routes></AuthProvider></MemoryRouter>,
+    ));
+    const form = host.querySelector<HTMLFormElement>("#cairn-login")!;
+    const username = form.elements.namedItem("username") as HTMLInputElement;
+    const password = form.elements.namedItem("password") as HTMLInputElement;
+    assert(form.method === "post" && form.autocomplete === "on", "login uses a discoverable POST form");
+    assert(username.autocomplete === "username" && password.autocomplete === "current-password", "password-manager field purposes are explicit");
+    assert(username.id === "cairn-username" && password.id === "cairn-current-password", "credential field identifiers are stable");
+    const access = " first.last@example.test ";
+    const secret = " 'saved password' with \"quotes\".$ ";
+    // Deliberately omit input/change events, as some extension autofill paths do.
+    username.value = access;
+    password.value = secret;
+    await act(async () => probe.resolve(new Response("{}", { status: 401 })));
+    const toggle = host.querySelector<HTMLButtonElement>('button[aria-label="Show secret key"]')!;
+    await act(async () => toggle.click());
+    assert(password.type === "text" && password.value === secret, "show-password rerender retains autofilled text");
+    await act(async () => form.requestSubmit());
+    assert(attempts === 1 && JSON.stringify(submitted) === JSON.stringify({ access_key: access, secret_key: secret }), "autofill submits exact DOM values without a change event");
+    assert(host.textContent?.includes("Check the reverse proxy HTTPS scheme."), "login form renders the real rejection");
+    assert(username.value === access && password.value === secret, "failed login retains autofilled values");
+    password.value = "";
+    await act(async () => form.requestSubmit());
+    assert(attempts === 1 && host.textContent?.includes("Enter your access key and secret key."), "empty password is refused without a request");
+    password.value = secret;
+    status = 200;
+    await act(async () => form.requestSubmit());
+    assert(host.textContent?.includes("Signed in"), "autofilled login can complete and navigate");
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    window.fetch = originalFetch;
+  }
 }
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -131,9 +234,11 @@ async function testBuckets() {
 }
 
 try {
+  await testConsoleLogin();
+  await testLoginAutofill();
   await testResource();
   await testBuckets();
-  window.performanceRegression = { ok: true, message: "resource lifecycle and 2000-bucket pagination passed" };
+  window.performanceRegression = { ok: true, message: "console login, resource lifecycle and 2000-bucket pagination passed" };
 } catch (error) {
   window.performanceRegression = { ok: false, message: String(error instanceof Error ? error.stack : error) };
 }

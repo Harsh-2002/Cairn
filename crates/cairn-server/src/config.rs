@@ -665,8 +665,23 @@ impl Config {
     /// # Errors
     /// Returns a [`ConfigError`] if the environment fails to parse or validation fails.
     pub fn load() -> Result<Self, ConfigError> {
-        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
-            .merge(Env::prefixed("CAIRN_"))
+        let mut figment =
+            Figment::from(Serialized::defaults(Config::default())).merge(Env::prefixed("CAIRN_"));
+        // Credential values are opaque strings. Do not let Figment interpret quote characters,
+        // booleans, numbers, or surrounding whitespace as configuration syntax inside them.
+        for (env, field) in [
+            ("CAIRN_ROOT_ACCESS_KEY", "root_access_key"),
+            ("CAIRN_ROOT_SECRET_KEY", "root_secret_key"),
+        ] {
+            match std::env::var(env) {
+                Ok(value) => figment = figment.merge(Serialized::default(field, value)),
+                Err(std::env::VarError::NotPresent) => {}
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::Parse(format!("{env} must be valid UTF-8")));
+                }
+            }
+        }
+        let cfg: Config = figment
             .extract()
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
@@ -1528,6 +1543,30 @@ mod tests {
             jail.set_env("CAIRN_TRUSTED_PROXIES", "proxy.internal");
             let error = Config::load().unwrap_err().to_string();
             assert!(error.contains("CAIRN_TRUSTED_PROXIES"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn root_credential_environment_values_are_exact_strings() {
+        figment::Jail::expect_with(|jail| {
+            for value in [
+                "first.last@example.test",
+                "'single quoted'",
+                "\"double quoted\"",
+                " spaces and 'quotes' with \"punctuation\". ",
+                "123456",
+                "true",
+                "[1, 2]",
+                "{key=value}",
+                "管理者",
+            ] {
+                jail.set_env("CAIRN_ROOT_ACCESS_KEY", value);
+                jail.set_env("CAIRN_ROOT_SECRET_KEY", value);
+                let cfg = Config::load().expect("credential strings load literally");
+                assert_eq!(cfg.root_access_key, value);
+                assert_eq!(cfg.root_secret_key.expose_secret(), value);
+            }
             Ok(())
         });
     }

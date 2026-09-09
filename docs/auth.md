@@ -22,6 +22,15 @@ When a put carries one of the streaming-payload content-sha256 sentinels, the bo
 
 ### 14.4 Bearer form
 
+The legacy wire form is `Bearer <id>.<secret>`, split at the first dot. First-party credential
+producers retain that form for ordinary machine credentials. Identifiers containing dots, or either
+string containing whitespace, quotes, or other non-token characters, use
+`Bearer ~1~<hex-UTF8-id>~<hex-UTF8-secret>` instead. This versioned form contains no dot, so it cannot
+reinterpret a legacy token. Both decoded strings must be non-empty valid UTF-8; malformed hex,
+unknown versions and extra components fail closed. Encoding is transport framing, not encryption.
+Console login, session cookies, CLI authentication and bootstrap output use the same encoder;
+neither credential string is trimmed or normalized.
+
 The Bearer scheme is a simpler first-party mechanism in which the credential is an access-key identifier joined to a secret, presented in the authorization header. Cairn looks up the user by the identifier and compares the hash of the presented secret to the stored hash in constant time, yielding the principal on a match. The secret is stored only as a hash, which is safe because these are high-entropy machine-generated tokens rather than human passwords, so a slow password hash is unnecessary and a fast cryptographic hash suffices; this reasoning is recorded so a reviewer does not mistake it for an oversight.
 
 Every successful long-term authentication method then passes through one identity-policy attachment
