@@ -189,7 +189,13 @@ def sample(group):
                     continue
                 fields[name] = {key: value.strip() for key, _, value in (line.partition(":") for line in lines)
                                 if key in {"VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap", "Threads", "Pss", "Pss_Anon", "Pss_File", "Private_Dirty", "Shared_Clean", "Anonymous", "read_bytes", "write_bytes", "syscr", "syscw"}}
-            fields["fds"] = len(list((root / "fd").iterdir()))
+            try:
+                fields["fds"] = len(list((root / "fd").iterdir()))
+            except PermissionError:
+                # Procfs access can disappear during child exit. Preserve the
+                # remaining sample without inventing a zero descriptor count.
+                fields["fds"] = None
+                fields["fds_unavailable"] = "permission"
             fields["stat"] = (root / "stat").read_text().split(")", 1)[1].strip()
             records.append({"identity": member, **fields})
         except (FileNotFoundError, ProcessLookupError):

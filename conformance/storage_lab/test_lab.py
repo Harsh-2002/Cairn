@@ -11,8 +11,28 @@ from unittest.mock import patch
 
 from budget import Campaign, SPACE_LIMIT, Unavailable, footprint, remove_tree, validate_ledger
 from lab import profile_command, purge_artifacts, recover, reservation, run_case
-from processes import Child, live_group_members
+from processes import Child, identity, live_group_members, sample
 from s3_driver import distribution, payload
+
+
+class ProcessSamplingTests(unittest.TestCase):
+    def test_denied_fd_directory_preserves_other_metrics(self):
+        member = identity(os.getpid())
+        original = Path.iterdir
+
+        def denied(path):
+            if path == Path(f"/proc/{member['pid']}/fd"):
+                raise PermissionError("fixture: child procfs access lost")
+            return original(path)
+
+        with patch("processes.group_members", return_value=[member]), patch.object(Path, "iterdir", denied):
+            records = sample(member["pgrp"])["processes"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["identity"], member)
+        self.assertIsNone(records[0]["fds"])
+        self.assertEqual(records[0]["fds_unavailable"], "permission")
+        self.assertIn("VmRSS", records[0]["status"])
+        self.assertTrue(records[0]["stat"])
 
 
 class BudgetTests(unittest.TestCase):
