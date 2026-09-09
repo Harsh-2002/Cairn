@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -309,6 +310,18 @@ for path in yaml_files:
 
 # Installer inputs must resolve to an exact tool/package version. Registry locks and explicit
 # wheel/archive checksums provide the content binding.
+toolchain_path = ROOT / "rust-toolchain.toml"
+channel = tomllib.loads(toolchain_path.read_text(encoding="utf-8"))["toolchain"]["channel"]
+setup_text = (GITHUB / "actions/setup/action.yml").read_text(encoding="utf-8")
+setup_channel = re.search(r"^\s+toolchain:\s*(\S+)", setup_text, re.MULTILINE)
+if (
+    not re.fullmatch(r"\d+\.\d+\.\d+", channel)
+    or setup_channel is None
+    or setup_channel.group(1) != channel
+    or set(re.findall(r'rust: "([^"]+)"', RELEASE.read_text(encoding="utf-8"))) != {channel}
+):
+    fail(toolchain_path, 1, "repository Rust toolchain must match installed CI targets and release provenance")
+
 for path in [*yaml_files, ROOT / "Dockerfile"]:
     text = path.read_text(encoding="utf-8")
     for match in re.finditer(r"python-version:\s*[\"']?([^\"'\s#]+)", text):
