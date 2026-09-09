@@ -308,6 +308,16 @@ for path in yaml_files:
         if not re.fullmatch(rf"[^@\s]+@{SHA256}", match.group(1)):
             fail(path, line_number(text, match.start()), "BuildKit driver image is not digest-pinned")
 
+# Both independently assembled runtime images must carry the shell-free, env-aware probe.
+healthcheck = (
+    'HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 '
+    'CMD ["/usr/local/bin/cairn", "healthcheck"]'
+)
+for path in (ROOT / "Dockerfile", RELEASE):
+    declarations = re.findall(r"^\s*(HEALTHCHECK[^\n]*)", path.read_text(), re.MULTILINE)
+    if declarations != [healthcheck]:
+        fail(path, 1, "runtime image must use the built-in configured-listener health check")
+
 # Installer inputs must resolve to an exact tool/package version. Registry locks and explicit
 # wheel/archive checksums provide the content binding.
 toolchain_path = ROOT / "rust-toolchain.toml"

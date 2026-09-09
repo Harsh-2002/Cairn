@@ -339,6 +339,7 @@ jobs:
           ENV CAIRN_DATA_DIR=/data CAIRN_DB_PATH=/data/cairn.db
           EXPOSE 7373 7374
           USER nonroot
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD ["/usr/local/bin/cairn", "healthcheck"]
           ENTRYPOINT ["/usr/local/bin/cairn"]
           CMD ["serve"]
           DOCKER

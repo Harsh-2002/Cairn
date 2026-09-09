@@ -574,6 +574,8 @@ jobs:
     - run: chmod +x target/debug/cairn
     - name: Disjoint listeners + httpOnly cookie + origin-bound console S3 transfer
       run: BIN=target/debug/cairn bash conformance/console_session.sh
+    - name: Configured-listener container health probe
+      run: BIN=target/debug/cairn python3 conformance/healthcheck.py
     if: ${{ inputs.profile == 'full' }}
   error-pages:
     name: browser error-page negotiation (ARCH 25.1.1)

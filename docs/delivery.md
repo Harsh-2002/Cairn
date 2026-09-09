@@ -8,6 +8,22 @@
 
 Cairn builds with a stable Rust toolchain into a single binary, with a release profile favouring optimisation and a small stripped artifact, and it targets a fully static build so the container needs no system libraries, with the C SQLite compiled in so there is no external database dependency. The embedded web console is produced by the two-stage build of Section 23.2, so a release build yields one binary that contains the server, the management web console, and the CLI subcommands, and a feature switch can omit the web console for a smaller artifact. The container image is built in stages with dependency caching so that incremental builds are fast, and the final image is a minimal distroless or empty base holding just the static binary, which keeps the attack surface and the image size small. Continuous integration mirrors the local gate — formatting, linting with warnings denied (including the all-features build), RustSec and production/full-tree npm dependency audits, shell lint and generation/argument regressions for the standalone installer, the release trust-boundary policy, the workspace test suite on both the glibc and the static-musl targets, the doctests, and the embedded-web console build — and is the authoritative definition of a green change; the end-to-end conformance suite and the crash-consistency and replication harnesses under `conformance/` run there as well, so a feature with a failure mode lands with a harness and a CI job that exercises it, alongside its in-crate regression test.
 
+Both the Dockerfile and release-assembled image declare an exec-form `HEALTHCHECK` invoking
+`cairn healthcheck`: every 30 seconds, a 5-second Docker timeout, three consecutive failures, and
+a 60-second startup grace. The command uses the ordinary environment configuration and probes
+`GET /readyz` on `CAIRN_LISTEN_ADDR`, mapping wildcard IPv4/IPv6 binds to same-family loopback.
+It preserves custom ports and explicit bind addresses; Docker host-port mappings, the console
+listener and the public URL do not select the probe destination. Port zero cannot be discovered
+from static configuration and fails the probe. No node lock, metadata open, credentials, shell,
+HTTP proxy, redirect, or additional executable is involved. HTTP must return 200 with the complete
+`ready` body within four seconds; response headers and body are bounded.
+
+Native TLS probes pin the exact leaf in `CAIRN_TLS_CERT_PATH` and verify TLS handshake signatures;
+an unreadable, malformed or different certificate fails. This local readiness check does not
+validate public DNS names, CA chains or certificate expiry. Certificate rotation must update the
+configured certificate and reload the server. TLS terminated upstream leaves the local probe on
+HTTP. Operators with long startup reconciliation can extend Docker/Compose's health startup grace.
+
 ### 31.2 The one-filesystem requirement
 
 The database file, the staging directory, and the per-bucket blob directories must reside on the same filesystem, because the atomic-rename step of the commit protocol works only within a filesystem and a cross-device rename fails; the staging directory is therefore inside the data root by design. This is an operational invariant the documentation states plainly, because violating it by, for instance, placing the staging directory on a different mount would break the durability protocol.

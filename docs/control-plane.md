@@ -95,6 +95,11 @@ As an API client the CLI offers commands mirroring the management API: creating,
 
 ### 24.3 Node-local commands
 
+`healthcheck` reads the node configuration and probes its running S3 listener's `/readyz` without
+acquiring the node lock or opening local metadata. It exits zero only for readiness, nonzero for
+configuration, connection, TLS, HTTP or timeout failure, and stays silent on success. It is the
+built-in container health command; listener selection and TLS pinning are specified in Section 31.1.
+
 `storage-baseline <empty-backup-dir>` creates and validates an offline safety snapshot, classifies
 the supported namespace through the metadata Writer, drains exact cleanup and completes coverage
 before releasing legacy staging charges (Section 8.5.1). It supports the native single-SQLite

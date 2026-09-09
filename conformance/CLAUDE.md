@@ -73,6 +73,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   request keeps the byte-identical `application/xml` `<Error><Code>` document (the invariant every
   other harness's `<Code>` assertions rest on), while only a real browser navigation gets HTML;
   `<img>`/`fetch()` subresources, `text/htmlx`, a bare java `Accept` and HEAD all stay machine-shaped.
+- `healthcheck.py` — built-in container probe against real headless nodes on custom IPv4/IPv6
+  ports and native TLS. Checks node-lock independence, no local-state creation, wrong-certificate
+  refusal, bounded failure while the node is stopped, recovery, and failure after shutdown.
 - `console_session.sh` — console httpOnly session-cookie and origin-bound transfer regression (pure
   curl): `cairn_session` authenticates only `/api/v1` on the control listener; both route matrices
   reject cross-plane fall-through; unsafe cookie mutations require the exact control `Origin` while
