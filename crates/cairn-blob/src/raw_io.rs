@@ -15,9 +15,10 @@ pub(crate) const HINT_THRESHOLD: u64 = 1 << 20; // 1 MiB
 
 /// Reserve `len` bytes of blocks for `file` (without changing its logical size) and advise the
 /// kernel that access will be sequential. Reserving up front lets the filesystem place the file
-/// contiguously and surfaces an out-of-space condition **immediately and cleanly** rather than
-/// partway through the streamed write (ARCH 7.5). `KEEP_SIZE` keeps the file's reported length
-/// tracking the bytes actually written, so a short body never leaves a padded blob.
+/// contiguously (ARCH 7.5). Allocation failure remains best-effort; actual writes still report
+/// ENOSPC. `KEEP_SIZE` keeps the file's reported length tracking the bytes actually written, so a
+/// short body never leaves a padded blob. Staging finalization releases unused allocation past
+/// the actual EOF before syncing; dropping cached pages alone cannot release those disk blocks.
 #[cfg(unix)]
 pub(crate) fn preallocate_sequential(file: &File, len: u64) {
     use rustix::fs::{Advice, FallocateFlags, fadvise, fallocate};

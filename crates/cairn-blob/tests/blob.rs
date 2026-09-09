@@ -656,6 +656,103 @@ async fn compression_is_transparent_and_etag_invariant() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn preallocated_containers_release_tail_blocks_and_preserve_full_content() {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    for algorithm in [
+        CompressionAlgorithm::None,
+        CompressionAlgorithm::Zstd,
+        CompressionAlgorithm::Lz4,
+    ] {
+        for encrypted in [false, true] {
+            for multipart in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store =
+                    LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                        .await
+                        .unwrap();
+                let bucket = BucketName::parse("allocation").unwrap();
+                let data = vec![b'Q'; 2 * 1024 * 1024 + 17];
+                let options = StageOptions {
+                    content_length: Some(data.len() as u64),
+                    encryption: encrypted.then(|| [71; 32].into()),
+                    ..opts(
+                        Some(CompressionPolicy {
+                            algorithm,
+                            block_size: 256 * 1024,
+                        }),
+                        "text/plain",
+                    )
+                };
+                let staged = if multipart {
+                    let upload = UploadId::generate();
+                    let mut parts = Vec::new();
+                    for (index, bytes) in data.chunks(1024 * 1024).enumerate() {
+                        let number = u16::try_from(index + 1).unwrap();
+                        let part = store
+                            .stage_part_fixture(
+                                &upload,
+                                number,
+                                "allocation-part",
+                                body(bytes.to_vec()),
+                                ChecksumSet::none(),
+                                10 * 1024 * 1024,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        parts.push(part_ref(number, &part, None));
+                    }
+                    store.assemble_fixture(&bucket, &parts, options).await
+                } else {
+                    store
+                        .stage_fixture(&bucket, chunked_body(data.clone(), 65537), options)
+                        .await
+                }
+                .unwrap();
+                let metadata =
+                    std::fs::metadata(dir.path().join(staged.storage_path.as_str())).unwrap();
+                assert_eq!(metadata.len(), staged.size_physical);
+                assert_eq!(staged.size_logical, data.len() as u64);
+                assert_eq!(staged.internal_sha256, hex::encode(Sha256::digest(&data)));
+                if algorithm != CompressionAlgorithm::None {
+                    assert!(metadata.len() < data.len() as u64 / 4);
+                    assert!(
+                        metadata.blocks() * 512 < data.len() as u64 / 2,
+                        "{algorithm:?}, encrypted={encrypted}, multipart={multipart}: tail blocks retained"
+                    );
+                } else if encrypted {
+                    assert!(metadata.len() > data.len() as u64);
+                }
+                let cipher = if encrypted {
+                    BlobCipher::AuthenticatedV3([71; 32].into())
+                } else {
+                    BlobCipher::KnownPlaintext
+                };
+                let mut handle = store
+                    .open_raw(
+                        &staged.storage_path,
+                        None,
+                        cipher,
+                        &staged.compression,
+                        staged.size_logical,
+                    )
+                    .await
+                    .unwrap();
+                let mut received = Vec::new();
+                while let Some(chunk) = handle.body.next().await {
+                    received.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(received, data);
+            }
+        }
+    }
+}
+
 async fn read_all_dek(
     store: &LocalBlobStore,
     path: &StoragePath,

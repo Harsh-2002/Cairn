@@ -11,8 +11,9 @@ Cairn is for people who want to host their own object storage on a homelab machi
 production node, with the S3 API and a console but without operating a distributed system.
 
 Releases are CI-gated and publish static `linux/amd64` and `linux/arm64` binaries with a `SHA256SUMS`
-manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a download with
-`sha256sum -c SHA256SUMS`.
+manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. The release workflow provides
+Cosign signatures, an SPDX dependency SBOM and SLSA build-provenance attestations; see
+[`SECURITY.md`](./SECURITY.md#verifying-release-artifacts) for verification.
 
 ## The console
 
@@ -185,6 +186,11 @@ with the harness CI runs on every push (`bench-compare`):
 BIN=target/release/cairn bash conformance/bench_compare.sh
 ```
 
+A separate [100 GB mirrored replication exercise](./docs/benchmarks.md#bidirectional-replication-and-compressed-allocation-2026-09-09)
+verified 241,124 full-version reads across two processes, including overwrite/delete propagation
+and restart catch-up. This used a shared development host and client-side hashing; its throughput
+figures are separate from the MinIO comparison above, and it did not measure per-GET tail latency.
+
 ## Scope
 
 Cairn is single-node by design: one process, one data filesystem, one metadata database. Cross-host
@@ -199,15 +205,19 @@ a console without running a distributed system.
 
 ## Roadmap
 
-Planned work, tracked against the architecture in [`docs/delivery.md`](./docs/delivery.md) (Phase 15).
-These are additive and do not change the S3 or management API.
+Remaining work is tracked in [`docs/delivery.md`](./docs/delivery.md) (Phase 15). API, configuration
+and compatibility requirements will be specified for each feature before implementation.
 
 - Integration with an external KMS (distinct per-key material and tenant isolation); the current
   `aws:kms` surface is a label over the node master key, and transparent encryption of all objects at
   rest already ships (`CAIRN_ENCRYPT_AT_REST`).
 - Lifecycle transition to a remote cold tier, with a restore-from-cold workflow.
-- Zero-copy reads with kernel TLS, building on the existing sendfile fast path.
-- Signed release artifacts (cosign) and SBOM attestation.
+- Zero-copy reads with kernel TLS; the existing plaintext sendfile path is experimental and
+  disabled by default.
+
+Already implemented: release signing, SPDX SBOM generation and SLSA build-provenance attestations
+([verification guide](./SECURITY.md#verifying-release-artifacts)). The optional io_uring backend is also
+implemented, but remains experimental and disabled by default.
 
 ## Documentation
 
