@@ -185,7 +185,7 @@ jobs:
         persist-credentials: false
     - name: Install musl tools
       if: endsWith(matrix.target, 'musl')
-      run: sudo apt-get update && sudo apt-get install -y musl-tools=1.2.4-2
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" musl-tools
     - uses: ./.github/actions/setup
       with:
         targets: ${{ matrix.target }}

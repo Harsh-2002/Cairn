@@ -21,6 +21,35 @@ import ci
 import docs_check
 
 
+class MuslSetupTests(unittest.TestCase):
+    def test_ubuntu_sources_only_and_update_failure_stops_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = root / 'calls.jsonl'
+            sudo = root / 'sudo'
+            sudo.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
+with open(os.environ['APT_CALLS'], 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\\n')
+sys.exit(int(os.environ['APT_UPDATE_EXIT']) if sys.argv[-1] == 'update' else 0)
+''')
+            sudo.chmod(0o755)
+            for failure in [0, 100]:
+                with self.subTest(update_exit=failure):
+                    calls.unlink(missing_ok=True)
+                    env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                           'APT_CALLS': str(calls), 'APT_UPDATE_EXIT': str(failure)}
+                    result = subprocess.run(['bash', str(ROOT / '.github/scripts/ci-jobs.sh'),
+                                             'musl-tools'], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, failure)
+                    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+                    prefix = ['apt-get', '-o', 'Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources',
+                              '-o', 'Dir::Etc::sourceparts=-', '-o', 'APT::Update::Error-Mode=any']
+                    expected = [prefix + ['update']]
+                    if not failure:
+                        expected.append(prefix + ['install', '-y', 'musl-tools=1.2.4-2'])
+                    self.assertEqual(commands, expected)
+
+
 class SelectionTests(unittest.TestCase):
     def test_docs_allowlist_and_full_fallback(self):
         for paths in [['README.md'], ['CONTRIBUTING.md', 'docs/configuration.md'], ['docs/nested/example.md']]:
