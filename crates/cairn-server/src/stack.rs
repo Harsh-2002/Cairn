@@ -121,13 +121,8 @@ pub struct AppStack {
     /// (env single target, env named targets, and stored per-bucket targets) so the policy is
     /// server-global. Default `false` (refuse, and reschedule the object rather than fail it).
     pub replication_allow_plaintext_sse_over_http: bool,
-    /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
-    /// `None`, the minting request's own scheme + Host is used.
-    pub public_base_url: Option<String>,
-    /// The data-listener address. Without an explicit public base URL, control-plane URL minting
-    /// combines this port with the request Host's hostname to keep object bytes on a distinct
-    /// origin.
-    pub data_listen_addr: std::net::SocketAddr,
+    /// Validated API/console bindings and public origins used by URL minting.
+    pub endpoints: crate::endpoints::Endpoints,
     /// The in-process request-metrics aggregator (ARCH 26.5). Every completed request bumps a
     /// counter here (zero DB I/O on the hot path); the background flush loop drains it into a
     /// batched upsert through the single writer. Held behind an `Arc` so the request path and the
@@ -655,8 +650,10 @@ pub async fn build(
             // The build-injected release/dev version (see `build.rs::emit_version`), so `GET /system`
             // and the console footer report the same string as `cairn --version`.
             version: crate::CAIRN_VERSION.to_owned(),
-            s3_addr: cfg.listen_addr.to_string(),
-            web_addr: cfg.web_addr.clone(),
+            api_addr: cfg.api_addr.to_string(),
+            console_addr: cfg.console_addr.clone(),
+            api_public_url: cfg.api_public_url.clone(),
+            console_public_url: cfg.console_public_url.clone(),
             tls: cfg.tls_enabled(),
             data_dir: cfg.data_dir.clone(),
             started_at: std::time::Instant::now(),
@@ -767,8 +764,18 @@ pub async fn build(
         region: cfg.region.clone(),
         allow_internal_endpoints: cfg.allow_internal_endpoints,
         replication_allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
-        public_base_url: cfg.public_base_url.clone(),
-        data_listen_addr: cfg.listen_addr,
+        endpoints: crate::endpoints::Endpoints {
+            api_addr: cfg.api_addr,
+            console_addr: cfg.console_listen_addr().map_err(|e| e.to_string())?,
+            api_public_url: cfg
+                .api_public_url
+                .as_deref()
+                .and_then(crate::endpoints::Origin::parse),
+            console_public_url: cfg
+                .console_public_url
+                .as_deref()
+                .and_then(crate::endpoints::Origin::parse),
+        },
         request_metrics: Arc::new(crate::metrics_agg::RequestMetricsAgg::new(
             cfg.request_metrics_bucket_secs,
         )),

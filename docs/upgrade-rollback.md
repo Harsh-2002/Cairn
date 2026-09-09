@@ -89,3 +89,26 @@ data across with replication or an S3-level copy (`aws s3 sync`), then cut over.
 - [ ] Stop → swap binary → start; confirm `/readyz` is `ready`.
 - [ ] Spot-check a GET/PUT against a real S3 client.
 - [ ] If anything is wrong: stop, restore the snapshot, start the previous binary.
+
+## API and console configuration migration
+
+This change has no compatibility aliases. Replace these settings before starting the new binary:
+
+| Removed | Replacement |
+|---|---|
+| `CAIRN_LISTEN_ADDR` | `CAIRN_API_ADDR` |
+| `CAIRN_WEB_ADDR` | `CAIRN_CONSOLE_ADDR` |
+| `CAIRN_PUBLIC_BASE_URL` | `CAIRN_API_PUBLIC_URL` |
+| `CAIRN_ENDPOINT`, `CAIRN_S3_ENDPOINT` | `CAIRN_API_ENDPOINT` (CLI only) |
+
+Add `CAIRN_CONSOLE_PUBLIC_URL` for public console download links behind ingress. Public URL values
+must be origins, without path prefixes. Replace Cairn CLI `--endpoint`/`--s3-endpoint` with one
+`--api-endpoint`; replace installer `--expose-s3` with `--expose-api`. Server configuration remains
+environment-only. Do not change storage paths, credentials or master keys during this migration.
+
+Native `/api/v1` administration is now exposed on the API listener. Disabling or firewalling the
+console does not disable native administration; update proxy access rules where required.
+Run `cairn validate-config`, then recreate the container or restart the service with the new
+environment. Verify API readiness, native administration, console sign-in, upload and a public
+download link. This PR does not change the storage format or create a new downgrade guarantee;
+all existing storage rollback restrictions still apply.

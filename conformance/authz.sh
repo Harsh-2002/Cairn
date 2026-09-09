@@ -29,9 +29,9 @@ DATA="$(mktemp -d)"
 
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
-export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
+export CAIRN_API_ADDR="127.0.0.1:$PORT"
 # The console listener stays ON: the harness mints its second tenant via POST /api/v1/users.
-export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_CONSOLE_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 

@@ -8,6 +8,7 @@
 //! [`shared_body_stream`], which keeps the incoming body reachable so an early error can drain
 //! whatever the service left unread rather than poisoning the pooled keep-alive connection (issue #5).
 
+use crate::endpoints::{EndpointIssue, EndpointRequest};
 use crate::stack::AppStack;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -52,19 +53,18 @@ pub(crate) fn full_body(bytes: Bytes) -> ResponseBody {
 /// serving layer: a connection cannot accidentally gain both planes through a fall-through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListenerRole {
-    /// S3, STS, signed public shares, and infrastructure endpoints.
-    Data,
-    /// The embedded console and versioned management API.
-    Control,
+    /// S3, native management, STS, shares and infrastructure endpoints.
+    Api,
+    /// Embedded console, session-authenticated management and forced downloads.
+    Console,
 }
 
 impl ListenerRole {
-    pub(crate) const fn is_data(self) -> bool {
-        matches!(self, Self::Data)
+    pub(crate) const fn is_api(self) -> bool {
+        matches!(self, Self::Api)
     }
-
-    pub(crate) const fn is_control(self) -> bool {
-        matches!(self, Self::Control)
+    pub(crate) const fn is_console(self) -> bool {
+        matches!(self, Self::Console)
     }
 }
 
@@ -98,10 +98,10 @@ impl<'a> RequestTransport<'a> {
 
 /// The route family selected before authentication or body processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerRoute {
-    Data,
+pub(crate) enum ListenerRoute {
+    S3,
     PublicShare,
-    ControlApi,
+    Management,
     ConsoleAsset,
     NotFound,
 }
@@ -175,30 +175,39 @@ where
     }
 }
 
-/// Apply the listener route matrix. No branch may fall through from one plane into the other.
-fn listener_route(role: ListenerRole, method: &Method, path: &str) -> ListenerRoute {
-    match role {
-        ListenerRole::Data => {
-            if is_control_path(path) {
-                ListenerRoute::NotFound
-            } else if (*method == Method::GET || *method == Method::HEAD)
-                && path.starts_with("/share/")
-            {
-                ListenerRoute::PublicShare
-            } else {
-                ListenerRoute::Data
-            }
+/// Select a route before authentication, body collection or optimized object dispatch.
+pub(crate) fn listener_route(role: ListenerRole, method: &Method, path: &str) -> ListenerRoute {
+    if is_control_path(path) {
+        if role.is_api() && console_only_path(path) {
+            return ListenerRoute::NotFound;
         }
-        ListenerRole::Control => {
-            if is_control_path(path) {
-                ListenerRoute::ControlApi
-            } else if *method == Method::GET && is_console_asset(path) {
-                ListenerRoute::ConsoleAsset
-            } else {
-                ListenerRoute::NotFound
-            }
-        }
+        return ListenerRoute::Management;
     }
+    if path.starts_with("/share/") {
+        return if matches!(*method, Method::GET | Method::HEAD) {
+            ListenerRoute::PublicShare
+        } else {
+            ListenerRoute::NotFound
+        };
+    }
+    match role {
+        ListenerRole::Api => ListenerRoute::S3,
+        ListenerRole::Console if *method == Method::GET && is_console_asset(path) => {
+            ListenerRoute::ConsoleAsset
+        }
+        ListenerRole::Console => ListenerRoute::NotFound,
+    }
+}
+
+fn console_only_path(path: &str) -> bool {
+    let subpath = path
+        .strip_prefix("/api/v1")
+        .unwrap_or(path)
+        .trim_matches('/');
+    subpath == "session"
+        || subpath.starts_with("session/")
+        || subpath == "events"
+        || subpath.starts_with("events/")
 }
 
 /// The root shell and concrete files embedded in the console bundle are the entire console route
@@ -247,10 +256,21 @@ pub async fn handle(
     // control connection, validated forwarding provenance affects only the browser cookie's
     // externally-visible scheme.
     let cookie_secure = control_cookie_is_secure(transport, &headers);
+    let endpoint_request = EndpointRequest {
+        role: listener_role,
+        host: &host,
+        secure: crate::proxy::effective_scheme(
+            secure,
+            transport.peer,
+            &headers,
+            transport.trusted_proxies,
+        )
+        .is_https(),
+        direct_loopback: transport.peer.is_loopback() && source.is_direct_loopback(),
+    };
 
     // Enforce the listener boundary before authentication or body collection. In particular this
-    // makes `CAIRN_WEB_ADDR=off` genuinely headless, prevents `/api/v1` from leaking onto the S3
-    // port, and prevents the control port from interpreting an unknown path as S3.
+    // keeps sessions/assets console-only and prevents unknown console paths becoming S3.
     let route = listener_route(listener_role, &method, &raw_path);
     if route == ListenerRoute::NotFound {
         let response = json_status(404, r#"{"error":"not found"}"#);
@@ -261,7 +281,7 @@ pub async fn handle(
     // worker script fetch with `Service-Worker: script`, so refuse it before S3/share dispatch.
     // Successful object responses also carry a narrowly scoped Service-Worker-Allowed header below
     // as defense in depth for clients that do not send the standard request marker.
-    if listener_role.is_data()
+    if matches!(route, ListenerRoute::S3 | ListenerRoute::PublicShare)
         && request_header(&headers, "service-worker")
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("script"))
     {
@@ -274,10 +294,26 @@ pub async fn handle(
     // A browser preflights the exact presigned data URL with OPTIONS, which cannot itself verify a
     // signature minted for the eventual GET/PUT/etc. The signed console-origin query marker grants
     // only CORS metadata (never S3 authorization), so answer this narrow preflight before auth.
-    if listener_role.is_data() && method == Method::OPTIONS {
+    if route == ListenerRoute::S3 && method == Method::OPTIONS {
         if let Some(response) = console_presign_preflight(&raw_path, &query_str, &headers) {
             return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
         }
+    }
+
+    // Persistent public-read ("share") URLs: GET|HEAD /share/{token} — unauthenticated, resolved by
+    // an opaque registry token (ARCH 15.8). The token is the only authority on either listener.
+    if route == ListenerRoute::PublicShare {
+        let token = &raw_path["/share/".len()..]; // after "/share/"
+        if token.is_empty() || token.contains('/') {
+            return json_status(404, r#"{"error":"not found"}"#);
+        }
+        let mut response =
+            serve_share(&stack, token, method, &headers, source, secure, request_id).await;
+        constrain_service_worker_scope(&mut response, &raw_path);
+        if listener_role.is_console() {
+            harden_console_download(&mut response);
+        }
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
 
     // Console session cookie → Bearer. On the web-console listener only, a request carrying the
@@ -291,7 +327,7 @@ pub async fn handle(
     // Login creates ambient browser authority too. Requiring the exact control origin prevents
     // same-site object content from replacing a victim's console session with attacker-chosen
     // credentials (login CSRF/session fixation), independently of whether a stale cookie exists.
-    if listener_role.is_control()
+    if listener_role.is_console()
         && is_login
         && !cookie_request_has_control_origin(&method, &headers, &host, cookie_secure)
     {
@@ -302,7 +338,7 @@ pub async fn handle(
         return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
     let mut authenticated_from_cookie = false;
-    if listener_role.is_control() && !is_login && !headers.iter().any(|(k, _)| k == "authorization")
+    if listener_role.is_console() && !is_login && !headers.iter().any(|(k, _)| k == "authorization")
     {
         if let Some(token) = session_cookie_token(&headers) {
             headers.push(("authorization".to_owned(), format!("Bearer {token}")));
@@ -332,7 +368,7 @@ pub async fn handle(
     // to the data listener, the root path, and the form content type, so no normal S3
     // request is captured; disabled entirely by `CAIRN_STS_ENABLED=false`.
     if stack.sts_enabled
-        && listener_role.is_data()
+        && listener_role.is_api()
         && method == Method::POST
         && raw_path == "/"
         && content_type_is_form(&headers)
@@ -370,9 +406,23 @@ pub async fn handle(
         }
     };
 
-    // The management API exists only on the control listener. `listener_route` already checked the
+    // Management uses the same handlers on both listeners. `listener_route` already checked the
     // exact segment boundary, so stripping this prefix cannot capture `/api/v10`.
-    if route == ListenerRoute::ControlApi {
+    if route == ListenerRoute::Management {
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.method == AuthMethod::SigV4Presigned)
+        {
+            return drain_or_close(
+                json_status(
+                    403,
+                    r#"{"error":"forbidden","message":"Management requires explicit credentials"}"#,
+                ),
+                request_has_body(&headers),
+                req.into_body(),
+            )
+            .await;
+        }
         let subpath = raw_path
             .strip_prefix("/api/v1")
             .expect("control route has the /api/v1 prefix");
@@ -429,6 +479,23 @@ pub async fn handle(
         };
         // Master-key rotation status (audit #29, Phase E): an admin-only operator surface served
         // from the server stack because it reads the concrete per-shard handles + the key ring.
+        if principal
+            .as_ref()
+            .is_some_and(|p| p.method == AuthMethod::SigV4Header)
+            && !management_payload_valid(&headers, &body_bytes, body_bearing)
+        {
+            return json_status(
+                400,
+                r#"{"error":"InvalidRequest","message":"Management SigV4 requests require a matching non-streaming SHA-256 payload digest"}"#,
+            );
+        }
+        if method == Method::GET && subpath == "/system/endpoints" {
+            let status = stack.endpoints.status(endpoint_request);
+            return json_status(
+                200,
+                &serde_json::to_string(&status).expect("endpoint status is serializable"),
+            );
+        }
         if method == Method::GET && subpath == "/system/crypto-status" {
             return crypto_status_response(&stack, principal.as_ref(), &request_id).await;
         }
@@ -445,8 +512,7 @@ pub async fn handle(
                     bucket,
                     &body_bytes,
                     principal.as_ref(),
-                    &host,
-                    secure,
+                    endpoint_request,
                 )
                 .await;
             }
@@ -461,8 +527,7 @@ pub async fn handle(
                     bucket,
                     &body_bytes,
                     principal.as_ref(),
-                    &host,
-                    secure,
+                    endpoint_request,
                 )
                 .await;
             }
@@ -526,19 +591,6 @@ pub async fn handle(
         // The classifier checked the same immutable embedded bundle; keep a fail-closed fallback in
         // case that invariant ever changes.
         return json_status(404, r#"{"error":"not found"}"#);
-    }
-
-    // Persistent public-read ("share") URLs: GET|HEAD /share/{token} — unauthenticated, resolved by
-    // an opaque registry token (ARCH 15.8). They exist only on the data listener.
-    if route == ListenerRoute::PublicShare {
-        let token = &raw_path["/share/".len()..]; // after "/share/"
-        if token.is_empty() || token.contains('/') {
-            return json_status(404, r#"{"error":"not found"}"#);
-        }
-        let mut response =
-            serve_share(&stack, token, method, &headers, source, secure, request_id).await;
-        constrain_service_worker_scope(&mut response, &raw_path);
-        return response;
     }
 
     // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
@@ -932,7 +984,7 @@ pub(crate) fn service_worker_scope_for_path(request_path: &str) -> Option<String
 }
 
 fn control_cookie_is_secure(transport: RequestTransport<'_>, headers: &[(String, String)]) -> bool {
-    transport.listener_role.is_control()
+    transport.listener_role.is_console()
         && crate::proxy::effective_scheme(
             transport.direct_secure,
             transport.peer,
@@ -1075,8 +1127,7 @@ async fn create_share(
     bucket: &str,
     body: &Bytes,
     principal: Option<&Principal>,
-    request_host: &str,
-    secure: bool,
+    endpoint_request: EndpointRequest<'_>,
 ) -> Response<ResponseBody> {
     if principal.map(|p| p.role) != Some(Role::Administrator) {
         return json_status(403, r#"{"error":"forbidden"}"#);
@@ -1088,6 +1139,8 @@ async fn create_share(
     #[derive(serde::Deserialize)]
     struct ShareReq {
         key: String,
+        #[serde(default)]
+        delivery: ShareDelivery,
         #[serde(default)]
         expires_in_secs: Option<u64>,
         #[serde(default)]
@@ -1105,12 +1158,41 @@ async fn create_share(
         Ok(k) if !req.key.is_empty() => k,
         _ => return json_status(400, r#"{"error":"a valid key is required"}"#),
     };
+    let origin = match req.delivery {
+        ShareDelivery::Api => stack.endpoints.api_origin(endpoint_request, None),
+        ShareDelivery::ConsoleDownload => stack
+            .endpoints
+            .resolve(ListenerRole::Console, endpoint_request),
+    };
+    let origin = match origin {
+        Ok(origin) => origin,
+        Err(issue) => return endpoint_error(issue),
+    };
+    if req.delivery == ShareDelivery::ConsoleDownload
+        && req.disposition.as_deref() == Some("inline")
+    {
+        return json_status(
+            400,
+            r#"{"error":"InvalidRequest","message":"Console shares must use attachment disposition"}"#,
+        );
+    }
+    if req
+        .disposition
+        .as_deref()
+        .is_some_and(|d| !matches!(d, "inline" | "attachment"))
+    {
+        return json_status(
+            400,
+            r#"{"error":"InvalidRequest","message":"Invalid share disposition"}"#,
+        );
+    }
     let now = SystemClock::new().now();
     // null/absent expiry = forever (admin-minted, revocable, audited).
     let expires_at = req
         .expires_in_secs
         .map(|s| Timestamp(now.as_millis() + (s as i64) * 1000));
     let disposition = match req.disposition.as_deref() {
+        _ if req.delivery == ShareDelivery::ConsoleDownload => ShareDisposition::Attachment,
         Some("attachment") => ShareDisposition::Attachment,
         _ => ShareDisposition::Inline,
     };
@@ -1153,8 +1235,7 @@ async fn create_share(
             at: now,
         })))
         .await;
-    let (scheme, data_host) = data_scheme_host(stack, request_host, secure);
-    let url = format!("{scheme}://{data_host}/share/{}", token.expose_secret());
+    let url = format!("{origin}/share/{}", token.expose_secret());
     #[derive(serde::Serialize)]
     struct ShareCreateResponse<'a> {
         id: &'a str,
@@ -1214,8 +1295,7 @@ async fn presign(
     bucket: &str,
     body: &Bytes,
     principal: Option<&Principal>,
-    host: &str,
-    secure: bool,
+    endpoint_request: EndpointRequest<'_>,
 ) -> Response<ResponseBody> {
     let p = match principal {
         Some(p) if p.role == Role::Administrator => p,
@@ -1341,17 +1421,19 @@ async fn presign(
         }
     }
 
-    let (scheme, signed_host) = data_scheme_host(stack, host, secure);
+    let api = match stack
+        .endpoints
+        .api_origin(endpoint_request, req.origin.as_deref())
+    {
+        Ok(origin) => origin,
+        Err(issue) => return endpoint_error(issue),
+    };
+    let scheme = &api.scheme;
+    let signed_host = api.authority();
     if let Some(origin) = req.origin.as_deref() {
         let Some(origin) = normalize_origin(origin) else {
             return json_status(400, r#"{"error":"origin must be an http(s) origin"}"#);
         };
-        if origin == format!("{scheme}://{signed_host}") {
-            return json_status(
-                400,
-                r#"{"error":"console and data origins must be distinct"}"#,
-            );
-        }
         extra_query.push(("X-Cairn-Console-Origin".to_owned(), origin));
     }
 
@@ -1534,53 +1616,79 @@ fn presign_key_has_browser_dot_segment(key: &str) -> bool {
     })
 }
 
-/// Resolve the data-plane `(scheme, host)` for an absolute share/presigned URL. An explicit public
-/// base URL wins. Otherwise retain the control request's hostname but replace its port with the
-/// configured data-listener port, which makes local/default deployments work without co-locating
-/// object bytes on the console origin.
-fn data_scheme_host(stack: &AppStack, req_host: &str, secure: bool) -> (String, String) {
-    if let Some(base) = stack.public_base_url.as_deref() {
-        if let Some(rest) = base.strip_prefix("https://") {
-            return (
-                "https".to_owned(),
-                rest.split('/').next().unwrap_or(rest).to_owned(),
-            );
-        }
-        if let Some(rest) = base.strip_prefix("http://") {
-            return (
-                "http".to_owned(),
-                rest.split('/').next().unwrap_or(rest).to_owned(),
-            );
-        }
-    }
-    let host = req_host
-        .parse::<http::uri::Authority>()
-        .ok()
-        .map(|authority| authority.host().to_owned())
-        .filter(|hostname| !hostname.is_empty())
-        .unwrap_or_else(|| stack.data_listen_addr.ip().to_string());
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host
-    };
-    (
-        if secure { "https" } else { "http" }.to_owned(),
-        format!("{host}:{}", stack.data_listen_addr.port()),
+fn normalize_origin(origin: &str) -> Option<String> {
+    crate::endpoints::Origin::parse(origin).map(|o| o.to_string())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShareDelivery {
+    #[default]
+    Api,
+    ConsoleDownload,
+}
+
+fn endpoint_error(issue: EndpointIssue) -> Response<ResponseBody> {
+    json_status(
+        400,
+        &serde_json::json!({
+            "error": issue.code, "message": issue.message, "setting": issue.setting,
+        })
+        .to_string(),
     )
 }
 
-fn normalize_origin(origin: &str) -> Option<String> {
-    let uri = origin.parse::<http::Uri>().ok()?;
-    let scheme = uri.scheme_str()?;
-    if !matches!(scheme, "http" | "https") || uri.query().is_some() {
-        return None;
+/// Management documents never use the S3 streaming decoder. Bind their bytes before dispatch.
+fn management_payload_valid(headers: &[(String, String)], body: &[u8], body_bearing: bool) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut hashes = headers
+        .iter()
+        .filter(|(k, _)| k == "x-amz-content-sha256")
+        .map(|(_, v)| v.as_str());
+    let hash = hashes.next();
+    if hashes.next().is_some() {
+        return false;
     }
-    let authority = uri.authority()?.as_str();
-    if authority.is_empty() || !matches!(uri.path(), "" | "/") {
-        return None;
+    match hash {
+        None | Some("UNSIGNED-PAYLOAD") => !body_bearing && body.is_empty(),
+        Some(hash) => hex::decode(hash)
+            .is_ok_and(|expected| expected.as_slice() == Sha256::digest(body).as_slice()),
     }
-    Some(format!("{scheme}://{authority}"))
+}
+
+/// Object-controlled bytes must never execute in the cookie-bearing console origin.
+fn harden_console_download(response: &mut Response<ResponseBody>) {
+    let success = response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED;
+    let headers = response.headers_mut();
+    if success {
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/octet-stream"),
+        );
+        if !headers
+            .get(http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("attachment"))
+        {
+            headers.insert(
+                http::header::CONTENT_DISPOSITION,
+                http::HeaderValue::from_static("attachment; filename=\"download\""),
+            );
+        }
+    }
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        (
+            "content-security-policy",
+            "sandbox; default-src 'none'; frame-ancestors 'none'",
+        ),
+    ] {
+        headers.insert(name, http::HeaderValue::from_static(value));
+    }
+    headers.remove(http::header::SET_COOKIE);
 }
 
 /// Extract a console CORS marker only from a complete presigned-session query. The marker itself is
@@ -2393,6 +2501,96 @@ mod tests {
     }
 
     #[test]
+    fn browser_only_routes_are_never_native_management() {
+        for path in [
+            "/api/v1/session",
+            "/api/v1/session/",
+            "/api/v1/events/ticket",
+            "/api/v1/events/stream",
+        ] {
+            for method in [Method::GET, Method::POST, Method::DELETE, Method::OPTIONS] {
+                assert_eq!(
+                    listener_route(ListenerRole::Api, &method, path),
+                    ListenerRoute::NotFound
+                );
+                assert_eq!(
+                    listener_route(ListenerRole::Console, &method, path),
+                    ListenerRoute::Management
+                );
+            }
+        }
+        for role in [ListenerRole::Api, ListenerRole::Console] {
+            assert_eq!(
+                listener_route(role, &Method::PUT, "/share/token"),
+                ListenerRoute::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn management_payload_digest_binds_the_actual_document() {
+        use sha2::{Digest, Sha256};
+        let body = br#"{"name":"expected"}"#;
+        let header = vec![(
+            "x-amz-content-sha256".into(),
+            hex::encode(Sha256::digest(body)),
+        )];
+        assert!(management_payload_valid(&header, body, true));
+        assert!(!management_payload_valid(
+            &header,
+            br#"{"name":"tampered"}"#,
+            true
+        ));
+        for sentinel in [
+            "UNSIGNED-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "bad",
+        ] {
+            assert!(!management_payload_valid(
+                &[("x-amz-content-sha256".into(), sentinel.into())],
+                body,
+                true
+            ));
+        }
+        assert!(!management_payload_valid(&[], body, true));
+        assert!(management_payload_valid(&[], b"", false));
+    }
+
+    #[test]
+    fn console_download_headers_override_active_object_metadata() {
+        let mut response = json_status(200, "<script>active()</script>");
+        response
+            .headers_mut()
+            .insert("content-type", "text/html".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("content-disposition", "inline".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("set-cookie", "injected=1".parse().unwrap());
+        harden_console_download(&mut response);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert!(
+            response.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment")
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+    }
+
+    #[test]
     fn crypto_status_abbreviates_the_durable_full_key_identity() {
         let durable = format!("deadbeef{}", "42".repeat(28));
         assert_eq!(durable.len(), 64);
@@ -2410,74 +2608,73 @@ mod tests {
     }
 
     #[test]
-    fn data_listener_never_selects_control_or_console_handlers() {
+    fn api_listener_exposes_management_but_never_console_assets() {
         let get = Method::GET;
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/api/v1"),
-            ListenerRoute::NotFound
+            listener_route(ListenerRole::Api, &get, "/api/v1"),
+            ListenerRoute::Management
         );
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/api/v1/buckets"),
-            ListenerRoute::NotFound
+            listener_route(ListenerRole::Api, &get, "/api/v1/buckets"),
+            ListenerRoute::Management
         );
         // Segment boundaries remain exact: these are ordinary path-style S3 names, not API paths.
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/api/v10"),
-            ListenerRoute::Data
+            listener_route(ListenerRole::Api, &get, "/api/v10"),
+            ListenerRoute::S3
         );
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/api/v1-preview"),
-            ListenerRoute::Data
+            listener_route(ListenerRole::Api, &get, "/api/v1-preview"),
+            ListenerRoute::S3
         );
         // A concrete embedded filename on this port is still data-plane routing. The data listener
         // never reads or returns the embedded console bundle.
         assert!(cairn_web::asset("favicon.svg").is_some());
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/favicon.svg"),
-            ListenerRoute::Data
+            listener_route(ListenerRole::Api, &get, "/favicon.svg"),
+            ListenerRoute::S3
         );
         assert_eq!(
-            listener_route(ListenerRole::Data, &get, "/share/token"),
+            listener_route(ListenerRole::Api, &get, "/share/token"),
             ListenerRoute::PublicShare
         );
     }
 
     #[test]
-    fn control_listener_never_falls_through_to_s3_or_public_shares() {
+    fn console_listener_has_only_explicit_routes() {
         let get = Method::GET;
         assert_eq!(
-            listener_route(ListenerRole::Control, &get, "/api/v1"),
-            ListenerRoute::ControlApi
+            listener_route(ListenerRole::Console, &get, "/api/v1"),
+            ListenerRoute::Management
         );
         assert_eq!(
-            listener_route(ListenerRole::Control, &get, "/api/v1/session"),
-            ListenerRoute::ControlApi
+            listener_route(ListenerRole::Console, &get, "/api/v1/session"),
+            ListenerRoute::Management
         );
         assert_eq!(
-            listener_route(ListenerRole::Control, &get, "/"),
+            listener_route(ListenerRole::Console, &get, "/"),
             ListenerRoute::ConsoleAsset
         );
         assert_eq!(
-            listener_route(ListenerRole::Control, &get, "/favicon.svg"),
+            listener_route(ListenerRole::Console, &get, "/favicon.svg"),
             ListenerRoute::ConsoleAsset
         );
         for path in [
             "/bucket",
             "/bucket/key",
-            "/share/token",
             "/healthz",
             "/readyz",
             "/metrics",
             "/api/v10",
         ] {
             assert_eq!(
-                listener_route(ListenerRole::Control, &get, path),
+                listener_route(ListenerRole::Console, &get, path),
                 ListenerRoute::NotFound,
                 "{path} must not escape the control-plane matrix"
             );
         }
         assert_eq!(
-            listener_route(ListenerRole::Control, &Method::PUT, "/favicon.svg"),
+            listener_route(ListenerRole::Console, &Method::PUT, "/favicon.svg"),
             ListenerRoute::NotFound
         );
     }
@@ -3165,7 +3362,7 @@ mod tests {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         assert!(
             !control_cookie_is_secure(
-                RequestTransport::new(loopback, false, &no_proxies, ListenerRole::Control),
+                RequestTransport::new(loopback, false, &no_proxies, ListenerRole::Console),
                 &[],
             ),
             "direct loopback plaintext remains usable for explicit local development"
@@ -3176,7 +3373,7 @@ mod tests {
                     "203.0.113.9".parse().unwrap(),
                     true,
                     &no_proxies,
-                    ListenerRole::Control,
+                    ListenerRole::Console,
                 ),
                 &[("x-forwarded-proto".to_owned(), "http".to_owned())],
             ),
@@ -3193,7 +3390,7 @@ mod tests {
                 "10.0.0.9".parse().unwrap(),
                 false,
                 &trusted,
-                ListenerRole::Control,
+                ListenerRole::Console,
             ),
             &forwarded_https,
         ));
@@ -3203,7 +3400,7 @@ mod tests {
                     "203.0.113.9".parse().unwrap(),
                     false,
                     &trusted,
-                    ListenerRole::Control,
+                    ListenerRole::Console,
                 ),
                 &forwarded_https,
             ),
@@ -3215,7 +3412,7 @@ mod tests {
                     "10.0.0.9".parse().unwrap(),
                     true,
                     &trusted,
-                    ListenerRole::Data,
+                    ListenerRole::Api,
                 ),
                 &forwarded_https,
             ),
@@ -3230,7 +3427,7 @@ mod tests {
             "10.0.0.9".parse().unwrap(),
             false,
             &trusted,
-            ListenerRole::Data,
+            ListenerRole::Api,
         );
         assert_eq!(
             request_client_source(transport, &[]),

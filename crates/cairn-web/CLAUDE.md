@@ -23,6 +23,6 @@ separate npm project, excluded from the cargo workspace; see `../../web/CLAUDE.m
   served BEFORE S3 routing so a bucket named `assets` can't shadow `/assets/...`; any other path
   falls through to S3 routing. Don't add routing logic here — this crate only resolves bytes.
 - Keep the surface tiny: no HTTP, no auth, no state. It maps a request path to embedded bytes; the
-  server owns response building, the two listeners, and the `/web`→`/` back-compat redirect.
+  server owns response building, the two listeners, and explicit management and download routes.
 - Spec: `../../docs/control-plane.md` (ARCH 23). Visual system: `../../docs/design.md`,
   `../../docs/product.md`. See the root `../../CLAUDE.md` for the gate and workspace-wide rules.

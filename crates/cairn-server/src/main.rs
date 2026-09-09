@@ -19,6 +19,7 @@ mod background;
 mod baseline;
 mod cli_remote;
 mod config;
+mod endpoints;
 mod error_page;
 mod healthcheck;
 mod import_dest;

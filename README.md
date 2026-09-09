@@ -74,8 +74,8 @@ Docker's `--env-file` supplies those variables; Cairn itself does not read a con
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 listener |
-| `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Console/API listener; `off` for headless |
+| `CAIRN_API_ADDR` | `0.0.0.0:7373` | S3 + native management listener |
+| `CAIRN_CONSOLE_ADDR` | `0.0.0.0:7374` | Console, browser API and download links; `off` leaves native API available |
 | `CAIRN_DATA_DIR` | `./data` | Object storage root |
 | `CAIRN_DB_PATH` | `./data/cairn.db` | Metadata database |
 | `CAIRN_MASTER_KEY` | Development key | Set a persistent 32-byte hex master key |
@@ -115,3 +115,14 @@ remote cold-tier transition/restore and zero-copy HTTPS reads.
 
 [Apache-2.0](LICENSE). See [governance](GOVERNANCE.md), the [security policy](SECURITY.md) and the
 [code of conduct](CODE_OF_CONDUCT.md).
+
+### API and console endpoints
+
+Use `http://localhost:7373` for both S3 clients and Cairn administration. The console at
+`http://localhost:7374` has its own session API and public download links. Set
+`CAIRN_CONSOLE_ADDR=off` for API-only operation. Closing the console port does not restrict
+native administrator access on the API port.
+
+Behind a reverse proxy, set both `CAIRN_API_PUBLIC_URL` and `CAIRN_CONSOLE_PUBLIC_URL` to distinct
+HTTP(S) origins. See [deployment examples](docs/operations.md#api-and-console-ingress) and the
+[configuration migration](docs/upgrade-rollback.md#api-and-console-configuration-migration).

@@ -104,9 +104,13 @@ pub struct SystemResp {
     /// Seconds since this process started.
     pub uptime_secs: u64,
     /// The S3 API listener address as configured.
-    pub s3_addr: String,
+    pub api_addr: String,
     /// The web-console listener address as configured (may be `off`).
-    pub web_addr: String,
+    pub console_addr: String,
+    /// Configured public API origin, when explicitly set.
+    pub api_public_url: Option<String>,
+    /// Configured public console origin, when explicitly set.
+    pub console_public_url: Option<String>,
     /// Whether TLS is enabled on the S3 listener.
     pub tls: bool,
     /// The data directory path.

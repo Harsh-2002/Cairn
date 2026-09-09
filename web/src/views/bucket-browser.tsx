@@ -1,3 +1,4 @@
+import { useEndpoints } from "@/lib/use-endpoints";
 import {
   useCallback,
   useEffect,
@@ -141,6 +142,7 @@ const TAG_COLUMNS: Column[] = [
 const LISTING_SKELETON_WIDTHS = ["w-64", "w-16", "w-36", "w-8"];
 
 export function BucketBrowser() {
+  const { apiIssue } = useEndpoints();
   // :name comes from the parent /buckets/:name layout route.
   const { name = "" } = useParams<{ name: string }>();
 
@@ -339,6 +341,7 @@ export function BucketBrowser() {
   const uploadAll = useCallback(
     async (items: PendingUpload[]) => {
       if (items.length === 0 || uploading) return;
+      if (apiIssue) { toast.error(apiIssue.message); return; }
       setUploading(true);
       setUploads(
         items.map((it) => ({
@@ -395,7 +398,7 @@ export function BucketBrowser() {
         toast.error("Upload failed.");
       }
     },
-    [name, path, uploading, load],
+    [name, path, uploading, load, apiIssue],
   );
 
   // Map picked Files to uploads, honoring webkitRelativePath (set by a folder pick).
@@ -914,14 +917,14 @@ export function BucketBrowser() {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem
-                disabled={uploading}
+                disabled={uploading || !!apiIssue}
                 onSelect={() => fileInputRef.current?.click()}
               >
                 <Upload aria-hidden="true" />
                 Upload files
               </DropdownMenuItem>
               <DropdownMenuItem
-                disabled={uploading}
+                disabled={uploading || !!apiIssue}
                 onSelect={() => folderInputRef.current?.click()}
               >
                 <FolderUp aria-hidden="true" />
@@ -1003,7 +1006,7 @@ export function BucketBrowser() {
               type="button"
               variant="ghost"
               size="xs"
-              disabled={uploading}
+              disabled={uploading || !!apiIssue}
               onClick={() => setUploads([])}
             >
               Clear

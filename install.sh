@@ -12,7 +12,7 @@
 #   sudo sh install.sh --uninstall     # remove the service/compose project (keeps data)
 #
 # Flags: --host | --docker, --update, --uninstall, --yes (non-interactive), --version <tag>,
-#        --data-dir <path>, --tls-cert <path>, --tls-key <path>, --expose-s3,
+#        --data-dir <path>, --tls-cert <path>, --tls-key <path>, --expose-api,
 #        --expose-console, --acknowledge-public-http, --no-color, --help.
 set -eu
 
@@ -26,8 +26,8 @@ HOST_ETC="/etc/cairn"
 HOST_ENV="/etc/cairn/cairn.env"
 DOCKER_DIR="/opt/cairn"
 SVC_USER="cairn"
-S3_PORT="7373"
-WEB_PORT="7374"
+API_PORT="7373"
+CONSOLE_PORT="7374"
 
 # Options (defaults; overridden by flags / prompts).
 OPT_TARGET="auto"     # auto | host | docker
@@ -37,11 +37,13 @@ OPT_VERSION="latest"
 OPT_DATA_DIR="$HOST_DATA_DEFAULT"
 OPT_TLS_CERT=""
 OPT_TLS_KEY=""
-OPT_EXPOSE_S3="0"
+OPT_API_PUBLIC_URL=""
+OPT_CONSOLE_PUBLIC_URL=""
+OPT_EXPOSE_API="0"
 OPT_EXPOSE_CONSOLE="0"
 OPT_ACK_PUBLIC_HTTP="0"
-S3_BIND_HOST="127.0.0.1"
-WEB_BIND_HOST="127.0.0.1"
+API_BIND_HOST="127.0.0.1"
+CONSOLE_BIND_HOST="127.0.0.1"
 USE_COLOR="1"
 C_RESET=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_DIM=''
 
@@ -101,8 +103,10 @@ Usage: sudo sh install.sh [options]
   --data-dir <path>  Host data directory (default: $HOST_DATA_DEFAULT)
   --tls-cert <path>  TLS certificate (enables HTTPS; requires --tls-key)
   --tls-key <path>   TLS private key
-  --expose-s3        Bind/publish the S3 listener on all host interfaces
-  --expose-console   Bind/publish the console on all host interfaces (independent of S3)
+  --expose-api       Bind/publish S3 and native administration on all host interfaces
+  --expose-console   Bind/publish the console on all host interfaces
+  --api-public-url <url>      Public S3/API origin for generated links
+  --console-public-url <url>  Public console origin for download links
   --acknowledge-public-http
                      Required with either exposure flag when TLS is disabled
   --yes              Non-interactive; accept defaults
@@ -185,16 +189,16 @@ validate_tls() {
 # loopback defaults unless the corresponding flags were supplied.
 prompt_exposure() {
   if [ "$OPT_YES" = "1" ] || [ ! -t 0 ]; then return 0; fi
-  if [ "$OPT_EXPOSE_S3" = "0" ] \
-    && confirm "Expose the S3 listener outside this host?" "n"; then
-    OPT_EXPOSE_S3="1"
+  if [ "$OPT_EXPOSE_API" = "0" ] \
+    && confirm "Expose S3 and native administration outside this host?" "n"; then
+    OPT_EXPOSE_API="1"
   fi
   if [ "$OPT_EXPOSE_CONSOLE" = "0" ] \
     && confirm "Expose the web console and management API outside this host?" "n"; then
     OPT_EXPOSE_CONSOLE="1"
   fi
   if [ -z "$OPT_TLS_CERT" ] \
-    && { [ "$OPT_EXPOSE_S3" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
+    && { [ "$OPT_EXPOSE_API" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
     && [ "$OPT_ACK_PUBLIC_HTTP" != "1" ]; then
     warn "Public HTTP sends credentials, object data, and management traffic without transport encryption."
     if confirm "I understand the risk and want public plaintext HTTP exposure." "n"; then
@@ -208,23 +212,29 @@ prompt_exposure() {
 # Resolve installer exposure choices to host-side addresses. Cairn's own raw configuration defaults
 # remain unchanged; generated host and Compose deployments deliberately override them.
 resolve_exposure() {
+  for re_url in "$OPT_API_PUBLIC_URL" "$OPT_CONSOLE_PUBLIC_URL"; do
+    if [ -n "$re_url" ]; then
+      printf '%s\n' "$re_url" | LC_ALL=C grep -Eq '^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?/?$' \
+        || die "public URLs must be http(s) origins without credentials, paths, queries or fragments"
+    fi
+  done
   if [ -z "$OPT_TLS_CERT" ] \
-    && { [ "$OPT_EXPOSE_S3" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
+    && { [ "$OPT_EXPOSE_API" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
     && [ "$OPT_ACK_PUBLIC_HTTP" != "1" ]; then
     die "public plaintext exposure requires --acknowledge-public-http (or configure TLS)"
   fi
 
-  S3_BIND_HOST="127.0.0.1"
-  WEB_BIND_HOST="127.0.0.1"
-  if [ "$OPT_EXPOSE_S3" = "1" ]; then S3_BIND_HOST="0.0.0.0"; fi
-  if [ "$OPT_EXPOSE_CONSOLE" = "1" ]; then WEB_BIND_HOST="0.0.0.0"; fi
+  API_BIND_HOST="127.0.0.1"
+  CONSOLE_BIND_HOST="127.0.0.1"
+  if [ "$OPT_EXPOSE_API" = "1" ]; then API_BIND_HOST="0.0.0.0"; fi
+  if [ "$OPT_EXPOSE_CONSOLE" = "1" ]; then CONSOLE_BIND_HOST="0.0.0.0"; fi
 }
 
 # Wait for the server to answer /healthz on the S3 port.
 wait_healthy() {
   wh_i=0
   while [ "$wh_i" -lt 60 ]; do
-    if fetch "http://127.0.0.1:$S3_PORT/healthz" >/dev/null 2>&1; then return 0; fi
+    if fetch "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1; then return 0; fi
     wh_i=$((wh_i + 1)); sleep 1
   done
   return 1
@@ -234,12 +244,12 @@ print_access() {
   pa_scheme="http"; [ -n "$OPT_TLS_CERT" ] && pa_scheme="https"
   pa_s3_host="127.0.0.1"
   pa_web_host="127.0.0.1"
-  [ "$OPT_EXPOSE_S3" = "1" ] && pa_s3_host="<host>"
+  [ "$OPT_EXPOSE_API" = "1" ] && pa_s3_host="<host>"
   [ "$OPT_EXPOSE_CONSOLE" = "1" ] && pa_web_host="<host>"
   printf '\n'
   step "Cairn is ready"
-  info "S3 API     ${C_B}$pa_scheme://$pa_s3_host:$S3_PORT${C_RESET}"
-  info "Console    ${C_B}$pa_scheme://$pa_web_host:$WEB_PORT${C_RESET}"
+  info "API        ${C_B}$pa_scheme://$pa_s3_host:$API_PORT${C_RESET}"
+  info "Console    ${C_B}$pa_scheme://$pa_web_host:$CONSOLE_PORT${C_RESET}"
   info "Access key ${C_B}$ROOT_AK${C_RESET}"
   info "Secret key ${C_B}$ROOT_SK${C_RESET}"
   info "${C_DIM}Keep these and the master key safe. Update later by re-running this script.${C_RESET}"
@@ -374,8 +384,10 @@ write_env_file() {
     printf 'CAIRN_MASTER_KEY=%s\n' "$MASTER_KEY"
     printf 'CAIRN_ROOT_ACCESS_KEY=%s\n' "$ROOT_AK"
     printf 'CAIRN_ROOT_SECRET_KEY=%s\n' "$ROOT_SK"
-    printf 'CAIRN_LISTEN_ADDR=%s:%s\n' "$S3_BIND_HOST" "$S3_PORT"
-    printf 'CAIRN_WEB_ADDR=%s:%s\n' "$WEB_BIND_HOST" "$WEB_PORT"
+    printf 'CAIRN_API_ADDR=%s:%s\n' "$API_BIND_HOST" "$API_PORT"
+    printf 'CAIRN_CONSOLE_ADDR=%s:%s\n' "$CONSOLE_BIND_HOST" "$CONSOLE_PORT"
+    if [ -n "$OPT_API_PUBLIC_URL" ]; then printf 'CAIRN_API_PUBLIC_URL=%s\n' "$OPT_API_PUBLIC_URL"; fi
+    if [ -n "$OPT_CONSOLE_PUBLIC_URL" ]; then printf 'CAIRN_CONSOLE_PUBLIC_URL=%s\n' "$OPT_CONSOLE_PUBLIC_URL"; fi
     if [ -n "$OPT_TLS_CERT" ]; then
       printf 'CAIRN_TLS_CERT_PATH=%s\n' "$OPT_TLS_CERT"
       printf 'CAIRN_TLS_KEY_PATH=%s\n' "$OPT_TLS_KEY"
@@ -512,8 +524,8 @@ services:
     container_name: cairn
     restart: unless-stopped
     ports:
-      - "$S3_BIND_HOST:$S3_PORT:7373"
-      - "$WEB_BIND_HOST:$WEB_PORT:7374"
+      - "$API_BIND_HOST:$API_PORT:7373"
+      - "$CONSOLE_BIND_HOST:$CONSOLE_PORT:7374"
     environment:
       CAIRN_DATA_DIR: /data
       CAIRN_DB_PATH: /data/cairn.db
@@ -521,6 +533,8 @@ services:
       CAIRN_ROOT_ACCESS_KEY: \${CAIRN_ROOT_ACCESS_KEY}
       CAIRN_ROOT_SECRET_KEY: \${CAIRN_ROOT_SECRET_KEY}
 EOF
+  if [ -n "$OPT_API_PUBLIC_URL" ]; then printf '      CAIRN_API_PUBLIC_URL: "%s"\n' "$OPT_API_PUBLIC_URL" >> "$DOCKER_DIR/docker-compose.yml"; fi
+  if [ -n "$OPT_CONSOLE_PUBLIC_URL" ]; then printf '      CAIRN_CONSOLE_PUBLIC_URL: "%s"\n' "$OPT_CONSOLE_PUBLIC_URL" >> "$DOCKER_DIR/docker-compose.yml"; fi
   if [ -n "$wc_tls" ]; then
     cat >> "$DOCKER_DIR/docker-compose.yml" <<EOF
       CAIRN_TLS_CERT_PATH: /certs/cert.pem
@@ -652,9 +666,17 @@ parse_args() {
       --uninstall) OPT_MODE="uninstall" ;;
       --yes | -y) OPT_YES="1" ;;
       --no-color) USE_COLOR="0" ;;
-      --expose-s3) OPT_EXPOSE_S3="1" ;;
+      --expose-api) OPT_EXPOSE_API="1" ;;
       --expose-console) OPT_EXPOSE_CONSOLE="1" ;;
       --acknowledge-public-http) OPT_ACK_PUBLIC_HTTP="1" ;;
+      --api-public-url)
+        [ "$#" -ge 2 ] || die "--api-public-url requires a value"
+        shift; OPT_API_PUBLIC_URL="$1"
+        ;;
+      --console-public-url)
+        [ "$#" -ge 2 ] || die "--console-public-url requires a value"
+        shift; OPT_CONSOLE_PUBLIC_URL="$1"
+        ;;
       --version)
         [ "$#" -ge 2 ] || die "--version requires a value"
         shift

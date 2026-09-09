@@ -3,6 +3,7 @@ import { Link, Outlet, useLocation } from "react-router";
 import { AppSidebar } from "@/components/app-sidebar";
 import { CommandPalette } from "@/components/command-palette";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/primitives/sidebar";
+import { EndpointsProvider } from "@/providers/endpoints-provider";
 import { Toaster } from "@/components/primitives/sonner";
 
 /** The sidebar's persisted open/closed state (the framework stores it in the `sidebar_state`
@@ -82,11 +83,13 @@ export function AppShell() {
           tabIndex={-1}
           className="flex-1 outline-none"
         >
+          <EndpointsProvider>
           {/* A calm fade+rise when moving between top-level sections. Keyed by the first path
               segment so in-page tab switches (bucket Browser/Settings) don't re-animate. */}
           <div key={location.pathname.split("/")[1] || "overview"} className="animate-enter">
             <Outlet />
           </div>
+          </EndpointsProvider>
         </main>
       </SidebarInset>
       {/* Cmd/Ctrl+K launcher — owns its own open state and global shortcut. */}

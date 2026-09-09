@@ -7,7 +7,7 @@
 #   * the cookie alone (no Authorization header) authenticates only the management API.
 #   * every cookie-authenticated mutation proves its exact control Origin; same-site data-origin
 #     content and a missing Origin are denied, while explicit Bearer clients remain compatible.
-#   * control-listener object paths and data-listener `/api/v1` paths are fail-closed 404s.
+#   * control-listener object paths and API management requires explicit credentials; cookie-only access is refused.
 #   * the management API mints an exact data-origin SigV4 URL backed by a scoped temporary session;
 #     a browser-shaped CORS preflight and PUT/GET round-trip succeed only for the signed origin.
 #   * object/share responses cannot install a directory-scoped service worker on the data origin.
@@ -27,8 +27,8 @@ JAR="$DATA/cookies.txt"
 
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
-export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_WEB_ADDR="127.0.0.1:$WEBPORT"
+export CAIRN_API_ADDR="127.0.0.1:$PORT"
+export CAIRN_CONSOLE_ADDR="127.0.0.1:$WEBPORT"
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 
@@ -117,7 +117,7 @@ st="$(code -b "$JAR" -X PUT "$WEB/conf-session/greeting.txt")"
 ok "control listener does not fall through to S3"
 
 st="$(code -b "$JAR" "$S3/api/v1/overview")"
-[ "$st" = "404" ] || fail "data-listener management path should be 404, got $st"
+[ "$st" = "403" ] || fail "API management must reject cookie-only requests, got $st"
 ok "data listener rejects the management namespace and ignores the cookie"
 
 # 5) SameSite is not an origin boundary: the two localhost ports are same-site. A simple

@@ -30,6 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/primitive
 import { CopyField } from "@/components/copy-field";
 import { api, errorMessage } from "@/lib/api";
 import { whenMs } from "@/lib/format";
+import { useEndpoints } from "@/lib/use-endpoints";
 import type { ShareDisposition } from "@/lib/types";
 
 // Persistent durations include "forever"; presigned is capped at 12 hours.
@@ -50,10 +51,11 @@ export function ShareDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const idp = useId();
+  const { status, apiIssue, consoleIssue } = useEndpoints();
 
   // --- persistent "share link" tab ---
   const [pExpiry, setPExpiry] = useState("86400"); // default 24h
-  const [pDisposition, setPDisposition] = useState<ShareDisposition>("inline");
+  const [pDisposition, setPDisposition] = useState<ShareDisposition>("attachment");
   const [pFilename, setPFilename] = useState("");
   const [pBusy, setPBusy] = useState(false);
   const [pLink, setPLink] = useState<{ url: string; expiresAtMs: number | null } | null>(null);
@@ -69,7 +71,7 @@ export function ShareDialog({
 
   useEffect(() => {
     setPExpiry("86400");
-    setPDisposition("inline");
+    setPDisposition("attachment");
     setPFilename("");
     setPLink(null);
     setSMethod("GET");
@@ -85,6 +87,7 @@ export function ShareDialog({
     try {
       const res = await api.createShare(bucket, {
         key: objectKey,
+        delivery: pDisposition === "attachment" ? "console_download" : "api",
         expires_in_secs: pExpiry === "forever" ? null : Number(pExpiry),
         disposition: pDisposition,
         filename:
@@ -94,7 +97,7 @@ export function ShareDialog({
         version_id: versionId ?? null,
       });
       setPLink({
-        url: new URL(res.url, window.location.origin).toString(),
+        url: res.url,
         expiresAtMs: res.expires_at_ms,
       });
       toast.success("Share link created");
@@ -112,6 +115,7 @@ export function ShareDialog({
       const res = await api.presignShare(bucket, {
         key: objectKey,
         method: sMethod,
+        origin: window.location.origin,
         expires_in_secs: Number(sExpiry),
         version_id: versionId ?? null,
         // The S3-link tab has no disposition control of its own, so it must NOT read the separate
@@ -183,9 +187,14 @@ export function ShareDialog({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="inline">View in browser</SelectItem>
-                  <SelectItem value="attachment">Force download</SelectItem>
+                  <SelectItem value="attachment">Download</SelectItem>
                 </SelectContent>
               </Select>
+              <p className="break-all text-sm text-muted-foreground">
+                {pDisposition === "attachment"
+                  ? `Downloads through the console: ${status?.console_url ?? "this console"}.`
+                  : `Opens through the API: ${status?.api_url ?? "API URL not configured"}. Recipients must be able to reach it.`}
+              </p>
               {pDisposition === "attachment" ? (
                 <Input
                   placeholder="Download filename (optional)"
@@ -197,7 +206,7 @@ export function ShareDialog({
               ) : null}
             </div>
 
-            <Button onClick={() => void createShareLink()} disabled={pBusy}>
+            <Button onClick={() => void createShareLink()} disabled={pBusy || !!(pDisposition === "attachment" ? consoleIssue : apiIssue)}>
               {pBusy ? "Creating…" : "Create share link"}
             </Button>
 
@@ -282,7 +291,7 @@ export function ShareDialog({
               </>
             ) : null}
 
-            <Button onClick={() => void createPresigned()} disabled={sBusy}>
+            <Button onClick={() => void createPresigned()} disabled={sBusy || !!apiIssue}>
               {sBusy ? "Creating…" : "Create presigned URL"}
             </Button>
 

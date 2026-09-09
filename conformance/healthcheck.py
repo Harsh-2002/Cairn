@@ -32,8 +32,8 @@ def exercise(ipv6=False, tls=False):
         env.update(
             CAIRN_DATA_DIR=str(root / "data"),
             CAIRN_DB_PATH=str(root / "data/cairn.db"),
-            CAIRN_LISTEN_ADDR=f"[::]:{port}" if ipv6 else f"0.0.0.0:{port}",
-            CAIRN_WEB_ADDR="off",
+            CAIRN_API_ADDR=f"[::]:{port}" if ipv6 else f"0.0.0.0:{port}",
+            CAIRN_CONSOLE_ADDR="off",
             CAIRN_ALLOW_INSECURE="true",
         )
         if tls:
@@ -55,7 +55,7 @@ def exercise(ipv6=False, tls=False):
                                 CAIRN_DB_PATH=str(root / "untouched/cairn.db"))
                 assert probe(detached).returncode == 0
                 assert not (root / "untouched").exists()
-                invalid = probe(dict(env, CAIRN_LISTEN_ADDR="not-a-socket-address"))
+                invalid = probe(dict(env, CAIRN_API_ADDR="not-a-socket-address"))
                 assert invalid.returncode == 1, "Docker probes must use exit 1, not reserved exit 2"
                 assert invalid.stderr == b"health check: invalid node configuration\n"
                 if tls:

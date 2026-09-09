@@ -121,8 +121,8 @@ def scenario(binary, work, stage, cleanup_lease):
 
     def environment(data, peer=False):
         settings = dict(base, CAIRN_DATA_DIR=str(data), CAIRN_DB_PATH=str(data / "cairn.db"),
-                        CAIRN_LISTEN_ADDR=f"127.0.0.1:{peer_port if peer else source_port}",
-                        CAIRN_WEB_ADDR="off" if peer else f"127.0.0.1:{ui_port}")
+                        CAIRN_API_ADDR=f"127.0.0.1:{peer_port if peer else source_port}",
+                        CAIRN_CONSOLE_ADDR="off" if peer else f"127.0.0.1:{ui_port}")
         return settings
 
     def cli(data, *args, peer=False):

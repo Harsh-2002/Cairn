@@ -27,15 +27,15 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Where the **S3 API** listener binds (`CAIRN_LISTEN_ADDR`): the S3 protocol, the signed
-    /// public-read share URLs (`/share/…`), and the liveness/readiness/metrics endpoints. This is the
-    /// data-plane port you expose to S3 clients. Default `0.0.0.0:7373`.
-    pub listen_addr: SocketAddr,
-    /// Where the **web console** listener binds (`CAIRN_WEB_ADDR`): the management console served at
-    /// the root path and the management API (`/api/v1`). It never serves S3 objects or public
-    /// shares. This is the control-plane port you can firewall off. Default `0.0.0.0:7374`.
+    /// Where the API listener binds (`CAIRN_API_ADDR`): S3, native administration at
+    /// `/api/v1`, STS, public shares and infrastructure endpoints. Default `0.0.0.0:7373`.
+    pub api_addr: SocketAddr,
+    /// Where the **web console** listener binds (`CAIRN_CONSOLE_ADDR`): the management console served at
+    /// the root path, the management API (`/api/v1`) and forced-download public shares.
+    /// Disabling this listener leaves native administration on the API listener available.
+    /// Default `0.0.0.0:7374`.
     /// Set it empty (or `off`/`none`/`disabled`) to run headless with no web console listener.
-    pub web_addr: String,
+    pub console_addr: String,
     /// Root of the staging and per-bucket blob directories.
     pub data_dir: PathBuf,
     /// Location of the SQLite metadata file.
@@ -47,7 +47,9 @@ pub struct Config {
     pub meta_backend: String,
     /// External S3 data-origin base URL used when generating share and presigned URLs behind
     /// ingress. It must be browser-origin-distinct from the console/management endpoint.
-    pub public_base_url: Option<String>,
+    pub api_public_url: Option<String>,
+    /// External console origin used for forced-download public share links.
+    pub console_public_url: Option<String>,
     /// TLS certificate path (enables built-in TLS when set together with the key).
     pub tls_cert_path: Option<PathBuf>,
     /// TLS private-key path.
@@ -430,12 +432,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:7373".parse().expect("valid default addr"),
-            web_addr: "0.0.0.0:7374".to_owned(),
+            api_addr: "0.0.0.0:7373".parse().expect("valid default addr"),
+            console_addr: "0.0.0.0:7374".to_owned(),
             data_dir: PathBuf::from("./data"),
             db_path: PathBuf::from("./data/cairn.db"),
             meta_backend: "sqlite".to_owned(),
-            public_base_url: None,
+            api_public_url: None,
+            console_public_url: None,
             tls_cert_path: None,
             tls_key_path: None,
             trusted_proxies: None,
@@ -571,19 +574,19 @@ impl Config {
     /// # Errors
     /// Returns a [`ConfigError::Parse`] if the JSON is malformed or does not match the
     /// [`ReplicationTarget`] shape.
-    /// Resolve the web-console listener address from [`web_addr`](Self::web_addr): `Some(addr)` to bind a
+    /// Resolve the web-console listener address from [`console_addr`](Self::console_addr): `Some(addr)` to bind a
     /// web console listener, or `None` for headless mode (empty / `off` / `none` / `disabled`).
     ///
     /// # Errors
     /// Returns a [`ConfigError::Invalid`] if a non-empty value does not parse as `host:port`.
-    pub fn web_listen_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
-        let v = self.web_addr.trim();
+    pub fn console_listen_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let v = self.console_addr.trim();
         if v.is_empty() || matches!(v.to_ascii_lowercase().as_str(), "off" | "none" | "disabled") {
             return Ok(None);
         }
         v.parse::<SocketAddr>().map(Some).map_err(|e| {
             ConfigError::Invalid(format!(
-                "CAIRN_WEB_ADDR {v:?} is not a valid host:port: {e}"
+                "CAIRN_CONSOLE_ADDR {v:?} is not a valid host:port: {e}"
             ))
         })
     }
@@ -665,6 +668,7 @@ impl Config {
     /// # Errors
     /// Returns a [`ConfigError`] if the environment fails to parse or validation fails.
     pub fn load() -> Result<Self, ConfigError> {
+        reject_retired_environment()?;
         let mut figment =
             Figment::from(Serialized::defaults(Config::default())).merge(Env::prefixed("CAIRN_"));
         // Credential values are opaque strings. Do not let Figment interpret quote characters,
@@ -698,7 +702,12 @@ impl Config {
     /// # Errors
     /// Returns [`ConfigError::Invalid`] when an insecure default is in use on a public bind.
     pub fn refuse_insecure_public_bind(&self) -> Result<(), ConfigError> {
-        if self.listen_addr.ip().is_loopback() || self.allow_insecure {
+        if self.allow_insecure
+            || (self.api_addr.ip().is_loopback()
+                && self
+                    .console_listen_addr()?
+                    .is_none_or(|addr| addr.ip().is_loopback()))
+        {
             return Ok(());
         }
         if self.master_key.is_none() && self.master_key_ring.is_none() {
@@ -871,10 +880,24 @@ impl Config {
                  or CAIRN_WAL_CHECKPOINT_INTERVAL_SECS <= 60 to keep the WAL bounded".into(),
             ));
         }
-        if let Some(url) = &self.public_base_url {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+        for (name, value) in [
+            ("CAIRN_API_PUBLIC_URL", &self.api_public_url),
+            ("CAIRN_CONSOLE_PUBLIC_URL", &self.console_public_url),
+        ] {
+            if value
+                .as_ref()
+                .is_some_and(|url| crate::endpoints::Origin::parse(url).is_none())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} must be an http(s) origin with no credentials, path, query or fragment"
+                )));
+            }
+        }
+        if let (Some(api), Some(console)) = (&self.api_public_url, &self.console_public_url) {
+            if crate::endpoints::Origin::parse(api) == crate::endpoints::Origin::parse(console) {
                 return Err(ConfigError::Invalid(
-                    "public_base_url must be an http(s) URL".into(),
+                    "CAIRN_API_PUBLIC_URL and CAIRN_CONSOLE_PUBLIC_URL must be distinct origins"
+                        .into(),
                 ));
             }
         }
@@ -915,9 +938,9 @@ impl Config {
                 "max_object_size must be positive".into(),
             ));
         }
-        if self.dev_auth && !self.listen_addr.ip().is_loopback() {
+        if self.dev_auth && !self.api_addr.ip().is_loopback() {
             return Err(ConfigError::Invalid(
-                "dev_auth is only permitted on a loopback listen_addr".into(),
+                "dev_auth is only permitted on a loopback api_addr".into(),
             ));
         }
         if self.lifecycle_interval_secs == 0 {
@@ -1196,11 +1219,11 @@ impl Config {
             }
         }
         // Validate (but don't bind) the web-console listener address.
-        let web = self.web_listen_addr()?;
+        let web = self.console_listen_addr()?;
         if let Some(web) = web {
-            if web == self.listen_addr {
+            if web == self.api_addr {
                 return Err(ConfigError::Invalid(
-                    "CAIRN_WEB_ADDR must differ from the S3 API listener (CAIRN_LISTEN_ADDR)"
+                    "CAIRN_CONSOLE_ADDR must differ from the S3 API listener (CAIRN_API_ADDR)"
                         .into(),
                 ));
             }
@@ -1299,6 +1322,24 @@ pub enum ConfigError {
     /// A value was invalid.
     #[error("invalid configuration: {0}")]
     Invalid(String),
+}
+
+/// Retired configuration keys are errors, never silently ignored aliases.
+pub(crate) fn reject_retired_environment() -> Result<(), ConfigError> {
+    for (old, new) in [
+        ("CAIRN_LISTEN_ADDR", "CAIRN_API_ADDR"),
+        ("CAIRN_WEB_ADDR", "CAIRN_CONSOLE_ADDR"),
+        ("CAIRN_PUBLIC_BASE_URL", "CAIRN_API_PUBLIC_URL"),
+        ("CAIRN_ENDPOINT", "CAIRN_API_ENDPOINT"),
+        ("CAIRN_S3_ENDPOINT", "CAIRN_API_ENDPOINT"),
+    ] {
+        if std::env::var_os(old).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{old} has been removed; use {new}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1617,9 +1658,9 @@ mod tests {
     #[test]
     fn rejects_bad_public_url() {
         let mut c = base();
-        c.public_base_url = Some("ftp://nope".into());
+        c.api_public_url = Some("ftp://nope".into());
         assert!(c.validate().is_err());
-        c.public_base_url = Some("https://ok.example".into());
+        c.api_public_url = Some("https://ok.example".into());
         assert!(c.validate().is_ok());
     }
 
@@ -1967,13 +2008,14 @@ mod tests {
         );
         let public = |f: fn(&mut Config)| {
             let mut c = base();
-            c.listen_addr = "0.0.0.0:7373".parse().unwrap();
+            c.api_addr = "0.0.0.0:7373".parse().unwrap();
             f(&mut c);
             c.refuse_insecure_public_bind()
         };
         // Loopback is always allowed, even with the bare dev defaults.
         let mut lo = base();
-        lo.listen_addr = "127.0.0.1:7373".parse().unwrap();
+        lo.api_addr = "127.0.0.1:7373".parse().unwrap();
+        lo.console_addr = "off".into();
         assert!(lo.refuse_insecure_public_bind().is_ok());
         // Public bind with the built-in dev master key (none) -> refused.
         assert!(public(|_| {}).is_err());
@@ -1995,9 +2037,9 @@ mod tests {
     fn rejects_dev_auth_on_non_loopback() {
         let mut c = base();
         c.dev_auth = true;
-        c.listen_addr = "0.0.0.0:9000".parse().unwrap();
+        c.api_addr = "0.0.0.0:9000".parse().unwrap();
         assert!(c.validate().is_err());
-        c.listen_addr = "127.0.0.1:9000".parse().unwrap();
+        c.api_addr = "127.0.0.1:9000".parse().unwrap();
         assert!(c.validate().is_ok());
     }
 
@@ -2007,7 +2049,7 @@ mod tests {
     fn load_env_only_returns_defaults_when_unset() {
         figment::Jail::expect_with(|_jail| {
             let cfg = Config::load().expect("defaults load and validate");
-            assert_eq!(cfg.listen_addr, Config::default().listen_addr);
+            assert_eq!(cfg.api_addr, Config::default().api_addr);
             assert_eq!(cfg.region, "us-east-1");
             assert!(cfg.replication_targets.is_none());
             Ok(())
@@ -2020,14 +2062,14 @@ mod tests {
     fn load_env_only_applies_overrides() {
         figment::Jail::expect_with(|jail| {
             jail.set_env("CAIRN_REGION", "eu-west-1");
-            jail.set_env("CAIRN_LISTEN_ADDR", "0.0.0.0:8080");
+            jail.set_env("CAIRN_API_ADDR", "0.0.0.0:8080");
             jail.set_env("CAIRN_LOG_FORMAT", "json");
             jail.set_env("CAIRN_REPLICATION_INTERVAL_SECS", "7");
             jail.set_env("CAIRN_REQUEST_METRICS_RETENTION_DAYS", "14");
             jail.set_env("CAIRN_REQUEST_METRICS_FLUSH_SECS", "5");
             let cfg = Config::load().expect("env overrides load and validate");
             assert_eq!(cfg.region, "eu-west-1");
-            assert_eq!(cfg.listen_addr, "0.0.0.0:8080".parse().unwrap());
+            assert_eq!(cfg.api_addr, "0.0.0.0:8080".parse().unwrap());
             assert_eq!(cfg.log_format, LogFormat::Json);
             assert_eq!(cfg.replication_interval_secs, 7);
             assert_eq!(cfg.request_metrics_retention_days, 14);

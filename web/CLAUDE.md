@@ -3,12 +3,12 @@
 The management console: a **React 19 + TypeScript SPA** (Vite, Tailwind v4, shadcn-style
 `radix-ui` components, self-hosted Geist fonts). Built into `web/dist`, which the `cairn-web` crate
 embeds into the binary and the server serves at the root of the web-console listener
-(`CAIRN_WEB_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run lint`
+(`CAIRN_CONSOLE_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run lint`
 (ESLint 10 with `jsx-a11y-x`) + `npm run build` (strict `tsc` + vite), followed by
 `npm audit --omit=dev --audit-level=moderate` and `npm audit --audit-level=high`; it is not covered
 by cargo (see the root `../CLAUDE.md`).
 
-For a live browser pass against a disposable running node, set `CAIRN_E2E_BASE_URL`,
+For a live browser pass against a disposable running node, set `CAIRN_E2E_CONSOLE_URL`,
 `CAIRN_E2E_ACCESS_KEY`, and `CAIRN_E2E_SECRET_KEY`, then run `npm run e2e`. The Chrome/axe harness
 creates isolated bucket/user fixtures, covers every route at desktop and mobile widths, and removes
 those fixtures before exit.
@@ -61,7 +61,7 @@ waits two seconds after SIGTERM before falling back to SIGKILL with a second two
   `image/svg+xml` object would otherwise be stored XSS. Do not add a `sandbox` to the PDF frame: it
   breaks the built-in viewer, which is script-driven.
 - **Hash routing on purpose** (`createHashRouter`). The server serves the SPA shell only at `/` and
-  concrete embedded assets; every other control-listener path is a fail-closed 404. Don't switch to
+  concrete embedded assets; management and forced-download shares have explicit server routes, and all other console paths fail closed. Don't switch to
   a browser router without defining an explicit, non-S3 server route family.
 - **Recursive delete must converge.** A protected Object Lock version can make the control API
   return `more=true` indefinitely. Stop automatic retries after any zero-deletion pass, and
@@ -91,3 +91,5 @@ waits two seconds after SIGTERM before falling back to SIGKILL with a second two
   primary, semantic colour only when it means something, AAA-where-it-helps, honour
   `prefers-reduced-motion`); product intent in `../docs/product.md`.
 - Rust embed side: `../crates/cairn-web/`. Spec: `../docs/control-plane.md` (22–24).
+
+Endpoint diagnostics are session-scoped in `endpoints-provider.tsx`, backed by `/system/endpoints`. Share Download uses console delivery; inline preview and S3 links require the API origin. Never add a console inline rendering path or a relative-link fallback.

@@ -23,7 +23,7 @@ investigation there.
 | `404`/missing object after a crash | Reconciliation in progress, or a genuinely-uncommitted write | startup log; `cairn integrity` output | A *committed* write survives a crash (durability contract). On startup Cairn reconciles (reclaims orphan blobs) before answering `/readyz`. If a row's blob is missing, `cairn integrity --repair` drops the dangling row. |
 | Server won't start: master-key error | Wrong/missing `CAIRN_MASTER_KEY[_RING]`, or an incomplete rotation | startup log; `GET /api/v1/system/crypto-status` | Crypto fails closed: the key that sealed the data must be present. If mid-rotation, do not retire the old key until `retire_eligible=true` (see [`operations.md`](./operations.md) §7). |
 | WAL file growing without bound | A long-lived reader pinning the checkpoint | the WAL file size next to the DB | Find and close the stuck long-running read connection; the checkpoint resumes ([`scaling-limits.md`](./scaling-limits.md) §6). |
-| Console/web console won't load, S3 works | web console listener off or firewalled | `CAIRN_WEB_ADDR`; the second listener bound | The console + management API are on `:7374` by default; `CAIRN_WEB_ADDR=off` runs headless. |
+| Console/web console won't load, S3 works | web console listener off or firewalled | `CAIRN_CONSOLE_ADDR`; the second listener bound | The console + management API are on `:7374` by default; `CAIRN_CONSOLE_ADDR=off` runs headless. |
 | A phantom bucket name in Metrics | (fixed) console asset miscounted | — | Resolved in current builds; upgrade if you see it. |
 
 ## Compressed file length is small, but disk allocation remains large
@@ -65,3 +65,5 @@ Restore (per [`backup-restore.md`](./backup-restore.md)) when blobs are lost/cor
 `integrity --repair` can reconcile, or when an upgrade went wrong (see
 [`upgrade-rollback.md`](./upgrade-rollback.md) §3). Reconciliation reclaims orphans and drops dangling
 rows; it cannot recreate bytes that are gone — that's what the snapshot is for.
+
+Endpoint configuration errors identify the setting to change: `ApiPublicUrlRequired` requires the public API origin, `EndpointOriginConflict` requires distinct API/console origins, and `ApiMixedContent` requires HTTPS API access from an HTTPS console. Inspect `/api/v1/system/endpoints` with administrator credentials or the console Node panel. These diagnostics do not probe DNS/TLS or firewall reachability. `ConsoleDisabled` affects console download-link creation; API administration and API shares remain available.

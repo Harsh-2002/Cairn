@@ -176,3 +176,5 @@ journal I/O failure, commit-boundary SIGKILL and wrong-resume-identity fixtures.
 outside the production workspace and refuses unsupported operations. See
 [the conditional comparison contract](storage-metadata-alternative-2026-09.md); no tiny fixture,
 process-kill test or isolated gain establishes production migration/backup/power-loss parity.
+
+The required `console-browser` validation job runs `conformance/api_console.py` with browser coverage: API/console authorization, header-signed management-body binding, encrypted console downloads, API-blocked browser downloads, headless CLI/S3 and retired environment rejection. Existing routing, console-session, share and healthcheck harnesses remain required.

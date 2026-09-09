@@ -11,7 +11,7 @@ Cairn builds with a stable Rust toolchain into a single binary, with a release p
 Both the Dockerfile and release-assembled image declare an exec-form `HEALTHCHECK` invoking
 `cairn healthcheck`: every 30 seconds, a 5-second Docker timeout, three consecutive failures, and
 a 60-second startup grace. The command uses the ordinary environment configuration and probes
-`GET /readyz` on `CAIRN_LISTEN_ADDR`, mapping wildcard IPv4/IPv6 binds to same-family loopback.
+`GET /readyz` on `CAIRN_API_ADDR`, mapping wildcard IPv4/IPv6 binds to same-family loopback.
 It preserves custom ports and explicit bind addresses; Docker host-port mappings, the console
 listener and the public URL do not select the probe destination. Port zero cannot be discovered
 from static configuration and fails the probe. No node lock, metadata open, credentials, shell,
@@ -142,7 +142,9 @@ security and conduct guides qualify for `docs`. Agent instructions, the contract
 symlinked files, mixed changes and unknown paths select `full`. Documentation checks cover local
 links, incoming heading links and shell-example syntax; workflow policy checks run in both profiles.
 Every other change receives the complete correctness suite, including GNU/musl tests, optional
-features, audits, CodeQL, crash tests, bounded soaks and large encrypted replication.
+features, audits, CodeQL, crash tests, bounded soaks and large encrypted replication. The required
+`console-browser` job checks native administration, headless S3/CLI operation, browser uploads and
+forced console downloads with browser API access blocked, using the shared server build.
 
 The final `required` job checks every selected result, including unexpected skips, before recording
 its versioned JSON receipt. A push to `main` can reuse a successful PR run only when its merged PR,
@@ -232,6 +234,7 @@ Their API, configuration and compatibility requirements must be specified before
 | Replication | Asynchronous, outbox-driven, at-least-once with idempotent application, requiring versioning on the source. | Cross-host redundancy without clustering, well-defined and idempotent through stable version identity. |
 | Versioning | Designed in as a substrate that lifecycle and replication build on, with three states matching S3. | Cheap under the blob model and required by the features that depend on it. |
 | Control plane | One JSON management API consumed by both an embedded React web console compiled into the binary and a CLI. | A single artifact to deploy and parity between browser and terminal administration. |
+| API and console listeners | API serves S3, native administration and STS; console serves browser administration and forced-download shares through shared in-process handlers. Browser sessions remain console-only. | Headless administration and public console downloads with a private API, with separate browser origins and no privileged console shortcut. |
 | Transport | Optional native TLS in addition to running behind a terminating proxy. | A standalone secure endpoint without mandating a proxy. |
 | Secrets at rest | Envelope-encrypt SigV4 and replication secrets under an out-of-band master key; hash Bearer secrets. | Database disclosure must not yield usable secrets; high-entropy tokens need only a fast hash. |
 | SSE-KMS surface | Accept the aws:kms client surface (header, key id, bucket-key flag) and a per-bucket allow-list, but seal every DEK under the same master key ring — the key id is a validated label, not distinct key material or external-KMS isolation. | SDK and tooling compatibility today without standing up a real KMS; the label-only limitation is documented so it is never mistaken for cryptographic isolation. |

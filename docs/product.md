@@ -35,9 +35,7 @@ client compatibility.
 
 Cairn runs directly as a host service or as a container; Kubernetes deployments use one StatefulSet
 replica with persistent storage. Server configuration is supplied exclusively through validated
-`CAIRN_*` environment variables. The S3 data plane normally listens on port 7373, while the embedded
-console and management API use a separate listener on port 7374 so browser credentials and stored
-object content remain on distinct origins.
+`CAIRN_*` environment variables. S3 and native administration listen on port 7373. The optional console on port 7374 adds browser sessions and forced-download public shares. Inline object content stays on the API origin; disabling the console leaves API administration and S3 available.
 
 Operators work through standard S3 SDKs and tools, the browser console, or CLI subcommands. Typical
 flows include bootstrapping the first administrator, creating and configuring buckets, uploading and

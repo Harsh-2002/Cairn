@@ -1,22 +1,22 @@
 // Browser-level console smoke and accessibility coverage. Run against a disposable Cairn node:
-// CAIRN_E2E_BASE_URL=http://127.0.0.1:7374 CAIRN_E2E_ACCESS_KEY=... \
+// CAIRN_E2E_CONSOLE_URL=http://127.0.0.1:7374 CAIRN_E2E_ACCESS_KEY=... \
 // CAIRN_E2E_SECRET_KEY=... npm run e2e
 
 import axe from "axe-core";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const baseUrl = process.env.CAIRN_E2E_BASE_URL;
+const baseUrl = process.env.CAIRN_E2E_CONSOLE_URL;
 const accessKey = process.env.CAIRN_E2E_ACCESS_KEY;
 const secretKey = process.env.CAIRN_E2E_SECRET_KEY;
 const chromeBin = process.env.CHROME_BIN ?? "google-chrome";
 
 if (!baseUrl || !accessKey || !secretKey) {
   throw new Error(
-    "CAIRN_E2E_BASE_URL, CAIRN_E2E_ACCESS_KEY, and CAIRN_E2E_SECRET_KEY are required",
+    "CAIRN_E2E_CONSOLE_URL, CAIRN_E2E_ACCESS_KEY, and CAIRN_E2E_SECRET_KEY are required",
   );
 }
 
@@ -169,7 +169,7 @@ async function inspectRoute({ path, heading, title }) {
     const duplicateIds = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
     return {
       duplicateIds,
-      horizontalOverflow: document.documentElement.scrollWidth - innerWidth,
+      horizontalOverflow: document.documentElement.scrollWidth - ${viewportWidth},
       routeError: document.body.textContent.includes("Page unavailable"),
       mainCount: [...document.querySelectorAll("main")].filter(visible).length,
     };
@@ -190,6 +190,7 @@ async function inspectRoute({ path, heading, title }) {
   }
 }
 
+let viewportWidth = 1440;
 let bucketName;
 let userId;
 try {
@@ -240,6 +241,7 @@ try {
 
   for (const route of routes) await inspectRoute(route);
 
+  viewportWidth = 390;
   await command("Emulation.setDeviceMetricsOverride", {
     width: 390,
     height: 844,
@@ -247,6 +249,41 @@ try {
     mobile: true,
   });
   for (const route of routes) await inspectRoute(route);
+
+  const endpointStatus = await request("GET", "/system/endpoints");
+  if (!endpointStatus.api_url || endpointStatus.issues.length) throw new Error("Expected valid local endpoints");
+  await command("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: profileDir });
+  for (const [filename, contentType, payload] of [
+    ["active.html", "text/html", '<script>window.shareExecuted=true;document.cookie="injected=1"</script>'],
+    ["active.svg", "image/svg+xml", '<svg xmlns="http://www.w3.org/2000/svg" onload="window.shareExecuted=true"/>'],
+  ]) {
+    const signed = await request("POST", `/buckets/${bucketName}/objects/presign`, {
+      key: filename, method: "PUT", expires_in_secs: 300, content_type: contentType, origin: new URL(baseUrl).origin,
+    });
+    const status = await evaluate(`fetch(${JSON.stringify(signed.url)}, {
+      method: "PUT", credentials: "omit", headers: { "Content-Type": ${JSON.stringify(contentType)} }, body: ${JSON.stringify(payload)}
+    }).then(r => r.status)`);
+    if (status !== 200) throw new Error(`Browser upload failed: ${status}`);
+    const share = await request("POST", `/buckets/${bucketName}/objects/shares`, {
+      key: filename, delivery: "console_download", filename, expires_in_secs: 300,
+    });
+    if (new URL(share.url).origin !== new URL(baseUrl).origin) throw new Error("Download link must target console");
+    await command("Network.setBlockedURLs", { urls: [endpointStatus.api_url + "/*"] });
+    const navigation = await command("Page.navigate", { url: share.url + "?response-content-type=text/html&response-content-disposition=inline" });
+    if (!navigation.isDownload) throw new Error("Active object did not initiate a download");
+    const deadline = Date.now() + 10_000;
+    while (!(await readdir(profileDir)).includes(filename)) {
+      if (Date.now() > deadline) throw new Error("Download did not complete");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if ((await readFile(join(profileDir, filename), "utf8")) !== payload) throw new Error("Download bytes differ");
+    if (await evaluate('!!window.shareExecuted || document.cookie.includes("injected=1")')) throw new Error("Shared content executed in console");
+    const workerRefused = await evaluate(`navigator.serviceWorker.register(${JSON.stringify(share.url)}).then(() => false, () => true)`);
+    if (!workerRefused) throw new Error("Shared object became a service worker");
+    await command("Network.setBlockedURLs", { urls: [] });
+    await request("DELETE", `/buckets/${bucketName}/objects/shares/${share.id}`);
+  }
+  process.stdout.write("Browser uploads and console downloads passed with API requests blocked during download\n");
 
   if (browserErrors.length) {
     throw new Error(`browser errors: ${browserErrors.join(" | ")}`);

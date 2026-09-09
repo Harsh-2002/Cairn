@@ -123,8 +123,8 @@ def node_env(i, master_key):
     e.update({
         "CAIRN_DATA_DIR": os.path.join(d, "data"),
         "CAIRN_DB_PATH": os.path.join(d, "data/cairn.db"),
-        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{s3_port(i)}",
-        "CAIRN_WEB_ADDR": f"127.0.0.1:{web_port(i)}",
+        "CAIRN_API_ADDR": f"127.0.0.1:{s3_port(i)}",
+        "CAIRN_CONSOLE_ADDR": f"127.0.0.1:{web_port(i)}",
         "CAIRN_MASTER_KEY": master_key,
         "CAIRN_ROOT_ACCESS_KEY": AKID, "CAIRN_ROOT_SECRET_KEY": SECRET,
         "CAIRN_REGION": REGION, "CAIRN_ALLOW_INSECURE": "true",

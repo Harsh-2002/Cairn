@@ -349,7 +349,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh` (the CI form). Most
   default `BIN` to `$ROOT/target/debug/cairn`, so they run from any cwd; a few (`run`, `share`,
   `rotation`, `concurrency`, `warp*`) want `target/debug/cairn` relative to the repo root.
-- The bash launcher is thin: `mktemp -d` data dir, `CAIRN_WEB_ADDR=off` unless the script needs the
+- The bash launcher is thin: `mktemp -d` data dir, `CAIRN_CONSOLE_ADDR=off` unless the script needs the
   console, `bootstrap`, `serve`, poll `/healthz`, cleanup via `trap`. **A running server needs the
   dev sandbox disabled** (it binds listen sockets). Default config is env-only (ARCH 28) — these set
   `CAIRN_*` directly; mirror that, never invent a config file.
@@ -377,3 +377,5 @@ Protocol-2 crash recovery can reclaim through exact journals before the full sca
 must verify retired alias absence and empty recovered intent/debt rather than require the scan's
 orphan counter to include journal work. Terminal multipart HTTP success precedes deferred cleanup;
 the focused stress harness uses a one-second sweep and bounded disk/debt/quota polling.
+
+`api_console.py` covers native/console management, signed payload binding, forced-download shares and headless CLI/S3. With `BROWSER=1` it invokes the Chrome console harness, including blocked-API share downloads and active HTML/SVG refusal. The `console-browser` full-profile job gates this coverage. All launchers use `CAIRN_API_ADDR` and `CAIRN_CONSOLE_ADDR`.

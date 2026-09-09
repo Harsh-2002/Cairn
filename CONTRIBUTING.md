@@ -32,7 +32,7 @@ For each development session, load that same key and use loopback listeners:
 ```sh
 export CAIRN_MASTER_KEY="$(sed -n 's/^CAIRN_MASTER_KEY=//p' cairn.env)"
 export CAIRN_DATA_DIR="$PWD/data" CAIRN_DB_PATH="$PWD/data/cairn.db"
-export CAIRN_LISTEN_ADDR=127.0.0.1:7373 CAIRN_WEB_ADDR=127.0.0.1:7374
+export CAIRN_API_ADDR=127.0.0.1:7373 CAIRN_CONSOLE_ADDR=127.0.0.1:7374
 cargo run --bin cairn -- validate-config
 cargo run --bin cairn -- serve
 ```

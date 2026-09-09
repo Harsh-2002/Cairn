@@ -301,7 +301,7 @@ def run_case(args, campaign):
             secret = secrets.token_hex(24)
             server_env = {**env, "CAIRN_DATA_DIR": config["root"], "CAIRN_DB_PATH": str(directory / "data" / "metadata.db"),
                           "CAIRN_MASTER_KEY": secrets.token_hex(32), "CAIRN_ROOT_ACCESS_KEY": "lab-key", "CAIRN_ROOT_SECRET_KEY": secret,
-                          "CAIRN_LISTEN_ADDR": f"127.0.0.1:{port}", "CAIRN_WEB_ADDR": "off", "CAIRN_META_SYNCHRONOUS": "full",
+                          "CAIRN_API_ADDR": f"127.0.0.1:{port}", "CAIRN_CONSOLE_ADDR": "off", "CAIRN_META_SYNCHRONOUS": "full",
                           "CAIRN_META_READ_POOL_SIZE": "8", "CAIRN_META_CACHE_BYTES_PER_CONN": "8388608", "CAIRN_META_MMAP_BYTES": "0",
                           "CAIRN_META_BACKEND": "sqlite", "CAIRN_META_SHARDS": "1", "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0",
                           "CAIRN_META_CACHE_TOTAL_BUDGET_BYTES": "2147483648", "CAIRN_META_CACHE_BYTES": "67108864",

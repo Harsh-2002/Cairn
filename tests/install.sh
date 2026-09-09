@@ -97,31 +97,47 @@ assert_ack_required() {
     || fail "missing acknowledgement error did not name --acknowledge-public-http"
 }
 
+# Public origins are emitted literally into both deployment formats.
+public_host=$(render_host public-origins --api-public-url https://api.example.test --console-public-url https://console.example.test)
+assert_line "$public_host" 'CAIRN_API_PUBLIC_URL=https://api.example.test'
+assert_line "$public_host" 'CAIRN_CONSOLE_PUBLIC_URL=https://console.example.test'
+public_compose=$(render_compose public-origins --api-public-url https://api.example.test --console-public-url https://console.example.test)
+assert_line "$public_compose" '      CAIRN_API_PUBLIC_URL: "https://api.example.test"'
+assert_line "$public_compose" '      CAIRN_CONSOLE_PUBLIC_URL: "https://console.example.test"'
+for bad_origin in 'https://user:secret@example.test' 'https://example.test/path' 'https://example.test?x=1' 'https://example.test#x' 'https://example.test"'; do
+  if render_host invalid-origin --api-public-url "$bad_origin" > /dev/null 2>&1; then
+    fail "unsafe public origin accepted"
+  fi
+done
+if render_host retired-flag --expose-s3 > /dev/null 2>&1; then
+  fail "retired --expose-s3 flag accepted"
+fi
+
 # Host: unattended installs are safe for both plaintext and TLS. Exposure flags are independent.
 host_plain=$(render_host host-plain --host --yes)
-assert_line "$host_plain" 'CAIRN_LISTEN_ADDR=127.0.0.1:7373'
-assert_line "$host_plain" 'CAIRN_WEB_ADDR=127.0.0.1:7374'
+assert_line "$host_plain" 'CAIRN_API_ADDR=127.0.0.1:7373'
+assert_line "$host_plain" 'CAIRN_CONSOLE_ADDR=127.0.0.1:7374'
 assert_absent "$host_plain" 'CAIRN_TLS_CERT_PATH='
 
 host_tls=$(render_host host-tls --host --yes --tls-cert "$TLS_CERT" --tls-key "$TLS_KEY")
-assert_line "$host_tls" 'CAIRN_LISTEN_ADDR=127.0.0.1:7373'
-assert_line "$host_tls" 'CAIRN_WEB_ADDR=127.0.0.1:7374'
+assert_line "$host_tls" 'CAIRN_API_ADDR=127.0.0.1:7373'
+assert_line "$host_tls" 'CAIRN_CONSOLE_ADDR=127.0.0.1:7374'
 assert_line "$host_tls" "CAIRN_TLS_CERT_PATH=$TLS_CERT"
 
-host_plain_s3=$(render_host host-plain-s3 --host --yes --expose-s3 \
+host_plain_s3=$(render_host host-plain-s3 --host --yes --expose-api \
   --acknowledge-public-http)
-assert_line "$host_plain_s3" 'CAIRN_LISTEN_ADDR=0.0.0.0:7373'
-assert_line "$host_plain_s3" 'CAIRN_WEB_ADDR=127.0.0.1:7374'
+assert_line "$host_plain_s3" 'CAIRN_API_ADDR=0.0.0.0:7373'
+assert_line "$host_plain_s3" 'CAIRN_CONSOLE_ADDR=127.0.0.1:7374'
 
 host_tls_s3=$(render_host host-tls-s3 --host --yes --tls-cert "$TLS_CERT" \
-  --tls-key "$TLS_KEY" --expose-s3)
-assert_line "$host_tls_s3" 'CAIRN_LISTEN_ADDR=0.0.0.0:7373'
-assert_line "$host_tls_s3" 'CAIRN_WEB_ADDR=127.0.0.1:7374'
+  --tls-key "$TLS_KEY" --expose-api)
+assert_line "$host_tls_s3" 'CAIRN_API_ADDR=0.0.0.0:7373'
+assert_line "$host_tls_s3" 'CAIRN_CONSOLE_ADDR=127.0.0.1:7374'
 
 host_plain_console=$(render_host host-plain-console --host --yes --expose-console \
   --acknowledge-public-http)
-assert_line "$host_plain_console" 'CAIRN_LISTEN_ADDR=127.0.0.1:7373'
-assert_line "$host_plain_console" 'CAIRN_WEB_ADDR=0.0.0.0:7374'
+assert_line "$host_plain_console" 'CAIRN_API_ADDR=127.0.0.1:7373'
+assert_line "$host_plain_console" 'CAIRN_CONSOLE_ADDR=0.0.0.0:7374'
 
 # Compose: host-port publication is loopback-only by default, including when TLS is configured.
 compose_plain=$(render_compose compose-plain --docker --yes)
@@ -135,7 +151,7 @@ assert_line "$compose_tls" '      - "127.0.0.1:7373:7373"'
 assert_line "$compose_tls" '      - "127.0.0.1:7374:7374"'
 assert_line "$compose_tls" '      CAIRN_TLS_CERT_PATH: /certs/cert.pem'
 
-compose_plain_s3=$(render_compose compose-plain-s3 --docker --yes --expose-s3 \
+compose_plain_s3=$(render_compose compose-plain-s3 --docker --yes --expose-api \
   --acknowledge-public-http)
 assert_line "$compose_plain_s3" '      - "0.0.0.0:7373:7373"'
 assert_line "$compose_plain_s3" '      - "127.0.0.1:7374:7374"'
@@ -146,13 +162,13 @@ assert_line "$compose_tls_console" '      - "127.0.0.1:7373:7373"'
 assert_line "$compose_tls_console" '      - "0.0.0.0:7374:7374"'
 
 # Argument validation: every public plaintext listener needs the explicit risk acknowledgement.
-assert_ack_required host --host --yes --expose-s3
+assert_ack_required host --host --yes --expose-api
 assert_ack_required host --host --yes --expose-console
-assert_ack_required compose --docker --yes --expose-s3
+assert_ack_required compose --docker --yes --expose-api
 assert_ack_required compose --docker --yes --expose-console
 
 help_output=$(sh "$REPO_DIR/install.sh" --help)
-for help_flag in --expose-s3 --expose-console --acknowledge-public-http; do
+for help_flag in --expose-api --expose-console --acknowledge-public-http; do
   printf '%s\n' "$help_output" | grep -F -- "$help_flag" >/dev/null \
     || fail "installer help omits $help_flag"
 done

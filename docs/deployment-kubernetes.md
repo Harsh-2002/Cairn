@@ -11,8 +11,8 @@
 A `Dockerfile` ships in the repo (static musl binary → minimal image). Two listeners and three
 operational endpoints to know:
 
-- **`:7373`** — the S3 data plane (`CAIRN_LISTEN_ADDR`). Also serves `/healthz`, `/readyz`, `/metrics`.
-- **`:7374`** — the web console + management API (`CAIRN_WEB_ADDR`). Set `CAIRN_WEB_ADDR=off` for headless.
+- **`:7373`** — S3 and native administrator API (`CAIRN_API_ADDR`). Also serves `/healthz`, `/readyz`, `/metrics`.
+- **`:7374`** — the console + browser management API + forced-download shares (`CAIRN_CONSOLE_ADDR`). Set `CAIRN_CONSOLE_ADDR=off` for headless.
 - Data lives under `CAIRN_DATA_DIR` (with `CAIRN_DB_PATH` inside it) — mount a **persistent volume** there.
 
 Minimal run:
@@ -55,8 +55,8 @@ metadata: { name: cairn-config }
 data:
   CAIRN_DATA_DIR: "/data"
   CAIRN_DB_PATH: "/data/cairn.db"
-  CAIRN_LISTEN_ADDR: "0.0.0.0:7373"
-  CAIRN_WEB_ADDR: "0.0.0.0:7374"
+  CAIRN_API_ADDR: "0.0.0.0:7373"
+  CAIRN_CONSOLE_ADDR: "0.0.0.0:7374"
   # CAIRN_META_SYNCHRONOUS: "full"   # default; see scaling-limits.md before relaxing
   # CAIRN_META_SHARDS: "1"           # LOCKED at first init — pick up front (scaling-limits.md §3)
 ---
@@ -124,3 +124,5 @@ must fail rather than capture a moving blob tree. Preserve the complete `manifes
 directory as one unit. A PVC VolumeSnapshot alone is acceptable only if it is crash-consistent for
 the whole filesystem at one instant; the offline `cairn backup` procedure is the supported,
 ordering-correct path.
+
+For two-hostname ingress, configure `CAIRN_API_PUBLIC_URL` and `CAIRN_CONSOLE_PUBLIC_URL`; see [the canonical proxy example](operations.md#api-and-console-ingress). API-only operation keeps native administration available. Use ingress path restrictions on `/api/v1` when native administration and public S3 need different network access rules.

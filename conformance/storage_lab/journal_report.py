@@ -86,7 +86,7 @@ def validate_reports(reports, baseline_count, tokens, ledger_runs):
     expected = {'layer': 's3', 'concurrency': 4, 'buckets': 1,
                 'size': 4096 if baseline_count == 5 else 1024 * 1024,
                 'seed': 0x5eed, 'seconds': 3, 'idle': 1, 'cycles': 3, 'max_ops': 30000}
-    ephemeral = {'CAIRN_DATA_DIR', 'CAIRN_DB_PATH', 'CAIRN_LISTEN_ADDR'}
+    ephemeral = {'CAIRN_DATA_DIR', 'CAIRN_DB_PATH', 'CAIRN_API_ADDR'}
     configuration = {key: value for key, value in reference['server_configuration'].items() if key not in ephemeral}
     if (configuration.get('CAIRN_META_SYNCHRONOUS') != 'full'
             or configuration.get('CAIRN_META_BACKEND') != 'sqlite'

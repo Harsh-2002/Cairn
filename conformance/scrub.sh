@@ -61,8 +61,8 @@ start_node() {
   ENVS=(
     "CAIRN_DATA_DIR=$DATADIR"
     "CAIRN_DB_PATH=$DATADIR/cairn.db"
-    "CAIRN_LISTEN_ADDR=127.0.0.1:$port"
-    "CAIRN_WEB_ADDR=127.0.0.1:$uiport"
+    "CAIRN_API_ADDR=127.0.0.1:$port"
+    "CAIRN_CONSOLE_ADDR=127.0.0.1:$uiport"
     "CAIRN_MASTER_KEY=$mk"
     "CAIRN_LOG_LEVEL=${CAIRN_LOG_LEVEL:-warn}"
     # Scrub every 2s so a pass runs within the test window. NOTE: the scrub is OFF BY DEFAULT

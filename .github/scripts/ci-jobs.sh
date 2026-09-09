@@ -2,6 +2,10 @@
 set -euo pipefail
 
 case "${1:?CI task required}" in
+  console-browser)
+    chmod +x target/debug/cairn
+    BIN=target/debug/cairn BROWSER=1 python3 conformance/api_console.py
+    ;;
   storage-lab)
     chmod +x target/debug/cairn
     shellcheck -s sh conformance/storage_lab/run.sh

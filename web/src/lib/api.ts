@@ -43,6 +43,7 @@ import type {
   RotateCredentialsResp,
   ShareListResp,
   SystemResp,
+  EndpointStatus,
   TagObjectsResp,
   TagSummaryResp,
   UserDetailResp,
@@ -311,6 +312,7 @@ export const api = {
   overviewBuckets: () =>
     request<OverviewBucketsResp>("GET", "/overview/buckets"),
   system: () => request<SystemResp>("GET", "/system"),
+  endpoints: () => request<EndpointStatus>("GET", "/system/endpoints"),
 
   // Mint a short-lived, single-use ticket for the SSE live-update stream. EventSource cannot send
   // an Authorization header, so the browser POSTs here with its Bearer token, then opens the stream

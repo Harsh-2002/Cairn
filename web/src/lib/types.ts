@@ -14,8 +14,10 @@ export interface OverviewResp {
 export interface SystemResp {
   version: string;
   uptime_secs: number;
-  s3_addr: string;
-  web_addr: string;
+  api_addr: string;
+  console_addr: string;
+  api_public_url: string | null;
+  console_public_url: string | null;
   tls: boolean;
   data_dir: string;
   disk_total_bytes: number | null;
@@ -90,6 +92,7 @@ export interface ShareRecord {
 }
 
 export interface CreateShareReq {
+  delivery?: "api" | "console_download";
   key: string;
   expires_in_secs?: number | null; // null/absent = forever
   disposition?: ShareDisposition;
@@ -102,7 +105,7 @@ export interface CreateShareResp {
   id: string;
   /** Bearer capability returned exactly once; never present in list/get responses. */
   token: string;
-  url: string; // absolute data-origin URL
+  url: string; // absolute URL for the selected delivery endpoint
   expires_at_ms: number | null;
 }
 
@@ -518,4 +521,12 @@ export interface TagObjectItem {
 
 export interface TagObjectsResp {
   objects: TagObjectItem[];
+}
+
+/** Resolved URL configuration, not a network reachability check. */
+export interface EndpointStatus {
+  api_url: string | null;
+  console_url: string | null;
+  console_enabled: boolean;
+  issues: { code: string; setting: string; message: string }[];
 }
