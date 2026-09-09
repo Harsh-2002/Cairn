@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -153,6 +154,21 @@ class VerdictTests(unittest.TestCase):
                                            env={**os.environ,'RUNNER_TEMP':directory,'ZIG_WHEEL_URL':url},text=True)
             self.assertEqual(Path(actual).name,url.rsplit('/',1)[1])
             self.assertRegex(Path(actual).name,r'^ziglang-[^-]+-py3-none-[^-]+\.whl$')
+
+    def test_release_policy_rejects_toolchain_overrides_that_lose_installed_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            shutil.copytree(ROOT/'.github',root/'.github',ignore=shutil.ignore_patterns('__pycache__'))
+            shutil.copyfile(ROOT/'Dockerfile',root/'Dockerfile')
+            (root/'tests').mkdir()
+            shutil.copyfile(ROOT/'tests/release_policy.py',root/'tests/release_policy.py')
+            for channel,code in [('1.97.1',0),('stable',1),('1.97.2',1)]:
+                with self.subTest(channel=channel):
+                    (root/'rust-toolchain.toml').write_text(f'[toolchain]\nchannel = "{channel}"\n')
+                    result=subprocess.run([sys.executable,str(root/'tests/release_policy.py')],capture_output=True,text=True)
+                    self.assertEqual(result.returncode,code,result.stdout+result.stderr)
+                    if code:
+                        self.assertIn('must match installed CI targets and release provenance',result.stderr)
 
 
 class EvidenceTests(unittest.TestCase):
