@@ -20,6 +20,7 @@ mod baseline;
 mod cli_remote;
 mod config;
 mod error_page;
+mod healthcheck;
 mod import_dest;
 mod import_run;
 mod key_rewrap;
@@ -74,6 +75,8 @@ enum Command {
     Serve,
     /// Validate the configuration and exit.
     ValidateConfig,
+    /// Probe readiness on the configured S3 listener (for container health checks).
+    Healthcheck,
     /// Ensure the single root administrator exists and print its credentials. Idempotent, and the
     /// same identity `serve` seeds — so a node always has exactly one default admin (root).
     Bootstrap,
@@ -202,6 +205,10 @@ fn main() -> ExitCode {
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
+            if matches!(&command, Command::Healthcheck) {
+                eprintln!("health check: invalid node configuration");
+                return ExitCode::FAILURE;
+            }
             eprintln!("configuration error: {e}");
             return ExitCode::from(2);
         }
@@ -214,6 +221,11 @@ fn main() -> ExitCode {
     {
         eprintln!("{error}");
         return ExitCode::from(2);
+    }
+
+    // The health probe only contacts the running listener; never contend with its node lock.
+    if matches!(&command, Command::Healthcheck) {
+        return healthcheck::run(&cfg);
     }
 
     // Every command that directly accesses node-local state cooperates on the data-root and
@@ -306,14 +318,15 @@ fn main() -> ExitCode {
                 .expect("audit owns node lock")
                 .clone(),
         ),
-        // The remote-admin variants are handled and returned above.
-        Command::Bucket { .. }
+        // Client commands are handled and returned above.
+        Command::Healthcheck
+        | Command::Bucket { .. }
         | Command::User { .. }
         | Command::Replication { .. }
         | Command::Object { .. }
         | Command::Share { .. }
         | Command::Import { .. }
-        | Command::Overview { .. } => unreachable!("remote commands dispatched above"),
+        | Command::Overview { .. } => unreachable!("client commands dispatched above"),
     }
 }
 

@@ -160,6 +160,17 @@ sudo sh install.sh --docker --yes --expose-s3 --acknowledge-public-http
 The release artifact is one fully static binary (`musl`) containing the server, the management
 web console, and the CLI; it runs in a `scratch`/distroless container.
 
+The image includes a health check that runs `cairn healthcheck` against `/readyz` every 30 seconds.
+It follows `CAIRN_LISTEN_ADDR` automatically: the default is port 7373, while
+`CAIRN_LISTEN_ADDR=0.0.0.0:9000` makes it probe port 9000 inside the container. Publishing
+`9000:7373` instead leaves the internal probe on 7373. IPv6, headless mode and native TLS are
+supported; TLS uses the configured certificate as an exact local pin. No `curl`, shell, credentials
+or separate health-port variable is needed. Success is quiet; failure details appear in Docker's
+health log. Three consecutive failures after a 60-second startup grace mark the container unhealthy.
+For a large store whose startup reconciliation takes longer, override `--health-start-period`
+with `docker run` or `healthcheck.start_period` in Compose. This probes local service readiness;
+monitor public TLS validity and reverse-proxy reachability separately.
+
 ## 5. Day-two operations
 
 Liveness `/healthz`, readiness `/readyz` (ready only after migrations + reconciliation),

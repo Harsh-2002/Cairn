@@ -7,14 +7,16 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 ## Layout (`src/`)
 - `main.rs` — entrypoint + the `Command` enum (clap). Node-local commands operate on the data dir
   from config: `serve` (default), `validate-config`, `bootstrap`, `integrity [--repair]`, `migrate`,
-  `backup <dir>`, `restore <dir>`, `storage-baseline <empty-backup-dir>`. Remote-admin commands (`bucket`/`user`/`replication`/`object`/
+  `backup <dir>`, `restore <dir>`, `storage-baseline <empty-backup-dir>`. `healthcheck` reads config
+  but bypasses the node lock and storage: `healthcheck.rs` probes the configured S3 readiness
+  endpoint, with bounded HTTP and exact configured-certificate TLS pinning. Remote-admin commands (`bucket`/`user`/`replication`/`object`/
   `share`/`overview`, ARCH 24.2) are a thin HTTP client — dispatched **before** `Config::load()`,
   they never touch the local data dir. **One exception**: `replication audit` is NODE-LOCAL (a
   dispatch guard lets it fall through to `Config::load()`), because it reads the durable version-row
   ledger no API exposes; `--verify` additionally re-derives each source plaintext MD5 and GETs the
   replica. See `replication_audit.rs`.
-- `node_lock.rs` — non-waiting advisory exclusion shared by every node-local command (except the
-  side-effect-free `validate-config`). It locks both the data root and configured database identity,
+- `node_lock.rs` — non-waiting advisory exclusion shared by every command accessing node-local
+  storage (`validate-config` and `healthcheck` bypass it). It locks both the data root and configured database identity,
   making built-in backup/restore explicitly offline relative to `serve`. Lock files open with
   no-follow semantics; database symlinks/hard links and database parents nested below the data root
   are rejected. The snapshot format supports only one SQLite shard; it refuses other topologies,
