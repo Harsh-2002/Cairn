@@ -72,5 +72,5 @@ jobs:
       with:
         name: ci-receipt-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/ci-receipt.json
-        retention-days: 90
+        retention-days: ${{ github.retention_days }}
         if-no-files-found: error

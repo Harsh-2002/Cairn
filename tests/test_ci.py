@@ -81,6 +81,34 @@ class VerdictTests(unittest.TestCase):
             with self.assertRaises(ci.EvidenceError): ci.check_gate('success',status,False)
         with self.assertRaises(ci.EvidenceError): ci.check_gate('success','success',True)
 
+    def test_record_accepts_github_omitted_empty_outputs_but_requires_pr_identity(self):
+        revision=ci.git('rev-parse','HEAD').decode().strip()
+        planned={'revision':revision,'tree':ci.tree(revision),'profile':'full','reused':'false',
+                 'source':'{}','head_repository_id':'0','pr_number':'0'}
+        needs={'plan':{'result':'success','outputs':planned},
+               'validate':{'result':'success','outputs':{'results':json.dumps(ci.expected_jobs('full'))}}}
+        with tempfile.TemporaryDirectory() as directory:
+            env={'GITHUB_REPOSITORY':'owner/repo','GITHUB_REPOSITORY_ID':'17',
+                 'GITHUB_RUN_ID':'200','GITHUB_RUN_ATTEMPT':'1','RUNNER_TEMP':directory}
+            for event in ['push','workflow_dispatch','pull_request']:
+                with self.subTest(event=event),patch.dict(os.environ,{**env,'GITHUB_EVENT_NAME':event,
+                                                                    'NEEDS_JSON':json.dumps(needs)}):
+                    if event == 'pull_request':
+                        with self.assertRaises(ci.EvidenceError): ci.record()
+                    else:
+                        ci.record()
+                        receipt=json.loads((Path(directory)/'ci-receipt.json').read_text())
+                        self.assertEqual(receipt['base_sha'],'')
+                        self.assertEqual(receipt['head_sha'],'')
+                        self.assertEqual(receipt['revision'],revision)
+                        ci.check_results('full',receipt['results'])
+            planned.update(base_sha='a'*40,head_sha='b'*40,head_repository_id='17',pr_number='7')
+            with patch.dict(os.environ,{**env,'GITHUB_EVENT_NAME':'pull_request','NEEDS_JSON':json.dumps(needs)}):
+                ci.record()
+            receipt=json.loads((Path(directory)/'ci-receipt.json').read_text())
+            self.assertEqual(receipt['base_sha'],'a'*40)
+            self.assertEqual(receipt['head_sha'],'b'*40)
+
     def test_declared_jobs_match_the_reusable_workflow(self):
         text=(ROOT/'.github/workflows/validate.yml').read_text().split('\njobs:\n',1)[1]
         blocks=dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)',text,re.M|re.S))
@@ -100,7 +128,7 @@ class VerdictTests(unittest.TestCase):
             self.assertNotIn('pull_request_target:',text)
         wrapper=(ROOT/'.github/workflows/ci.yml').read_text()
         self.assertIn('name: required',wrapper)
-        self.assertIn('retention-days: 90',wrapper)
+        self.assertIn('retention-days: ${{ github.retention_days }}',wrapper)
         self.assertIn('python3 .github/scripts/ci.py record',wrapper)
         release=(ROOT/'.github/workflows/release.yml').read_text()
         self.assertIn('.headSha == $sha',release)
@@ -112,6 +140,19 @@ class VerdictTests(unittest.TestCase):
         self.assertNotIn('conformance/bench_compare.sh',validation)
         self.assertIn('conformance/bench_compare.sh',extended)
         self.assertNotIn('conformance/replication_large.sh',extended)
+        large=validation.split('\n  large-replication:\n',1)[1].split('\n  codeql:\n',1)[0]
+        self.assertNotIn('upload-artifact',large)
+        self.assertNotIn('LARGE_REPORT=',large)
+
+    def test_release_preserves_the_installable_zig_wheel_filename(self):
+        release=(ROOT/'.github/workflows/release.yml').read_text()
+        url=re.search(r'ZIG_WHEEL_URL: (\S+)',release).group(1)
+        assignment=re.search(r'^\s*wheel=(.*)$',release,re.M).group(1)
+        with tempfile.TemporaryDirectory() as directory:
+            actual=subprocess.check_output(['bash','-c',f'wheel={assignment}; printf "%s" "$wheel"'],
+                                           env={**os.environ,'RUNNER_TEMP':directory,'ZIG_WHEEL_URL':url},text=True)
+            self.assertEqual(Path(actual).name,url.rsplit('/',1)[1])
+            self.assertRegex(Path(actual).name,r'^ziglang-[^-]+-py3-none-[^-]+\.whl$')
 
 
 class EvidenceTests(unittest.TestCase):

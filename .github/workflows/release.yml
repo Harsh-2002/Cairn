@@ -114,7 +114,7 @@ jobs:
           ZIG_WHEEL_SHA256: 9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b
         run: |
           set -euo pipefail
-          wheel="${RUNNER_TEMP}/ziglang-0.16.0.whl"
+          wheel="${RUNNER_TEMP}/${ZIG_WHEEL_URL##*/}"
           curl --proto '=https' --tlsv1.2 -fsSL -o "$wheel" "$ZIG_WHEEL_URL"
           printf '%s  %s\n' "$ZIG_WHEEL_SHA256" "$wheel" | sha256sum -c -
           python -m pip install --no-deps --no-index "$wheel"

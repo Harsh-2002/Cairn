@@ -1101,14 +1101,7 @@ jobs:
         web-artifact: web-dist
     - run: cargo build --release --bin cairn
     - name: Real encrypted >2 GiB and >5 GiB replication to Cairn and MinIO
-      run: BIN=target/release/cairn LARGE_ENCRYPT=true LARGE_REPORT=replication-large.json bash conformance/replication_large.sh
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      if: always()
-      with:
-        name: replication-large-results
-        path: replication-large.json
-        retention-days: 14
-        if-no-files-found: warn
+      run: BIN=target/release/cairn LARGE_ENCRYPT=true bash conformance/replication_large.sh
     if: ${{ inputs.profile == 'full' }}
     needs:
     - web-bundle

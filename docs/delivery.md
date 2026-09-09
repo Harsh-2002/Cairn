@@ -124,7 +124,7 @@ its versioned JSON receipt. A push to `main` can reuse a successful PR run only 
 head/base identities, tested merge tree, workflow policy and required job results match. A docs
 receipt additionally requires successful `main` validation for its base. The verifier checks
 GitHub's run and attempt metadata and the artifact digest; it parses bounded data and never executes
-PR artifacts. Receipts are retained for 90 days. Missing, expired, ambiguous or mismatched evidence
+PR artifacts. Receipts follow the repository's configured retention period. Missing, expired, ambiguous or mismatched evidence
 selects fresh full validation. A manual `CI` dispatch on `main` always forces full validation.
 
 This maintainer-approved reuse policy retains a green CI verdict for the exact merged SHA while

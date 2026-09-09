@@ -268,12 +268,16 @@ def record():
     source = json.loads(planned["source"])
     results = source["results"] if reused else json.loads(needs["validate"]["outputs"]["results"])
     check_results(planned["profile"], results)
+    base, head = planned.get("base_sha", ""), planned.get("head_sha", "")
+    if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+        sha(base)
+        sha(head)
     receipt = {
         "version": VERSION, "mode": "reused" if reused else "tested", "event": os.environ["GITHUB_EVENT_NAME"],
         "workflow": WORKFLOW, "repository": os.environ["GITHUB_REPOSITORY"],
         "repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]), "revision": revision, "tree": tree(revision),
         "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-        "base_sha": planned["base_sha"], "head_sha": planned["head_sha"],
+        "base_sha": base, "head_sha": head,
         "head_repository_id": int(planned["head_repository_id"]), "pr_number": int(planned["pr_number"]),
         "profile": planned["profile"], "policy_digest": policy_digest(), "results": results,
     }
