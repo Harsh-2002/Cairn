@@ -31,7 +31,7 @@ fn main() {
 /// `CAIRN_VERSION` const (see `main.rs`), consumed by clap (`cairn --version`) and by `SystemInfo`
 /// (`GET /system`, the console footer).
 ///
-/// A **release** build injects the calendar version (`vYYYY.MM.DD`) via `CAIRN_RELEASE_VERSION`; the
+/// A **release** build injects the calendar version (`vYYYY.MM.DD[.revision]`) via `CAIRN_RELEASE_VERSION`; the
 /// release workflow computes that once and threads it into both the binaries and the git tag, so the
 /// binary and the release it ships in always agree. A **local/dev** build has no such env, so it
 /// reports the crate version with a `-dev` marker plus the short git commit for traceability — a dev

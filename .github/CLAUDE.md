@@ -59,7 +59,7 @@ digest. Before either recovery or publication, the job paginates releases and ma
 refuses to continue if any exact CalVer name is newer than the current tag, preventing an older
 failed run from promoting `:latest` backward.
 `retire-prior-releases` runs last, independently paginates releases and Git refs, deletes only exact
-older `vYYYY.MM.DD` names, verifies both sets again, and fails on every unexpected error. Unrelated
+older `vYYYY.MM.DD[.revision]` names (ordered numerically within a day), verifies both sets again, and fails on every unexpected error. Unrelated
 and later-dated releases and tags are untouched. A failed cross-service handoff can therefore leave
 a valid signed immutable release/candidate for diagnosis, but can never advance `:latest` to an
 unsigned or older image or silently claim that older releases were retired.

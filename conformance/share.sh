@@ -58,7 +58,7 @@ case "$SHURL" in "$BASE"/share/*) ;; *) fail "share URL was not on the data orig
 BODY=$(curl -s "$BASE/share/$TOK")
 [ "$BODY" = "v1-contents" ] || fail "share fetch body mismatch ($BODY)"
 DISP=$(curl -sI "$BASE/share/$TOK" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-disposition"{print $2}')
-[ "$DISP" = 'attachment; filename="r.txt"' ] || fail "disposition mismatch ($DISP)"
+[ "$DISP" = "attachment; filename=\"r.txt\"; filename*=UTF-8''r.txt" ] || fail "disposition mismatch ($DISP)"
 ok "persistent share fetch + forced-download disposition"
 
 # Existing-share management is capability-free: list/get expose the stable id but never the bearer

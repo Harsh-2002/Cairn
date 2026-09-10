@@ -922,6 +922,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: ObjectKey::parse("upload").unwrap(),
                 content_type: "application/octet-stream".into(),
+                content_disposition: None,
                 status: cairn_types::MultipartStatus::Active,
                 owner_id: UserId("owner".into()),
                 initiated_by: UserId("owner".into()),

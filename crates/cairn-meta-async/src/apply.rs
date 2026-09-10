@@ -321,8 +321,8 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
                      (id, bucket_name, key, content_type, status, owner_id, intended_acl,
                       user_metadata, sse_requested, encrypt_parts, sse_kms_requested,
                       sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at, initiated_by,
-                      initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known, replica_intent)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                      initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known, replica_intent, content_disposition)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                     vec![
                         Value::Text(s.upload_id.as_str().to_owned()),
                         Value::Text(s.bucket.as_str().to_owned()),
@@ -354,6 +354,7 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
                             .map_or(Value::Null, |on| Value::Int(on as i64)),
                         Value::Int(1),
                         opt_text(s.replica_intent.as_ref().map(to_json)),
+                        opt_text(s.content_disposition.clone()),
                     ],
                 )
                 .await?;

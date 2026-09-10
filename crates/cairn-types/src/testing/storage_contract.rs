@@ -553,6 +553,7 @@ pub(super) async fn create_upload(
                 bucket: bucket.clone(),
                 key: ObjectKey::parse("multipart/key").unwrap(),
                 content_type: "application/octet-stream".into(),
+                content_disposition: None,
                 status: crate::meta::MultipartStatus::Active,
                 owner_id: owner.clone(),
                 initiated_by: owner,

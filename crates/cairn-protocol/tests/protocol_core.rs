@@ -10477,6 +10477,70 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
 }
 
 #[tokio::test]
+async fn response_header_overrides_reject_injection_on_get_and_head() {
+    let h = harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("download-headers"),
+                None,
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("download-headers"),
+                Some("file.txt"),
+                &[],
+                &[],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for method in [Method::GET, Method::HEAD] {
+        for value in ["attachment\r\nx-injected: true", "bad\0value", "bad\nvalue"] {
+            for headers in [
+                vec![],
+                vec![("if-none-match", "*")],
+                vec![("range", "bytes=0-1")],
+            ] {
+                let (status, response_headers, _) = drain(
+                    send(
+                        &h.svc,
+                        req(
+                            method.clone(),
+                            Some("download-headers"),
+                            Some("file.txt"),
+                            &[("response-content-disposition", value)],
+                            &headers,
+                            vec![],
+                        ),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(header(&response_headers, "x-injected").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn inbound_replica_delete_requires_replication_action() {
     let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
     versioned_bucket(&h, "repldel").await;
@@ -16713,6 +16777,7 @@ async fn pre_v21_session_completes_legacy() {
         bucket: bucket.clone(),
         key: key.clone(),
         content_type: "application/octet-stream".to_owned(),
+        content_disposition: None,
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("admin".to_owned()),
         initiated_by: UserId("admin".to_owned()),
@@ -17321,6 +17386,7 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
         bucket: bucket.clone(),
         key: key.clone(),
         content_type: "application/octet-stream".to_owned(),
+        content_disposition: None,
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("admin".to_owned()),
         initiated_by: UserId("admin".to_owned()),

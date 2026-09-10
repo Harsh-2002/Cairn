@@ -307,8 +307,19 @@ pub async fn handle(
         if token.is_empty() || token.contains('/') {
             return json_status(404, r#"{"error":"not found"}"#);
         }
-        let mut response =
-            serve_share(&stack, token, method, &headers, source, secure, request_id).await;
+        let mut response = serve_share(
+            &stack,
+            token,
+            ShareRead {
+                method,
+                headers: &headers,
+                source,
+                secure,
+                request_id,
+                listener_role,
+            },
+        )
+        .await;
         constrain_service_worker_scope(&mut response, &raw_path);
         if listener_role.is_console() {
             harden_console_download(&mut response);
@@ -656,7 +667,7 @@ pub async fn handle(
         merge_csv_header(
             response.headers_mut(),
             "access-control-expose-headers",
-            "ETag, Content-Length, Content-Range, Content-Type, Last-Modified, x-amz-version-id, x-amz-request-id",
+            "ETag, Content-Length, Content-Range, Content-Type, Content-Disposition, Last-Modified, x-amz-version-id, x-amz-request-id",
         );
     }
     // If the service returned before consuming the body — e.g. an UploadPart rejected for an unknown
@@ -1100,20 +1111,6 @@ async fn session_endpoint(
     }
 }
 
-/// Strip header-injection and quoting characters from a download filename before it goes into
-/// `Content-Disposition`.
-fn sanitize_filename(s: &str) -> String {
-    let name: String = s
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '"' | '\\' | '/'))
-        .collect();
-    if name.trim().is_empty() || matches!(name.as_str(), "." | "..") {
-        "download".to_owned()
-    } else {
-        name
-    }
-}
-
 /// A 256-bit opaque token (two v4 UUIDs of hex), URL-safe and unguessable. Persistent-share
 /// callers immediately wrap it in [`SecretString`] and persist only [`ShareLookupHash`].
 fn generate_share_token() -> String {
@@ -1392,7 +1389,7 @@ async fn presign(
     if let Some(v) = &req.version_id {
         extra_query.push(("versionId".to_owned(), v.clone()));
     }
-    if http_method == "GET" {
+    if matches!(http_method.as_str(), "GET" | "HEAD") {
         if let Some(d) = &req.response_content_disposition {
             extra_query.push(("response-content-disposition".to_owned(), d.clone()));
         }
@@ -1836,19 +1833,28 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+struct ShareRead<'a> {
+    method: Method,
+    headers: &'a [(String, String)],
+    source: ClientSource,
+    secure: bool,
+    request_id: String,
+    listener_role: ListenerRole,
+}
+
 /// Serve a persistent share by its token: look it up, reject revoked/expired (`410`) or unknown
 /// (`404`), then stream the object through the normal S3 read path under a least-privilege synthetic
 /// principal scoped to read-only of the one key. Version-pinned shares serve the pinned version;
 /// the server sets `Content-Disposition` from the share and `Referrer-Policy: no-referrer`.
-async fn serve_share(
-    stack: &AppStack,
-    token: &str,
-    method: Method,
-    in_headers: &[(String, String)],
-    source: ClientSource,
-    secure: bool,
-    request_id: String,
-) -> Response<ResponseBody> {
+async fn serve_share(stack: &AppStack, token: &str, read: ShareRead<'_>) -> Response<ResponseBody> {
+    let ShareRead {
+        method,
+        headers: in_headers,
+        source,
+        secure,
+        request_id,
+        listener_role,
+    } = read;
     // A share link is opened by a person far more often than by a program, so a dead link explains
     // itself as a page. The share token is a credential and is deliberately NOT echoed into the
     // page (the resource is left blank) — it already rides the URL, and `Referrer-Policy:
@@ -1948,16 +1954,18 @@ async fn serve_share(
 
     // Server-controlled delivery + privacy: override any object-set disposition, and never leak the
     // token through a referer.
-    let disp = match (row.disposition, row.filename.as_deref()) {
-        (ShareDisposition::Attachment, Some(name)) => {
-            format!("attachment; filename=\"{}\"", sanitize_filename(name))
-        }
-        (ShareDisposition::Attachment, None) => "attachment".to_owned(),
-        (ShareDisposition::Inline, _) => "inline".to_owned(),
-    };
+    let success = resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED;
     let h = resp.headers_mut();
-    if let Ok(v) = http::HeaderValue::from_str(&disp) {
-        h.insert(http::header::CONTENT_DISPOSITION, v);
+    if success {
+        let delivery = if listener_role.is_console() {
+            ShareDisposition::Attachment
+        } else {
+            row.disposition
+        };
+        h.insert(
+            http::header::CONTENT_DISPOSITION,
+            crate::download::disposition(delivery, row.filename.as_deref(), row.key.as_str()),
+        );
     }
     h.insert(
         "referrer-policy",
@@ -2164,7 +2172,7 @@ fn parse_key(decoded: &str) -> Result<ObjectKey, Error> {
     })
 }
 
-fn parse_query(q: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_query(q: &str) -> Vec<(String, String)> {
     q.split('&')
         .filter(|p| !p.is_empty())
         .map(|p| {
@@ -2563,15 +2571,6 @@ mod tests {
     }
 
     #[test]
-    fn share_download_filenames_are_safe_and_nonempty() {
-        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
-        assert_eq!(sanitize_filename("a/b\\c\r\n\t\".html"), "abc.html");
-        for name in ["", " ", ".", "..", "\r\n\t\"/\\"] {
-            assert_eq!(sanitize_filename(name), "download");
-        }
-    }
-
-    #[test]
     fn console_download_headers_override_active_object_metadata() {
         let mut response = json_status(200, "<script>active()</script>");
         response
@@ -2602,6 +2601,26 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("sandbox")
+        );
+    }
+
+    #[test]
+    fn read_query_decoding_preserves_filename_encoding_and_literal_plus() {
+        assert_eq!(
+            parse_query(
+                "response-content-disposition=attachment%3B%20filename%2A%3DUTF-8%27%27r%25C3%25A9sum%25C3%25A9%2520%252B.pdf&versionId=a%2Bb%2Fc"
+            ),
+            vec![
+                (
+                    "response-content-disposition".to_owned(),
+                    "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9%20%2B.pdf".to_owned()
+                ),
+                ("versionId".to_owned(), "a+b/c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            parse_query("name=a+b"),
+            vec![("name".to_owned(), "a+b".to_owned())]
         );
     }
 

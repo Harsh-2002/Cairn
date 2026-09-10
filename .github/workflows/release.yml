@@ -5,6 +5,12 @@ name: Release
 # only checksum-bound artifacts from those builds.
 on:
   workflow_dispatch:
+    inputs:
+      revision:
+        description: "Same-day revision (blank for the first release, positive integer thereafter)"
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -44,9 +50,15 @@ jobs:
         id: release
         env:
           REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
-          echo "version=$(date -u +v%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          version="$(date -u +v%Y.%m.%d)"
+          if [ -n "$REVISION" ]; then
+            [[ "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::revision must be a positive integer"; exit 1; }
+            version="${version}.${REVISION}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" \
             >> "$GITHUB_OUTPUT"
       - name: Install checksum-pinned GitHub CLI
@@ -1023,14 +1035,17 @@ jobs:
             jq -er --arg tag "$TAG" \
               '[.[][] | select(.tag_name == $tag)] | length' "$1"
           }
+          calver_before() {
+            [ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+          }
           refuse_newer_calver() {
             releases="$1"
             release_tags="${RUNNER_TEMP}/existing-release-tags.txt"
             tag_refs="${RUNNER_TEMP}/existing-release-tag-refs.txt"
             jq -r '.[][] | .tag_name' "$releases" > "$release_tags"
             while read -r candidate; do
-              [[ "$candidate" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
-              if [[ "$candidate" > "$TAG" ]]; then
+              [[ "$candidate" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
+              if calver_before "$TAG" "$candidate"; then
                 echo "::error::newer CalVer release ${candidate} exists; refusing to promote ${TAG} backward" >&2
                 return 1
               fi
@@ -1041,8 +1056,8 @@ jobs:
             while read -r ref; do
               ref_path="${ref#refs/tags/}"
               [ "$ref_path" != "$ref" ] || continue
-              [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
-              if [[ "$ref_path" > "$TAG" ]]; then
+              [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
+              if calver_before "$TAG" "$ref_path"; then
                 echo "::error::newer CalVer tag ${ref_path} exists; refusing to promote ${TAG} backward" >&2
                 return 1
               fi
@@ -1172,7 +1187,7 @@ jobs:
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
           "$GH" release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" \
             --title "$TAG" --draft \
-            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) are attached below. The signed immutable multi-arch container subject is \`$IMAGE@$DIGEST\`; after this workflow completes, \`$IMAGE:$TAG\` and \`$IMAGE:latest\` resolve to that same digest. Binaries and checksums are cosign-keyless-signed (\`*.cosign.bundle\`), an SPDX dependency SBOM is attached, and both the binaries and image carry SLSA build-provenance attestations — see SECURITY.md for verification." \
+            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD[.revision]). Static linux binaries (amd64 + arm64) are attached below. The signed immutable multi-arch container subject is \`$IMAGE@$DIGEST\`; after this workflow completes, \`$IMAGE:$TAG\` and \`$IMAGE:latest\` resolve to that same digest. Binaries and checksums are cosign-keyless-signed (\`*.cosign.bundle\`), an SPDX dependency SBOM is attached, and both the binaries and image carry SLSA build-provenance attestations — see SECURITY.md for verification." \
             rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS \
             rel/cairn-sbom.spdx.json rel/IMAGE-DIGEST rel/PUBLISH-MANIFEST.sha256 \
             rel/cairn-linux-amd64.provenance.json rel/cairn-linux-arm64.provenance.json \
@@ -1334,6 +1349,9 @@ jobs:
           export LC_ALL=C
           REPO="$REPOSITORY"
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
+          calver_before() {
+            [ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+          }
           releases="${RUNNER_TEMP}/cairn-releases.tsv"
           refs="${RUNNER_TEMP}/cairn-tag-refs.txt"
 
@@ -1349,9 +1367,9 @@ jobs:
           "$GH" api --paginate "/repos/${REPO}/releases?per_page=100" \
             --jq '.[] | [.id, .tag_name] | @tsv' > "$releases"
           while IFS=$'\t' read -r release_id previous; do
-            [[ "$previous" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [[ "$previous" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
             [ "$previous" = "$TAG" ] && continue
-            [[ "$previous" < "$TAG" ]] || continue
+            calver_before "$previous" "$TAG" || continue
             [[ "$release_id" =~ ^[0-9]+$ ]]
             echo "retiring prior CalVer release: $previous"
             "$GH" api --method DELETE "/repos/${REPO}/releases/${release_id}"
@@ -1363,9 +1381,9 @@ jobs:
           while read -r ref; do
             ref_path="${ref#refs/tags/}"
             [ "$ref_path" != "$ref" ] || continue
-            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
             [ "$ref_path" = "$TAG" ] && continue
-            [[ "$ref_path" < "$TAG" ]] || continue
+            calver_before "$ref_path" "$TAG" || continue
             echo "retiring prior CalVer tag: $ref_path"
             "$GH" api --method DELETE \
               "/repos/${REPO}/git/refs/tags/${ref_path}"
@@ -1374,9 +1392,9 @@ jobs:
           "$GH" api --paginate "/repos/${REPO}/releases?per_page=100" \
             --jq '.[] | [.id, .tag_name] | @tsv' > "$releases"
           while IFS=$'\t' read -r release_id remaining; do
-            [[ "$remaining" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [[ "$remaining" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
             [ "$remaining" = "$TAG" ] && continue
-            [[ "$remaining" < "$TAG" ]] || continue
+            calver_before "$remaining" "$TAG" || continue
             echo "::error::prior CalVer release remains after retirement: ${remaining} (${release_id})" >&2
             exit 1
           done < "$releases"
@@ -1387,9 +1405,9 @@ jobs:
           while read -r ref; do
             ref_path="${ref#refs/tags/}"
             [ "$ref_path" != "$ref" ] || continue
-            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$ ]] || continue
             [ "$ref_path" = "$TAG" ] && continue
-            [[ "$ref_path" < "$TAG" ]] || continue
+            calver_before "$ref_path" "$TAG" || continue
             echo "::error::prior CalVer tag remains after retirement: ${ref_path}" >&2
             exit 1
           done < "$refs"

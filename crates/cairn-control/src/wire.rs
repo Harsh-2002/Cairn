@@ -573,7 +573,7 @@ pub struct ShareRecord {
     pub created_by: String,
     /// `inline` or `attachment`.
     pub disposition: String,
-    /// The download filename for `attachment`, or null.
+    /// The suggested filename for saving the object, or null to use its basename.
     pub filename: Option<String>,
     /// Server-derived: `active`, `expired`, or `revoked`.
     pub status: String,

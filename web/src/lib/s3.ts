@@ -5,6 +5,7 @@
 // temporary signing secret enters JavaScript.
 
 import { api, ApiError } from "./api";
+import { downloadFilename, type ObjectDownload } from "./download";
 import {
   parseReplication,
   replicationXml,
@@ -247,16 +248,16 @@ export async function putObjectWithProgress(
   });
 }
 
-export async function getObjectBlob(
+export async function getObjectDownload(
   bucket: string,
   key: string,
   versionId?: string,
-): Promise<Blob> {
+): Promise<ObjectDownload> {
   const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
   const res = await dataFetch(objectPath(bucket, key) + q, { headers: s3headers() });
   if (!res.ok)
     throw await s3Error(res, "download");
-  return await res.blob();
+  return { blob: await res.blob(), filename: downloadFilename(res.headers.get("Content-Disposition"), key) };
 }
 
 /**

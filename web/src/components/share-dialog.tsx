@@ -28,6 +28,7 @@ import {
 } from "@/components/primitives/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/primitives/tabs";
 import { CopyField } from "@/components/copy-field";
+import { objectFilename } from "@/lib/download";
 import { api, errorMessage } from "@/lib/api";
 import { whenMs } from "@/lib/format";
 import { useEndpoints } from "@/lib/use-endpoints";
@@ -128,7 +129,7 @@ export function ShareDialog({
         // The S3-link tab has no disposition control of its own, so it must NOT read the separate
         // persistent-share tab's Delivery selector (that made the presigned link's inline-vs-download
         // behavior depend, invisibly, on an unrelated tab — audit 2026-07). Use the default
-        // (inline) disposition.
+        // stored object disposition.
         response_content_disposition: null,
         content_type:
           sMethod === "PUT" && sContentType.trim() ? sContentType.trim() : null,
@@ -203,13 +204,19 @@ export function ShareDialog({
                   : `Opens through the API: ${status?.api_url ?? "API URL not configured"}. Recipients must be able to reach it.`}
               </p>
               {pDisposition === "attachment" ? (
-                <Input
-                  placeholder="Download filename (optional)"
-                  value={pFilename}
-                  onChange={(e) => setPFilename(e.target.value)}
-                  className="font-mono"
-                  aria-label="Download filename"
-                />
+                <div className="grid gap-1.5">
+                  <Input
+                    placeholder={objectFilename(objectKey)}
+                    value={pFilename}
+                    onChange={(e) => setPFilename(e.target.value)}
+                    className="font-mono"
+                    aria-label="Download filename"
+                    aria-describedby={`${idp}-filename-help`}
+                  />
+                  <p id={`${idp}-filename-help`} className="text-sm text-muted-foreground">
+                    Optional. Leave blank to use the object's filename.
+                  </p>
+                </div>
               ) : null}
             </div>
 

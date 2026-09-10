@@ -1,3 +1,4 @@
+import { saveDownload } from "@/lib/download";
 import { useEndpoints } from "@/lib/use-endpoints";
 import {
   useCallback,
@@ -85,7 +86,7 @@ import {
   copyObject,
   createFolder,
   deleteObject,
-  getObjectBlob,
+  getObjectDownload,
   getObjectLockConfig,
   listObjectVersions,
   putObjectWithProgress,
@@ -646,15 +647,7 @@ export function BucketBrowser() {
 
   async function download(key: string, versionId?: string) {
     try {
-      const blob = await getObjectBlob(name, key, versionId);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = key.split("/").pop() || key;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      saveDownload(await getObjectDownload(name, key, versionId));
     } catch (e) {
       toast.error(errorMessage(e, "Download failed."));
     }
@@ -671,15 +664,7 @@ export function BucketBrowser() {
     try {
       for (const key of keys) {
         try {
-          const blob = await getObjectBlob(name, key);
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = key.split("/").pop() || key;
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          URL.revokeObjectURL(url);
+          saveDownload(await getObjectDownload(name, key));
           ok++;
         } catch {
           /* counted in the summary below */

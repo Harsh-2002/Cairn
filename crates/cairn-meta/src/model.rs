@@ -377,6 +377,7 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
             .unwrap_or_else(|_| unreachable_bucket()),
         key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
         content_type: row.get("content_type")?,
+        content_disposition: row.get("content_disposition")?,
         status: mp_status_from(&row.get::<_, String>("status")?),
         owner_id,
         initiated_by,

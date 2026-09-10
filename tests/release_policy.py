@@ -770,8 +770,8 @@ if "publish-release" in blocks:
         "refusing ambiguous recovery",
         "refuse_newer_calver",
         "/git/matching-refs/tags/v?per_page=100",
-        '[[ "$candidate" > "$TAG" ]]',
-        '[[ "$ref_path" > "$TAG" ]]',
+        'calver_before "$TAG" "$candidate"',
+        'calver_before "$TAG" "$ref_path"',
         "newer CalVer release",
         "newer CalVer tag",
         "export LC_ALL=C",
@@ -999,7 +999,7 @@ for job, (job_line, block) in blocks.items():
 
 if "retire-prior-releases" in blocks:
     job_line, retire_block = blocks["retire-prior-releases"]
-    calver = r'^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'
+    calver = r'^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]*)?$'
     required = (
         "/releases?per_page=100",
         "/git/matching-refs/tags/v?per_page=100",
@@ -1008,9 +1008,9 @@ if "retire-prior-releases" in blocks:
         calver,
         '"$GH" api --method DELETE "/repos/${REPO}/releases/${release_id}"',
         '"/repos/${REPO}/git/refs/tags/${ref_path}"',
-        '[[ "$previous" < "$TAG" ]]',
-        '[[ "$ref_path" < "$TAG" ]]',
-        '[[ "$remaining" < "$TAG" ]]',
+        'calver_before "$previous" "$TAG"',
+        'calver_before "$ref_path" "$TAG"',
+        'calver_before "$remaining" "$TAG"',
         "export LC_ALL=C",
         "prior CalVer release remains after retirement",
         "prior CalVer tag remains after retirement",
@@ -1028,13 +1028,13 @@ if "retire-prior-releases" in blocks:
         )
         tag_delete = retire_block.index('"/repos/${REPO}/git/refs/tags/${ref_path}"')
         release_guard = retire_block.index(
-            '[[ "$previous" =~ ^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}$ ]]'
+            '[[ "$previous" =~ ^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(\\.[1-9][0-9]*)?$ ]]'
         )
         ref_guard = retire_block.index(
-            '[[ "$ref_path" =~ ^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}$ ]]'
+            '[[ "$ref_path" =~ ^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(\\.[1-9][0-9]*)?$ ]]'
         )
-        release_older = retire_block.index('[[ "$previous" < "$TAG" ]]')
-        ref_older = retire_block.index('[[ "$ref_path" < "$TAG" ]]')
+        release_older = retire_block.index('calver_before "$previous" "$TAG"')
+        ref_older = retire_block.index('calver_before "$ref_path" "$TAG"')
         if not (
             release_guard < release_older < release_delete
             and ref_guard < ref_older < tag_delete

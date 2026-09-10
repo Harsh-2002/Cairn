@@ -1065,6 +1065,7 @@ mod multipart_recovery_tests {
                     bucket: BucketName::parse("recovery-bucket").unwrap(),
                     key: ObjectKey::parse("large-object").unwrap(),
                     content_type: "application/octet-stream".to_owned(),
+                    content_disposition: None,
                     status: MultipartStatus::Active,
                     owner_id: UserId("owner".to_owned()),
                     initiated_by: UserId("owner".to_owned()),

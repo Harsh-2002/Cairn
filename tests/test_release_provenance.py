@@ -155,5 +155,37 @@ class ProvenanceTests(unittest.TestCase):
             self.assertNotEqual(run(command, changed).returncode, 0)
 
 
+
+class CalverTests(unittest.TestCase):
+    def test_release_and_retirement_order_same_day_revisions_numerically(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        helpers = re.findall(r'          calver_before\(\) \{\n.*?\n          \}', workflow, re.S)
+        self.assertEqual(len(helpers), 2)
+        ordered = ['v2026.09.09.99', 'v2026.09.10', 'v2026.09.10.1',
+                   'v2026.09.10.2', 'v2026.09.10.9', 'v2026.09.10.10', 'v2026.09.11']
+        for helper in helpers:
+            for i, left in enumerate(ordered):
+                for j, right in enumerate(ordered):
+                    result = subprocess.run(['bash', '-c', helper + '\ncalver_before "$1" "$2"',
+                                             'test', left, right], capture_output=True)
+                    self.assertEqual(result.returncode, 0 if i < j else 1, (left, right))
+
+    def test_coordinate_revision_accepts_only_positive_integers(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        block = workflow.split('          version="$(date -u +v%Y.%m.%d)"', 1)[1]
+        block = block.split('          echo "image=', 1)[0]
+        import os
+        import tempfile
+        for revision in ['', '1', '10', '0', '01', '-1', '1.2', '1\n2', '$(false)']:
+            with tempfile.NamedTemporaryFile() as output:
+                result = subprocess.run(['bash', '-c', 'set -euo pipefail\nversion=v2026.09.10\n' + block],
+                                        env={**os.environ, 'REVISION': revision, 'GITHUB_OUTPUT': output.name},
+                                        capture_output=True)
+                valid = revision in ['', '1', '10']
+                self.assertEqual(result.returncode == 0, valid, revision)
+                if valid:
+                    self.assertEqual(Path(output.name).read_text().strip(),
+                                     'version=v2026.09.10' + ('.' + revision if revision else ''))
+
 if __name__ == '__main__':
     unittest.main()

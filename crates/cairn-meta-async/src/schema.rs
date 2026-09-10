@@ -887,6 +887,11 @@ ALTER TABLE storage_recovery_state ADD COLUMN legacy_accounting_hold INTEGER NOT
 ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER NOT NULL DEFAULT 0 CHECK (legacy_release_authorized IN (0,1));
 "#,
     },
+    Migration {
+        version: 39,
+        name: "multipart download filename metadata",
+        sql: "ALTER TABLE multipart_uploads ADD COLUMN content_disposition TEXT;",
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -1129,7 +1134,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 38);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 39);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
