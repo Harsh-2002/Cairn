@@ -887,6 +887,11 @@ ALTER TABLE storage_recovery_state ADD COLUMN legacy_accounting_hold INTEGER NOT
 ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER NOT NULL DEFAULT 0 CHECK (legacy_release_authorized IN (0,1));
 "#,
     },
+    Migration {
+        version: 39,
+        name: "multipart download filename metadata",
+        sql: "ALTER TABLE multipart_uploads ADD COLUMN content_disposition TEXT;",
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.

@@ -171,7 +171,7 @@ pub enum ShareCmd {
         /// Force download instead of viewing inline.
         #[arg(long)]
         download: bool,
-        /// Download filename (with `--download`).
+        /// Suggested filename when saving the object (defaults to its basename).
         #[arg(long)]
         filename: Option<String>,
         /// Pin to a specific version id (default: always the current version).

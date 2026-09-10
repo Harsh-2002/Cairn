@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "e2e": "node scripts/console-e2e.mjs",
     "preview": "vite preview",
-    "lint": "eslint . && node scripts/browser-path-regression.mjs",
+    "lint": "eslint . && node scripts/browser-path-regression.mjs && node --experimental-strip-types --test scripts/download-filename.test.mjs",
     "test:performance": "node --test scripts/chrome-startup.test.mjs && node scripts/console-performance.mjs"
   },
   "dependencies": {

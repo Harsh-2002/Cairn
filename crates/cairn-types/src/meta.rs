@@ -1393,6 +1393,8 @@ pub struct MultipartSession {
     pub key: ObjectKey,
     /// The content type to apply on completion.
     pub content_type: String,
+    /// The Content-Disposition supplied at initiation, applied on completion.
+    pub content_disposition: Option<String>,
     /// The session status.
     pub status: MultipartStatus,
     /// The owner.
@@ -1531,7 +1533,7 @@ pub struct ShareRow {
     pub expires_at: Option<Timestamp>,
     /// How the object is delivered (inline vs forced download).
     pub disposition: ShareDisposition,
-    /// The download filename for `attachment`, or `None` to use the object's basename.
+    /// The suggested filename for saving either disposition; absent/blank uses the object's basename.
     pub filename: Option<String>,
     /// The user id that minted the share (for audit).
     pub created_by: UserId,

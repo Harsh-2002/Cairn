@@ -1143,6 +1143,7 @@ impl S3Service {
     }
 
     async fn get_object(&self, req: &S3Request) -> Result<S3Response> {
+        validate_response_overrides(req)?;
         let row = match self.resolve_read_target(req).await? {
             ReadTarget::Object(row) => *row,
             ReadTarget::DeleteMarker(resp) => return Ok(resp),
@@ -1218,6 +1219,7 @@ impl S3Service {
     }
 
     async fn head_object(&self, req: &S3Request) -> Result<S3Response> {
+        validate_response_overrides(req)?;
         let row = match self.resolve_read_target(req).await? {
             ReadTarget::Object(row) => *row,
             ReadTarget::DeleteMarker(resp) => return Ok(resp),
@@ -1650,6 +1652,7 @@ impl S3Service {
                 .header("content-type")
                 .unwrap_or("application/octet-stream")
                 .to_owned(),
+            content_disposition: req.header("content-disposition").map(str::to_owned),
             status: cairn_types::meta::MultipartStatus::Active,
             owner_id: bucket.owner_id.clone(),
             initiated_by: req.principal.as_ref().map_or_else(
@@ -2441,10 +2444,7 @@ impl S3Service {
                 .replica_intent
                 .as_ref()
                 .and_then(|intent| intent.cache_control.clone()),
-            content_disposition: session
-                .replica_intent
-                .as_ref()
-                .and_then(|intent| intent.content_disposition.clone()),
+            content_disposition: session.content_disposition.clone(),
             content_language: session
                 .replica_intent
                 .as_ref()
@@ -5823,20 +5823,33 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     resp
 }
 
+const RESPONSE_OVERRIDES: &[(&str, &str)] = &[
+    ("response-content-type", "content-type"),
+    ("response-content-disposition", "content-disposition"),
+    ("response-content-encoding", "content-encoding"),
+    ("response-content-language", "content-language"),
+    ("response-cache-control", "cache-control"),
+    ("response-expires", "expires"),
+];
+
+// Validate even on conditional reads so decoded input cannot become a raw HTTP header on the
+// sendfile path. S3 response overrides remain verbatim values rather than filename guesses.
+fn validate_response_overrides(req: &S3Request) -> Result<()> {
+    for (param, _) in RESPONSE_OVERRIDES {
+        if let Some(value) = req.query(param) {
+            http::HeaderValue::from_str(value)
+                .map_err(|_| Error::InvalidArgument(format!("invalid {param} header value")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply the GET `response-*` query-parameter header overrides (ARCH 21.2): each present param
 /// REPLACES the corresponding response header (set rather than append, so no duplicate is emitted).
 /// Applied after `object_headers`, so a client override always wins over the stored value.
 fn apply_response_overrides(resp: S3Response, req: &S3Request) -> S3Response {
-    const OVERRIDES: &[(&str, &str)] = &[
-        ("response-content-type", "content-type"),
-        ("response-content-disposition", "content-disposition"),
-        ("response-content-encoding", "content-encoding"),
-        ("response-content-language", "content-language"),
-        ("response-cache-control", "cache-control"),
-        ("response-expires", "expires"),
-    ];
     let mut resp = resp;
-    for (param, header) in OVERRIDES {
+    for (param, header) in RESPONSE_OVERRIDES {
         if let Some(v) = req.query(param) {
             // Replace any existing value for this header, then set the override.
             resp.headers

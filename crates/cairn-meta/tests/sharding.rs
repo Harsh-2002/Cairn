@@ -327,6 +327,7 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         bucket: b.clone(),
         key: ObjectKey::parse("big").unwrap(),
         content_type: "application/octet-stream".to_owned(),
+        content_disposition: None,
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("owner".to_owned()),
         initiated_by: UserId("owner".to_owned()),

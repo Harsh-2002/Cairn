@@ -40,7 +40,7 @@ pub const BUCKET_COLS: &str =
 pub const MULTIPART_COLS: &str = "id, bucket_name, key, content_type, status, owner_id, \
      intended_acl, user_metadata, created_at, updated_at, sse_requested, encrypt_parts, \
      sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, initiated_by, initial_tags, \
-     lock_mode, retain_until, legal_hold, replica_intent";
+     lock_mode, retain_until, legal_hold, replica_intent, content_disposition";
 
 /// `multipart_parts` columns in mapper order.
 pub const PART_COLS: &str = "part_number, size, etag, storage_path, checksum, part_dek";
@@ -331,6 +331,7 @@ pub fn multipart_from_row(row: &Row) -> Result<MultipartSession, MetaError> {
         bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
         key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
         content_type: row.get_text(3),
+        content_disposition: row.get_opt_text(21),
         status: mp_status_from(&row.get_text(4)),
         owner_id,
         initiated_by,

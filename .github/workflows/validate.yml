@@ -662,6 +662,8 @@ jobs:
     - run: cargo build --bin cairn --features fast-io
     - name: Full boto3 lifecycle through the sendfile fast path
       run: CAIRN_FASTIO_MIN_BYTES=0 BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+    - name: Download filename overrides through sendfile and streamed fallback
+      run: BIN=target/debug/cairn python3 conformance/downloads.py
     - name: Sendfile keep-alive engagement
       run: BIN=target/debug/cairn bash conformance/sendfile_keepalive.sh
     if: ${{ inputs.profile == 'full' }}
@@ -724,6 +726,12 @@ jobs:
     - run: chmod +x target/debug/cairn
     - name: Persistent share tokens + SigV4 presigned URLs, end to end
       run: BIN=target/debug/cairn bash conformance/share.sh
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Download filenames, GET/HEAD overrides and encrypted byte preservation
+      run: BIN=target/debug/cairn python3 conformance/downloads.py
     if: ${{ inputs.profile == 'full' }}
   concurrency:
     name: concurrency contention (single-key races)

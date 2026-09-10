@@ -39,6 +39,17 @@ same contract: existing-share lists can inspect/revoke but cannot recover or cop
 
 Share creation accepts `delivery: "api" | "console_download"` (default `api`). API delivery accepts inline or attachment disposition. Console delivery requires an enabled/resolvable console, defaults to attachment and rejects explicitly inline disposition. Both endpoints redeem the same capability; the console always forces an attachment. The console UI defaults to Download; View in browser uses API delivery. CLI `share create --delivery console-download` selects console links; CLI default `api` works headlessly. Saved metadata and revocation use the existing stable share id and hash-only token lookup.
 
+Multipart uploads retain the `Content-Disposition` supplied to `CreateMultipartUpload` when the object is completed.
+
+Shared objects always carry a suggested filename, including inline responses for later saving.
+A usable custom `filename` wins; omitted, null, blank or unusable names use the object's basename.
+Only an unusable basename falls back to `download`. Path components and control characters are
+removed; Unicode names use RFC 8187 `filename*` with an ASCII `filename` fallback. Names and
+extensions are never inferred from MIME types, storage paths or share tokens. Console downloads
+honor a valid S3 response filename (`filename*` before `filename`) and otherwise use the object
+basename. Ordinary S3 GET/HEAD continue to return stored Content-Disposition and explicit response
+overrides. The management presign endpoint accepts its named response overrides for both GET and HEAD.
+
 `GET /system` reports `api_addr`, `console_addr`, `api_public_url` and `console_public_url`. Administrator-only `GET /system/endpoints` returns resolved `api_url`, `console_url`, `console_enabled` and `issues` containing `code`, `setting`, and `message`. This reports configuration, not network reachability. The authenticated console shell checks it once per session and offers explicit refresh; affected transfers show an actionable error while other management remains usable.
 
 ### 22.3 Authentication and authorization of the control plane

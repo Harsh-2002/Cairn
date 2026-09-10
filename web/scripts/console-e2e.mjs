@@ -276,19 +276,22 @@ try {
   const endpointStatus = await request("GET", "/system/endpoints");
   if (!endpointStatus.api_url || endpointStatus.issues.length) throw new Error("Expected valid local endpoints");
   await command("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: profileDir });
-  for (const [filename, contentType, payload] of [
-    ["active.html", "text/html", '<script>window.shareExecuted=true;document.cookie="injected=1"</script>'],
-    ["active.svg", "image/svg+xml", '<svg xmlns="http://www.w3.org/2000/svg" onload="window.shareExecuted=true"/>'],
+  for (const [key, customName, filename, contentType, payload] of [
+    ["active.html", null, "active.html", "text/html", '<script>window.shareExecuted=true;document.cookie="injected=1"</script>'],
+    ["active.svg", null, "active.svg", "image/svg+xml", '<svg xmlns="http://www.w3.org/2000/svg" onload="window.shareExecuted=true"/>'],
+    ["nested/résumé.pdf", null, "résumé.pdf", "application/pdf", "%PDF-1.4 filename test"],
+    ["nested/original.txt", "renamed résumé.txt", "renamed résumé.txt", "text/plain", "custom filename bytes"],
+    ["nested/100%2F+done.txt", " ", "100%2F+done.txt", "text/plain", "literal URL characters"],
   ]) {
     const signed = await request("POST", `/buckets/${bucketName}/objects/presign`, {
-      key: filename, method: "PUT", expires_in_secs: 300, content_type: contentType, origin: new URL(baseUrl).origin,
+      key, method: "PUT", expires_in_secs: 300, content_type: contentType, origin: new URL(baseUrl).origin,
     });
     const status = await evaluate(`fetch(${JSON.stringify(signed.url)}, {
       method: "PUT", credentials: "omit", headers: { "Content-Type": ${JSON.stringify(contentType)} }, body: ${JSON.stringify(payload)}
     }).then(r => r.status)`);
     if (status !== 200) throw new Error(`Browser upload failed: ${status}`);
     const share = await request("POST", `/buckets/${bucketName}/objects/shares`, {
-      key: filename, delivery: "console_download", filename, expires_in_secs: 300,
+      key, delivery: "console_download", filename: customName, expires_in_secs: 300,
     });
     if (new URL(share.url).origin !== new URL(baseUrl).origin) throw new Error("Download link must target console");
     await command("Network.setBlockedURLs", { urls: [endpointStatus.api_url + "/*"] });
@@ -308,6 +311,39 @@ try {
   }
   process.stdout.write("Browser uploads and console downloads passed with API requests blocked during download\n");
 
+  viewportWidth = 1440;
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  // Exercise the console's Blob download path, including the shared bulk helper and CORS exposure.
+  const metadataFilename = "stored résumé.pdf";
+  const metadataBytes = "%PDF-1.4 stored metadata bytes";
+  const metadataPut = await request("POST", `/buckets/${bucketName}/objects/presign`, {
+    key: "metadata.pdf", method: "PUT", expires_in_secs: 300,
+  });
+  const metadataResponse = await fetch(metadataPut.url, {
+    method: "PUT", headers: { "Content-Disposition": "attachment; filename=\"fallback.pdf\"; filename*=UTF-8''stored%20r%C3%A9sum%C3%A9.pdf" },
+    body: metadataBytes,
+  });
+  if (!metadataResponse.ok) throw new Error("Metadata upload failed");
+  async function verifyMetadataDownload() {
+    const deadline = Date.now() + 10_000;
+    while (!(await readdir(profileDir)).includes(metadataFilename)) {
+      if (Date.now() > deadline) throw new Error("Console ignored the stored Unicode filename");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if ((await readFile(join(profileDir, metadataFilename), "utf8")) !== metadataBytes) throw new Error("Console changed stored object bytes");
+    await rm(join(profileDir, metadataFilename));
+  }
+  await inspectRoute({ path: `/buckets/${bucketName}/browser`, heading: bucketName, title: bucketName });
+  await waitFor(`!!document.querySelector('button[aria-label="Actions for metadata.pdf"]')`, "metadata object");
+  await clickElement(`document.querySelector('button[aria-label="Actions for metadata.pdf"]')`);
+  await clickText('[role="menuitem"]', "Download");
+  await verifyMetadataDownload();
+  await clickElement(`[...document.querySelectorAll('[aria-label="Select metadata.pdf"]')].find(el => el.getBoundingClientRect().width > 0)`);
+  await clickText("button", "Download");
+  await verifyMetadataDownload();
+  await clickElement(`[...document.querySelectorAll('[aria-label="Select metadata.pdf"]')].find(el => el.getBoundingClientRect().width > 0)`);
+  process.stdout.write("Single and bulk console downloads honor stored Unicode filename metadata\n");
+
   // A copied URL must describe the currently selected delivery/method, not a previous result.
   await inspectRoute({ path: `/buckets/${bucketName}/browser`, heading: bucketName, title: bucketName });
   await waitFor(`!!document.querySelector('button[aria-label="Actions for active.html"]')`, "object actions");
@@ -317,6 +353,15 @@ try {
   await waitFor('!!document.querySelector("input[readonly]")?.value', "console share URL");
   const consoleLink = await evaluate('document.querySelector("input[readonly]").value');
   if (new URL(consoleLink).origin !== new URL(baseUrl).origin) throw new Error("Default share must download through console");
+  await rm(join(profileDir, "active.html"));
+  const defaultDownload = await command("Page.navigate", { url: consoleLink });
+  if (!defaultDownload.isDownload) throw new Error("Blank filename did not download");
+  const downloadDeadline = Date.now() + 10_000;
+  while (!(await readdir(profileDir)).includes("active.html")) {
+    if (Date.now() > downloadDeadline) throw new Error("Blank filename lost the object basename");
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  if ((await readFile(join(profileDir, "active.html"), "utf8")) !== '<script>window.shareExecuted=true;document.cookie="injected=1"</script>') throw new Error("Blank-name share changed bytes");
   await selectLabeled("Delivery", "View in browser");
   await waitFor('!document.querySelector("input[readonly]")', "previous download link cleared");
   await clickText("button", "Create share link");

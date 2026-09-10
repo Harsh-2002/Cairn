@@ -48,7 +48,7 @@ fn row(
         content_type: "text/plain".to_owned(),
         content_encoding: None,
         cache_control: None,
-        content_disposition: None,
+        content_disposition: Some("attachment; filename=\"stored.pdf\"".to_owned()),
         content_language: None,
         expires: None,
         storage_path: Some(StoragePath::generate(bucket)),
@@ -1199,6 +1199,7 @@ async fn multipart_lifecycle_parity() {
             bucket: bk.clone(),
             key: ObjectKey::parse("big").unwrap(),
             content_type: "application/octet-stream".to_owned(),
+            content_disposition: None,
             status: MultipartStatus::Active,
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
@@ -1224,7 +1225,15 @@ async fn multipart_lifecycle_parity() {
             .unwrap(),
             MutationOutcome::MultipartCreated(_)
         ));
-        assert!(s.get_multipart(&upload).await.unwrap().is_some());
+        assert_eq!(
+            s.get_multipart(&upload)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_disposition
+                .as_deref(),
+            Some("attachment; filename=\"stored.pdf\"")
+        );
 
         for n in 1u16..=2 {
             let attempt_id = format!("part-{n}");
@@ -1527,6 +1536,7 @@ async fn multipart_lifecycle_parity() {
                 bucket: bk.clone(),
                 key: ObjectKey::parse("aborted").unwrap(),
                 content_type: "application/octet-stream".to_owned(),
+                content_disposition: None,
                 status: MultipartStatus::Active,
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
@@ -1629,6 +1639,7 @@ async fn multipart_part_encryption_parity() {
             bucket: bk.clone(),
             key: ObjectKey::parse("big").unwrap(),
             content_type: "application/octet-stream".to_owned(),
+            content_disposition: None,
             status: MultipartStatus::Active,
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
@@ -1754,6 +1765,7 @@ async fn multipart_kms_intent_parity() {
             bucket: bk.clone(),
             key: ObjectKey::parse("big").unwrap(),
             content_type: "application/octet-stream".to_owned(),
+            content_disposition: None,
             status: MultipartStatus::Active,
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
@@ -2874,6 +2886,7 @@ async fn object_lock_parity() {
                 bucket: bk.clone(),
                 key: multipart_key.clone(),
                 content_type: "application/octet-stream".to_owned(),
+                content_disposition: None,
                 status: MultipartStatus::Active,
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
@@ -3001,6 +3014,7 @@ async fn turso_legacy_multipart_intent_fails_closed_and_preserves_session() {
                 bucket: bucket_name.clone(),
                 key: key.clone(),
                 content_type: "application/octet-stream".to_owned(),
+                content_disposition: None,
                 status: MultipartStatus::Active,
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),

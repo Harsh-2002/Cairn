@@ -204,6 +204,8 @@ fn head_eligible(head: &Head) -> bool {
         // The normal adapter rejects browser service-worker script fetches before S3 dispatch.
         // Falling back preserves that security boundary instead of letting sendfile bypass it.
         && !has("service-worker")
+        // Browser responses require the normal adapter's origin-bound CORS headers.
+        && !has("origin")
 }
 
 /// Resolve the same client provenance as the hyper adapter, declining the optimized path when a
@@ -435,14 +437,7 @@ pub async fn try_sendfile_get(
             method: hyper::Method::GET,
             bucket,
             key,
-            query: query
-                .split('&')
-                .filter(|p| !p.is_empty())
-                .map(|p| {
-                    let (k, v) = p.split_once('=').unwrap_or((p, ""));
-                    (k.to_owned(), v.to_owned())
-                })
-                .collect(),
+            query: crate::adapter::parse_query(&query),
             headers: head.headers.clone(),
             principal,
             source,
@@ -483,6 +478,12 @@ pub async fn try_sendfile_get(
         // them to the next iteration when we keep the connection alive.
         let leftover = buf[head_len..].to_vec();
         let resp_bytes = length;
+        if resp.headers.iter().any(|(name, value)| {
+            http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || http::HeaderValue::from_str(value).is_err()
+        }) {
+            return fallback(stream, buf, "invalid_header");
+        }
         let out = format_head(status, &resp.headers, &request_id, &path, keep_alive);
 
         // Write the head + `sendfile` on a blocking thread (the socket must be blocking for
@@ -865,6 +866,10 @@ mod tests {
             &[("if-unmodified-since", "x")]
         )));
         assert!(!head_eligible(&head("GET", &[("upgrade", "h2c")])));
+        assert!(!head_eligible(&head(
+            "GET",
+            &[("origin", "https://console.example")]
+        )));
         assert!(
             !head_eligible(&head("GET", &[("service-worker", "script")])),
             "service-worker fetches must fall back to the rejecting adapter"

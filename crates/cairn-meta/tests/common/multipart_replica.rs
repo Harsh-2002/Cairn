@@ -36,6 +36,7 @@ pub async fn preserves_replica_intent(store: &dyn MetadataStore) {
                 bucket: bucket.clone(),
                 key: ObjectKey::parse("key").unwrap(),
                 content_type: "text/plain".to_owned(),
+                content_disposition: None,
                 status: MultipartStatus::Active,
                 owner_id: owner.clone(),
                 initiated_by: owner,
