@@ -38,8 +38,11 @@ const chrome = spawn(
 
 function debuggerUrl() {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Chrome did not expose DevTools")), 10_000);
     let output = "";
+    const timer = setTimeout(() => {
+      chrome.kill("SIGKILL");
+      reject(new Error(`Chrome did not expose DevTools within 30 seconds: ${output}`));
+    }, 30_000);
     chrome.stderr.setEncoding("utf8");
     chrome.stderr.on("data", (chunk) => {
       output += chunk;
@@ -51,12 +54,19 @@ function debuggerUrl() {
     });
     chrome.once("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`Chrome exited before DevTools was ready (${code})`));
+      reject(new Error(`Chrome exited before DevTools was ready (${code}): ${output}`));
+    });
+    chrome.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
     });
   });
 }
 
-const browserWsUrl = new URL(await debuggerUrl());
+const browserWsUrl = new URL(await debuggerUrl().catch(async (error) => {
+  await rm(profileDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  throw error;
+}));
 const target = await fetch(
   `http://${browserWsUrl.host}/json/new?${encodeURIComponent(baseUrl)}`,
   { method: "PUT" },

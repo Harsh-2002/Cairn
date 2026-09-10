@@ -146,6 +146,7 @@ struct MultipartSessionCodec {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub content_type: String,
+    pub content_disposition: Option<String>,
     pub status: MultipartStatus,
     pub owner_id: UserId,
     pub initiated_by: UserId,

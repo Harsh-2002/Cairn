@@ -615,6 +615,7 @@ impl Fixture {
                     bucket: bucket.clone(),
                     key,
                     content_type: "application/octet-stream".to_owned(),
+                    content_disposition: None,
                     status: MultipartStatus::Active,
                     owner_id: owner(),
                     initiated_by: owner(),
