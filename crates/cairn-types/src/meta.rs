@@ -1720,17 +1720,19 @@ pub struct ReplicationCounts {
     ///
     /// [`Clock`]: crate::traits::Clock
     pub oldest_pending_at_ms: i64,
-    /// Per-target pending/failed breakdown; targets with neither are omitted.
+    /// Per-target waiting/active/failed breakdown; idle targets are omitted.
     pub by_target: Vec<ReplicationTargetCounts>,
 }
 
-/// One target's pending/failed replication counts (part of [`ReplicationCounts`]).
+/// One target's waiting/active/failed replication counts (part of [`ReplicationCounts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplicationTargetCounts {
     /// The remote-target ARN (`None` = the legacy env single-target path).
     pub target_arn: Option<String>,
     /// Entries pending to this target.
     pub pending: u64,
+    /// Entries leased by a worker for this target.
+    pub claimed: u64,
     /// Entries terminally failed to this target.
     pub failed: u64,
 }

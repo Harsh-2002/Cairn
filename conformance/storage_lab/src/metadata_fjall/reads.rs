@@ -274,10 +274,11 @@ pub fn replication_counts(
             .enqueued_at
             .0;
     }
-    if counts.pending + counts.failed > 0 {
+    if counts.pending > 0 || counts.claimed > 0 || counts.failed > 0 {
         counts.by_target.push(ReplicationTargetCounts {
             target_arn: None,
             pending: counts.pending,
+            claimed: counts.claimed,
             failed: counts.failed,
         });
     }

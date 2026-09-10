@@ -8,6 +8,7 @@ import { ApiError, api, errorMessage } from "../../src/lib/api";
 import { AuthProvider, useAuth } from "../../src/providers/auth-provider";
 import { Login } from "../../src/views/login";
 import "../../src/globals.css";
+import { runReplicationTests } from "./replication";
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean;
@@ -238,7 +239,8 @@ try {
   await testLoginAutofill();
   await testResource();
   await testBuckets();
-  window.performanceRegression = { ok: true, message: "console login, resource lifecycle and 2000-bucket pagination passed" };
+  await runReplicationTests();
+  window.performanceRegression = { ok: true, message: "console login, resource lifecycle, replication safety and 2000-bucket pagination passed" };
 } catch (error) {
   window.performanceRegression = { ok: false, message: String(error instanceof Error ? error.stack : error) };
 }

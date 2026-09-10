@@ -700,6 +700,10 @@ pub struct SetUserQuotaReq {
 /// One entry in the failed-replication listing.
 #[derive(Debug, Serialize)]
 pub struct FailedReplicationEntry {
+    /// Stable outbox identity, including distinct attempts to different targets.
+    pub id: String,
+    /// Destination ARN, or `None` for legacy routing.
+    pub target_arn: Option<String>,
     /// The bucket.
     pub bucket: String,
     /// The key.
@@ -710,7 +714,7 @@ pub struct FailedReplicationEntry {
     pub error: Option<String>,
     /// The retry attempt count.
     pub attempts: u32,
-    /// When the entry is next due, in epoch milliseconds.
+    /// Last scheduled attempt time, retained for compatibility; terminal failures need manual retry.
     pub next_attempt_at_ms: i64,
 }
 
@@ -883,18 +887,20 @@ pub struct ReplicationResyncResp {
 }
 
 /// `GET /buckets/{name}/replication/status` response: per-bucket replication counters plus the
-/// most recent failed entries' errors. All figures are bounded by the standard page limit.
+/// most recent failed entries' errors. Counters are exact; the error sample is bounded.
 #[derive(Debug, Serialize)]
 pub struct ReplicationStatusResp {
     /// The bucket the status pertains to.
     pub bucket: String,
-    /// Count of entries currently due (pending and claimable) for this bucket, bounded.
+    /// Entries awaiting their first/next attempt, including future retries.
     pub pending: u64,
+    /// Entries currently leased by a worker.
+    pub claimed: u64,
     /// Count of terminally failed entries for this bucket (exact, not page-bounded).
     pub failed: u64,
     /// Age of the oldest still-pending enqueue for this bucket, in seconds (true lag, 0 when idle).
     pub lag_seconds: u64,
-    /// Per-target pending/failed breakdown for this bucket.
+    /// Per-target waiting/active/failed breakdown for this bucket.
     pub by_target: Vec<ReplicationTargetCount>,
     /// The most recent failed entries' errors for this bucket (bounded), newest first.
     pub recent_errors: Vec<ReplicationStatusError>,
@@ -911,13 +917,15 @@ pub struct ReplicationStatusError {
     pub error: Option<String>,
 }
 
-/// One target's pending/failed counts in a replication status/summary response.
+/// One target's waiting/active/failed counts in a replication status/summary response.
 #[derive(Debug, Serialize)]
 pub struct ReplicationTargetCount {
     /// The remote-target ARN (`None` = the legacy env single-target path).
     pub target_arn: Option<String>,
     /// Entries pending to this target.
     pub pending: u64,
+    /// Entries currently leased by a worker.
+    pub claimed: u64,
     /// Entries terminally failed to this target.
     pub failed: u64,
 }

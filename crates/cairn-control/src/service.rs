@@ -2493,6 +2493,8 @@ impl ControlService {
         let entries = entries
             .into_iter()
             .map(|e| wire::FailedReplicationEntry {
+                id: e.id,
+                target_arn: e.target_arn,
                 bucket: e.bucket.as_str().to_owned(),
                 key: e.key.as_str().to_owned(),
                 version_id: e.version_id.as_str().to_owned(),
@@ -3104,9 +3106,8 @@ impl ControlService {
         )
     }
 
-    /// `GET /buckets/{name}/replication/status`: per-bucket replication counters — `pending` (due
-    /// entries filtered to this bucket) and `failed` (terminal entries filtered to this bucket) —
-    /// plus the most recent failed entries' errors. Every figure is bounded by [`PAGE_LIMIT`].
+    /// `GET /buckets/{name}/replication/status`: exact waiting/active/failed counters plus a
+    /// bounded sample of terminal errors. Waiting includes retries scheduled in the future.
     async fn replication_status(&self, name: &str) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
@@ -3138,6 +3139,7 @@ impl ControlService {
             &wire::ReplicationStatusResp {
                 bucket: bucket_name.as_str().to_owned(),
                 pending: counts.pending,
+                claimed: counts.claimed,
                 failed: counts.failed,
                 lag_seconds: replication_lag_seconds(now, counts.oldest_pending_at_ms),
                 by_target: counts
@@ -3526,6 +3528,7 @@ fn target_count_wire(
     wire::ReplicationTargetCount {
         target_arn: t.target_arn,
         pending: t.pending,
+        claimed: t.claimed,
         failed: t.failed,
     }
 }

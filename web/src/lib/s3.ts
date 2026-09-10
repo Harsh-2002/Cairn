@@ -5,8 +5,12 @@
 // temporary signing secret enters JavaScript.
 
 import { api, ApiError } from "./api";
-import type { PresignSession } from "./types";
-import type { ReplicationRule } from "./types";
+import {
+  parseReplication,
+  replicationXml,
+  requireEditableReplication,
+} from "./replication-config";
+import type { PresignSession, ReplicationConfiguration } from "./types";
 
 function s3headers(extra?: Record<string, string>): Record<string, string> {
   return { ...extra };
@@ -720,24 +724,19 @@ export async function deleteBucketTagging(bucket: string): Promise<void> {
 // Match it against the bucket's registered targets to render the destination. Null when unset.
 export async function getReplication(
   bucket: string,
-): Promise<ReplicationRule | null> {
+): Promise<ReplicationConfiguration | null> {
   const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     headers: s3headers(),
   });
-  if (res.status === 404) return null;
-  if (!res.ok)
-    throw await s3Error(res, "load replication");
-  const xml = await res.text();
-  const dest = /<Bucket>(?:arn:aws:s3:::)?([^<]+)<\/Bucket>/.exec(xml);
-  const prefix = /<Prefix>([^<]*)<\/Prefix>/.exec(xml);
-  const enabled = (tag: string) =>
-    new RegExp(`<${tag}>\\s*<Status>\\s*Enabled\\s*</Status>`, "i").test(xml);
-  return {
-    dest_bucket: dest ? dest[1]! : "",
-    prefix: prefix ? prefix[1]! : "",
-    existing_objects: enabled("ExistingObjectReplication"),
-    delete_markers: enabled("DeleteMarkerReplication"),
-  };
+  if (!res.ok) {
+    const error = await s3Error(res, "load replication");
+    if (
+      res.status === 404 &&
+      error.code === "ReplicationConfigurationNotFoundError"
+    ) return null;
+    throw error;
+  }
+  return parseReplication(await res.text());
 }
 
 // `destination` is the remote **target ARN** (`arn:cairn:replication:…`) the rule ships to, not a
@@ -748,20 +747,17 @@ export async function putReplication(
   bucket: string,
   destination: string,
   prefix = "",
-  opts: { existingObjects?: boolean; deleteMarkers?: boolean } = {},
+  opts: {
+    existingObjects?: boolean;
+    deleteMarkers?: boolean;
+    expected: ReplicationConfiguration | null;
+  },
 ): Promise<void> {
-  // Opt-in toggles: existing-object backfill (required for "Resync existing") and delete-marker
-  // propagation. Each is an `<X><Status>Enabled|Disabled</Status></X>` element on the rule.
-  const toggle = (tag: string, on: boolean | undefined) =>
-    `<${tag}><Status>${on ? "Enabled" : "Disabled"}</Status></${tag}>`;
-  const xml =
-    `<ReplicationConfiguration><Role>cairn</Role><Rule><ID>cairn-web</ID>` +
-    `<Status>Enabled</Status>` +
-    toggle("DeleteMarkerReplication", opts.deleteMarkers) +
-    toggle("ExistingObjectReplication", opts.existingObjects) +
-    `<Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
-    `<Destination><Bucket>${xmlEscape(destination)}</Bucket></Destination></Rule>` +
-    `</ReplicationConfiguration>`;
+  const current = await getReplication(bucket);
+  requireEditableReplication(current, opts.expected);
+  const xml = replicationXml(
+    current, destination, prefix, !!opts.existingObjects, !!opts.deleteMarkers,
+  );
   const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
@@ -771,7 +767,12 @@ export async function putReplication(
     throw await s3Error(res, "set replication");
 }
 
-export async function deleteReplication(bucket: string): Promise<void> {
+export async function deleteReplication(
+  bucket: string,
+  expected: ReplicationConfiguration | null,
+): Promise<void> {
+  const current = await getReplication(bucket);
+  requireEditableReplication(current, expected);
   const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "DELETE",
     headers: s3headers(),

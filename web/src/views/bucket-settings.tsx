@@ -52,13 +52,12 @@ import { ApiError, api, errorMessage } from "@/lib/api";
 import { bytes, count } from "@/lib/format";
 import { pretty, validate } from "@/lib/policy";
 import * as s3 from "@/lib/s3";
+import { readBucketReplication } from "@/lib/replication-status";
+import { TextLink } from "@/components/text-link";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 import type {
   CreateReplicationTargetReq,
-  ReplicationRule,
-  ReplicationStatusResp,
-  ReplicationTarget,
   WebhookEndpointView,
 } from "@/lib/types";
 
@@ -189,24 +188,12 @@ export function BucketSettings() {
     } catch {
       /* compression stays "none" */
     }
-    let repl: ReplicationRule | null = null;
-    try {
-      repl = await s3.getReplication(name);
-    } catch {
-      /* treated as no rule */
-    }
-    let targets: ReplicationTarget[] = [];
-    try {
-      targets = (await api.listReplicationTargets(name)).targets;
-    } catch {
-      /* no targets / endpoint unavailable */
-    }
-    let replStatus: ReplicationStatusResp | null = null;
-    try {
-      replStatus = await api.replicationStatus(name);
-    } catch {
-      /* status unavailable */
-    }
+    const replicationState = await readBucketReplication(name);
+    const repl = replicationState.configuration?.rules.length === 1
+      ? replicationState.configuration.rules[0]!
+      : null;
+    const targets = replicationState.targets;
+    const replStatus = replicationState.status;
     let pab: s3.PublicAccessBlock | null = null;
     try {
       pab = await s3.getPublicAccessBlock(name);
@@ -231,6 +218,7 @@ export function BucketSettings() {
       repl,
       targets,
       replStatus,
+      replicationState,
       pab,
       bucketTags,
       notifications,
@@ -440,6 +428,10 @@ export function BucketSettings() {
 
   async function saveReplication() {
     setReplError("");
+    if (!data || replProtected) {
+      setReplError("Refresh replication settings or use the S3 API / CLI to edit this configuration safely.");
+      return;
+    }
     if (!replTargetArn) {
       setReplError("Choose a replication target to ship objects to.");
       return;
@@ -455,7 +447,8 @@ export function BucketSettings() {
     const dest = data?.targets.find((t) => t.arn === replTargetArn);
     setBusy("replication");
     try {
-      await s3.putReplication(name, replTargetArn, replPrefix.trim(), {
+      await s3.putReplication(name, replTargetArn, replPrefix, {
+        expected: data.replicationState.configuration,
         existingObjects: replExisting,
         deleteMarkers: replDeleteMarkers,
       });
@@ -474,8 +467,9 @@ export function BucketSettings() {
 
   function clearReplication() {
     setConfirmClearRepl(false);
+    if (!data || replProtected) return;
     void run("replication", async () => {
-      await s3.deleteReplication(name);
+      await s3.deleteReplication(name, data.replicationState.configuration);
       toast.success("Replication rule removed.");
       setReplTargetArn("");
       setReplPrefix("");
@@ -533,6 +527,7 @@ export function BucketSettings() {
   }
 
   function retryReplication() {
+    if (!data || data.replicationState.errors.length || res.error) return;
     void run("retry", async () => {
       const r = await api.retryReplication(name);
       toast.success(
@@ -544,6 +539,7 @@ export function BucketSettings() {
   }
 
   function resyncReplication() {
+    if (!data || data.replicationState.errors.length || res.error) return;
     void run("resync", async () => {
       await api.resyncReplication(name);
       toast.success("Backfill started for existing objects.");
@@ -576,6 +572,16 @@ export function BucketSettings() {
   }
 
   const data = res.data;
+  const replConfiguration = data?.replicationState.configuration;
+  const replUnavailable =
+    !data || !!res.error || data.replicationState.errors.length > 0;
+  const replProtected =
+    replUnavailable || (replConfiguration != null && !replConfiguration.editable);
+  const canResync = !replUnavailable && replConfiguration?.rules.some(
+    (r) => r.enabled && r.existing_objects,
+  );
+  const replicationEnabled = replConfiguration?.rules.some((r) => r.enabled);
+
   const { config, repl, targets, replStatus } = data ?? {
     config: undefined,
     repl: undefined,
@@ -786,8 +792,10 @@ export function BucketSettings() {
             title={
               <>
                 Replication
-                <StatusBadge tone={repl ? "positive" : "neutral"}>
-                  {repl ? "Active" : "Off"}
+                <StatusBadge
+                  tone={replUnavailable ? "neutral" : replicationEnabled ? "positive" : "neutral"}
+                >
+                  {replUnavailable ? "Unavailable" : replicationEnabled ? "Active" : "Off"}
                 </StatusBadge>
               </>
             }
@@ -796,7 +804,7 @@ export function BucketSettings() {
                 Continuously copy new objects to a remote target (configured
                 below). Needs versioning enabled on this bucket.
                 {repl
-                  ? ` Currently replicating to ${
+                  ? ` Configured destination: ${
                       replActiveTarget
                         ? `"${replActiveTarget.dest_bucket}" @ ${replActiveTarget.endpoint}`
                         : repl.dest_bucket
@@ -805,13 +813,19 @@ export function BucketSettings() {
               </>
             }
             headerExtra={
-              replStatus &&
-              (replStatus.pending > 0 || replStatus.failed > 0) ? (
+              !replUnavailable && replStatus &&
+              (replStatus.pending > 0 || replStatus.claimed > 0 || replStatus.failed > 0) ? (
                 <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
                   <span className="text-muted-foreground">
                     Pending:{" "}
                     <span className="tabular-nums text-foreground">
                       {count(replStatus.pending)}
+                    </span>
+                  </span>
+                  <span className="text-muted-foreground">
+                    In progress:{" "}
+                    <span className="tabular-nums text-foreground">
+                      {count(replStatus.claimed)}
                     </span>
                   </span>
                   {replStatus.failed > 0 ? (
@@ -836,7 +850,7 @@ export function BucketSettings() {
                   <Button
                     variant="outline"
                     onClick={retryReplication}
-                    disabled={busy === "retry"}
+                    disabled={busy === "retry" || replUnavailable}
                     aria-busy={busy === "retry" || undefined}
                   >
                     {busy === "retry" ? "Retrying…" : "Retry failed"}
@@ -845,10 +859,10 @@ export function BucketSettings() {
                 <Button
                   variant="outline"
                   onClick={resyncReplication}
-                  disabled={busy === "resync" || !repl?.existing_objects}
+                  disabled={busy === "resync" || !canResync}
                   aria-busy={busy === "resync" || undefined}
                   title={
-                    repl?.existing_objects
+                    canResync
                       ? "Enqueue the objects already in this bucket for replication"
                       : "Enable “Replicate existing objects” on the rule and save first"
                   }
@@ -859,7 +873,7 @@ export function BucketSettings() {
                   <Button
                     variant="outline"
                     onClick={() => setConfirmClearRepl(true)}
-                    disabled={busy === "replication"}
+                    disabled={busy === "replication" || replProtected}
                   >
                     Remove rule
                   </Button>
@@ -867,7 +881,7 @@ export function BucketSettings() {
                 <Button
                   onClick={() => void saveReplication()}
                   disabled={
-                    busy === "replication" ||
+                    busy === "replication" || replProtected ||
                     !targets?.length ||
                     versioning !== "Enabled"
                   }
@@ -883,6 +897,23 @@ export function BucketSettings() {
             }
           >
             <CardContent className="space-y-3">
+              {replUnavailable ? (
+                <ErrorAlert
+                  title="Replication information unavailable"
+                  message={res.error || data?.replicationState.errors.join(" ") || "Refresh to load the current configuration."}
+                  onRetry={res.refresh}
+                />
+              ) : null}
+              {replConfiguration && !replConfiguration.editable ? (
+                <Alert>
+                  <CircleAlert aria-hidden="true" />
+                  <AlertTitle>Rule configuration is read-only</AlertTitle>
+                  <AlertDescription>
+                    <p>This configuration has multiple rules or settings the simple editor cannot preserve. Use the S3 API or CLI to change it.</p>
+                    <TextLink to="/replication">View all destinations and rules</TextLink>
+                  </AlertDescription>
+                </Alert>
+              ) : null}
               {versioning !== "Enabled" ? (
                 <Alert>
                   <CircleAlert aria-hidden="true" />
@@ -912,6 +943,7 @@ export function BucketSettings() {
                   <div className="flex flex-wrap gap-2">
                     <Select
                       value={replTargetArn}
+                      disabled={replProtected}
                       onValueChange={(v) => {
                         setReplTargetArn(v);
                         setReplError("");
@@ -934,6 +966,7 @@ export function BucketSettings() {
                     </Select>
                     <Input
                       value={replPrefix}
+                      disabled={replProtected}
                       placeholder="Prefix (optional)"
                       autoComplete="off"
                       aria-label="Replication prefix"
@@ -945,6 +978,7 @@ export function BucketSettings() {
                     <label className="flex items-start gap-3">
                       <Checkbox
                         checked={replExisting}
+                        disabled={replProtected}
                         onCheckedChange={(v) => setReplExisting(v === true)}
                         aria-label="Replicate existing objects"
                         className="mt-0.5"
@@ -963,6 +997,7 @@ export function BucketSettings() {
                     <label className="flex items-start gap-3">
                       <Checkbox
                         checked={replDeleteMarkers}
+                        disabled={replProtected}
                         onCheckedChange={(v) => setReplDeleteMarkers(v === true)}
                         aria-label="Replicate delete markers"
                         className="mt-0.5"

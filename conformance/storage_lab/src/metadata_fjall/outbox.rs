@@ -238,6 +238,12 @@ mod tests {
             else {
                 panic!("claim outcome");
             };
+            let counts = super::super::reads::replication_counts(&view, None).unwrap();
+            assert_eq!(counts.claimed, batch.len() as u64);
+            assert_eq!(counts.by_target.len(), 1);
+            assert!(counts.by_target[0].target_arn.is_none());
+            assert_eq!(counts.by_target[0].claimed, counts.claimed);
+            assert_eq!(counts.by_target[0].pending, counts.pending);
             for entry in batch {
                 done(
                     &mut view,
@@ -249,6 +255,12 @@ mod tests {
             }
         }
         assert_eq!(stats(&view, &bucket).unwrap().outbox, [0, 0, 0, 260]);
+        assert!(
+            super::super::reads::replication_counts(&view, None)
+                .unwrap()
+                .by_target
+                .is_empty()
+        );
         for (key, value) in view.into_edits() {
             if let Some(value) = value {
                 tx.insert(&tree, key, value);

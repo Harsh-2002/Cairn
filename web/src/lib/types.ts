@@ -267,10 +267,12 @@ export interface ActivityResp {
 }
 
 export interface FailedReplicationEntry {
+  id: string;
+  target_arn: string | null;
   bucket: string;
   key: string;
   version_id: string;
-  error: string;
+  error: string | null;
   attempts: number;
   next_attempt_at_ms: number;
 }
@@ -279,7 +281,16 @@ export interface FailedReplicationResp {
   entries: FailedReplicationEntry[];
 }
 
+export interface ReplicationConfiguration {
+  xml: string;
+  rules: ReplicationRule[];
+  editable: boolean;
+}
+
 export interface ReplicationRule {
+  id: string;
+  enabled: boolean;
+  tags: { key: string; value: string }[];
   dest_bucket: string;
   prefix: string;
   /** Replicate objects that already existed when the rule was created (enables "Resync existing"). */
@@ -324,10 +335,20 @@ export interface ReplicationStatusError {
   error: string;
 }
 
+export interface ReplicationTargetCount {
+  target_arn: string | null;
+  pending: number;
+  claimed: number;
+  failed: number;
+}
+
 export interface ReplicationStatusResp {
   bucket: string;
   pending: number;
+  claimed: number;
   failed: number;
+  lag_seconds: number;
+  by_target: ReplicationTargetCount[];
   recent_errors: ReplicationStatusError[];
 }
 
