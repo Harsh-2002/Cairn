@@ -1,271 +1,361 @@
-// Replication overview: where each bucket replicates, the live health of every
-// rule (pending / failed), and — as a section beneath — the objects that could
-// not be copied after repeated tries. The dead-letter queue is one part of the
-// picture, not the whole page. Configuration lives per-bucket in Settings →
-// Integrations; this page links there.
-
-import { useMemo } from "react";
-import { CircleAlert, CircleCheck, Repeat } from "lucide-react";
-import { api } from "@/lib/api";
-import * as s3 from "@/lib/s3";
-import { whenMs } from "@/lib/format";
+// Replication health is per destination. Unknown reads must never look like an empty queue.
+import { useState } from "react";
+import { Repeat, RefreshCw } from "lucide-react";
+import { api, errorMessage } from "@/lib/api";
+import { count, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { useLiveTopic } from "@/lib/live";
-import type { FailedReplicationEntry, ReplicationTarget } from "@/lib/types";
+import {
+  readReplicationBuckets,
+  replicationRows,
+  replicationHealth,
+} from "@/lib/replication-status";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { StatusBadge, type StatusTone } from "@/components/status-badge";
+import { StatusBadge } from "@/components/status-badge";
 import { TextLink } from "@/components/text-link";
+import { Button } from "@/components/primitives/button";
 import { TableCell, TableRow } from "@/components/primitives/table";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/primitives/tooltip";
 
-const RULE_COLUMNS: Column[] = [
+const COLUMNS: Column[] = [
   { key: "bucket", label: "Bucket" },
-  { key: "dest", label: "Replicates to" },
+  { key: "target", label: "Replicates to" },
   { key: "status", label: "Status" },
   { key: "pending", label: "Pending", className: "text-right" },
+  { key: "claimed", label: "In progress", className: "text-right" },
   { key: "failed", label: "Failed", className: "text-right" },
 ];
-
 const FAILED_COLUMNS: Column[] = [
-  { key: "bucket", label: "Bucket" },
-  { key: "key", label: "Key" },
-  { key: "version", label: "Version" },
+  { key: "bucket", label: "Bucket / destination" },
+  { key: "key", label: "Object" },
   { key: "attempts", label: "Attempts", className: "text-right" },
-  { key: "next", label: "Next attempt" },
-  { key: "error", label: "Error" },
+  { key: "error", label: "Error / recovery" },
 ];
+const PAGE_SIZE = 50;
+const settingsHref = (bucket: string) =>
+  `/buckets/${encodeURIComponent(bucket)}/settings`;
 
-interface RuleRow {
-  bucket: string;
-  /** The destination as the rule names it (target ARN, or a legacy bucket name). */
-  destinationLabel: string;
-  prefix: string;
-  pending: number;
-  failed: number;
-}
-
-function ruleTone(r: RuleRow): { tone: StatusTone; label: string } {
-  if (r.failed > 0) return { tone: "negative", label: "Failing" };
-  if (r.pending > 0) return { tone: "warning", label: "Replicating" };
-  return { tone: "positive", label: "Healthy" };
-}
-
-function settingsHref(bucket: string): string {
-  return `/buckets/${encodeURIComponent(bucket)}/settings`;
+function failureSummary(raw: string | null): string {
+  if (!raw) return "No error details were recorded.";
+  const xml = raw.search(/<\?xml|<Error(?:\s|>)/);
+  const detail =
+    xml >= 0
+      ? new DOMParser()
+          .parseFromString(raw.slice(xml), "application/xml")
+          .querySelector("Message")?.textContent
+      : null;
+  return errorMessage(
+    new Error(detail || raw),
+    "The destination refused this attempt.",
+  );
 }
 
 export function Replication() {
   const res = useResource(async () => {
     const { buckets } = await api.listBuckets();
-    // Resolve each bucket's rule + targets + live status in parallel; keep only
-    // the buckets that actually carry a replication rule.
-    const perBucket = await Promise.all(
-      buckets.map(async (b) => {
-        const [rule, targets, status] = await Promise.all([
-          s3.getReplication(b.name).catch(() => null),
-          api
-            .listReplicationTargets(b.name)
-            .then((r) => r.targets)
-            .catch(() => [] as ReplicationTarget[]),
-          api.replicationStatus(b.name).catch(() => null),
-        ]);
-        if (!rule) return null;
-        const match = targets.find((t) => t.arn === rule.dest_bucket);
-        const row: RuleRow = {
-          bucket: b.name,
-          destinationLabel: match
-            ? `${match.dest_bucket} @ ${match.endpoint}`
-            : rule.dest_bucket,
-          prefix: rule.prefix,
-          pending: status?.pending ?? 0,
-          failed: status?.failed ?? 0,
-        };
-        return row;
-      }),
-    );
-    const rules = perBucket
-      .filter((r): r is RuleRow => r !== null)
-      .sort((a, b) => a.bucket.localeCompare(b.bucket));
-    const failed = await api
-      .failedReplication(100)
-      .then((r) => r.entries)
-      .catch(() => [] as FailedReplicationEntry[]);
-    return { rules, failed };
+    return { buckets: await readReplicationBuckets(buckets), at: Date.now() };
   }, []);
-
-  const rules = useMemo(() => res.data?.rules ?? [], [res.data]);
-  const failed = useMemo(() => res.data?.failed ?? [], [res.data]);
-  // Live: the server pulses the "replication" topic; re-fetch the page on each. This view's
-  // refresh is a per-bucket fan-out (listBuckets + 3 calls/bucket), so throttle it to at most once
-  // every 12 s rather than re-running that storm on every 3 s pulse.
-  useLiveTopic("replication", res.refresh, 12_000);
-
+  // Failure diagnostics remain usable even if one bucket is slow or unavailable.
+  const failures = useResource(
+    async () => ({ ...(await api.failedReplication(100)), at: Date.now() }),
+    [],
+  );
+  const refresh = () => {
+    res.refresh();
+    failures.refresh();
+  };
+  useLiveTopic("replication", refresh, 12_000);
+  const [page, setPage] = useState(0);
+  const rows = (res.data?.buckets ?? [])
+    .flatMap(replicationRows)
+    .sort(
+      (a, b) =>
+        a.bucket.localeCompare(b.bucket) ||
+        a.destination.localeCompare(b.destination),
+    );
+  const lastPage = Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const stale = !!res.error;
+  const errors = res.data?.buckets.filter((b) => b.errors.length) ?? [];
+  const failed = failures.data?.entries ?? [];
+  const busy = res.refreshing || failures.refreshing;
   return (
     <Page>
       <PageHeader
         title="Replication"
-        description="Where each bucket replicates, and the health of every copy."
+        description="Waiting work, active transfers, and failures for each destination."
+        actions={
+          <Button
+            variant="outline"
+            onClick={refresh}
+            disabled={busy}
+            aria-busy={busy || undefined}
+            className="min-h-11"
+          >
+            <RefreshCw aria-hidden="true" />
+            Refresh
+          </Button>
+        }
       />
-
+      {res.data ? (
+        <p className="mb-4 text-sm text-muted-foreground">
+          {stale || errors.length ? "Last read" : "Updated"}{" "}
+          {whenMs(res.data.at)}. Counts describe the replication queue, not a
+          byte-for-byte destination audit.
+        </p>
+      ) : null}
       {res.error ? (
         <ErrorAlert
-          title="Could not load replication status"
+          title="Replication status is stale"
           message={res.error}
-          onRetry={res.refresh}
+          onRetry={refresh}
         />
       ) : null}
-
-      {/* ---- Rules + live health ---- */}
-      <section className="space-y-3">
-        <h2 className="text-base font-semibold tracking-tight">
-          Replication rules
+      <section className="space-y-3" aria-labelledby="replication-destinations">
+        <h2
+          id="replication-destinations"
+          className="text-base font-semibold tracking-tight"
+        >
+          Replication destinations
         </h2>
+        {errors.length ? (
+          <details className="rounded-lg border p-3 text-sm">
+            <summary className="min-h-11 cursor-pointer py-3">
+              Some replication information is unavailable (
+              {count(errors.length)} buckets)
+            </summary>
+            <ul className="space-y-2">
+              {errors.map((b) => (
+                <li key={b.bucket}>
+                  <TextLink to={settingsHref(b.bucket)}>{b.bucket}</TextLink>:{" "}
+                  {b.errors.join(" ")}
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
         {res.loading ? (
-          <DataTable columns={RULE_COLUMNS} minWidth={720}>
+          <DataTable columns={COLUMNS}>
             <SkeletonRows
               rows={3}
-              widths={["w-28", "w-48", "w-20", "w-10", "w-10"]}
+              widths={["w-28", "w-48", "w-20", "w-10", "w-10", "w-10"]}
             />
           </DataTable>
-        ) : rules.length > 0 ? (
-          <DataTable columns={RULE_COLUMNS} minWidth={720}>
-            {rules.map((r) => {
-              const { tone, label } = ruleTone(r);
-              return (
-                <TableRow key={r.bucket}>
-                  <TableCell data-label="Bucket" className="font-mono text-[13px]">
-                    <TextLink to={settingsHref(r.bucket)}>{r.bucket}</TextLink>
-                  </TableCell>
-                  <TableCell
-                    data-label="Replicates to"
-                    className="font-mono text-[13px]"
-                  >
-                    <span
-                      title={r.destinationLabel}
-                      className="block max-w-[36ch] truncate"
-                    >
-                      {r.destinationLabel}
-                    </span>
-                    {r.prefix ? (
-                      <span className="text-muted-foreground">
-                        prefix “{r.prefix}”
-                      </span>
-                    ) : null}
-                  </TableCell>
-                  <TableCell data-label="Status">
-                    <StatusBadge tone={tone}>{label}</StatusBadge>
-                  </TableCell>
-                  <TableCell
-                    data-label="Pending"
-                    className="text-right tabular-nums"
-                  >
-                    {r.pending}
-                  </TableCell>
-                  <TableCell
-                    data-label="Failed"
-                    className={
-                      r.failed > 0
-                        ? "text-right tabular-nums text-destructive"
-                        : "text-right tabular-nums"
-                    }
-                  >
-                    {r.failed}
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </DataTable>
+        ) : rows.length ? (
+          <>
+            <DataTable columns={COLUMNS} minWidth={850}>
+              {rows
+                .slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)
+                .map((r) => {
+                  const health = stale
+                    ? { tone: "neutral" as const, label: "Stale" }
+                    : replicationHealth(r);
+                  return (
+                    <TableRow key={JSON.stringify([r.bucket, r.target])}>
+                      <TableCell
+                        data-label="Bucket"
+                        className="font-mono text-[13px]"
+                      >
+                        <TextLink
+                          className="inline-flex min-h-11 items-center break-all"
+                          to={settingsHref(r.bucket)}
+                        >
+                          {r.bucket}
+                        </TextLink>
+                      </TableCell>
+                      <TableCell
+                        data-label="Replicates to"
+                        className="max-w-sm whitespace-normal text-[13px]"
+                      >
+                        <span className="block break-all font-mono">
+                          {r.destination}
+                        </span>
+                        {r.rules.length ? (
+                          <details>
+                            <summary className="min-h-11 cursor-pointer py-3">
+                              {count(r.rules.length)} rule
+                              {r.rules.length === 1 ? "" : "s"}
+                            </summary>
+                            <ul className="space-y-2 text-muted-foreground">
+                              {r.rules.map((rule, index) => (
+                                <li
+                                  key={`${rule.id}:${index}`}
+                                  className="break-all"
+                                >
+                                  {rule.id || "Unnamed rule"}:{" "}
+                                  {rule.enabled ? "Enabled" : "Disabled"};{" "}
+                                  {rule.prefix
+                                    ? `prefix “${rule.prefix}”`
+                                    : "all prefixes"}
+                                  {rule.tags
+                                    .map(
+                                      (tag) => `; tag ${tag.key}=${tag.value}`,
+                                    )
+                                    .join("")}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : (
+                          <span className="text-muted-foreground">
+                            No current rule details
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell data-label="Status">
+                        <StatusBadge tone={health.tone}>
+                          {health.label}
+                        </StatusBadge>
+                      </TableCell>
+                      {(["pending", "claimed", "failed"] as const).map(
+                        (key, i) => (
+                          <TableCell
+                            key={key}
+                            data-label={["Pending", "In progress", "Failed"][i]}
+                            className="text-right tabular-nums"
+                          >
+                            {stale || r.errors.length || !r.counts
+                              ? "—"
+                              : count(r.counts[key])}
+                          </TableCell>
+                        ),
+                      )}
+                    </TableRow>
+                  );
+                })}
+            </DataTable>
+            {lastPage > 0 ? (
+              <nav
+                aria-label="Replication pages"
+                className="flex flex-wrap items-center justify-end gap-3 text-sm"
+              >
+                <Button
+                  variant="outline"
+                  className="min-h-11"
+                  disabled={currentPage === 0}
+                  onClick={() => setPage(currentPage - 1)}
+                >
+                  Previous
+                </Button>
+                <span>
+                  Page {currentPage + 1} of {lastPage + 1}
+                </span>
+                <Button
+                  variant="outline"
+                  className="min-h-11"
+                  disabled={currentPage === lastPage}
+                  onClick={() => setPage(currentPage + 1)}
+                >
+                  Next
+                </Button>
+              </nav>
+            ) : null}
+          </>
         ) : !res.error ? (
           <EmptyState
             icon={Repeat}
             title="No replication configured"
-            body="Replication copies a bucket's new objects to a remote target. Set it up in a bucket's Settings → Integrations: add a target, then a rule."
+            body="Add a target and rule in a bucket’s Settings → Integrations."
           />
         ) : null}
       </section>
-
-      {/* ---- Failed objects (dead-letter) ---- */}
-      <section className="mt-8 space-y-3">
-        <h2 className="text-base font-semibold tracking-tight">
-          Failed objects
+      <section
+        className="mt-8 space-y-3"
+        aria-labelledby="replication-failures"
+      >
+        <h2
+          id="replication-failures"
+          className="text-base font-semibold tracking-tight"
+        >
+          Failed attempts
         </h2>
-        {res.loading ? (
-          <DataTable columns={FAILED_COLUMNS} minWidth={760}>
-            <SkeletonRows
-              rows={3}
-              widths={["w-24", "w-40", "w-20", "w-10", "w-32", "w-44"]}
-            />
+        <p className="text-sm text-muted-foreground">
+          Up to 100 retained failures. Older entries may have expired. Retry
+          failed attempts in the bucket’s Settings → Integrations.
+        </p>
+        {failures.error ? (
+          <ErrorAlert
+            title="Failure list unavailable"
+            message={`Previously loaded entries may be stale. ${failures.error}`}
+            onRetry={failures.refresh}
+          />
+        ) : null}
+        {failures.loading ? (
+          <DataTable columns={FAILED_COLUMNS}>
+            <SkeletonRows rows={3} widths={["w-28", "w-40", "w-10", "w-44"]} />
           </DataTable>
-        ) : failed.length > 0 ? (
+        ) : failed.length ? (
           <DataTable columns={FAILED_COLUMNS} minWidth={760}>
-            {failed.map((e, i) => (
-              <TableRow
-                key={`${e.bucket}:${e.key}:${e.version_id}:${e.attempts}:${i}`}
-              >
-                <TableCell data-label="Bucket" className="font-mono text-[13px]">
-                  <TextLink to={settingsHref(e.bucket)}>{e.bucket}</TextLink>
-                </TableCell>
-                <TableCell data-label="Key" className="font-mono text-[13px]">
-                  <span title={e.key} className="block max-w-[28ch] truncate">
-                    {e.key}
+            {failed.map((e) => (
+              <TableRow key={e.id}>
+                <TableCell
+                  data-label="Bucket / destination"
+                  className="max-w-xs whitespace-normal text-[13px]"
+                >
+                  <TextLink
+                    className="inline-flex min-h-11 items-center break-all font-mono"
+                    to={settingsHref(e.bucket)}
+                  >
+                    {e.bucket}
+                  </TextLink>
+                  <span className="block break-all font-mono">
+                    {rows.find(
+                      (r) => r.bucket === e.bucket && r.target === e.target_arn,
+                    )?.destination ??
+                      e.target_arn ??
+                      "Legacy / unassigned target"}
                   </span>
                 </TableCell>
-                <TableCell data-label="Version" className="font-mono text-[13px]">
-                  <span title={e.version_id} className="block max-w-[12ch] truncate">
-                    {e.version_id || "—"}
-                  </span>
+                <TableCell
+                  data-label="Object"
+                  className="max-w-xs whitespace-normal font-mono text-[13px]"
+                >
+                  <span className="break-all">{e.key}</span>
+                  <details>
+                    <summary className="min-h-11 cursor-pointer py-3">
+                      Version
+                    </summary>
+                    <span className="break-all">
+                      {e.version_id || "No version ID"}
+                    </span>
+                  </details>
                 </TableCell>
                 <TableCell
                   data-label="Attempts"
                   className="text-right tabular-nums"
                 >
-                  {e.attempts}
+                  {count(e.attempts)}
                 </TableCell>
                 <TableCell
-                  data-label="Next attempt"
-                  className="text-muted-foreground tabular-nums"
+                  data-label="Error / recovery"
+                  className="max-w-sm whitespace-normal text-sm"
                 >
-                  {whenMs(e.next_attempt_at_ms)}
-                </TableCell>
-                <TableCell
-                  data-label="Error"
-                  className="text-[13px] text-destructive"
-                >
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span
-                        title={e.error}
-                        className="flex max-w-[32ch] items-center gap-1.5"
-                      >
-                        <CircleAlert
-                          aria-hidden="true"
-                          className="size-3.5 shrink-0"
-                        />
-                        <span className="truncate">{e.error}</span>
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-sm break-words">
-                      {e.error}
-                    </TooltipContent>
-                  </Tooltip>
+                  <p className="break-words text-destructive">
+                    {failureSummary(e.error)}
+                  </p>
+                  <p className="mt-1 text-muted-foreground">
+                    Manual retry required
+                  </p>
+                  {e.error ? (
+                    <details>
+                      <summary className="min-h-11 cursor-pointer py-3">
+                        Full error
+                      </summary>
+                      <pre className="whitespace-pre-wrap break-all text-xs">
+                        {e.error}
+                      </pre>
+                    </details>
+                  ) : null}
                 </TableCell>
               </TableRow>
             ))}
           </DataTable>
-        ) : !res.error ? (
-          <EmptyState
-            icon={CircleCheck}
-            positive
-            title="All caught up"
-            body="No failed replication. Objects in buckets with a replication rule are copying normally."
-          />
+        ) : !failures.error ? (
+          <p className="py-4 text-sm text-muted-foreground">
+            No recent failed attempts.
+          </p>
         ) : null}
       </section>
     </Page>

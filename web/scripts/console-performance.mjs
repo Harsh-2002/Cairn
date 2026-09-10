@@ -142,7 +142,7 @@ for (const [width, height] of [[1280, 900], [390, 844]]) {
   await command("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
   await evaluate("window.performanceRegression = undefined");
   await command("Page.navigate", { url: `${baseUrl}?width=${width}` });
-  await waitFor("window.performanceRegression", "performance regressions", 30_000);
+  await waitFor("window.performanceRegression", "performance regressions", 60_000);
   const result = await evaluate("window.performanceRegression");
   if (!result.ok) throw new Error(result.message);
   process.stdout.write(`${width}px: ${result.message}\n`);

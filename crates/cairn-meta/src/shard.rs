@@ -1061,7 +1061,7 @@ impl MetadataStore for ShardedMetadataStore {
         bucket: Option<&BucketName>,
     ) -> Result<ReplicationCounts, MetaError> {
         let mut acc = ReplicationCounts::default();
-        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
+        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64, u64)> =
             std::collections::HashMap::new();
         for s in &self.shards {
             let c = s.replication_counts(bucket).await?;
@@ -1080,16 +1080,20 @@ impl MetadataStore for ShardedMetadataStore {
                 let e = by_target.entry(t.target_arn).or_default();
                 e.0 += t.pending;
                 e.1 += t.failed;
+                e.2 += t.claimed;
             }
         }
         acc.by_target = by_target
             .into_iter()
-            .filter(|(_, (p, f))| *p > 0 || *f > 0)
-            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
-                target_arn,
-                pending,
-                failed,
-            })
+            .filter(|(_, (p, f, c))| *p > 0 || *f > 0 || *c > 0)
+            .map(
+                |(target_arn, (pending, failed, claimed))| ReplicationTargetCounts {
+                    target_arn,
+                    pending,
+                    claimed,
+                    failed,
+                },
+            )
             .collect();
         Ok(acc)
     }

@@ -3054,11 +3054,24 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         )
         .await
         .unwrap();
+    let token = replication_claims
+        .take(&*h.meta, "outbox-1", cairn_types::Timestamp(1))
+        .await;
+    for path in ["/buckets/repl/replication/status", "/replication/summary"] {
+        let response = h
+            .svc
+            .handle(&Method::GET, path, &[], Some(&a), Bytes::new())
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let payload = json(&response);
+        assert_eq!(payload["pending"], 0);
+        assert_eq!(payload["claimed"], 1);
+        assert_eq!(payload["by_target"][0]["claimed"], 1);
+        assert!(payload["by_target"][0]["target_arn"].is_null());
+    }
     h.meta
         .submit(Mutation::MarkReplicationFailed {
-            claim_token: replication_claims
-                .take(&*h.meta, "outbox-1", cairn_types::Timestamp(1))
-                .await,
+            claim_token: token,
             now: cairn_types::Timestamp(1),
             id: "outbox-1".to_owned(),
             error: "destination unreachable".to_owned(),
@@ -3083,6 +3096,21 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
     assert_eq!(v["failed"], 1);
     assert_eq!(v["recent_errors"][0]["key"], "photo.jpg");
     assert_eq!(v["recent_errors"][0]["error"], "destination unreachable");
+
+    let response = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/replication/failed",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    let failure = json(&response);
+    assert_eq!(failure["entries"][0]["id"], "outbox-1");
+    assert!(failure["entries"][0]["target_arn"].is_null());
+    assert!(failure["entries"][0]["next_attempt_at_ms"].is_number());
 
     // Retry requeues it and reports the observed failed count.
     let resp = h

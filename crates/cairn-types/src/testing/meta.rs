@@ -1496,7 +1496,7 @@ impl MetadataStore for InMemoryMetadataStore {
     ) -> Result<ReplicationCounts, MetaError> {
         let st = self.state.lock().unwrap();
         let mut counts = ReplicationCounts::default();
-        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
+        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64, u64)> =
             std::collections::HashMap::new();
         for e in st
             .outbox
@@ -1518,18 +1518,23 @@ impl MetadataStore for InMemoryMetadataStore {
                     counts.oldest_pending_at_ms = e.enqueued_at.0;
                 }
                 by_target.entry(e.target_arn.clone()).or_default().0 += 1;
+            } else if e.status == ReplicationStatus::Claimed {
+                by_target.entry(e.target_arn.clone()).or_default().2 += 1;
             } else if e.status == ReplicationStatus::Failed {
                 by_target.entry(e.target_arn.clone()).or_default().1 += 1;
             }
         }
         counts.by_target = by_target
             .into_iter()
-            .filter(|(_, (p, f))| *p > 0 || *f > 0)
-            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
-                target_arn,
-                pending,
-                failed,
-            })
+            .filter(|(_, (p, f, c))| *p > 0 || *f > 0 || *c > 0)
+            .map(
+                |(target_arn, (pending, failed, claimed))| ReplicationTargetCounts {
+                    target_arn,
+                    pending,
+                    claimed,
+                    failed,
+                },
+            )
             .collect();
         Ok(counts)
     }

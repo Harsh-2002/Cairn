@@ -14,8 +14,8 @@ creates isolated bucket/user fixtures, covers every route at desktop and mobile 
 those fixtures before exit.
 
 `npm run test:performance` runs bounded Chrome regressions against a temporary Vite server with
-mocked management calls: resource lifecycle/refresh races and 2,000-bucket pagination at desktop
-and mobile widths. It needs Chrome (`CHROME_BIN` overrides the executable), creates no Cairn
+mocked management calls: resource lifecycle/refresh races, replication status and editor safety,
+and 2,000-bucket pagination at desktop and mobile widths. Each viewport suite has a 60-second deadline. It needs Chrome (`CHROME_BIN` overrides the executable), creates no Cairn
 data, and removes its browser profile on exit, including startup failures. Six startup fixtures
 run first; initialization has a fixed 30-second deadline and bounded stderr diagnostics. Browser shutdown
 waits two seconds after SIGTERM before falling back to SIGKILL with a second two-second deadline.

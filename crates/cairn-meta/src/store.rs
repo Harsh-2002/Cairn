@@ -1582,12 +1582,13 @@ impl MetadataStore for SqliteMetadataStore {
                     _ => {}
                 }
             }
-            // Per-target pending/failed breakdown (targets with neither are dropped below).
+            // Per-target waiting/active/failed breakdown (idle targets are dropped below).
             let mut stmt = conn
                 .prepare(
                     "SELECT target_arn, \
                      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
-                     SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) \
+                     SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), \
+                     SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END) \
                      FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) \
                      GROUP BY target_arn",
                 )
@@ -1598,15 +1599,17 @@ impl MetadataStore for SqliteMetadataStore {
                         r.get::<_, Option<String>>(0)?,
                         r.get::<_, i64>(1)? as u64,
                         r.get::<_, i64>(2)? as u64,
+                        r.get::<_, i64>(3)? as u64,
                     ))
                 })
                 .map_err(engine_err)?;
             for row in rows {
-                let (target_arn, pending, failed) = row.map_err(engine_err)?;
-                if pending > 0 || failed > 0 {
+                let (target_arn, pending, failed, claimed) = row.map_err(engine_err)?;
+                if pending > 0 || claimed > 0 || failed > 0 {
                     counts.by_target.push(ReplicationTargetCounts {
                         target_arn,
                         pending,
+                        claimed,
                         failed,
                     });
                 }

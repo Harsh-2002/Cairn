@@ -894,14 +894,15 @@ impl MetadataStore for AsyncMetadataStore {
                 _ => {}
             }
         }
-        // Per-target pending/failed breakdown.
+        // Per-target waiting/active/failed breakdown.
         let rows = self
             .reader()
             .await
             .query(
                 "SELECT target_arn, \
                  SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
-                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) \
+                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), \
+                 SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END) \
                  FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY target_arn",
                 vec![b.clone()],
             )
@@ -909,10 +910,12 @@ impl MetadataStore for AsyncMetadataStore {
         for row in &rows {
             let pending = row.get_i64(1) as u64;
             let failed = row.get_i64(2) as u64;
-            if pending > 0 || failed > 0 {
+            let claimed = row.get_i64(3) as u64;
+            if pending > 0 || claimed > 0 || failed > 0 {
                 counts.by_target.push(ReplicationTargetCounts {
                     target_arn: row.get_opt_text(0),
                     pending,
+                    claimed,
                     failed,
                 });
             }
