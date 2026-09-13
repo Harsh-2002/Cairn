@@ -14,6 +14,7 @@ import {
   Home,
   KeyRound,
   LogOut,
+  Network,
   Plus,
   RefreshCw,
   Search,
@@ -48,6 +49,12 @@ const PAGES: { label: string; path: string; icon: LucideIcon; keywords?: string 
   { label: "Import", path: "/imports", icon: DownloadCloud, keywords: "migrate" },
   { label: "Users", path: "/users", icon: Users, keywords: "access keys iam" },
   { label: "Credentials", path: "/credentials", icon: KeyRound, keywords: "secret token" },
+  {
+    label: "Network & Access",
+    path: "/system/network",
+    icon: Network,
+    keywords: "system endpoints bind public url tls",
+  },
 ];
 
 /** Order groups render in; also the flat order the keyboard cursor walks. */

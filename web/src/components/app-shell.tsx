@@ -29,6 +29,7 @@ function titleFor(pathname: string): string {
     activity: "Activity",
     replication: "Replication",
     imports: "Import",
+    system: "Network & Access",
   };
   return `${map[name] ?? "Overview"} — Cairn`;
 }

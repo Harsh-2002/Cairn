@@ -9,6 +9,7 @@ import {
   Home,
   KeyRound,
   LogOut,
+  Network,
   PanelLeft,
   RefreshCw,
   Search,
@@ -56,7 +57,7 @@ const SHORTCUT_HINT =
     ? "⌘K"
     : "Ctrl K";
 
-// The rail is grouped so nine destinations read as three short, labelled scans
+// The rail is grouped so destinations read as short, labelled scans
 // instead of one long flat list. Buckets carries an inline accordion of the
 // bucket names (below), so Tags/Replication/Import sit with it under Storage.
 const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
@@ -82,6 +83,12 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     items: [
       { label: "Users", path: "/users", icon: Users },
       { label: "Credentials", path: "/credentials", icon: KeyRound },
+    ],
+  },
+  {
+    label: "System",
+    items: [
+      { label: "Network & Access", path: "/system/network", icon: Network },
     ],
   },
 ];

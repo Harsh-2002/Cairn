@@ -15,7 +15,6 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { StatCard } from "@/components/stat-card";
-import { StatusBadge } from "@/components/status-badge";
 import { TextLink } from "@/components/text-link";
 import { UsageBar } from "@/components/usage-bar";
 import { Button } from "@/components/primitives/button";
@@ -73,7 +72,7 @@ export function Overview() {
   const physical = o?.physical_bytes ?? 0;
   const saved = Math.max(0, logical - physical);
   const savedPct = logical > 0 ? Math.round((saved / logical) * 100) : 0;
-  const compressed = logical > 0 && physical <= logical;
+  const savesSpace = logical > 0 && physical < logical;
 
   return (
     <Page>
@@ -131,14 +130,19 @@ export function Overview() {
             />
           </div>
 
-          {/* items-start so each card sizes to its own content — the Compression card is much
-              shorter than Node, and stretching it to match left a large empty void. */}
+          {/* Both summaries have a fixed number of facts. Keep natural heights so empty or
+              incompressible compression states do not stretch to match the Node card. */}
           <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
             {/* Node card: identity and health facts for this instance. */}
             <Card className="gap-4">
               <CardHeader className="gap-1">
                 <CardTitle>Node</CardTitle>
                 <CardDescription>This Cairn instance.</CardDescription>
+                <CardAction>
+                  <TextLink to="/system/network" className="text-[13px]">
+                    View network details
+                  </TextLink>
+                </CardAction>
               </CardHeader>
               <CardContent>
                 <dl className="space-y-3 text-sm">
@@ -152,42 +156,6 @@ export function Overview() {
                     <dt className="shrink-0 text-muted-foreground">Uptime</dt>
                     <dd className="text-[13px]">
                       {duration(sys.uptime_secs)}
-                    </dd>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-4">
-                    <dt className="shrink-0 text-muted-foreground">API bind</dt>
-                    <dd className="min-w-0 truncate font-mono text-[13px]">
-                      {sys.api_addr}
-                    </dd>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-4">
-                    <dt className="shrink-0 text-muted-foreground">Console bind</dt>
-                    <dd className="min-w-0 text-right">
-                      <span className="block truncate font-mono text-[13px]">
-                        {sys.console_addr}
-                      </span>
-                      <span className="block text-xs text-muted-foreground">
-                        configured address
-                      </span>
-                    </dd>
-                  </div>
-                  {[
-                    ["API public URL", sys.api_public_url],
-                    ["Console public URL", sys.console_public_url],
-                  ].map(([label, url]) => (
-                    <div key={label} className="flex flex-wrap items-baseline justify-between gap-2">
-                      <dt className="text-muted-foreground">{label}</dt>
-                      <dd className={cn("min-w-0 text-[13px]", url ? "break-all font-mono" : "text-muted-foreground")}>
-                        {url ?? "Inferred from request when possible"}
-                      </dd>
-                    </div>
-                  ))}
-                  <div className="flex items-baseline justify-between gap-4">
-                    <dt className="shrink-0 text-muted-foreground">TLS</dt>
-                    <dd>
-                      <StatusBadge tone={sys.tls ? "positive" : "neutral"}>
-                        {sys.tls ? "TLS on" : "TLS off"}
-                      </StatusBadge>
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
@@ -254,26 +222,40 @@ export function Overview() {
               </CardHeader>
               <CardContent>
                 {logical === 0 ? (
-                  <p className="text-sm text-muted-foreground">
-                    No data to compress yet — upload objects to a bucket to see
-                    the space compression saves.
-                  </p>
-                ) : compressed ? (
+                  <div className="space-y-2">
+                    <p className="text-sm text-muted-foreground">
+                      No data to compress yet — upload objects to a bucket to
+                      see the space compression saves.
+                    </p>
+                    <TextLink to="/buckets" className="text-[13px]">
+                      Configure bucket compression →
+                    </TextLink>
+                  </div>
+                ) : (
                   <div className="space-y-4">
                     <div className="flex items-baseline gap-2">
                       <span className="text-3xl font-semibold tracking-tight tabular-nums">
                         {ratio(o.compression_ratio)}
                       </span>
                       <span className="text-sm text-muted-foreground">
-                        smaller — {savedPct}% saved
+                        {savesSpace
+                          ? `smaller — ${savedPct}% saved`
+                          : "compression ratio — no space saved"}
                       </span>
                     </div>
-                    <UsageBar
-                      percent={savedPct}
-                      label={`${savedPct}% saved: ${bytes(saved)} of ${bytes(
-                        logical,
-                      )} original`}
-                    />
+                    {savesSpace ? (
+                      <UsageBar
+                        percent={savedPct}
+                        label={`${savedPct}% saved: ${bytes(saved)} of ${bytes(
+                          logical,
+                        )} original`}
+                      />
+                    ) : (
+                      <p className="text-sm leading-relaxed text-muted-foreground">
+                        Stored {bytes(physical)} for {bytes(logical)} of original
+                        data.
+                      </p>
+                    )}
                     <dl className="space-y-2 text-sm">
                       <div className="flex items-baseline justify-between gap-4">
                         <dt className="text-muted-foreground">Stored</dt>
@@ -295,11 +277,6 @@ export function Overview() {
                       </div>
                     </dl>
                   </div>
-                ) : (
-                  <p className="text-sm leading-relaxed text-muted-foreground">
-                    This data didn&apos;t compress (stored {bytes(physical)} vs{" "}
-                    {bytes(logical)} original).
-                  </p>
                 )}
               </CardContent>
             </Card>
@@ -459,8 +436,8 @@ function OverviewSkeleton() {
         <StatCard label="Stored" value="" sub=" " loading />
       </div>
       <div className="grid gap-4 lg:grid-cols-2" aria-hidden="true">
-        <Skeleton className="h-72 rounded-lg" />
-        <Skeleton className="h-72 rounded-lg" />
+        <Skeleton className="h-60 rounded-lg" />
+        <Skeleton className="h-60 rounded-lg" />
       </div>
       <Skeleton className="h-44 rounded-lg" aria-hidden="true" />
     </div>
