@@ -270,6 +270,7 @@ try {
     { path: "/activity", heading: "Activity", title: "Activity" },
     { path: "/replication", heading: "Replication", title: "Replication" },
     { path: "/imports", heading: "Import", title: "Import" },
+    { path: "/system/network", heading: "Network & Access", title: "Network & Access" },
   ];
 
   for (const route of routes) await inspectRoute(route);

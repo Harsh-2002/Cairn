@@ -125,6 +125,13 @@ export const router = createHashRouter([
           return { Component: Imports };
         },
       },
+      {
+        path: "system/network",
+        lazy: async () => {
+          const { NetworkAccess } = await import("@/views/network-access");
+          return { Component: NetworkAccess };
+        },
+      },
       // Parity with the old router: anything unknown lands on the overview.
       { path: "*", element: <Navigate to="/overview" replace /> },
     ],
