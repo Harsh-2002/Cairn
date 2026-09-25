@@ -34,8 +34,10 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   pending state, and strictly walks/syncs directories child-first through the root. Unknown names,
   symlinks, mounts, hard links, special files and errors prevent proof. Receipts retain the exact
   run, root identity, exemption list and actual maintenance lifetime; legacy accounting stays held.
-- `timing.rs` — bounded multipart permit/assembly/durability observations, mirrored by the server
-  metrics tick; includes interrupted stages and reports sample eviction.
+- `timing.rs` — bounded multipart permit/assembly/durability observations and one-in-32 sampled
+  ordinary-object blob-stage observations, including namespace queue/execution/parent barriers, aggregate
+  raw-body input/hash/sink and retained-blocking finalization substage timing,
+  mirrored by the server metrics tick; includes interrupted stages and reports sample eviction.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
   stream → `commit` / `abort`). One enum dispatching retained blocking file jobs vs. the io_uring
   backend; abort stops production and leaves admitted names for exact recovery.

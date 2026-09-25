@@ -125,6 +125,24 @@ fn describe_metrics() {
         "cairn_blob_multipart_timing_dropped_total",
         "Multipart timing samples evicted because bounded collection fell behind"
     );
+    describe_histogram!(
+        "cairn_blob_object_write_stage_seconds",
+        Unit::Seconds,
+        "Sampled object-write blob stage wall durations, including interrupted stages"
+    );
+    describe_counter!(
+        "cairn_blob_object_write_timing_dropped_total",
+        "Sampled object-write timing stages evicted before collection"
+    );
+    describe_histogram!(
+        "cairn_put_stage_seconds",
+        Unit::Seconds,
+        "One-in-32 sampled ordinary PUT response-path stage wall durations"
+    );
+    describe_counter!(
+        "cairn_put_timing_dropped_total",
+        "Sampled PUT response-path stages evicted before collection"
+    );
 
     // Fail-closed plaintext framing/metadata mismatches (ARCH 27).
     describe_counter!(

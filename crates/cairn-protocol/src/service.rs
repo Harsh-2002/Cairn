@@ -6,6 +6,7 @@ use crate::chunked::{ChunkDecoder, ChunkVerifier, decode_stream};
 use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
+use crate::put_timing::{PutStage, PutTiming, PutTimings};
 use crate::request::{S3Body, S3Request, S3Response};
 use crate::storage_write::{PreparedStorageWrite, StorageWriteGuard, StorageWriteRuntime};
 use base64::Engine;
@@ -75,6 +76,8 @@ pub struct S3Service {
     replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Required physical admission and retained recovery context for all object/part writes.
     storage_runtime: Option<StorageWriteRuntime>,
+    /// Bounded one-in-32 ordinary PUT response-path samples shared by service clones.
+    put_timings: Arc<PutTimings>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -113,6 +116,7 @@ impl S3Service {
             encrypt_at_rest: false,
             replication_wake: None,
             storage_runtime: None,
+            put_timings: Arc::new(PutTimings::default()),
         }
     }
 
@@ -157,6 +161,16 @@ impl S3Service {
     pub fn with_storage_runtime(mut self, runtime: StorageWriteRuntime) -> Self {
         self.storage_runtime = Some(runtime);
         self
+    }
+
+    /// Drain fixed-label sampled PUT response-path timings for the metrics task.
+    pub fn drain_put_timings(&self) -> Vec<PutTiming> {
+        self.put_timings.drain()
+    }
+
+    /// Number of PUT timing samples evicted before the metrics task drained them.
+    pub fn put_timings_dropped_total(&self) -> u64 {
+        self.put_timings.dropped_total()
     }
 
     async fn prepare_storage(
@@ -798,6 +812,9 @@ impl S3Service {
         raw_body: cairn_types::BodyStream,
         is_replica: bool,
     ) -> Result<S3Response> {
+        let sampled = self.put_timings.sample();
+        let total_timer = sampled.then(|| self.put_timings.start(PutStage::Total));
+        let preflight_timer = sampled.then(|| self.put_timings.start(PutStage::Preflight));
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
@@ -931,7 +948,11 @@ impl S3Service {
             replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
         };
         let row_id = uuid::Uuid::new_v4().simple().to_string();
-        let (creation, mut write_guard) = self
+        if let Some(timer) = preflight_timer {
+            timer.complete();
+        }
+        let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
+        let admitted = self
             .admit_object_storage(
                 &bucket.name,
                 StorageWriteTarget::Object {
@@ -940,12 +961,26 @@ impl S3Service {
                     row_id: row_id.clone(),
                 },
             )
-            .await?;
-        let mut staged = self
+            .await;
+        if admitted.is_ok() {
+            if let Some(timer) = admission_timer {
+                timer.complete();
+            }
+        }
+        let (creation, mut write_guard) = admitted?;
+        let blob_timer = sampled.then(|| self.put_timings.start(PutStage::BlobStage));
+        let staged_result = self
             .blob
             .stage(creation, body, opts)
             .await
-            .map_err(map_stage_err)?;
+            .map_err(map_stage_err);
+        if staged_result.is_ok() {
+            if let Some(timer) = blob_timer {
+                timer.complete();
+            }
+        }
+        let mut staged = staged_result?;
+        let prep_timer = sampled.then(|| self.put_timings.start(PutStage::PublicationPrep));
 
         // Verify any client-supplied Content-MD5 (decoded above, before staging) against the computed
         // plaintext MD5. A genuine mismatch is a post-stage failure, so delete the staged blob first.
@@ -1075,7 +1110,11 @@ impl S3Service {
             }
         };
         let enqueued_repl = !replication.is_empty();
-        match self
+        if let Some(timer) = prep_timer {
+            timer.complete();
+        }
+        let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
+        let publication = self
             .meta
             .submit(write_guard.publication(Mutation::PutObjectVersion {
                 row: Box::new(row),
@@ -1086,8 +1125,13 @@ impl S3Service {
                 },
                 replication,
             }))
-            .await
-        {
+            .await;
+        if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
+            if let Some(timer) = publication_timer {
+                timer.complete();
+            }
+        }
+        match publication {
             Ok(MutationOutcome::Put { version_id, .. }) => {
                 // The metadata commit now owns the blob. Disarm before any best-effort post-commit
                 // await so cancellation can never enqueue cleanup for a live object.
@@ -1097,6 +1141,8 @@ impl S3Service {
                     self.pulse_replication();
                 }
                 // Emit an ObjectCreated:Put event notification (best-effort).
+                let notification_timer =
+                    sampled.then(|| self.put_timings.start(PutStage::Notification));
                 self.emit_events(
                     &bucket.name,
                     &key,
@@ -1107,7 +1153,11 @@ impl S3Service {
                     now,
                 )
                 .await;
+                if let Some(timer) = notification_timer {
+                    timer.complete();
+                }
                 // Audit the mutation (ARCH 26.3, best-effort).
+                let audit_timer = sampled.then(|| self.put_timings.start(PutStage::Audit));
                 self.audit(
                     "PutObject",
                     bucket.name.as_str(),
@@ -1117,6 +1167,9 @@ impl S3Service {
                     req.principal.as_ref(),
                 )
                 .await;
+                if let Some(timer) = audit_timer {
+                    timer.complete();
+                }
                 let mut resp = S3Response::status(StatusCode::OK)
                     .with_header("etag", quoted(&staged.etag))
                     .with_header("x-amz-request-id", &request_id);
@@ -1129,6 +1182,9 @@ impl S3Service {
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
+                if let Some(timer) = total_timer {
+                    timer.complete();
+                }
                 Ok(resp)
             }
             Ok(_) => {

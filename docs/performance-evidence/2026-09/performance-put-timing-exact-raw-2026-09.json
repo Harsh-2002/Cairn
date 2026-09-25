@@ -1,0 +1,948 @@
+{
+  "schema": 1,
+  "case": "put_1m",
+  "pairs": 3,
+  "duration": 12,
+  "host_capacity": {
+    "memtotal_kib": 9759516,
+    "swaptotal_kib": 0,
+    "logical_cpus": 4
+  },
+  "single_candidate_diagnostic": false,
+  "max_load_seconds": null,
+  "metrics_drain_seconds": 16,
+  "linger_us": {
+    "control": 0,
+    "candidate": 0
+  },
+  "binaries": {
+    "candidate": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+      "sha256": "df20f397c746d1081ab5cdbaa22d2147609bf34d354c2d1ea50255022b0780e6"
+    },
+    "warp": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+      "sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+    },
+    "control": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-control",
+      "sha256": "68afac8ba3e6bb2b2cb015a2f60e59fcb4edee5e9326640e820645611cc428c5"
+    }
+  },
+  "sync_probe_sha256": null,
+  "arms": [
+    {
+      "case": "put_1m",
+      "engine": "cairn",
+      "order": 1,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+        "put",
+        "--host",
+        "127.0.0.1:18001",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/01-cairn-put_1m-1lcn8egz/warp",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 16.011273904000063,
+      "host_capacity_before": {
+        "memtotal_kib": 9759516,
+        "swaptotal_kib": 0,
+        "logical_cpus": 4
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 9810632,
+        "swaptotal_kib": 0,
+        "logical_cpus": 4
+      },
+      "load_start_unix_seconds": 1790318538.2358525,
+      "load_end_unix_seconds": 1790318554.2474043,
+      "warp_operation_timeline": {
+        "status": "captured source-derived Warp scored interval with report-score parity",
+        "start_unix_seconds": 1790318543.0,
+        "end_unix_seconds": 1790318552.0,
+        "raw_end_unix_seconds": 1790318556.0,
+        "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+        "analyzed_seconds_exact": 9.0,
+        "aggregate_mib_per_second": 45.23678954421088,
+        "host_window": {
+          "complete_intervals": 3,
+          "coverage_seconds": 6.1422810554504395,
+          "unrelated_cpu_seconds": 4.43,
+          "unrelated_cpu_valid_intervals": 3,
+          "host_io_pressure_delta_us": {
+            "some": 1629660,
+            "full": 39862
+          },
+          "host_io_pressure_valid_intervals": 3,
+          "server_process_io_delta": {
+            "rchar": 0,
+            "wchar": 321824973,
+            "syscr": 0,
+            "syscw": 14470,
+            "read_bytes": 16384,
+            "write_bytes": 322875392
+          },
+          "server_process_io_valid_intervals": 3
+        }
+      },
+      "host_io_pressure_delta_us": {
+        "some": 3619054,
+        "full": 129404
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 153294,
+        "read_sectors": 7408111,
+        "read_ms": 76234,
+        "writes": 80323,
+        "write_sectors": 18142832,
+        "write_ms": 1423970,
+        "io_ms": 149120,
+        "weighted_io_ms": 1501117,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 153467,
+        "read_sectors": 7419135,
+        "read_ms": 76586,
+        "writes": 84949,
+        "write_sectors": 19936696,
+        "write_ms": 1446909,
+        "io_ms": 160036,
+        "weighted_io_ms": 1524418,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 173,
+        "read_sectors": 11024,
+        "read_ms": 352,
+        "writes": 4626,
+        "write_sectors": 1793864,
+        "write_ms": 22939,
+        "io_ms": 10916,
+        "weighted_io_ms": 23301
+      },
+      "server_process_io_load_delta": {
+        "rchar": 372737,
+        "wchar": 626812667,
+        "syscr": 92,
+        "syscw": 31475,
+        "read_bytes": 28672,
+        "write_bytes": 628715520
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0403368110000883,
+          "unix_seconds": 1790318540.2761884,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.02,
+              "rss_bytes": 15904768
+            },
+            "client": {
+              "cpu_seconds": 0.23,
+              "rss_bytes": 73740288
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 4.16,
+            "top": [
+              {
+                "pid": 26653,
+                "name": "compile",
+                "cpu_seconds": 3.24
+              },
+              {
+                "pid": 27413,
+                "name": "compile",
+                "cpu_seconds": 0.29
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.23
+              },
+              {
+                "pid": 1297,
+                "name": "codex",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 27424,
+                "name": "compile",
+                "cpu_seconds": 0.07
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 35818725,
+            "full": 20456281
+          },
+          "host_volume_diskstats": {
+            "reads": 153339,
+            "read_sectors": 7411567,
+            "read_ms": 76346,
+            "writes": 80363,
+            "write_sectors": 18185024,
+            "write_ms": 1424299,
+            "io_ms": 149300,
+            "weighted_io_ms": 1501560,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1568945,
+            "wchar": 72112,
+            "syscr": 436,
+            "syscw": 98,
+            "read_bytes": 0,
+            "write_bytes": 139264
+          }
+        },
+        {
+          "elapsed_seconds": 4.080378216000099,
+          "unix_seconds": 1790318542.3162298,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.54,
+              "rss_bytes": 34209792
+            },
+            "client": {
+              "cpu_seconds": 0.45,
+              "rss_bytes": 87011328
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 5.29,
+            "top": [
+              {
+                "pid": 27413,
+                "name": "compile",
+                "cpu_seconds": 2.79
+              },
+              {
+                "pid": 27418,
+                "name": "compile",
+                "cpu_seconds": 1.77
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.34
+              },
+              {
+                "pid": 27489,
+                "name": "compile",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 27495,
+                "name": "compile",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 3
+          },
+          "host_io_pressure_totals_us": {
+            "some": 35977115,
+            "full": 20458680
+          },
+          "host_volume_diskstats": {
+            "reads": 153343,
+            "read_sectors": 7411711,
+            "read_ms": 76349,
+            "writes": 80491,
+            "write_sectors": 18231528,
+            "write_ms": 1424897,
+            "io_ms": 149816,
+            "weighted_io_ms": 1502168,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 24231306,
+            "syscr": 467,
+            "syscw": 913,
+            "read_bytes": 0,
+            "write_bytes": 24408064
+          }
+        },
+        {
+          "elapsed_seconds": 6.133597043999998,
+          "unix_seconds": 1790318544.3694482,
+          "processes": {
+            "server": {
+              "cpu_seconds": 2.66,
+              "rss_bytes": 34787328
+            },
+            "client": {
+              "cpu_seconds": 0.99,
+              "rss_bytes": 91582464
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.74,
+            "top": [
+              {
+                "pid": 27565,
+                "name": "compile",
+                "cpu_seconds": 0.55
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.39
+              },
+              {
+                "pid": 27558,
+                "name": "compile",
+                "cpu_seconds": 0.38
+              },
+              {
+                "pid": 27590,
+                "name": "compile",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 1254,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 4
+          },
+          "host_io_pressure_totals_us": {
+            "some": 36545583,
+            "full": 20467645
+          },
+          "host_volume_diskstats": {
+            "reads": 153353,
+            "read_sectors": 7412183,
+            "read_ms": 76359,
+            "writes": 81065,
+            "write_sectors": 18472656,
+            "write_ms": 1427078,
+            "io_ms": 151596,
+            "weighted_io_ms": 1504358,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 136075951,
+            "syscr": 467,
+            "syscw": 5226,
+            "read_bytes": 4096,
+            "write_bytes": 136560640
+          }
+        },
+        {
+          "elapsed_seconds": 8.212024989999918,
+          "unix_seconds": 1790318546.4478765,
+          "processes": {
+            "server": {
+              "cpu_seconds": 4.93,
+              "rss_bytes": 36237312
+            },
+            "client": {
+              "cpu_seconds": 1.62,
+              "rss_bytes": 91971584
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.98,
+            "top": [
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.42
+              },
+              {
+                "pid": 1297,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 16204,
+                "name": "kworker/u16:2-events_unbound",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 1254,
+                "name": "herdr",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 240,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 185,
+            "exited_since_previous": 4
+          },
+          "host_io_pressure_totals_us": {
+            "some": 37123895,
+            "full": 20488705
+          },
+          "host_volume_diskstats": {
+            "reads": 153383,
+            "read_sectors": 7412519,
+            "read_ms": 76393,
+            "writes": 81898,
+            "write_sectors": 18877952,
+            "write_ms": 1432113,
+            "io_ms": 153480,
+            "weighted_io_ms": 1509428,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 252822570,
+            "syscr": 467,
+            "syscw": 9879,
+            "read_bytes": 4096,
+            "write_bytes": 253665280
+          }
+        },
+        {
+          "elapsed_seconds": 10.241517595000005,
+          "unix_seconds": 1790318548.477369,
+          "processes": {
+            "server": {
+              "cpu_seconds": 6.95,
+              "rss_bytes": 34308096
+            },
+            "client": {
+              "cpu_seconds": 2.21,
+              "rss_bytes": 91291648
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.4100000000000001,
+            "top": [
+              {
+                "pid": 27867,
+                "name": "compile",
+                "cpu_seconds": 0.55
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.23
+              },
+              {
+                "pid": 1297,
+                "name": "codex",
+                "cpu_seconds": 0.2
+              },
+              {
+                "pid": 27912,
+                "name": "compile",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 1254,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 3
+          },
+          "host_io_pressure_totals_us": {
+            "some": 37651354,
+            "full": 20501738
+          },
+          "host_volume_diskstats": {
+            "reads": 153392,
+            "read_sectors": 7412951,
+            "read_ms": 76410,
+            "writes": 82833,
+            "write_sectors": 19096312,
+            "write_ms": 1435308,
+            "io_ms": 155140,
+            "weighted_io_ms": 1512639,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 352170544,
+            "syscr": 467,
+            "syscw": 14764,
+            "read_bytes": 8192,
+            "write_bytes": 353341440
+          }
+        },
+        {
+          "elapsed_seconds": 12.27587769999991,
+          "unix_seconds": 1790318550.5117292,
+          "processes": {
+            "server": {
+              "cpu_seconds": 9.01,
+              "rss_bytes": 35192832
+            },
+            "client": {
+              "cpu_seconds": 2.73,
+              "rss_bytes": 96014336
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 2.04,
+            "top": [
+              {
+                "pid": 27986,
+                "name": "compile",
+                "cpu_seconds": 0.49
+              },
+              {
+                "pid": 27998,
+                "name": "compile",
+                "cpu_seconds": 0.46
+              },
+              {
+                "pid": 28009,
+                "name": "compile",
+                "cpu_seconds": 0.41
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.25
+              },
+              {
+                "pid": 28014,
+                "name": "compile",
+                "cpu_seconds": 0.14
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 4
+          },
+          "host_io_pressure_totals_us": {
+            "some": 38175243,
+            "full": 20507507
+          },
+          "host_volume_diskstats": {
+            "reads": 153433,
+            "read_sectors": 7417279,
+            "read_ms": 76463,
+            "writes": 83411,
+            "write_sectors": 19320040,
+            "write_ms": 1437361,
+            "io_ms": 156856,
+            "weighted_io_ms": 1514746,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 457900924,
+            "syscr": 467,
+            "syscw": 19696,
+            "read_bytes": 20480,
+            "write_bytes": 459436032
+          }
+        },
+        {
+          "elapsed_seconds": 14.338231532000009,
+          "unix_seconds": 1790318552.5740829,
+          "processes": {
+            "server": {
+              "cpu_seconds": 11.27,
+              "rss_bytes": 37470208
+            },
+            "client": {
+              "cpu_seconds": 3.32,
+              "rss_bytes": 96190464
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 3.03,
+            "top": [
+              {
+                "pid": 27986,
+                "name": "compile",
+                "cpu_seconds": 1.47
+              },
+              {
+                "pid": 28036,
+                "name": "compile",
+                "cpu_seconds": 0.59
+              },
+              {
+                "pid": 24222,
+                "name": "go",
+                "cpu_seconds": 0.24
+              },
+              {
+                "pid": 28063,
+                "name": "compile",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 28058,
+                "name": "compile",
+                "cpu_seconds": 0.11
+              }
+            ],
+            "processes_seen": 186,
+            "exited_since_previous": 4
+          },
+          "host_io_pressure_totals_us": {
+            "some": 38901469,
+            "full": 20566707
+          },
+          "host_volume_diskstats": {
+            "reads": 153461,
+            "read_sectors": 7418999,
+            "read_ms": 76581,
+            "writes": 84441,
+            "write_sectors": 19786904,
+            "write_ms": 1445190,
+            "io_ms": 158704,
+            "weighted_io_ms": 1522692,
+            "name": "sda1"
+          },
+          "server_process_io": {
+            "rchar": 1691826,
+            "wchar": 558440780,
+            "syscr": 467,
+            "syscw": 24543,
+            "read_bytes": 24576,
+            "write_bytes": 560283648
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 3.46,
+        "top": [
+          {
+            "pid": 28036,
+            "name": "compile",
+            "cpu_seconds": 1.85
+          },
+          {
+            "pid": 27986,
+            "name": "compile",
+            "cpu_seconds": 0.99
+          },
+          {
+            "pid": 1297,
+            "name": "codex",
+            "cpu_seconds": 0.15
+          },
+          {
+            "pid": 24222,
+            "name": "go",
+            "cpu_seconds": 0.1
+          },
+          {
+            "pid": 28106,
+            "name": "compile",
+            "cpu_seconds": 0.07
+          }
+        ],
+        "processes_seen": 186,
+        "exited_since_previous": 2
+      },
+      "unrelated_process_cpu_observed_seconds": 22.110000000000003,
+      "unrelated_process_cpu_valid_intervals": 8,
+      "server_cpu_seconds": 12.51,
+      "client_cpu_seconds": 3.32,
+      "server_peak_rss": 38051840,
+      "client_peak_rss": 96190464,
+      "peak_bytes": 3403268096,
+      "peak_inodes": 23526,
+      "server_last_cpu": 11.27,
+      "client_last_cpu": 3.32,
+      "summary": "* Average: 45.24 MiB/s, 45.24 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 45.24,
+      "mib_per_second": 45.24,
+      "reports": {
+        "PUT": {
+          "summary": "* Average: 45.24 MiB/s, 45.24 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 362.0,
+            "p50": 346.9,
+            "p90": 519.9,
+            "p99": 639.9
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: PUT. Concurrency: 16. Ran: 9s\n * Average: 45.24 MiB/s, 45.24 obj/s\n * Reqs: Avg: 362.0ms, 50%: 346.9ms, 90%: 519.9ms, 99%: 639.9ms, Fastest: 204.1ms, Slowest: 694.7ms, StdDev: 90.5ms\n * TTFB: Avg: 340ms, Best: 189ms, 25th: 280ms, Median: 328ms, 75th: 376ms, 90th: 501ms, 99th: 599ms, Worst: 645ms StdDev: 89ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 51.3MiB/s, 51.35 obj/s\n * 50% Median: 46.4MiB/s, 46.36 obj/s\n * Slowest: 35.8MiB/s, 35.79 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "metrics_after_drain": [
+        "cairn_wal_checkpointed_frames_total 0",
+        "cairn_blob_object_write_timing_dropped_total 0",
+        "cairn_wal_checkpoints_total 1",
+        "cairn_writer_queue_depth 0",
+        "cairn_wal_bytes 1450272",
+        "cairn_writer_batch_size{quantile=\"0\"} 1",
+        "cairn_writer_batch_size{quantile=\"0.5\"} 0.9998999999999999",
+        "cairn_writer_batch_size{quantile=\"0.9\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.95\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.99\"} 5.999643201074881",
+        "cairn_writer_batch_size{quantile=\"0.999\"} 5.999643201074881",
+        "cairn_writer_batch_size{quantile=\"1\"} 7",
+        "cairn_writer_batch_size_sum 3839",
+        "cairn_writer_batch_size_count 790",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0\"} 0.000005795",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.5\"} 0.000034439718941486924",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.9\"} 0.01738582572044984",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.95\"} 0.017472972534822735",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.99\"} 0.020341339847617313",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.999\"} 0.020341339847617313",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"1\"} 0.024164395",
+        "cairn_writer_stage_seconds_sum{stage=\"commit\",result=\"ok\"} 14.876225327000009",
+        "cairn_writer_stage_seconds_count{stage=\"commit\",result=\"ok\"} 790",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0\"} 0.000027156",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.5\"} 0.0000835638091674345",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.9\"} 0.00021311043910423864",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.95\"} 0.00021672093776343307",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.99\"} 0.0002488401009432407",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.999\"} 0.0002488401009432407",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"1\"} 0.000300592",
+        "cairn_writer_stage_seconds_sum{stage=\"apply\",result=\"ok\"} 0.8151163980000007",
+        "cairn_writer_stage_seconds_count{stage=\"apply\",result=\"ok\"} 790",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0\"} 0.00000647",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.5\"} 0.000020307911048395457",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.9\"} 0.00003030796406124385",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.95\"} 0.000031444073342432495",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.99\"} 0.00003849816273865954",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.999\"} 0.00003849816273865954",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"1\"} 0.000048324",
+        "cairn_writer_stage_seconds_sum{stage=\"begin\",result=\"ok\"} 0.027428146999999983",
+        "cairn_writer_stage_seconds_count{stage=\"begin\",result=\"ok\"} 790",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0\"} 0.0468494",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.5\"} 0.046845514565919094",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.9\"} 0.046845514565919094",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.95\"} 0.046845514565919094",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.99\"} 0.046845514565919094",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.999\"} 0.046845514565919094",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"1\"} 0.0468494",
+        "cairn_writer_stage_seconds_sum{stage=\"checkpoint\",result=\"ok\"} 0.0468494",
+        "cairn_writer_stage_seconds_count{stage=\"checkpoint\",result=\"ok\"} 1",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0\"} 0.000009466",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.5\"} 0.0046156617835247105",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.9\"} 0.019004109794922393",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.95\"} 0.019011712959397225",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.99\"} 0.020203487963787875",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.999\"} 0.020203487963787875",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"1\"} 0.020203965",
+        "cairn_writer_stage_seconds_sum{stage=\"queue\",result=\"ok\"} 21.927746906999943",
+        "cairn_writer_stage_seconds_count{stage=\"queue\",result=\"ok\"} 2048",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0\"} 0.000000052",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.5\"} 0.0000006369975340626326",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.9\"} 0.0000009150381748920771",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.95\"} 0.0000010070351380649467",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.99\"} 0.0000011250309060295188",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.999\"} 0.0000011250309060295188",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"1\"} 0.000001205",
+        "cairn_writer_stage_seconds_sum{stage=\"admission\",result=\"ok\"} 0.0008509799999999975",
+        "cairn_writer_stage_seconds_count{stage=\"admission\",result=\"ok\"} 2048",
+        "cairn_writer_commit_seconds{quantile=\"0\"} 0.00000573",
+        "cairn_writer_commit_seconds{quantile=\"0.5\"} 0.000034439718941486924",
+        "cairn_writer_commit_seconds{quantile=\"0.9\"} 0.01738582572044984",
+        "cairn_writer_commit_seconds{quantile=\"0.95\"} 0.017472972534822735",
+        "cairn_writer_commit_seconds{quantile=\"0.99\"} 0.020341339847617313",
+        "cairn_writer_commit_seconds{quantile=\"0.999\"} 0.020341339847617313",
+        "cairn_writer_commit_seconds{quantile=\"1\"} 0.024163553",
+        "cairn_writer_commit_seconds_sum 14.875411283000007",
+        "cairn_writer_commit_seconds_count 790",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0\"} 0.002129218",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.5\"} 0.027130410623460836",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.9\"} 0.05893618595303636",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.95\"} 0.07904800020793377",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.99\"} 0.07904800020793377",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.999\"} 0.07904800020793377",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"1\"} 0.100183205",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_sink\",result=\"ok\"} 0.585713801",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_sink\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0\"} 0.007660698",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.5\"} 0.02101119227253145",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.9\"} 0.03313715838760448",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.95\"} 0.03774508479301286",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.99\"} 0.03774508479301286",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.999\"} 0.03774508479301286",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"1\"} 0.108003921",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_sync\",result=\"ok\"} 0.44062232400000007",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_sync\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0\"} 0.003035907",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.5\"} 0.012998776784127425",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.9\"} 0.02444083408561739",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.95\"} 0.03384716563264691",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.99\"} 0.03460697539546088",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.999\"} 0.03460697539546088",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"1\"} 0.052619601",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_parent_sync\",result=\"ok\"} 0.521505909",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_parent_sync\",result=\"ok\"} 34",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0\"} 0.006388996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.5\"} 0.0177832190130235",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.9\"} 0.03525668874298627",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.95\"} 0.04203301006104527",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.99\"} 0.04203301006104527",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.999\"} 0.04203301006104527",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"1\"} 0.075213706",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_input_wait\",result=\"ok\"} 0.379206358",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_input_wait\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0\"} 0.000222424",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.5\"} 0.0037130559929604485",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.9\"} 0.0059754251907358485",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.95\"} 0.00996875058452783",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.99\"} 0.00996875058452783",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.999\"} 0.00996875058452783",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"1\"} 0.010217835",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_flush\",result=\"ok\"} 0.070105013",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_flush\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0\"} 0.009923185",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.5\"} 0.04600063789697417",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.9\"} 0.05839645958861028",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.95\"} 0.06004265729958891",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.99\"} 0.06004265729958891",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.999\"} 0.06004265729958891",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"1\"} 0.097188655",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace\",result=\"ok\"} 0.7256204890000002",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0\"} 0.011550922",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.5\"} 0.0297924576436648",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.9\"} 0.04865989910604837",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.95\"} 0.05765374839549216",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.99\"} 0.05765374839549216",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.999\"} 0.05765374839549216",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"1\"} 0.109112576",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize\",result=\"ok\"} 0.609608514",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0\"} 0.000162582",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.5\"} 0.011348155946496432",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.9\"} 0.01608770410814063",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.95\"} 0.024280055732307317",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.99\"} 0.024280055732307317",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.999\"} 0.024280055732307317",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"1\"} 0.026727925",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"staging_create\",result=\"ok\"} 0.196177318",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"staging_create\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0\"} 0.008687768",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.5\"} 0.026694438875724646",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.9\"} 0.04052241441217815",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.95\"} 0.04943483135819205",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.99\"} 0.04943483135819205",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.999\"} 0.04943483135819205",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"1\"} 0.083746598",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"directory_sync\",result=\"ok\"} 0.5183708929999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"directory_sync\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0\"} 0.000011613",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.5\"} 0.00024163069943929758",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.9\"} 0.0021802842398513005",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.95\"} 0.0024474710181426234",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.99\"} 0.0024474710181426234",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.999\"} 0.0024474710181426234",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"1\"} 0.004835703",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_queue\",result=\"ok\"} 0.012232697",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_queue\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0\"} 0.000000076",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.5\"} 0.00000018400552424925467",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.9\"} 0.0000008089731967608566",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.95\"} 0.000000887994709761596",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.99\"} 0.000000887994709761596",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.999\"} 0.000000887994709761596",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"1\"} 0.000008181",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"permit_wait\",result=\"ok\"} 0.000013267999999999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"permit_wait\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0\"} 0.008552406",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.5\"} 0.025024497915645306",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.9\"} 0.03915997828654939",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.95\"} 0.04025584711588556",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.99\"} 0.04025584711588556",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.999\"} 0.04025584711588556",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"1\"} 0.062267744",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_hash\",result=\"ok\"} 0.468277176",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_hash\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0\"} 0.000014961",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.5\"} 0.00020138339410910033",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.9\"} 0.004854253137448631",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.95\"} 0.009641293291659572",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.99\"} 0.009641293291659572",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.999\"} 0.009641293291659572",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"1\"} 0.012656832",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_queue\",result=\"ok\"} 0.036128593",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_queue\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0\"} 0.009728214",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.5\"} 0.027523914969308838",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.9\"} 0.04368720482869442",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.95\"} 0.058023915658194446",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.99\"} 0.058023915658194446",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.999\"} 0.058023915658194446",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"1\"} 0.087255456",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_execution\",result=\"ok\"} 0.545907527",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_execution\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0\"} 0.032893336",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.5\"} 0.08380186526041301",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.9\"} 0.13182236112868345",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.95\"} 0.13182236112868345",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.99\"} 0.13182236112868345",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.999\"} 0.13182236112868345",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"1\"} 0.137290731",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body\",result=\"ok\"} 1.4405957769999997",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0\"} 0.000025089",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.5\"} 0.0006140095785763086",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.9\"} 0.0026454872244803616",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.95\"} 0.006312016875496857",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.99\"} 0.006312016875496857",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.999\"} 0.006312016875496857",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"1\"} 0.016805152",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_rename\",result=\"ok\"} 0.032658905",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_rename\",result=\"ok\"} 17",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0\"} 0.000158331",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.5\"} 0.00017796920401720026",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.9\"} 0.00027325639373058155",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.95\"} 0.0002784979018752202",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.99\"} 0.0002784979018752202",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.999\"} 0.0002784979018752202",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"1\"} 0.000332265",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_advice\",result=\"ok\"} 0.003364398",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_advice\",result=\"ok\"} 17"
+      ],
+      "status": "INCONCLUSIVE",
+      "variant": "control"
+    }
+  ],
+  "elapsed_seconds": 35.8127120209997,
+  "stopped_reason": "arm 1 did not pass"
+}

@@ -56,3 +56,6 @@ Operator runbooks (NOT spec — these number their own local `## 1/2/3` headings
 - Per-folder agent briefs live in `crates/*/CLAUDE.md`; the workspace brief, gate, and conventions
   are the root `../CLAUDE.md` — start there. End-to-end verification harnesses: `../conformance/`.
 - `CLAUDE.md` files (this one included) are agent briefs, **not** part of the numbered spec.
+- The dated performance work queue and decisions start at
+  [`performance-execution-2026-09.md`](performance-execution-2026-09.md); their retained raw JSON
+  lives under [`performance-evidence/`](performance-evidence/README.md), not in the docs root.

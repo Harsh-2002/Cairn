@@ -50,6 +50,54 @@ store retains only the latest 1,024 samples across clones until the existing met
 them; `cairn_blob_multipart_timing_dropped_total` counts older samples evicted when collection falls
 behind. No bucket, key, upload ID, or per-chunk labels/samples are retained.
 
+Ordinary-object blob staging also publishes `cairn_blob_object_write_stage_seconds{stage,result}`
+for one in every 32 calls to `BlobStore::stage` (including copy and replica writes). Its fixed
+stages are `permit_wait`, `namespace`, `namespace_queue`, `namespace_execution`,
+`namespace_parent_sync`,
+`staging_create`, `body`, `finalize`, `finalize_flush`, `finalize_queue`,
+`finalize_sync`, `finalize_advice`, `finalize_rename`, and `directory_sync`;
+`result` is `ok` or `interrupted`, the latter covering both errors and
+cancellation. The stages exclude metadata admission, publication, and audit work. Durations are
+wall time, including scheduler and I/O wait; they are not additive CPU time or complete S3 PUT
+latency. The same 1,024-sample bounded collection is drained by the existing metrics tick;
+`cairn_blob_object_write_timing_dropped_total` counts evictions. No object identifiers are labels.
+`namespace_queue` is submission-to-blocking-worker-start, while `namespace_execution` is
+worker execution through anchored path preparation. Their sum may differ from `namespace` due
+to the async wake-up after the worker returns. `namespace_parent_sync` measures each mandatory
+parent-directory barrier within that execution, including the existing-directory case; its count
+is **barrier calls**, not sampled objects. The stage does not include open/lock/revalidation work.
+On the default retained-blocking-file backend, `finalize_flush` includes any residual
+buffered write, `finalize_queue` is submission-to-worker-start, `finalize_sync`
+includes mandatory preallocation trim plus file `sync_data`, `finalize_advice` is emitted
+only when page-release advice is attempted, and `finalize_rename` is the exact admitted
+rename. The optional io_uring backend retains only the inclusive `finalize` label.
+For sampled **raw plaintext** writes only, three additional fixed stages subdivide `body`:
+`body_input_wait` (awaiting the next chunk or end of stream), `body_hash` (mandatory hash updates
+and finalization), and `body_sink` (awaiting the buffered staging sink). Each is aggregated once
+per sampled object, not emitted per chunk; an active cancelled phase is `interrupted`.
+`body_sink` does not include residual buffer flushing, which remains in `finalize`. Encoded writes
+retain only the aggregate `body` stage, so substage counts must not be read as all-write counts.
+
+The protocol service additionally publishes `cairn_put_stage_seconds{stage,result}`
+for one in every 32 ordinary PUT handlers. All stages of a selected PUT use the same
+sampling decision, independently of the blob sampler. The fixed stages are `total`,
+`preflight`, `storage_admission`, `blob_stage`, `publication_prep`, `publication`,
+`notification` and `audit`; `result=interrupted` includes an error or cancellation
+before that stage completed. `preflight` includes bucket/config reads and request
+preparation; `storage_admission` includes plan preparation and the Writer admission
+await; `blob_stage` is the inclusive blob-store await; `publication_prep` includes
+post-stage validations, row construction and replication intent; `publication` is
+the authoritative Writer await; `notification` and `audit` are the two best-effort
+post-commit awaits. The latter two mark completion when their await returns, even
+if their internal best-effort operation failed. The exclusive stages do not include
+every small synchronous instruction between boundaries, so their sum may be less
+than `total`; `total` excludes HTTP authentication, authorization and response
+serialization outside this handler. A bounded 1,024-stage ring is drained by the
+existing metrics task; `cairn_put_timing_dropped_total` reports evictions. These
+are wall waits, not CPU attribution, and the histogram has no request identity or
+high-cardinality object labels. Protocol and blob one-in-32 samples are not aligned
+with each other or with Writer batch samples.
+
 ### 26.3 Audit log
 
 Mutating actions across both the S3 and management surfaces are recorded in an audit log with the actor, the action, the resource, and the salient attributes, retained in the metadata store and surfaced through the management API and web console. This serves both the operational need to see recent activity and the security need to have a record of who changed or accessed what, and it is distinct from the operational metrics in that it is per-event and attributable rather than aggregate.

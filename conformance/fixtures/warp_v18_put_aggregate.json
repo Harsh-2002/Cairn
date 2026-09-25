@@ -1,0 +1,35 @@
+{
+  "v": 2,
+  "final": true,
+  "by_op_type": {
+    "PUT": {
+      "total_requests": 8,
+      "total_objects": 8,
+      "total_errors": 0,
+      "total_bytes": 8388608,
+      "concurrency": 1,
+      "throughput": {
+        "start_time": "2026-09-23T12:00:01Z",
+        "end_time": "2026-09-23T12:00:13Z",
+        "errors": 0,
+        "measure_duration_millis": 8000,
+        "bytes": 8388608,
+        "objects": 8,
+        "ops": 8,
+        "segmented": {
+          "segment_duration_millis": 1000,
+          "segments": [
+            {"start": "2026-09-23T12:00:01Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:02Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:03Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:04Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:05Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:06Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:07Z", "bytes_per_sec": 1048576, "obj_per_sec": 1},
+            {"start": "2026-09-23T12:00:08Z", "bytes_per_sec": 1048576, "obj_per_sec": 1}
+          ]
+        }
+      }
+    }
+  }
+}

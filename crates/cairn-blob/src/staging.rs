@@ -4,7 +4,10 @@
 use crate::io_err;
 use crate::namespace::AnchoredPath;
 use crate::owned_file::{FileOwner, OwnedFile};
+use crate::timing::{ObjectWriteStage, ObjectWriteTimings};
 use cairn_types::{error::BlobError, storage::io::StorageIoLease};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 const STAGING_WRITE_BUF: usize = 256 * 1024;
@@ -78,22 +81,67 @@ impl Staging {
     /// File sync precedes the exclusive rename. The caller then synchronizes the exact destination
     /// directory through the shared coalescer before reporting the blob durable (ARCH 8.2).
     pub(crate) async fn commit(self, destination: &AnchoredPath) -> Result<(), BlobError> {
+        self.commit_sampled(destination, None).await
+    }
+
+    pub(crate) async fn commit_sampled(
+        self,
+        destination: &AnchoredPath,
+        timing: Option<Arc<ObjectWriteTimings>>,
+    ) -> Result<(), BlobError> {
         match self {
             Self::Tokio {
                 mut writer,
                 staging,
                 release_len,
             } => {
-                writer.flush().await.map_err(io_err)?;
+                {
+                    let flush_timer = timing
+                        .as_ref()
+                        .map(|timing| timing.start(ObjectWriteStage::FinalizeFlush));
+                    writer.flush().await.map_err(io_err)?;
+                    if let Some(timer) = flush_timer {
+                        timer.complete();
+                    }
+                }
                 let owner = writer.into_inner().into_owner().map_err(io_err)?;
                 let destination = destination.clone();
+                let queued_at = timing.as_ref().map(|_| Instant::now());
                 owner
                     .run(move |file| {
-                        sync_staged(file, release_len)?;
-                        if let Some(len) = release_len {
-                            crate::raw_io::release_pages(file, len);
+                        if let (Some(timing), Some(queued_at)) = (&timing, queued_at) {
+                            timing.record_elapsed(
+                                ObjectWriteStage::FinalizeQueue,
+                                queued_at.elapsed(),
+                                true,
+                            );
                         }
-                        staging.rename_to(&destination)
+                        let sync_timer = timing
+                            .as_ref()
+                            .map(|timing| timing.start(ObjectWriteStage::FinalizeSync));
+                        sync_staged(file, release_len)?;
+                        if let Some(timer) = sync_timer {
+                            timer.complete();
+                        }
+                        if let Some(len) = release_len {
+                            let advice_timer = timing
+                                .as_ref()
+                                .map(|timing| timing.start(ObjectWriteStage::FinalizeAdvice));
+                            crate::raw_io::release_pages(file, len);
+                            if let Some(timer) = advice_timer {
+                                timer.complete();
+                            }
+                        }
+                        let rename_timer = timing
+                            .as_ref()
+                            .map(|timing| timing.start(ObjectWriteStage::FinalizeRename));
+                        let result = staging.rename_to(&destination);
+                        if result.is_ok() {
+                            if let Some(timer) = rename_timer {
+                                timer.complete();
+                            }
+                        }
+                        result
                     })
                     .await
                     .map_err(io_err)
@@ -157,12 +205,26 @@ mod tests {
                 staging: AnchoredPath::fixture(&path),
                 release_len: Some(8 * 1024 * 1024),
             };
+            let timing = Arc::new(ObjectWriteTimings::default());
             let result = if rename {
-                staging.commit(&AnchoredPath::fixture(&destination)).await
+                staging
+                    .commit_sampled(&AnchoredPath::fixture(&destination), Some(timing.clone()))
+                    .await
             } else {
                 staging.fsync_in_place().await
             };
             assert!(result.is_err(), "trim errors must not be ignored");
+            if rename {
+                let samples = timing.drain();
+                assert!(samples.iter().any(|sample| {
+                    sample.stage == ObjectWriteStage::FinalizeSync && !sample.completed
+                }));
+                assert!(
+                    !samples
+                        .iter()
+                        .any(|sample| sample.stage == ObjectWriteStage::FinalizeRename)
+                );
+            }
             assert!(!destination.exists());
             assert_eq!(std::fs::read(path).unwrap(), b"owned bytes");
         }
@@ -187,9 +249,10 @@ mod tests {
             let allocated = std::fs::metadata(&path).unwrap().blocks() * 512;
             let bytes = vec![37; 1024 * 1024 + 17];
             staging.write_all(&bytes).await.unwrap();
+            let timing = Arc::new(ObjectWriteTimings::default());
             let output = if rename {
                 staging
-                    .commit(&AnchoredPath::fixture(&destination))
+                    .commit_sampled(&AnchoredPath::fixture(&destination), Some(timing.clone()))
                     .await
                     .unwrap();
                 destination
@@ -198,6 +261,22 @@ mod tests {
                 path
             };
             assert_eq!(std::fs::read(&output).unwrap(), bytes);
+            if rename {
+                let samples = timing.drain();
+                for stage in [
+                    ObjectWriteStage::FinalizeFlush,
+                    ObjectWriteStage::FinalizeQueue,
+                    ObjectWriteStage::FinalizeSync,
+                    ObjectWriteStage::FinalizeAdvice,
+                    ObjectWriteStage::FinalizeRename,
+                ] {
+                    assert!(
+                        samples
+                            .iter()
+                            .any(|sample| { sample.stage == stage && sample.completed })
+                    );
+                }
+            }
             let metadata = std::fs::metadata(&output).unwrap();
             assert_eq!(metadata.len(), bytes.len() as u64);
             if allocated >= 8 * 1024 * 1024 {

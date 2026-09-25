@@ -3,8 +3,8 @@
 
 use bytes::Bytes;
 use cairn_protocol::{
-    S3Body, S3Request, S3Response, S3Service, StorageRecoveryPermit, StorageWriteRecovery,
-    StorageWriteRuntime,
+    PutStage, S3Body, S3Request, S3Response, S3Service, StorageRecoveryPermit,
+    StorageWriteRecovery, StorageWriteRuntime,
 };
 use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
@@ -1862,6 +1862,87 @@ async fn put_simple(h: &Harness, bucket: &str, key: &str) -> String {
     .await;
     assert_eq!(st, StatusCode::OK);
     header(&hdrs, "etag").unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn sampled_put_timing_covers_one_successful_response_path() {
+    let h = harness().await;
+    put_simple(&h, "timed", "obj").await;
+    let samples = h.svc.drain_put_timings();
+    assert_eq!(samples.len(), 8);
+    assert!(samples.iter().all(|sample| sample.completed));
+    for stage in [
+        PutStage::Total,
+        PutStage::Preflight,
+        PutStage::StorageAdmission,
+        PutStage::BlobStage,
+        PutStage::PublicationPrep,
+        PutStage::Publication,
+        PutStage::Notification,
+        PutStage::Audit,
+    ] {
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == stage)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(h.svc.put_timings_dropped_total(), 0);
+}
+
+#[tokio::test]
+async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
+    let (h, meta) = in_memory_harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("timed-fail"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    meta.reject_next_storage_admission_out_of_space();
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("timed-fail"),
+                Some("obj"),
+                &[],
+                &[],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    let samples = h.svc.drain_put_timings();
+    assert_eq!(samples.len(), 3);
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::Preflight && sample.completed)
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::StorageAdmission && !sample.completed)
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::Total && !sample.completed)
+    );
+    assert!(
+        !samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::BlobStage)
+    );
 }
 
 #[tokio::test]

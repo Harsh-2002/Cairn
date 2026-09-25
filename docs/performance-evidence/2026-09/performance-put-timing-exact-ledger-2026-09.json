@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "max_client_seconds": 300,
+  "max_bytes": 10000000000,
+  "duration": 12,
+  "host_capacity": {
+    "memtotal_kib": 9759516,
+    "swaptotal_kib": 0,
+    "logical_cpus": 4
+  },
+  "profile": "put_timing",
+  "metrics_drain_seconds": 16,
+  "binaries": {
+    "candidate": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+      "sha256": "df20f397c746d1081ab5cdbaa22d2147609bf34d354c2d1ea50255022b0780e6"
+    },
+    "control": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-control",
+      "sha256": "68afac8ba3e6bb2b2cb015a2f60e59fcb4edee5e9326640e820645611cc428c5"
+    },
+    "rustfs": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/rustfs",
+      "sha256": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd"
+    },
+    "warp": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+      "sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+    }
+  },
+  "phases": [
+    {
+      "name": "timing_ab",
+      "status": "INCONCLUSIVE",
+      "wall_cap_seconds": 270,
+      "command": [
+        "/usr/bin/python3",
+        "/home/dev/Cairn/conformance/cairn_put_ab.py",
+        "--control",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-control",
+        "--candidate",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+        "--root",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu",
+        "--warp",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+        "--case",
+        "put_1m",
+        "--pairs",
+        "3",
+        "--duration",
+        "12",
+        "--metrics-drain-seconds",
+        "16",
+        "--max-seconds",
+        "270",
+        "--max-bytes",
+        "10000000000"
+      ],
+      "started_unix_seconds": 1790318533.9023757,
+      "host_capacity_after": {
+        "memtotal_kib": 9913032,
+        "swaptotal_kib": 0,
+        "logical_cpus": 4
+      },
+      "client_seconds": 16.011273904000063,
+      "raw_report": "/var/tmp/cairn-performance-timing-ni5ZpdEu/root-barrier-timing_ab-raw.json",
+      "raw_sha256": "7ec8c807355c963c21ffcb03dae0d7056ee5e0f814085a5d6c28ff4e2210c0f4",
+      "exit_code": 1,
+      "finished_unix_seconds": 1790318570.53098
+    }
+  ],
+  "client_seconds": 16.011273904000063,
+  "stopped_reason": "phase timing_ab did not pass"
+}

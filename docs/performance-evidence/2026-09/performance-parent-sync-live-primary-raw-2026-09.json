@@ -1,0 +1,4045 @@
+{
+  "schema": 2,
+  "cases": [
+    [
+      "put_1m",
+      "put",
+      "1MiB",
+      16,
+      []
+    ]
+  ],
+  "pairs": 2,
+  "duration": 12,
+  "metrics_drain_seconds": 16,
+  "diagnostic_sync_probe": false,
+  "engine_selection": "both",
+  "strict_settings": {
+    "cairn": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+    },
+    "rustfs": {
+      "RUSTFS_DURABILITY_MODE": "strict",
+      "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+      "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+    }
+  },
+  "max_seconds": 300,
+  "max_bytes": 10000000000,
+  "binary_sha256": {
+    "cairn": "fab439182fdf6c49dd81ebf08866ca086b2aa1894cfa5d02ea7d9a6d4154c640",
+    "rustfs": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd",
+    "warp": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+  },
+  "arms": [
+    {
+      "case": "put_1m",
+      "engine": "cairn",
+      "order": 1,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/warp",
+        "put",
+        "--host",
+        "127.0.0.1:18001",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/01-cairn-put_1m-o23nai5a/warp",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 16.978487216998474,
+      "load_start_unix_seconds": 1790185166.8145332,
+      "load_end_unix_seconds": 1790185183.7930212,
+      "warp_operation_timeline": {
+        "status": "captured source-derived Warp scored interval with report-score parity",
+        "start_unix_seconds": 1790185171.0,
+        "end_unix_seconds": 1790185181.0,
+        "raw_end_unix_seconds": 1790185185.0,
+        "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+        "analyzed_seconds_exact": 10.0,
+        "aggregate_mib_per_second": 80.44615496617493,
+        "host_window": {
+          "complete_intervals": 4,
+          "coverage_seconds": 8.105572700500488,
+          "unrelated_cpu_seconds": 1.27,
+          "unrelated_cpu_valid_intervals": 4,
+          "host_io_pressure_delta_us": {
+            "some": 2615359,
+            "full": 1524121
+          },
+          "host_io_pressure_valid_intervals": 4
+        }
+      },
+      "host_io_pressure_delta_us": {
+        "some": 4357555,
+        "full": 2526448
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 16508595,
+        "read_sectors": 1966928975,
+        "read_ms": 10113463,
+        "writes": 14598772,
+        "write_sectors": 1264691472,
+        "write_ms": 29775237,
+        "io_ms": 9160728,
+        "weighted_io_ms": 39955784,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 16508655,
+        "read_sectors": 1966931351,
+        "read_ms": 10113543,
+        "writes": 14607807,
+        "write_sectors": 1267082920,
+        "write_ms": 29798272,
+        "io_ms": 9173544,
+        "weighted_io_ms": 39978901,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 60,
+        "read_sectors": 2376,
+        "read_ms": 80,
+        "writes": 9035,
+        "write_sectors": 2391448,
+        "write_ms": 23035,
+        "io_ms": 12816,
+        "weighted_io_ms": 23117
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0225134169886587,
+          "unix_seconds": 1790185168.8370469,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.02,
+              "rss_bytes": 18128896
+            },
+            "client": {
+              "cpu_seconds": 0.13,
+              "rss_bytes": 71892992
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.28,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 618,
+                "name": "orva",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 919,
+                "name": "containerd-shim",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3102497311,
+            "full": 1708932805
+          },
+          "host_volume_diskstats": {
+            "reads": 16508620,
+            "read_sectors": 1966930263,
+            "read_ms": 10113478,
+            "writes": 14599166,
+            "write_sectors": 1264700624,
+            "write_ms": 29775432,
+            "io_ms": 9160772,
+            "weighted_io_ms": 39955994,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.042530127990176,
+          "unix_seconds": 1790185170.8570638,
+          "processes": {
+            "server": {
+              "cpu_seconds": 2.24,
+              "rss_bytes": 35115008
+            },
+            "client": {
+              "cpu_seconds": 0.77,
+              "rss_bytes": 89305088
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.27,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 46085,
+                "name": "codex-code-mode",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3102745438,
+            "full": 1708986709
+          },
+          "host_volume_diskstats": {
+            "reads": 16508620,
+            "read_sectors": 1966930263,
+            "read_ms": 10113478,
+            "writes": 14599907,
+            "write_sectors": 1264962824,
+            "write_ms": 29776667,
+            "io_ms": 9161532,
+            "weighted_io_ms": 39957229,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.071225669991691,
+          "unix_seconds": 1790185172.8857589,
+          "processes": {
+            "server": {
+              "cpu_seconds": 7.06,
+              "rss_bytes": 35041280
+            },
+            "client": {
+              "cpu_seconds": 2.13,
+              "rss_bytes": 91529216
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.37,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 900687,
+                "name": "kworker/u16:2-events_unbound",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 195,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3103304868,
+            "full": 1709121817
+          },
+          "host_volume_diskstats": {
+            "reads": 16508625,
+            "read_sectors": 1966930303,
+            "read_ms": 10113483,
+            "writes": 14601440,
+            "write_sectors": 1265539568,
+            "write_ms": 29779235,
+            "io_ms": 9163284,
+            "weighted_io_ms": 39959802,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.103699545987183,
+          "unix_seconds": 1790185174.9182327,
+          "processes": {
+            "server": {
+              "cpu_seconds": 11.88,
+              "rss_bytes": 37888000
+            },
+            "client": {
+              "cpu_seconds": 3.45,
+              "rss_bytes": 90996736
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.45,
+            "top": [
+              {
+                "pid": 954352,
+                "name": "ssh",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 195,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3103891159,
+            "full": 1709276501
+          },
+          "host_volume_diskstats": {
+            "reads": 16508640,
+            "read_sectors": 1966930615,
+            "read_ms": 10113507,
+            "writes": 14605470,
+            "write_sectors": 1266148048,
+            "write_ms": 29785045,
+            "io_ms": 9164992,
+            "weighted_io_ms": 39965636,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.124850207997952,
+          "unix_seconds": 1790185176.9393833,
+          "processes": {
+            "server": {
+              "cpu_seconds": 14.7,
+              "rss_bytes": 38604800
+            },
+            "client": {
+              "cpu_seconds": 4.22,
+              "rss_bytes": 91934720
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.34,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 954385,
+                "name": "ssh",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 33249,
+                "name": "codex-code-mode",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 194,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3104553373,
+            "full": 1709658826
+          },
+          "host_volume_diskstats": {
+            "reads": 16508649,
+            "read_sectors": 1966930935,
+            "read_ms": 10113520,
+            "writes": 14606312,
+            "write_sectors": 1266496048,
+            "write_ms": 29788154,
+            "io_ms": 9166892,
+            "weighted_io_ms": 39968759,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.154391891992418,
+          "unix_seconds": 1790185178.9689252,
+          "processes": {
+            "server": {
+              "cpu_seconds": 16.41,
+              "rss_bytes": 37863424
+            },
+            "client": {
+              "cpu_seconds": 4.69,
+              "rss_bytes": 90501120
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.2,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 900687,
+                "name": "kworker/u16:2-events_unbound",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 194,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3105230317,
+            "full": 1710154994
+          },
+          "host_volume_diskstats": {
+            "reads": 16508651,
+            "read_sectors": 1966930951,
+            "read_ms": 10113526,
+            "writes": 14606769,
+            "write_sectors": 1266707704,
+            "write_ms": 29791407,
+            "io_ms": 9168896,
+            "weighted_io_ms": 39972018,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.176798319997033,
+          "unix_seconds": 1790185180.9913316,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.19,
+              "rss_bytes": 38191104
+            },
+            "client": {
+              "cpu_seconds": 5.14,
+              "rss_bytes": 90587136
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.28,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 1005,
+                "name": "orva",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 17,
+                "name": "ksoftirqd/0",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3105920227,
+            "full": 1710645938
+          },
+          "host_volume_diskstats": {
+            "reads": 16508653,
+            "read_sectors": 1966930967,
+            "read_ms": 10113532,
+            "writes": 14607343,
+            "write_sectors": 1266940320,
+            "write_ms": 29794824,
+            "io_ms": 9170876,
+            "weighted_io_ms": 39975442,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.200884619989665,
+          "unix_seconds": 1790185183.0154176,
+          "processes": {
+            "server": {
+              "cpu_seconds": 19.12,
+              "rss_bytes": 38912000
+            },
+            "client": {
+              "cpu_seconds": 5.4,
+              "rss_bytes": 93499392
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.31,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 954429,
+                "name": "gh",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 915240,
+                "name": "chrome",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 194,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3106580892,
+            "full": 1711199416
+          },
+          "host_volume_diskstats": {
+            "reads": 16508653,
+            "read_sectors": 1966930967,
+            "read_ms": 10113532,
+            "writes": 14607687,
+            "write_sectors": 1267060384,
+            "write_ms": 29797512,
+            "io_ms": 9172824,
+            "weighted_io_ms": 39978131,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.17,
+        "top": [
+          {
+            "pid": 954429,
+            "name": "gh",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.04
+          },
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 44594,
+            "name": "codex",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 241,
+            "name": "jbd2/sda1-8",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 194,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 2.6700000000000004,
+      "unrelated_process_cpu_valid_intervals": 9,
+      "server_cpu_seconds": 19.2,
+      "client_cpu_seconds": 5.390000000000001,
+      "server_peak_rss": 39530496,
+      "client_peak_rss": 93499392,
+      "peak_bytes": 1459310592,
+      "peak_inodes": 997,
+      "server_last_cpu": 19.12,
+      "client_last_cpu": 5.4,
+      "summary": "* Average: 80.45 MiB/s, 80.45 obj/s",
+      "analyzed_seconds": 10.0,
+      "objects_per_second": 80.45,
+      "mib_per_second": 80.45,
+      "reports": {
+        "PUT": {
+          "summary": "* Average: 80.45 MiB/s, 80.45 obj/s",
+          "analyzed_seconds": 10.0,
+          "request_latency_ms": {
+            "avg": 273.7,
+            "p50": 252.3,
+            "p90": 389.6,
+            "p99": 434.4
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: PUT. Concurrency: 16. Ran: 10s\n * Average: 80.45 MiB/s, 80.45 obj/s\n * Reqs: Avg: 273.7ms, 50%: 252.3ms, 90%: 389.6ms, 99%: 434.4ms, Fastest: 81.7ms, Slowest: 468.4ms, StdDev: 68.3ms\n * TTFB: Avg: 267ms, Best: 62ms, 25th: 225ms, Median: 245ms, 75th: 277ms, 90th: 385ms, 99th: 429ms, Worst: 464ms StdDev: 69ms\n\nThroughput, split into 10 x 1s:\n * Fastest: 122.6MiB/s, 122.60 obj/s\n * 50% Median: 93.1MiB/s, 93.13 obj/s\n * Slowest: 44.0MiB/s, 44.00 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "metrics_after_drain": [
+        "cairn_wal_checkpointed_frames_total 0",
+        "cairn_blob_object_write_timing_dropped_total 0",
+        "cairn_wal_checkpoints_total 1",
+        "cairn_wal_bytes 62891832",
+        "cairn_writer_queue_depth 10",
+        "cairn_writer_batch_size{quantile=\"0\"} 1",
+        "cairn_writer_batch_size{quantile=\"0.5\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"0.9\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.95\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.99\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.999\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"1\"} 6",
+        "cairn_writer_batch_size_sum 6739",
+        "cairn_writer_batch_size_count 1168",
+        "cairn_writer_commit_seconds{quantile=\"0\"} 0.025108831",
+        "cairn_writer_commit_seconds{quantile=\"0.5\"} 0.03769981785670418",
+        "cairn_writer_commit_seconds{quantile=\"0.9\"} 0.04623121705474904",
+        "cairn_writer_commit_seconds{quantile=\"0.95\"} 0.04636084585856896",
+        "cairn_writer_commit_seconds{quantile=\"0.99\"} 0.04636084585856896",
+        "cairn_writer_commit_seconds{quantile=\"0.999\"} 0.04636084585856896",
+        "cairn_writer_commit_seconds{quantile=\"1\"} 0.046979979",
+        "cairn_writer_commit_seconds_sum 24.367654951000006",
+        "cairn_writer_commit_seconds_count 1168",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0\"} 0.000013253",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.5\"} 0.000046665751345442596",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.9\"} 0.0004731490842141869",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.95\"} 0.0015459757314585298",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.99\"} 0.0021379667348736613",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.999\"} 0.0021379667348736613",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"1\"} 0.002892813",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_queue\",result=\"ok\"} 0.008491283",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_queue\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0\"} 0.000013932",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.5\"} 0.00005114222720393012",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.9\"} 0.00026640308675819656",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.95\"} 0.00034412691434511307",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.99\"} 0.0020785182361834024",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.999\"} 0.0020785182361834024",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"1\"} 0.005618057",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_queue\",result=\"ok\"} 0.009911927999999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_queue\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0\"} 0.00000094",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.5\"} 0.00512974144027417",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.9\"} 0.023956873143635565",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.95\"} 0.02477054539567561",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.99\"} 0.045071731935818725",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.999\"} 0.045071731935818725",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"1\"} 0.050307961",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_parent_sync\",result=\"ok\"} 0.586063431",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_parent_sync\",result=\"ok\"} 62",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0\"} 0.000177354",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.5\"} 0.0004102679681120679",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.9\"} 0.0033256171135999666",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.95\"} 0.003533381184579768",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.99\"} 0.004976143812798599",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.999\"} 0.004976143812798599",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"1\"} 0.008457179",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_flush\",result=\"ok\"} 0.03718010499999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_flush\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0\"} 0.00020322",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.5\"} 0.01217585946747033",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.9\"} 0.041764857798293975",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.95\"} 0.06259311354241476",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.99\"} 0.06938392865290768",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.999\"} 0.06938392865290768",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"1\"} 0.074643734",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace\",result=\"ok\"} 0.6192895629999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0\"} 0.00015491",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.5\"} 0.00020573944223242652",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.9\"} 0.00035305029532842013",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.95\"} 0.0004903946757273028",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.99\"} 0.0010046661034864663",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.999\"} 0.0010046661034864663",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"1\"} 0.001106618",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_advice\",result=\"ok\"} 0.008424493",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_advice\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0\"} 0.008045004",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.5\"} 0.009662527486021342",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.9\"} 0.014708936877647447",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.95\"} 0.017761891948934478",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.99\"} 0.01779033372349965",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.999\"} 0.01779033372349965",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"1\"} 0.019268775",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_hash\",result=\"ok\"} 0.3379821500000001",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_hash\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0\"} 0.003857735",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.5\"} 0.01309270571566715",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.9\"} 0.05763069150774209",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.95\"} 0.061685892907511586",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.99\"} 0.0699832036301957",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.999\"} 0.0699832036301957",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"1\"} 0.077299439",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"directory_sync\",result=\"ok\"} 0.6815705730000001",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"directory_sync\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0\"} 0.000737708",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.5\"} 0.005427373181562264",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.9\"} 0.022921039893674",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.95\"} 0.027337387259860797",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.99\"} 0.031076604288731647",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.999\"} 0.031076604288731647",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"1\"} 0.034359642",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_sink\",result=\"ok\"} 0.279599082",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_sink\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0\"} 0.000000064",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.5\"} 0.0000002399824465128584",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.9\"} 0.00000047597521493909517",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.95\"} 0.0000004810473872552814",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.99\"} 0.000000594051362309366",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.999\"} 0.000000594051362309366",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"1\"} 0.000007237",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"permit_wait\",result=\"ok\"} 0.000014338",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"permit_wait\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0\"} 0.000111727",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.5\"} 0.0015521720187178219",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.9\"} 0.00709120481347334",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.95\"} 0.007830726249060213",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.99\"} 0.00948446558337746",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.999\"} 0.00948446558337746",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"1\"} 0.010823124",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"staging_create\",result=\"ok\"} 0.07712649099999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"staging_create\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0\"} 0.006053612",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.5\"} 0.0077776579471060545",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.9\"} 0.015908527085850253",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.95\"} 0.017532481749978058",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.99\"} 0.01881501574238668",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.999\"} 0.01881501574238668",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"1\"} 0.019299125",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_input_wait\",result=\"ok\"} 0.29884559699999996",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_input_wait\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0\"} 0.015094145",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.5\"} 0.026930386585895",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.9\"} 0.04811794882102541",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.95\"} 0.05088943122877264",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.99\"} 0.054372323449268005",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.999\"} 0.054372323449268005",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"1\"} 0.057275338",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body\",result=\"ok\"} 0.9170085149999998",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0\"} 0.004042336",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.5\"} 0.01010525169656359",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.9\"} 0.034496410072692336",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.95\"} 0.03760192564497162",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.99\"} 0.04003104440635804",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.999\"} 0.04003104440635804",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"1\"} 0.041202588",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_sync\",result=\"ok\"} 0.47577671299999996",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_sync\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0\"} 0.000069792",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.5\"} 0.01122401028361657",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.9\"} 0.03827723232288333",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.95\"} 0.062430582828150234",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.99\"} 0.06928685911699987",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.999\"} 0.06928685911699987",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"1\"} 0.074336747",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_execution\",result=\"ok\"} 0.5880029260000001",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_execution\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0\"} 0.006852002",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.5\"} 0.014898421384065956",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.9\"} 0.03532727268111767",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.95\"} 0.03821603771970013",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.99\"} 0.0419154822482054",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.999\"} 0.0419154822482054",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"1\"} 0.04451325",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize\",result=\"ok\"} 0.580845599",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize\",result=\"ok\"} 31",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0\"} 0.000021381",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.5\"} 0.00005943067579128901",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.9\"} 0.002126027581947735",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.95\"} 0.002300796238630415",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.99\"} 0.003148906515956877",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.999\"} 0.003148906515956877",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"1\"} 0.005932932",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_rename\",result=\"ok\"} 0.016664444",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_rename\",result=\"ok\"} 31",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0\"} 0.000113162",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.5\"} 0.000197514208698758",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.9\"} 0.00026886530399706366",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.95\"} 0.0003193253618607108",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.99\"} 0.0003193253618607108",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.999\"} 0.0003193253618607108",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"1\"} 0.000330605",
+        "cairn_writer_stage_seconds_sum{stage=\"apply\",result=\"ok\"} 0.8634817699999996",
+        "cairn_writer_stage_seconds_count{stage=\"apply\",result=\"ok\"} 1169",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0\"} 0.00000005",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.5\"} 0.00000042097177261358364",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.9\"} 0.000001074022029108583",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.95\"} 0.0000011548962434094104",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.99\"} 0.0000014448572216550217",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.999\"} 0.0000014448572216550217",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"1\"} 0.00000661",
+        "cairn_writer_stage_seconds_sum{stage=\"admission\",result=\"ok\"} 0.0010913729999999994",
+        "cairn_writer_stage_seconds_count{stage=\"admission\",result=\"ok\"} 2048",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0\"} 0.025109249",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.5\"} 0.03769981785670418",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.9\"} 0.04623121705474904",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.95\"} 0.04636084585856896",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.99\"} 0.04636084585856896",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.999\"} 0.04636084585856896",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"1\"} 0.046980204",
+        "cairn_writer_stage_seconds_sum{stage=\"commit\",result=\"ok\"} 24.36812766599996",
+        "cairn_writer_stage_seconds_count{stage=\"commit\",result=\"ok\"} 1168",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0\"} 0.000016463",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.5\"} 0.000017711435714003072",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.9\"} 0.000018452696593389364",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.95\"} 0.000019707721570645014",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.99\"} 0.000019707721570645014",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.999\"} 0.000019707721570645014",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"1\"} 0.000021239",
+        "cairn_writer_stage_seconds_sum{stage=\"begin\",result=\"ok\"} 0.04044634600000005",
+        "cairn_writer_stage_seconds_count{stage=\"begin\",result=\"ok\"} 1169",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0\"} 0.000003219",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.5\"} 0.022084041890089962",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.9\"} 0.0457620554311314",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.95\"} 0.04621272826586981",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.99\"} 0.046258964108358044",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.999\"} 0.046258964108358044",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"1\"} 0.046584861",
+        "cairn_writer_stage_seconds_sum{stage=\"queue\",result=\"ok\"} 49.16300800599995",
+        "cairn_writer_stage_seconds_count{stage=\"queue\",result=\"ok\"} 2048",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0\"} 0.050236428",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.5\"} 0.050232150203950734",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.9\"} 0.050232150203950734",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.95\"} 0.050232150203950734",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.99\"} 0.050232150203950734",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.999\"} 0.050232150203950734",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"1\"} 0.050236428",
+        "cairn_writer_stage_seconds_sum{stage=\"checkpoint\",result=\"ok\"} 0.050236428",
+        "cairn_writer_stage_seconds_count{stage=\"checkpoint\",result=\"ok\"} 1"
+      ],
+      "status": "PASS"
+    },
+    {
+      "case": "put_1m",
+      "engine": "rustfs",
+      "order": 2,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/warp",
+        "put",
+        "--host",
+        "127.0.0.1:18002",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/02-rustfs-put_1m-kk82ze36/warp",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "strict_settings": {
+        "RUSTFS_DURABILITY_MODE": "strict",
+        "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+        "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 28.989054179008235,
+      "load_start_unix_seconds": 1790185200.906993,
+      "load_end_unix_seconds": 1790185229.8960476,
+      "warp_operation_timeline": {
+        "status": "captured source-derived Warp scored interval with report-score parity",
+        "start_unix_seconds": 1790185206.0,
+        "end_unix_seconds": 1790185215.0,
+        "raw_end_unix_seconds": 1790185219.0,
+        "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+        "analyzed_seconds_exact": 9.0,
+        "aggregate_mib_per_second": 80.25684895198816,
+        "host_window": {
+          "complete_intervals": 3,
+          "coverage_seconds": 6.308756589889526,
+          "unrelated_cpu_seconds": 1.0,
+          "unrelated_cpu_valid_intervals": 3,
+          "host_io_pressure_delta_us": {
+            "some": 2525831,
+            "full": 1463498
+          },
+          "host_io_pressure_valid_intervals": 3
+        }
+      },
+      "host_io_pressure_delta_us": {
+        "some": 9035979,
+        "full": 6582091
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 16508693,
+        "read_sectors": 1966932439,
+        "read_ms": 10113607,
+        "writes": 14610289,
+        "write_sectors": 1267216168,
+        "write_ms": 29815225,
+        "io_ms": 9187668,
+        "weighted_io_ms": 39996014,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 16508732,
+        "read_sectors": 1966934559,
+        "read_ms": 10113669,
+        "writes": 14624544,
+        "write_sectors": 1269707944,
+        "write_ms": 29852645,
+        "io_ms": 9209792,
+        "weighted_io_ms": 40033785,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 39,
+        "read_sectors": 2120,
+        "read_ms": 62,
+        "writes": 14255,
+        "write_sectors": 2491776,
+        "write_ms": 37420,
+        "io_ms": 22124,
+        "weighted_io_ms": 37771
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0218235720094526,
+          "unix_seconds": 1790185202.9288166,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.24,
+              "rss_bytes": 168808448
+            },
+            "client": {
+              "cpu_seconds": 0.16,
+              "rss_bytes": 68472832
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.24,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 1005,
+                "name": "orva",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3111640192,
+            "full": 1716088659
+          },
+          "host_volume_diskstats": {
+            "reads": 16508693,
+            "read_sectors": 1966932439,
+            "read_ms": 10113607,
+            "writes": 14610338,
+            "write_sectors": 1267217904,
+            "write_ms": 29815579,
+            "io_ms": 9187996,
+            "weighted_io_ms": 39996370,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.038742174001527,
+          "unix_seconds": 1790185204.9457355,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.35,
+              "rss_bytes": 236294144
+            },
+            "client": {
+              "cpu_seconds": 0.51,
+              "rss_bytes": 88203264
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.21,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 52,
+                "name": "kcompactd0",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3112025355,
+            "full": 1716331596
+          },
+          "host_volume_diskstats": {
+            "reads": 16508693,
+            "read_sectors": 1966932439,
+            "read_ms": 10113607,
+            "writes": 14610779,
+            "write_sectors": 1267371944,
+            "write_ms": 29818091,
+            "io_ms": 9188852,
+            "weighted_io_ms": 39998894,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.148371099014184,
+          "unix_seconds": 1790185207.0553641,
+          "processes": {
+            "server": {
+              "cpu_seconds": 4.21,
+              "rss_bytes": 231235584
+            },
+            "client": {
+              "cpu_seconds": 1.42,
+              "rss_bytes": 90251264
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.57,
+            "top": [
+              {
+                "pid": 52,
+                "name": "kcompactd0",
+                "cpu_seconds": 0.22
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 900687,
+                "name": "kworker/u16:2-events_unbound",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3112768304,
+            "full": 1716715017
+          },
+          "host_volume_diskstats": {
+            "reads": 16508697,
+            "read_sectors": 1966932535,
+            "read_ms": 10113626,
+            "writes": 14611537,
+            "write_sectors": 1267745592,
+            "write_ms": 29821798,
+            "io_ms": 9190916,
+            "weighted_io_ms": 40002673,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.195290799005306,
+          "unix_seconds": 1790185209.1022837,
+          "processes": {
+            "server": {
+              "cpu_seconds": 6.99,
+              "rss_bytes": 235995136
+            },
+            "client": {
+              "cpu_seconds": 2.3,
+              "rss_bytes": 92020736
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.33,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 900687,
+                "name": "kworker/u16:2-ext4-rsv-conversion",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3113516103,
+            "full": 1717123411
+          },
+          "host_volume_diskstats": {
+            "reads": 16508697,
+            "read_sectors": 1966932535,
+            "read_ms": 10113626,
+            "writes": 14612134,
+            "write_sectors": 1268100152,
+            "write_ms": 29825087,
+            "io_ms": 9192940,
+            "weighted_io_ms": 40006001,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.294314395010588,
+          "unix_seconds": 1790185211.2013075,
+          "processes": {
+            "server": {
+              "cpu_seconds": 9.64,
+              "rss_bytes": 255344640
+            },
+            "client": {
+              "cpu_seconds": 3.14,
+              "rss_bytes": 91435008
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.27,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 924176,
+                "name": "kworker/u16:3-ext4-rsv-conversion",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3114243054,
+            "full": 1717521164
+          },
+          "host_volume_diskstats": {
+            "reads": 16508698,
+            "read_sectors": 1966932791,
+            "read_ms": 10113634,
+            "writes": 14612782,
+            "write_sectors": 1268460072,
+            "write_ms": 29828532,
+            "io_ms": 9195008,
+            "weighted_io_ms": 40009497,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.457127774003311,
+          "unix_seconds": 1790185213.3641207,
+          "processes": {
+            "server": {
+              "cpu_seconds": 12.13,
+              "rss_bytes": 261550080
+            },
+            "client": {
+              "cpu_seconds": 3.89,
+              "rss_bytes": 95154176
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.4,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 924176,
+                "name": "kworker/u16:3-events_unbound",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3115294135,
+            "full": 1718178515
+          },
+          "host_volume_diskstats": {
+            "reads": 16508703,
+            "read_sectors": 1966932847,
+            "read_ms": 10113643,
+            "writes": 14613933,
+            "write_sectors": 1268757648,
+            "write_ms": 29833483,
+            "io_ms": 9196908,
+            "weighted_io_ms": 40014484,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.60142016300233,
+          "unix_seconds": 1790185215.5084136,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.0,
+              "rss_bytes": 269041664
+            },
+            "client": {
+              "cpu_seconds": 5.43,
+              "rss_bytes": 97067008
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.49,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 924176,
+                "name": "kworker/u16:3-events_unbound",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3115919751,
+            "full": 1718338422
+          },
+          "host_volume_diskstats": {
+            "reads": 16508706,
+            "read_sectors": 1966932871,
+            "read_ms": 10113646,
+            "writes": 14615050,
+            "write_sectors": 1269307320,
+            "write_ms": 29836274,
+            "io_ms": 9198564,
+            "weighted_io_ms": 40017366,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.760136605007574,
+          "unix_seconds": 1790185217.6671295,
+          "processes": {
+            "server": {
+              "cpu_seconds": 19.44,
+              "rss_bytes": 279961600
+            },
+            "client": {
+              "cpu_seconds": 5.93,
+              "rss_bytes": 95207424
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.46,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3116268184,
+            "full": 1718528723
+          },
+          "host_volume_diskstats": {
+            "reads": 16508707,
+            "read_sectors": 1966932879,
+            "read_ms": 10113646,
+            "writes": 14616076,
+            "write_sectors": 1269483368,
+            "write_ms": 29837785,
+            "io_ms": 9199728,
+            "weighted_io_ms": 40018898,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 18.929878196009668,
+          "unix_seconds": 1790185219.8368711,
+          "processes": {
+            "server": {
+              "cpu_seconds": 20.36,
+              "rss_bytes": 279994368
+            },
+            "client": {
+              "cpu_seconds": 5.93,
+              "rss_bytes": 95207424
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.45,
+            "top": [
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 1005,
+                "name": "orva",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3116641034,
+            "full": 1718877826
+          },
+          "host_volume_diskstats": {
+            "reads": 16508707,
+            "read_sectors": 1966932879,
+            "read_ms": 10113646,
+            "writes": 14617701,
+            "write_sectors": 1269535720,
+            "write_ms": 29839478,
+            "io_ms": 9201236,
+            "weighted_io_ms": 40020591,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 21.123897327008308,
+          "unix_seconds": 1790185222.0308902,
+          "processes": {
+            "server": {
+              "cpu_seconds": 20.96,
+              "rss_bytes": 272654336
+            },
+            "client": {
+              "cpu_seconds": 5.93,
+              "rss_bytes": 95207424
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.57,
+            "top": [
+              {
+                "pid": 954745,
+                "name": "gh",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 193,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3117205998,
+            "full": 1719407701
+          },
+          "host_volume_diskstats": {
+            "reads": 16508707,
+            "read_sectors": 1966932879,
+            "read_ms": 10113646,
+            "writes": 14619360,
+            "write_sectors": 1269577504,
+            "write_ms": 29841723,
+            "io_ms": 9202992,
+            "weighted_io_ms": 40022836,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 26.22758461300691,
+          "unix_seconds": 1790185227.1345778,
+          "processes": {
+            "server": {
+              "cpu_seconds": 21.73,
+              "rss_bytes": 268460032
+            },
+            "client": {
+              "cpu_seconds": 5.93,
+              "rss_bytes": 95207424
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.74,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.2
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.16
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 618,
+                "name": "orva",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3119969308,
+            "full": 1722009800
+          },
+          "host_volume_diskstats": {
+            "reads": 16508710,
+            "read_sectors": 1966933103,
+            "read_ms": 10113650,
+            "writes": 14622002,
+            "write_sectors": 1269632160,
+            "write_ms": 29850332,
+            "io_ms": 9207856,
+            "weighted_io_ms": 40031449,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 28.68468615200254,
+          "unix_seconds": 1790185229.5916793,
+          "processes": {
+            "server": {
+              "cpu_seconds": 22.54,
+              "rss_bytes": 290324480
+            },
+            "client": {
+              "cpu_seconds": 5.93,
+              "rss_bytes": 95207424
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.41000000000000003,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3120555011,
+            "full": 1722562968
+          },
+          "host_volume_diskstats": {
+            "reads": 16508732,
+            "read_sectors": 1966934559,
+            "read_ms": 10113669,
+            "writes": 14624527,
+            "write_sectors": 1269687376,
+            "write_ms": 29852597,
+            "io_ms": 9209780,
+            "weighted_io_ms": 40033735,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.06,
+        "top": [
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 18,
+            "name": "rcu_preempt",
+            "cpu_seconds": 0.01
+          },
+          {
+            "pid": 241,
+            "name": "jbd2/sda1-8",
+            "cpu_seconds": 0.01
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.01
+          },
+          {
+            "pid": 915198,
+            "name": "chrome",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 191,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 5.199999999999999,
+      "unrelated_process_cpu_valid_intervals": 13,
+      "server_cpu_seconds": 22.889999999999997,
+      "client_cpu_seconds": 5.93,
+      "server_peak_rss": 290324480,
+      "client_peak_rss": 97067008,
+      "peak_bytes": 1433825280,
+      "peak_inodes": 6341,
+      "server_last_cpu": 22.54,
+      "client_last_cpu": 5.93,
+      "summary": "* Average: 80.26 MiB/s, 80.26 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 80.26,
+      "mib_per_second": 80.26,
+      "reports": {
+        "PUT": {
+          "summary": "* Average: 80.26 MiB/s, 80.26 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 179.0,
+            "p50": 173.5,
+            "p90": 219.1,
+            "p99": 431.6
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: PUT. Concurrency: 16. Ran: 9s\n * Average: 80.26 MiB/s, 80.26 obj/s\n * Reqs: Avg: 179.0ms, 50%: 173.5ms, 90%: 219.1ms, 99%: 431.6ms, Fastest: 79.0ms, Slowest: 684.6ms, StdDev: 51.1ms\n * TTFB: Avg: 166ms, Best: 65ms, 25th: 142ms, Median: 161ms, 75th: 182ms, 90th: 206ms, 99th: 418ms, Worst: 675ms StdDev: 51ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 112.7MiB/s, 112.66 obj/s\n * 50% Median: 78.0MiB/s, 78.04 obj/s\n * Slowest: 51.4MiB/s, 51.44 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "put_1m",
+      "engine": "rustfs",
+      "order": 3,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/warp",
+        "put",
+        "--host",
+        "127.0.0.1:18003",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/03-rustfs-put_1m-2asece79/warp",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "strict_settings": {
+        "RUSTFS_DURABILITY_MODE": "strict",
+        "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+        "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 44.425189945002785,
+      "load_start_unix_seconds": 1790185230.813695,
+      "load_end_unix_seconds": 1790185275.238885,
+      "warp_operation_timeline": {
+        "status": "captured source-derived Warp scored interval with report-score parity",
+        "start_unix_seconds": 1790185235.0,
+        "end_unix_seconds": 1790185245.0,
+        "raw_end_unix_seconds": 1790185249.0,
+        "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+        "analyzed_seconds_exact": 10.0,
+        "aggregate_mib_per_second": 77.13895375339128,
+        "host_window": {
+          "complete_intervals": 3,
+          "coverage_seconds": 6.25620174407959,
+          "unrelated_cpu_seconds": 0.8200000000000001,
+          "unrelated_cpu_valid_intervals": 3,
+          "host_io_pressure_delta_us": {
+            "some": 2285746,
+            "full": 1312540
+          },
+          "host_io_pressure_valid_intervals": 3
+        }
+      },
+      "host_io_pressure_delta_us": {
+        "some": 13807823,
+        "full": 11521357
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 16508732,
+        "read_sectors": 1966934559,
+        "read_ms": 10113669,
+        "writes": 14624707,
+        "write_sectors": 1269718232,
+        "write_ms": 29852800,
+        "io_ms": 9209980,
+        "weighted_io_ms": 40034016,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 16508762,
+        "read_sectors": 1966935095,
+        "read_ms": 10113769,
+        "writes": 14636988,
+        "write_sectors": 1272193232,
+        "write_ms": 29907840,
+        "io_ms": 9248068,
+        "weighted_io_ms": 40089355,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 30,
+        "read_sectors": 536,
+        "read_ms": 100,
+        "writes": 12281,
+        "write_sectors": 2475000,
+        "write_ms": 55040,
+        "io_ms": 38088,
+        "weighted_io_ms": 55339
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0229949920030776,
+          "unix_seconds": 1790185232.83669,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.26,
+              "rss_bytes": 166625280
+            },
+            "client": {
+              "cpu_seconds": 0.16,
+              "rss_bytes": 68952064
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.21,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 618,
+                "name": "orva",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3120628278,
+            "full": 1722624789
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14624749,
+            "write_sectors": 1269719720,
+            "write_ms": 29852844,
+            "io_ms": 9210028,
+            "weighted_io_ms": 40034062,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.04306558999815,
+          "unix_seconds": 1790185234.8567603,
+          "processes": {
+            "server": {
+              "cpu_seconds": 2.38,
+              "rss_bytes": 238604288
+            },
+            "client": {
+              "cpu_seconds": 0.85,
+              "rss_bytes": 87556096
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.25,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3120904865,
+            "full": 1722686535
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14625500,
+            "write_sectors": 1270024088,
+            "write_ms": 29854463,
+            "io_ms": 9210748,
+            "weighted_io_ms": 40035706,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.109364089992596,
+          "unix_seconds": 1790185236.9230592,
+          "processes": {
+            "server": {
+              "cpu_seconds": 5.47,
+              "rss_bytes": 262082560
+            },
+            "client": {
+              "cpu_seconds": 1.84,
+              "rss_bytes": 87830528
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.32,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-ext4-rsv-conversion",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3121606147,
+            "full": 1723038910
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14626515,
+            "write_sectors": 1270452288,
+            "write_ms": 29857940,
+            "io_ms": 9212700,
+            "weighted_io_ms": 40039212,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.181632669002283,
+          "unix_seconds": 1790185238.9953277,
+          "processes": {
+            "server": {
+              "cpu_seconds": 7.56,
+              "rss_bytes": 302227456
+            },
+            "client": {
+              "cpu_seconds": 2.46,
+              "rss_bytes": 87961600
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.33,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 954708,
+                "name": "kworker/u16:4+events_unbound",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3122449647,
+            "full": 1723602107
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14627545,
+            "write_sectors": 1270740064,
+            "write_ms": 29862254,
+            "io_ms": 9214740,
+            "weighted_io_ms": 40043557,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.26734156999737,
+          "unix_seconds": 1790185241.0810363,
+          "processes": {
+            "server": {
+              "cpu_seconds": 10.36,
+              "rss_bytes": 269996032
+            },
+            "client": {
+              "cpu_seconds": 3.36,
+              "rss_bytes": 90652672
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.24,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0+events_unbound",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3123185995,
+            "full": 1724000997
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14628153,
+            "write_sectors": 1271128456,
+            "write_ms": 29865771,
+            "io_ms": 9216780,
+            "weighted_io_ms": 40047116,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.365566106003826,
+          "unix_seconds": 1790185243.179261,
+          "processes": {
+            "server": {
+              "cpu_seconds": 13.54,
+              "rss_bytes": 279396352
+            },
+            "client": {
+              "cpu_seconds": 4.37,
+              "rss_bytes": 90292224
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.25,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-ext4-rsv-conversion",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3123891893,
+            "full": 1724351450
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14628911,
+            "write_sectors": 1271562376,
+            "write_ms": 29869157,
+            "io_ms": 9218836,
+            "weighted_io_ms": 40050536,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.480629319004947,
+          "unix_seconds": 1790185245.294324,
+          "processes": {
+            "server": {
+              "cpu_seconds": 15.62,
+              "rss_bytes": 284905472
+            },
+            "client": {
+              "cpu_seconds": 5.04,
+              "rss_bytes": 90669056
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.22,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3124860140,
+            "full": 1725045429
+          },
+          "host_volume_diskstats": {
+            "reads": 16508733,
+            "read_sectors": 1966934567,
+            "read_ms": 10113669,
+            "writes": 14629526,
+            "write_sectors": 1271858288,
+            "write_ms": 29872776,
+            "io_ms": 9220920,
+            "weighted_io_ms": 40054176,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.79454059699492,
+          "unix_seconds": 1790185247.6082358,
+          "processes": {
+            "server": {
+              "cpu_seconds": 16.87,
+              "rss_bytes": 290811904
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.19,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 1,
+                "name": "systemd",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3125685975,
+            "full": 1725753863
+          },
+          "host_volume_diskstats": {
+            "reads": 16508736,
+            "read_sectors": 1966934615,
+            "read_ms": 10113686,
+            "writes": 14630064,
+            "write_sectors": 1271950408,
+            "write_ms": 29875496,
+            "io_ms": 9222708,
+            "weighted_io_ms": 40056923,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 18.955548908998026,
+          "unix_seconds": 1790185249.7692437,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.12,
+              "rss_bytes": 291958784
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.19,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 915240,
+                "name": "chrome",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3126269415,
+            "full": 1726309876
+          },
+          "host_volume_diskstats": {
+            "reads": 16508736,
+            "read_sectors": 1966934615,
+            "read_ms": 10113686,
+            "writes": 14630402,
+            "write_sectors": 1271964392,
+            "write_ms": 29877913,
+            "io_ms": 9224764,
+            "weighted_io_ms": 40059340,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 21.156725537002785,
+          "unix_seconds": 1790185251.9704206,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.39,
+              "rss_bytes": 292028416
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.19,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 83,
+                "name": "kworker/2:1H-kblockd",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3126953335,
+            "full": 1726969787
+          },
+          "host_volume_diskstats": {
+            "reads": 16508736,
+            "read_sectors": 1966934615,
+            "read_ms": 10113686,
+            "writes": 14630802,
+            "write_sectors": 1271975136,
+            "write_ms": 29880268,
+            "io_ms": 9226872,
+            "weighted_io_ms": 40061694,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 23.377397581003606,
+          "unix_seconds": 1790185254.1910925,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.62,
+              "rss_bytes": 291078144
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.16999999999999998,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3127670082,
+            "full": 1727658709
+          },
+          "host_volume_diskstats": {
+            "reads": 16508736,
+            "read_sectors": 1966934615,
+            "read_ms": 10113686,
+            "writes": 14631109,
+            "write_sectors": 1271984568,
+            "write_ms": 29882666,
+            "io_ms": 9228992,
+            "weighted_io_ms": 40064093,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 25.52409807300137,
+          "unix_seconds": 1790185256.3377929,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.84,
+              "rss_bytes": 308219904
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.18,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 26,
+                "name": "migration/1",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3128346742,
+            "full": 1728307862
+          },
+          "host_volume_diskstats": {
+            "reads": 16508736,
+            "read_sectors": 1966934615,
+            "read_ms": 10113686,
+            "writes": 14631492,
+            "write_sectors": 1271999168,
+            "write_ms": 29885439,
+            "io_ms": 9231064,
+            "weighted_io_ms": 40066868,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 27.7793481300032,
+          "unix_seconds": 1790185258.5930429,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.95,
+              "rss_bytes": 308219904
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.34,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 20,
+                "name": "rcu_exp_gp_kthread_worker",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3129136985,
+            "full": 1729065850
+          },
+          "host_volume_diskstats": {
+            "reads": 16508737,
+            "read_sectors": 1966934623,
+            "read_ms": 10113686,
+            "writes": 14631812,
+            "write_sectors": 1272008952,
+            "write_ms": 29887981,
+            "io_ms": 9233176,
+            "weighted_io_ms": 40069411,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 30.01295893000497,
+          "unix_seconds": 1790185260.826654,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.05,
+              "rss_bytes": 308219904
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.24,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 1005,
+                "name": "orva",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3129923810,
+            "full": 1729833322
+          },
+          "host_volume_diskstats": {
+            "reads": 16508759,
+            "read_sectors": 1966935071,
+            "read_ms": 10113766,
+            "writes": 14632119,
+            "write_sectors": 1272019144,
+            "write_ms": 29890551,
+            "io_ms": 9235288,
+            "weighted_io_ms": 40072060,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 32.178052000002936,
+          "unix_seconds": 1790185262.991747,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.27,
+              "rss_bytes": 319078400
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.25,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 361,
+                "name": "systemd-resolve",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3130585166,
+            "full": 1730460906
+          },
+          "host_volume_diskstats": {
+            "reads": 16508760,
+            "read_sectors": 1966935079,
+            "read_ms": 10113768,
+            "writes": 14632488,
+            "write_sectors": 1272029512,
+            "write_ms": 29893176,
+            "io_ms": 9237348,
+            "weighted_io_ms": 40074687,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 34.4117880959966,
+          "unix_seconds": 1790185265.2254827,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.52,
+              "rss_bytes": 321175552
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.25,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3131231607,
+            "full": 1731077482
+          },
+          "host_volume_diskstats": {
+            "reads": 16508761,
+            "read_sectors": 1966935087,
+            "read_ms": 10113768,
+            "writes": 14632865,
+            "write_sectors": 1272042256,
+            "write_ms": 29895719,
+            "io_ms": 9239432,
+            "weighted_io_ms": 40077230,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 36.6586237540032,
+          "unix_seconds": 1790185267.4723184,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.75,
+              "rss_bytes": 310657024
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.22,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 618,
+                "name": "orva",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3131976477,
+            "full": 1731788660
+          },
+          "host_volume_diskstats": {
+            "reads": 16508761,
+            "read_sectors": 1966935087,
+            "read_ms": 10113768,
+            "writes": 14633227,
+            "write_sectors": 1272052144,
+            "write_ms": 29898328,
+            "io_ms": 9241600,
+            "weighted_io_ms": 40079840,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 40.253348641999764,
+          "unix_seconds": 1790185271.0670433,
+          "processes": {
+            "server": {
+              "cpu_seconds": 19.06,
+              "rss_bytes": 308637696
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.35,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 18,
+                "name": "rcu_preempt",
+                "cpu_seconds": 0.01
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3133625892,
+            "full": 1733376978
+          },
+          "host_volume_diskstats": {
+            "reads": 16508762,
+            "read_sectors": 1966935095,
+            "read_ms": 10113769,
+            "writes": 14634545,
+            "write_sectors": 1272080832,
+            "write_ms": 29904748,
+            "io_ms": 9245096,
+            "weighted_io_ms": 40086261,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 42.401444732997334,
+          "unix_seconds": 1790185273.2151396,
+          "processes": {
+            "server": {
+              "cpu_seconds": 19.66,
+              "rss_bytes": 310857728
+            },
+            "client": {
+              "cpu_seconds": 5.26,
+              "rss_bytes": 87117824
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.32,
+            "top": [
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 83,
+                "name": "kworker/2:1H-kblockd",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3134080914,
+            "full": 1733808057
+          },
+          "host_volume_diskstats": {
+            "reads": 16508762,
+            "read_sectors": 1966935095,
+            "read_ms": 10113769,
+            "writes": 14635587,
+            "write_sectors": 1272124104,
+            "write_ms": 29906466,
+            "io_ms": 9246752,
+            "weighted_io_ms": 40087978,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.23,
+        "top": [
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 241,
+            "name": "jbd2/sda1-8",
+            "cpu_seconds": 0.04
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.03
+          },
+          {
+            "pid": 44594,
+            "name": "codex",
+            "cpu_seconds": 0.03
+          },
+          {
+            "pid": 193,
+            "name": "kworker/1:1H-kblockd",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 190,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 4.94,
+      "unrelated_process_cpu_valid_intervals": 20,
+      "server_cpu_seconds": 20.54,
+      "client_cpu_seconds": 5.25,
+      "server_peak_rss": 321175552,
+      "client_peak_rss": 95088640,
+      "peak_bytes": 1431613440,
+      "peak_inodes": 6228,
+      "server_last_cpu": 19.66,
+      "client_last_cpu": 5.26,
+      "summary": "* Average: 77.14 MiB/s, 77.14 obj/s",
+      "analyzed_seconds": 10.0,
+      "objects_per_second": 77.14,
+      "mib_per_second": 77.14,
+      "reports": {
+        "PUT": {
+          "summary": "* Average: 77.14 MiB/s, 77.14 obj/s",
+          "analyzed_seconds": 10.0,
+          "request_latency_ms": {
+            "avg": 234.1,
+            "p50": 236.1,
+            "p90": 324.9,
+            "p99": 418.3
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: PUT. Concurrency: 16. Ran: 10s\n * Average: 77.14 MiB/s, 77.14 obj/s\n * Reqs: Avg: 234.1ms, 50%: 236.1ms, 90%: 324.9ms, 99%: 418.3ms, Fastest: 61.4ms, Slowest: 454.7ms, StdDev: 75.1ms\n * TTFB: Avg: 226ms, Best: 57ms, 25th: 163ms, Median: 228ms, 75th: 285ms, 90th: 313ms, 99th: 408ms, Worst: 447ms StdDev: 75ms\n\nThroughput, split into 10 x 1s:\n * Fastest: 103.5MiB/s, 103.46 obj/s\n * 50% Median: 78.5MiB/s, 78.46 obj/s\n * Slowest: 53.3MiB/s, 53.27 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "put_1m",
+      "engine": "cairn",
+      "order": 4,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/warp",
+        "put",
+        "--host",
+        "127.0.0.1:18004",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-nextdiag-ukMx4M/04-cairn-put_1m-sm0_lzev/warp",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 17.307220539994887,
+      "load_start_unix_seconds": 1790185276.3074582,
+      "load_end_unix_seconds": 1790185293.614679,
+      "warp_operation_timeline": {
+        "status": "captured source-derived Warp scored interval with report-score parity",
+        "start_unix_seconds": 1790185281.0,
+        "end_unix_seconds": 1790185290.0,
+        "raw_end_unix_seconds": 1790185294.0,
+        "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+        "analyzed_seconds_exact": 9.0,
+        "aggregate_mib_per_second": 112.4657060395966,
+        "host_window": {
+          "complete_intervals": 3,
+          "coverage_seconds": 6.0851874351501465,
+          "unrelated_cpu_seconds": 0.9500000000000001,
+          "unrelated_cpu_valid_intervals": 3,
+          "host_io_pressure_delta_us": {
+            "some": 1863976,
+            "full": 519805
+          },
+          "host_io_pressure_valid_intervals": 3
+        }
+      },
+      "host_io_pressure_delta_us": {
+        "some": 4302844,
+        "full": 1984168
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 16508762,
+        "read_sectors": 1966935095,
+        "read_ms": 10113769,
+        "writes": 14637327,
+        "write_sectors": 1272223688,
+        "write_ms": 29908163,
+        "io_ms": 9248376,
+        "weighted_io_ms": 40089730,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 16508856,
+        "read_sectors": 1966939559,
+        "read_ms": 10113865,
+        "writes": 14646870,
+        "write_sectors": 1275311136,
+        "write_ms": 29928449,
+        "io_ms": 9260908,
+        "weighted_io_ms": 40110120,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 94,
+        "read_sectors": 4464,
+        "read_ms": 96,
+        "writes": 9543,
+        "write_sectors": 3087448,
+        "write_ms": 20286,
+        "io_ms": 12532,
+        "weighted_io_ms": 20390
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.020833499991568,
+          "unix_seconds": 1790185278.3282917,
+          "processes": {
+            "server": {
+              "cpu_seconds": 0.02,
+              "rss_bytes": 18509824
+            },
+            "client": {
+              "cpu_seconds": 0.14,
+              "rss_bytes": 70586368
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.14,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 1,
+                "name": "systemd",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 52,
+                "name": "kcompactd0",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3134528867,
+            "full": 1734233129
+          },
+          "host_volume_diskstats": {
+            "reads": 16508766,
+            "read_sectors": 1966935175,
+            "read_ms": 10113782,
+            "writes": 14637327,
+            "write_sectors": 1272223688,
+            "write_ms": 29908163,
+            "io_ms": 9248380,
+            "weighted_io_ms": 40089743,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.0357384079979965,
+          "unix_seconds": 1790185280.3431964,
+          "processes": {
+            "server": {
+              "cpu_seconds": 2.24,
+              "rss_bytes": 35356672
+            },
+            "client": {
+              "cpu_seconds": 0.8,
+              "rss_bytes": 88756224
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.24,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-ext4-rsv-conversion",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3134777033,
+            "full": 1734291771
+          },
+          "host_volume_diskstats": {
+            "reads": 16508821,
+            "read_sectors": 1966937647,
+            "read_ms": 10113840,
+            "writes": 14638069,
+            "write_sectors": 1272489864,
+            "write_ms": 29909353,
+            "io_ms": 9249120,
+            "weighted_io_ms": 40090993,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.0515010230010375,
+          "unix_seconds": 1790185282.3589594,
+          "processes": {
+            "server": {
+              "cpu_seconds": 7.27,
+              "rss_bytes": 37081088
+            },
+            "client": {
+              "cpu_seconds": 2.13,
+              "rss_bytes": 91066368
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.31,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3135335727,
+            "full": 1734431579
+          },
+          "host_volume_diskstats": {
+            "reads": 16508846,
+            "read_sectors": 1966939215,
+            "read_ms": 10113856,
+            "writes": 14639680,
+            "write_sectors": 1273091240,
+            "write_ms": 29912017,
+            "io_ms": 9250840,
+            "weighted_io_ms": 40093674,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.068975421003415,
+          "unix_seconds": 1790185284.3764336,
+          "processes": {
+            "server": {
+              "cpu_seconds": 12.18,
+              "rss_bytes": 38567936
+            },
+            "client": {
+              "cpu_seconds": 3.47,
+              "rss_bytes": 93282304
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.32,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 954708,
+                "name": "kworker/u16:4-events_unbound",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3135908853,
+            "full": 1734581981
+          },
+          "host_volume_diskstats": {
+            "reads": 16508846,
+            "read_sectors": 1966939215,
+            "read_ms": 10113856,
+            "writes": 14641371,
+            "write_sectors": 1273679680,
+            "write_ms": 29914980,
+            "io_ms": 9252616,
+            "weighted_io_ms": 40096637,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.095392005998292,
+          "unix_seconds": 1790185286.4028504,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.04,
+              "rss_bytes": 38137856
+            },
+            "client": {
+              "cpu_seconds": 4.81,
+              "rss_bytes": 93175808
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.26,
+            "top": [
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 954708,
+                "name": "kworker/u16:4-events_unbound",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3136514310,
+            "full": 1734742187
+          },
+          "host_volume_diskstats": {
+            "reads": 16508852,
+            "read_sectors": 1966939527,
+            "read_ms": 10113863,
+            "writes": 14643556,
+            "write_sectors": 1274281024,
+            "write_ms": 29918270,
+            "io_ms": 9254284,
+            "weighted_io_ms": 40099935,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.136688632002915,
+          "unix_seconds": 1790185288.4441469,
+          "processes": {
+            "server": {
+              "cpu_seconds": 21.61,
+              "rss_bytes": 40906752
+            },
+            "client": {
+              "cpu_seconds": 6.05,
+              "rss_bytes": 95178752
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.37,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3137199703,
+            "full": 1734951384
+          },
+          "host_volume_diskstats": {
+            "reads": 16508854,
+            "read_sectors": 1966939543,
+            "read_ms": 10113865,
+            "writes": 14645381,
+            "write_sectors": 1274831784,
+            "write_ms": 29921284,
+            "io_ms": 9256036,
+            "weighted_io_ms": 40102955,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.177940652996767,
+          "unix_seconds": 1790185290.485399,
+          "processes": {
+            "server": {
+              "cpu_seconds": 24.26,
+              "rss_bytes": 37728256
+            },
+            "client": {
+              "cpu_seconds": 6.79,
+              "rss_bytes": 89784320
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.25,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 933515,
+                "name": "kworker/u16:0-events_unbound",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3137895310,
+            "full": 1735383378
+          },
+          "host_volume_diskstats": {
+            "reads": 16508856,
+            "read_sectors": 1966939559,
+            "read_ms": 10113865,
+            "writes": 14646256,
+            "write_sectors": 1275158792,
+            "write_ms": 29924447,
+            "io_ms": 9257984,
+            "weighted_io_ms": 40106118,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.204107489989838,
+          "unix_seconds": 1790185292.5115657,
+          "processes": {
+            "server": {
+              "cpu_seconds": 25.17,
+              "rss_bytes": 39796736
+            },
+            "client": {
+              "cpu_seconds": 7.06,
+              "rss_bytes": 94216192
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.21,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 241,
+                "name": "jbd2/sda1-8",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 618,
+                "name": "orva",
+                "cpu_seconds": 0.01
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 3138521040,
+            "full": 1735913288
+          },
+          "host_volume_diskstats": {
+            "reads": 16508856,
+            "read_sectors": 1966939559,
+            "read_ms": 10113865,
+            "writes": 14646611,
+            "write_sectors": 1275278432,
+            "write_ms": 29927142,
+            "io_ms": 9259888,
+            "weighted_io_ms": 40108813,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.08,
+        "top": [
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.03
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 44594,
+            "name": "codex",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 896592,
+            "name": "herdr",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 190,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 2.18,
+      "unrelated_process_cpu_valid_intervals": 9,
+      "server_cpu_seconds": 25.29,
+      "client_cpu_seconds": 7.05,
+      "server_peak_rss": 42553344,
+      "client_peak_rss": 95178752,
+      "peak_bytes": 1796816896,
+      "peak_inodes": 1293,
+      "server_last_cpu": 25.17,
+      "client_last_cpu": 7.06,
+      "summary": "* Average: 112.47 MiB/s, 112.47 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 112.47,
+      "mib_per_second": 112.47,
+      "reports": {
+        "PUT": {
+          "summary": "* Average: 112.47 MiB/s, 112.47 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 226.9,
+            "p50": 245.1,
+            "p90": 293.1,
+            "p99": 326.7
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: PUT. Concurrency: 16. Ran: 9s\n * Average: 112.47 MiB/s, 112.47 obj/s\n * Reqs: Avg: 226.9ms, 50%: 245.1ms, 90%: 293.1ms, 99%: 326.7ms, Fastest: 80.2ms, Slowest: 473.0ms, StdDev: 62.1ms\n * TTFB: Avg: 219ms, Best: 71ms, 25th: 165ms, Median: 238ms, 75th: 268ms, 90th: 283ms, 99th: 319ms, Worst: 466ms StdDev: 62ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 127.3MiB/s, 127.28 obj/s\n * 50% Median: 123.4MiB/s, 123.37 obj/s\n * Slowest: 63.7MiB/s, 63.75 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "metrics_after_drain": [
+        "cairn_wal_checkpointed_frames_total 0",
+        "cairn_blob_object_write_timing_dropped_total 0",
+        "cairn_wal_checkpoints_total 2",
+        "cairn_wal_bytes 15969152",
+        "cairn_writer_queue_depth 7",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0\"} 0.016243817",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.5\"} 0.0368794786788256",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.9\"} 0.04783010552057052",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.95\"} 0.04819499916323224",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.99\"} 0.048620986753650106",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.999\"} 0.048620986753650106",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"1\"} 0.049080374",
+        "cairn_writer_stage_seconds_sum{stage=\"commit\",result=\"ok\"} 23.590129343000022",
+        "cairn_writer_stage_seconds_count{stage=\"commit\",result=\"ok\"} 1471",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0\"} 0.038156429",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.5\"} 0.03815494094959501",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.9\"} 0.03815494094959501",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.95\"} 0.03815494094959501",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.99\"} 0.03815494094959501",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"0.999\"} 0.03815494094959501",
+        "cairn_writer_stage_seconds{stage=\"checkpoint\",result=\"ok\",quantile=\"1\"} 0.053149132",
+        "cairn_writer_stage_seconds_sum{stage=\"checkpoint\",result=\"ok\"} 0.09130556100000001",
+        "cairn_writer_stage_seconds_count{stage=\"checkpoint\",result=\"ok\"} 2",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0\"} 0.000088954",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.5\"} 0.00019225267538041727",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.9\"} 0.00030181387696578456",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.95\"} 0.000312877120146218",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.99\"} 0.0003976652324584919",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.999\"} 0.0003976652324584919",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"1\"} 0.000552506",
+        "cairn_writer_stage_seconds_sum{stage=\"apply\",result=\"ok\"} 1.1697135670000012",
+        "cairn_writer_stage_seconds_count{stage=\"apply\",result=\"ok\"} 1471",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0\"} 0.0000029",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.5\"} 0.023304704765439613",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.9\"} 0.04803141441718686",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.95\"} 0.048494736384271014",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.99\"} 0.048620986753650106",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.999\"} 0.048620986753650106",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"1\"} 0.049305248",
+        "cairn_writer_stage_seconds_sum{stage=\"queue\",result=\"ok\"} 36.439121375000056",
+        "cairn_writer_stage_seconds_count{stage=\"queue\",result=\"ok\"} 2048",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0\"} 0.000016745",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.5\"} 0.000018776583156677788",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.9\"} 0.000034570838843935404",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.95\"} 0.00004155469533360953",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.99\"} 0.000050441311905231034",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.999\"} 0.000050441311905231034",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"1\"} 0.000158206",
+        "cairn_writer_stage_seconds_sum{stage=\"begin\",result=\"ok\"} 0.04584460100000001",
+        "cairn_writer_stage_seconds_count{stage=\"begin\",result=\"ok\"} 1471",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0\"} 0.000000049",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.5\"} 0.000000433012148029682",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.9\"} 0.0000009710381780482892",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.95\"} 0.0000011180772928644943",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.99\"} 0.000001246089823989269",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.999\"} 0.000001246089823989269",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"1\"} 0.000001396",
+        "cairn_writer_stage_seconds_sum{stage=\"admission\",result=\"ok\"} 0.0009258239999999987",
+        "cairn_writer_stage_seconds_count{stage=\"admission\",result=\"ok\"} 2048",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0\"} 0.000159717",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.5\"} 0.0109075505335339",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.9\"} 0.023473104150614023",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.95\"} 0.049424945380518163",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.99\"} 0.052955676128046254",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.999\"} 0.052955676128046254",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"1\"} 0.268083029",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace\",result=\"ok\"} 0.784380424",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0\"} 0.006401775",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.5\"} 0.008602520641209989",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.9\"} 0.014036418307678334",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.95\"} 0.015220683508992822",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.99\"} 0.015612240595233832",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.999\"} 0.015612240595233832",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"1\"} 0.029493541",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_input_wait\",result=\"ok\"} 0.40792286",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_input_wait\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0\"} 0.001894132",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.5\"} 0.009198636424603859",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.9\"} 0.018398244651034033",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.95\"} 0.02182061709638299",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.99\"} 0.04151501891683201",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.999\"} 0.04151501891683201",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"1\"} 0.066765543",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"directory_sync\",result=\"ok\"} 0.491413913",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"directory_sync\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0\"} 0.000028494",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.5\"} 0.008900035435465423",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.9\"} 0.017947579527570222",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.95\"} 0.04891358960589605",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.99\"} 0.052681021332621536",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"0.999\"} 0.052681021332621536",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_execution\",result=\"ok\",quantile=\"1\"} 0.267987396",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_execution\",result=\"ok\"} 0.708107079",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_execution\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0\"} 0.005846726",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.5\"} 0.012332712185012466",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.9\"} 0.024125159571530583",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.95\"} 0.026951939515257817",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.99\"} 0.027032916739176484",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.999\"} 0.027032916739176484",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"1\"} 0.039655327",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize\",result=\"ok\"} 0.5899463399999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0\"} 0.000012148",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.5\"} 0.00010433538042897987",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.9\"} 0.0014871406542510356",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.95\"} 0.002409104866665275",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.99\"} 0.002777788907882913",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"0.999\"} 0.002777788907882913",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_queue\",result=\"ok\",quantile=\"1\"} 0.003822127",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_queue\",result=\"ok\"} 0.018886468999999996",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_queue\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0\"} 0.004954137",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.5\"} 0.008917853318339325",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.9\"} 0.018350471346989645",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.95\"} 0.022159255423317786",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.99\"} 0.023374723856091",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"0.999\"} 0.023374723856091",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_sync\",result=\"ok\",quantile=\"1\"} 0.039192865",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_sync\",result=\"ok\"} 0.44468440599999987",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_sync\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0\"} 0.001596972",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.5\"} 0.005474249871932236",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.9\"} 0.025693942449813816",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.95\"} 0.02694654966633966",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.99\"} 0.02694654966633966",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"0.999\"} 0.02694654966633966",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace_parent_sync\",result=\"ok\",quantile=\"1\"} 0.261095583",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace_parent_sync\",result=\"ok\"} 0.704233136",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace_parent_sync\",result=\"ok\"} 80",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0\"} 0.000021445",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.5\"} 0.00004176298911147135",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.9\"} 0.00028197277556231496",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.95\"} 0.0004940370565274036",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.99\"} 0.0010935783959560583",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"0.999\"} 0.0010935783959560583",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_rename\",result=\"ok\",quantile=\"1\"} 0.012673288",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_rename\",result=\"ok\"} 0.017171289000000003",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_rename\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0\"} 0.00001036",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.5\"} 0.000043138269193194116",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.9\"} 0.000484351327919778",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.95\"} 0.0008288262384060863",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.99\"} 0.001621343704340901",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"0.999\"} 0.001621343704340901",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_queue\",result=\"ok\",quantile=\"1\"} 0.004061674",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_queue\",result=\"ok\"} 0.009785000000000004",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_queue\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0\"} 0.00016062",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.5\"} 0.000567709888213522",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.9\"} 0.004799228885644942",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.95\"} 0.006574872966769784",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.99\"} 0.00807889622932804",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"0.999\"} 0.00807889622932804",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_flush\",result=\"ok\",quantile=\"1\"} 0.008476224",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_flush\",result=\"ok\"} 0.06923001499999999",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_flush\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0\"} 0.000000064",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.5\"} 0.00000020299183987615076",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.9\"} 0.0000006149652636085744",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.95\"} 0.0000008440112174535784",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.99\"} 0.0000008719793874969968",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.999\"} 0.0000008719793874969968",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"1\"} 0.000003274",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"permit_wait\",result=\"ok\"} 0.000014071999999999998",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"permit_wait\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0\"} 0.016746938",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.5\"} 0.028544242788595495",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.9\"} 0.04416158367725435",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.95\"} 0.04577120875755028",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.99\"} 0.04588119158553685",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.999\"} 0.04588119158553685",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"1\"} 0.048641225",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body\",result=\"ok\"} 1.1887584170000003",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0\"} 0.000152147",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.5\"} 0.00019060639153378232",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.9\"} 0.00025407017931495987",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.95\"} 0.0003542527092819405",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.99\"} 0.0005057338423639532",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"0.999\"} 0.0005057338423639532",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize_advice\",result=\"ok\",quantile=\"1\"} 0.000729101",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize_advice\",result=\"ok\"} 0.008756856",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize_advice\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0\"} 0.000744412",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.5\"} 0.004926630354408984",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.9\"} 0.017539496145487003",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.95\"} 0.02419280467750992",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.99\"} 0.02420248373509566",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.999\"} 0.02420248373509566",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"1\"} 0.027312561",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_sink\",result=\"ok\"} 0.30569862099999995",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_sink\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0\"} 0.000102357",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.5\"} 0.0012589213107561416",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.9\"} 0.006156172623049179",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.95\"} 0.0071667713799969945",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.99\"} 0.007899940737367618",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.999\"} 0.007899940737367618",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"1\"} 0.010371081",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"staging_create\",result=\"ok\"} 0.09132331200000002",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"staging_create\",result=\"ok\"} 40",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0\"} 0.008503934",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.5\"} 0.010227245214518014",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.9\"} 0.017041563304391296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.95\"} 0.019894737726850544",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.99\"} 0.023995234821952083",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.999\"} 0.023995234821952083",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"1\"} 0.026095853",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_hash\",result=\"ok\"} 0.47436007599999996",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_hash\",result=\"ok\"} 40",
+        "cairn_writer_commit_seconds{quantile=\"0\"} 0.016243562",
+        "cairn_writer_commit_seconds{quantile=\"0.5\"} 0.037444328741901255",
+        "cairn_writer_commit_seconds{quantile=\"0.9\"} 0.04837848856973766",
+        "cairn_writer_commit_seconds{quantile=\"0.95\"} 0.048446265887013",
+        "cairn_writer_commit_seconds{quantile=\"0.99\"} 0.048446265887013",
+        "cairn_writer_commit_seconds{quantile=\"0.999\"} 0.048446265887013",
+        "cairn_writer_commit_seconds{quantile=\"1\"} 0.049080113",
+        "cairn_writer_commit_seconds_sum 23.66104166900001",
+        "cairn_writer_commit_seconds_count 1490",
+        "cairn_writer_batch_size{quantile=\"0\"} 2",
+        "cairn_writer_batch_size{quantile=\"0.5\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"0.9\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.95\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.99\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.999\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"1\"} 5",
+        "cairn_writer_batch_size_sum 8567",
+        "cairn_writer_batch_size_count 1490"
+      ],
+      "status": "PASS"
+    }
+  ],
+  "elapsed_seconds": 143.44035835300747
+}

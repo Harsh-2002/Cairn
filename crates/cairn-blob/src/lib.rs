@@ -9,7 +9,7 @@
 
 mod commit;
 mod timing;
-pub use timing::{MultipartStage, MultipartTiming};
+pub use timing::{MultipartStage, MultipartTiming, ObjectWriteStage, ObjectWriteTiming};
 // Public only so the fuzz target (an external crate under `fuzz/`) can drive `CompressedReader`
 // against arbitrary bytes; `#[doc(hidden)]` keeps it out of the published API surface. Not part of
 // the supported interface — internal callers still go through the re-exports below. The reader /
@@ -193,6 +193,7 @@ pub struct LocalBlobStore {
     /// [`open_raw`]: cairn_types::traits::BlobStore::open_raw
     plaintext_length_mismatch: Arc<std::sync::atomic::AtomicU64>,
     multipart_timings: Arc<timing::MultipartTimings>,
+    object_write_timings: Arc<timing::ObjectWriteTimings>,
 }
 
 /// Default upper bound (bytes) for the small-object GET fast path — see [`LocalBlobStore`]'s
@@ -238,6 +239,7 @@ impl LocalBlobStore {
             small_read_max: SMALL_READ_MAX,
             plaintext_length_mismatch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             multipart_timings: Arc::default(),
+            object_write_timings: Arc::default(),
         })
     }
 
@@ -246,6 +248,19 @@ impl LocalBlobStore {
     #[must_use]
     pub fn drain_multipart_timings(&self) -> Vec<MultipartTiming> {
         self.multipart_timings.drain()
+    }
+
+    /// Drain sampled ordinary-object blob-stage durations for the server metrics tick.
+    /// One in 32 writes is sampled; interrupted stages remain visible.
+    #[must_use]
+    pub fn drain_object_write_timings(&self) -> Vec<ObjectWriteTiming> {
+        self.object_write_timings.drain()
+    }
+
+    /// Number of sampled object-write stages evicted before the metrics tick collected them.
+    #[must_use]
+    pub fn object_write_timings_dropped_total(&self) -> u64 {
+        self.object_write_timings.dropped_total()
     }
 
     /// Cumulative samples evicted when metrics collection falls behind.
@@ -409,6 +424,7 @@ async fn write_staged(
     mut body: cairn_types::BodyStream,
     opts: &StageOptions,
     paths: &AdmittedPaths,
+    mut raw_body_breakdown: Option<&mut timing::RawBodyBreakdown<'_>>,
 ) -> Result<
     (
         u64,
@@ -463,7 +479,15 @@ async fn write_staged(
         };
         Ok((logical, physical, md5, checks, descriptor, internal_sha256))
     } else {
-        while let Some(chunk) = body.next().await {
+        loop {
+            if let Some(detail) = raw_body_breakdown.as_mut() {
+                detail.begin(timing::RawBodyPhase::InputWait);
+            }
+            let next = body.next().await;
+            if let Some(detail) = raw_body_breakdown.as_mut() {
+                detail.end(!matches!(&next, Some(Err(_))));
+            }
+            let Some(chunk) = next else { break };
             let chunk = chunk?;
             logical = logical
                 .checked_add(chunk.len() as u64)
@@ -471,11 +495,28 @@ async fn write_staged(
             if logical > opts.size_ceiling {
                 return Err(BlobError::SizeExceeded);
             }
+            if let Some(detail) = raw_body_breakdown.as_mut() {
+                detail.begin(timing::RawBodyPhase::Hash);
+            }
             hashers.update(&chunk);
-            file.write_all(&chunk).await?;
+            if let Some(detail) = raw_body_breakdown.as_mut() {
+                detail.end(true);
+                detail.begin(timing::RawBodyPhase::Sink);
+            }
+            let written = file.write_all(&chunk).await;
+            if let Some(detail) = raw_body_breakdown.as_mut() {
+                detail.end(written.is_ok());
+            }
+            written?;
             physical += chunk.len() as u64;
         }
+        if let Some(detail) = raw_body_breakdown.as_mut() {
+            detail.begin(timing::RawBodyPhase::Hash);
+        }
         let (md5, checks, internal_sha256) = hashers.finalize();
+        if let Some(detail) = raw_body_breakdown.as_mut() {
+            detail.end(true);
+        }
         Ok((
             logical,
             physical,
@@ -994,20 +1035,41 @@ impl BlobStore for LocalBlobStore {
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
         validate_stage_len(&opts, opts.content_length)?;
+        let sampled = self.object_write_timings.sample();
         // Bound concurrent blob *copy* I/O (ARCH 7.4). Held through the data copy and the per-file
         // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
         // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
         // that concurrent GETs need — reads stop queueing behind writers' fsync barriers. The
         // barrier itself is bounded by the coalescer (one fsync per directory per batch), not by
         // this semaphore, and a waiter only parks on a oneshot, holding no blocking thread.
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::PermitWait)
+        });
         let copy_permit = self.acquire_io().await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         if !matches!(permit.plan().target, StorageWriteTarget::Object { .. }) {
             return Err(BlobError::Io(
                 "storage target is not an object write".into(),
             ));
         }
-        let paths = AdmittedPaths::open(&self.data_root, permit).await?;
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Namespace));
+        let paths = AdmittedPaths::open_sampled(
+            &self.data_root,
+            permit,
+            sampled.then(|| self.object_write_timings.clone()),
+        )
+        .await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         let storage_path = paths.storage_path.clone();
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::StagingCreate)
+        });
         let mut sink = Staging::create(
             paths.staging.clone(),
             self.use_uring,
@@ -1015,7 +1077,20 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        let outcome = write_staged(&mut sink, body, &opts, &paths).await;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
+        let mut raw_body_breakdown = (sampled && encoding_policies(&opts).1.is_none())
+            .then(|| self.object_write_timings.raw_body_breakdown());
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Body));
+        let outcome =
+            write_staged(&mut sink, body, &opts, &paths, raw_body_breakdown.as_mut()).await;
+        if let Some(timer) = timer {
+            if outcome.is_ok() {
+                timer.complete();
+            }
+        }
+        drop(raw_body_breakdown);
         let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
             Ok(v) => v,
             Err(e) => {
@@ -1023,11 +1098,26 @@ impl BlobStore for LocalBlobStore {
                 return Err(e);
             }
         };
-        sink.commit(&paths.final_file).await?;
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Finalize));
+        sink.commit_sampled(
+            &paths.final_file,
+            sampled.then(|| self.object_write_timings.clone()),
+        )
+        .await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         drop(copy_permit);
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::DirectorySync)
+        });
         self.dir_sync
             .sync_file(paths.final_file.parent.clone(), &paths.lease)
             .await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         // The crash window the durability ordering protects: the blob is now durable but no
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
         fail::fail_point!("blob_after_durable");
@@ -1186,7 +1276,7 @@ impl BlobStore for LocalBlobStore {
         )
         .await?;
         let (logical, _phys, md5, checks, _desc, _internal_sha256) =
-            match write_staged(&mut sink, body, &opts, &paths).await {
+            match write_staged(&mut sink, body, &opts, &paths, None).await {
                 Ok(v) => v,
                 Err(e) => {
                     sink.abort().await;
@@ -1472,14 +1562,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
-            .unwrap();
+            .unwrap()
+            .with_io_uring(false);
+        let timings = store.clone();
         let bucket = BucketName::parse("bkt").unwrap();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
-        let first = futures_util::stream::once(async move {
-            let _ = polled_tx.send(());
+        let first = futures_util::stream::once(async {
             Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"started"))
         });
-        let body: cairn_types::BodyStream = Box::pin(first.chain(futures_util::stream::pending()));
+        let mut polled_tx = Some(polled_tx);
+        let pending = futures_util::stream::poll_fn(move |_| {
+            if let Some(tx) = polled_tx.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending
+        });
+        let body: cairn_types::BodyStream = Box::pin(first.chain(pending));
 
         let task = tokio::spawn(async move {
             store
@@ -1496,6 +1594,15 @@ mod tests {
         polled_rx.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        let samples = timings.drain_object_write_timings();
+        assert!(
+            samples
+                .iter()
+                .any(|sample| { sample.stage == ObjectWriteStage::Body && !sample.completed })
+        );
+        assert!(samples.iter().any(|sample| {
+            sample.stage == ObjectWriteStage::BodyInputWait && !sample.completed
+        }));
 
         let files = std::fs::read_dir(dir.path().join(STAGING))
             .unwrap()
@@ -1668,19 +1775,102 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
-            .unwrap();
+            .unwrap()
+            .with_io_uring(false);
         let bucket = BucketName::parse("bkt").unwrap();
         for _ in 0..2 {
             store
                 .stage_fixture(
                     &bucket,
-                    Box::pin(futures_util::stream::empty()),
+                    Box::pin(futures_util::stream::once(async {
+                        Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"payload"))
+                    })),
                     StageOptions::default(),
                 )
                 .await
                 .unwrap();
             assert!(dir.path().join("bkt").is_dir());
         }
+        let samples = store.drain_object_write_timings();
+        assert_eq!(samples.len(), 17);
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
+                .count(),
+            2
+        );
+        assert!(samples.iter().any(|sample| {
+            sample.stage == ObjectWriteStage::NamespaceQueue && sample.completed
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.stage == ObjectWriteStage::NamespaceExecution && sample.completed
+        }));
+        for stage in [
+            ObjectWriteStage::FinalizeFlush,
+            ObjectWriteStage::FinalizeQueue,
+            ObjectWriteStage::FinalizeSync,
+            ObjectWriteStage::FinalizeRename,
+        ] {
+            assert!(
+                samples
+                    .iter()
+                    .any(|sample| sample.stage == stage && sample.completed)
+            );
+        }
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.stage == ObjectWriteStage::BodyInputWait)
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.stage == ObjectWriteStage::BodyHash)
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.stage == ObjectWriteStage::BodySink)
+        );
+        assert!(samples.iter().all(|sample| sample.completed));
+    }
+
+    #[tokio::test]
+    async fn encoded_object_write_keeps_aggregate_body_timing_without_raw_substages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+            .await
+            .unwrap()
+            .with_io_uring(false);
+        store
+            .stage_fixture(
+                &BucketName::parse("bkt").unwrap(),
+                Box::pin(futures_util::stream::once(async {
+                    Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"payload"))
+                })),
+                StageOptions {
+                    compression: Some(CompressionPolicy::default()),
+                    ..StageOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let samples = store.drain_object_write_timings();
+        assert_eq!(samples.len(), 14);
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
+                .count(),
+            2
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.stage == ObjectWriteStage::Body)
+        );
+        assert!(samples.iter().all(|sample| sample.completed));
     }
 
     #[cfg(unix)]

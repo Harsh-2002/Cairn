@@ -13,6 +13,10 @@ Clock/Crypto>`) — never a concrete engine.
   (explicit header > bucket default > transparent `AtRest` > plaintext) mints the object DEK across
   `SseMode {SseS3, AtRest, Kms}`; `open_sse_cipher`/`seal_part_cipher`/`open_part_cipher` carry the
   persisted CRNB version declaration together with each read key.
+- `put_timing.rs` — bounded one-in-32 ordinary PUT handler-stage wall samples;
+  each selected request covers admission, blob, publication and post-commit waits
+  with fixed labels and interrupted-stage reporting. The server's existing metrics
+  task drains these samples; this is diagnostic timing, not a change to durability.
 - `keyprovider.rs` — the SSE-KMS `KeyProvider` trait + `LocalRingProvider` (v1). Maps a KMS key id
   to DEK-sealing crypto and gates writes via the `CAIRN_KMS_KEY_IDS` allow-list. **Label-only**: every
   DEK is sealed under the same node master ring regardless of key id — the id is a label, not
