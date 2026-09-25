@@ -164,9 +164,10 @@ def check_node():
 
 def check_headless():
     with node(headless=True) as (api, console, env):
-        for old, new in [("CAIRN_LISTEN_ADDR", "CAIRN_API_ADDR"), ("CAIRN_WEB_ADDR", "CAIRN_CONSOLE_ADDR"), ("CAIRN_PUBLIC_BASE_URL", "CAIRN_API_PUBLIC_URL")]:
+        for old in ["CAIRN_LISTEN_ADDR", "CAIRN_WEB_ADDR", "CAIRN_PUBLIC_BASE_URL"]:
             result = subprocess.run([BIN, "validate-config"], env={**env, old: "do-not-print-this"}, capture_output=True)
-            assert result.returncode != 0 and new.encode() in result.stderr
+            assert result.returncode != 0
+            assert result.stderr == b"configuration error: invalid CAIRN_* environment configuration\n"
             assert b"do-not-print-this" not in result.stderr
         sdk = boto3.client("s3", endpoint_url=api, region_name="us-east-1",
                            aws_access_key_id=env["CAIRN_ROOT_ACCESS_KEY"],

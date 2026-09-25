@@ -1458,16 +1458,10 @@ async fn checkpoint_loop(
             total
         }
     };
-    // Poll on a cadence fine enough to react to the size threshold between interval ticks, but
-    // never longer than the interval itself. When the size trigger is disabled (threshold 0) the
-    // poll cadence is just the interval, preserving the original interval-only behaviour.
-    let poll = if size_threshold_bytes > 0 {
-        interval
-            .min(Duration::from_secs(10))
-            .max(Duration::from_secs(1))
-    } else {
-        interval
-    };
+    // A ten-second size probe allowed a busy single-node WAL to overshoot the 64-MiB trigger by
+    // hundreds of MiB between observations. Keep the size trigger responsive without adding a
+    // new worker: one off-writer sidecar stat per shard per second, capped by the interval.
+    let poll = checkpoint_poll_interval(interval, size_threshold_bytes);
     let mut elapsed = Duration::ZERO;
     while wait_for_interval_or_shutdown(poll, &mut shutdown).await {
         elapsed += poll;
@@ -1515,6 +1509,14 @@ async fn checkpoint_loop(
         }
         // Refresh the gauge post-checkpoint so a truncating checkpoint's effect is visible.
         metrics::gauge!("cairn_wal_bytes").set(total_wal_bytes(&stores).await as f64);
+    }
+}
+
+fn checkpoint_poll_interval(interval: Duration, size_threshold_bytes: u64) -> Duration {
+    if size_threshold_bytes > 0 {
+        interval.min(Duration::from_secs(1))
+    } else {
+        interval
     }
 }
 
@@ -2406,6 +2408,20 @@ async fn webhook_loop(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn wal_size_trigger_probes_each_second_without_changing_interval_only_mode() {
+        let interval = Duration::from_secs(300);
+        assert_eq!(
+            checkpoint_poll_interval(interval, 64 * 1024 * 1024),
+            Duration::from_secs(1)
+        );
+        assert_eq!(checkpoint_poll_interval(interval, 0), interval);
+        assert_eq!(
+            checkpoint_poll_interval(Duration::from_millis(250), 1),
+            Duration::from_millis(250)
+        );
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
