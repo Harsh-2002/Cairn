@@ -1588,6 +1588,31 @@ async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>)
         }
         metrics::counter!("cairn_blob_multipart_timing_dropped_total")
             .absolute(stack.blob_local.multipart_timings_dropped_total());
+        // Sampled ordinary-object writes expose blob stage waits without putting a
+        // clock or ring lock on every request. An interrupted await still records its stage.
+        for sample in stack.blob_local.drain_object_write_timings() {
+            metrics::histogram!(
+                "cairn_blob_object_write_stage_seconds",
+                "stage" => sample.stage.as_str(),
+                "result" => if sample.completed { "ok" } else { "interrupted" }
+            )
+            .record(sample.elapsed.as_secs_f64());
+        }
+        metrics::counter!("cairn_blob_object_write_timing_dropped_total")
+            .absolute(stack.blob_local.object_write_timings_dropped_total());
+        // Sampled ordinary PUT response-path waits share a selection decision within
+        // each request; unlike separate blob/Writer samples, their stage totals can
+        // be reconciled against the same sampled PUT handler population.
+        for sample in stack.s3.drain_put_timings() {
+            metrics::histogram!(
+                "cairn_put_stage_seconds",
+                "stage" => sample.stage.as_str(),
+                "result" => if sample.completed { "ok" } else { "interrupted" }
+            )
+            .record(sample.elapsed.as_secs_f64());
+        }
+        metrics::counter!("cairn_put_timing_dropped_total")
+            .absolute(stack.s3.put_timings_dropped_total());
         // Refused reads with inconsistent trusted plaintext lengths.
         metrics::counter!("cairn_blob_plaintext_length_mismatch_total")
             .absolute(stack.blob_local.plaintext_length_mismatch_total());

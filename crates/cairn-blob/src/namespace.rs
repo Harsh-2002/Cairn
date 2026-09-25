@@ -2,6 +2,7 @@
 //! selected by a key, and no asynchronous namespace operation can outlive its storage lease.
 
 use crate::io_err;
+use crate::timing::{ObjectWriteStage, ObjectWriteTimings};
 use cairn_types::storage::{StorageCreationPermit, StoragePathRole, io::StorageIoLease};
 use cairn_types::{BlobError, StoragePath};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, mkdirat, open, unlinkat};
@@ -9,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Open below an already trusted directory without crossing even a same-device bind mount.
 /// Device/inode comparisons alone cannot establish this boundary. Unsupported kernels or
@@ -74,15 +76,23 @@ pub(crate) fn initialize(root: &Path) -> std::io::Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    let staging = ensure_directory(&directory, ".staging")?;
-    ensure_directory(&staging, "multipart")?;
+    let staging = ensure_directory(&directory, ".staging", None)?;
+    ensure_directory(&staging, "multipart", None)?;
     Ok(())
 }
 
-fn ensure_directory(parent: &File, name: &str) -> std::io::Result<File> {
+fn ensure_directory(
+    parent: &File,
+    name: &str,
+    timing: Option<&ObjectWriteTimings>,
+) -> std::io::Result<File> {
     let directory = open_directory(parent, name, true)?;
     // EXIST can race a creator whose parent barrier has not completed yet.
+    let timer = timing.map(|timing| timing.start(ObjectWriteStage::NamespaceParentSync));
     parent.sync_all()?;
+    if let Some(timer) = timer {
+        timer.complete();
+    }
     Ok(directory)
 }
 
@@ -219,6 +229,14 @@ impl AdmittedPaths {
         root: &Path,
         permit: StorageCreationPermit,
     ) -> Result<Self, BlobError> {
+        Self::open_sampled(root, permit, None).await
+    }
+
+    pub(crate) async fn open_sampled(
+        root: &Path,
+        permit: StorageCreationPermit,
+        timing: Option<Arc<ObjectWriteTimings>>,
+    ) -> Result<Self, BlobError> {
         permit
             .plan()
             .validate()
@@ -226,7 +244,14 @@ impl AdmittedPaths {
         let (plan, lease) = permit.into_parts();
         let operation = lease.try_child()?;
         let root = root.to_owned();
+        let queued_at = timing.as_ref().map(|_| Instant::now());
         tokio::task::spawn_blocking(move || {
+            if let (Some(timing), Some(queued_at)) = (&timing, queued_at) {
+                timing.record_elapsed(ObjectWriteStage::NamespaceQueue, queued_at.elapsed(), true);
+            }
+            let execution_timer = timing
+                .as_ref()
+                .map(|timing| timing.start(ObjectWriteStage::NamespaceExecution));
             let _operation = operation;
             let root: File = open(
                 &root,
@@ -240,7 +265,8 @@ impl AdmittedPaths {
             let mut final_file = None;
             let mut spool = None;
             for intent in &plan.paths {
-                let path = prepare_path(&mut directories, intent.path.as_str()).map_err(io_err)?;
+                let path = prepare_path(&mut directories, intent.path.as_str(), timing.as_deref())
+                    .map_err(io_err)?;
                 match intent.role {
                     StoragePathRole::Temporary => staging = Some(path),
                     StoragePathRole::Final => final_file = Some(path),
@@ -249,7 +275,7 @@ impl AdmittedPaths {
             }
             let final_file =
                 final_file.ok_or_else(|| BlobError::Io("missing admitted final path".into()))?;
-            Ok(Self {
+            let paths = Self {
                 staging: staging.unwrap_or_else(|| final_file.clone()),
                 final_file,
                 spool: spool.ok_or_else(|| BlobError::Io("missing admitted spool path".into()))?,
@@ -258,7 +284,11 @@ impl AdmittedPaths {
                     .map_err(|error| BlobError::Io(error.to_string()))?
                     .clone(),
                 lease,
-            })
+            };
+            if let Some(timer) = execution_timer {
+                timer.complete();
+            }
+            Ok(paths)
         })
         .await
         .map_err(|error| BlobError::Io(error.to_string()))?
@@ -268,6 +298,7 @@ impl AdmittedPaths {
 fn prepare_path(
     directories: &mut HashMap<String, Arc<File>>,
     relative: &str,
+    timing: Option<&ObjectWriteTimings>,
 ) -> std::io::Result<AnchoredPath> {
     let mut components = relative.split('/').peekable();
     let mut prefix = String::new();
@@ -289,7 +320,7 @@ fn prepare_path(
         }
         // Existing does not imply durable: another creator may have failed its parent sync.
         // Complete this barrier in the same non-cancellable closure before dependent creation.
-        let child = ensure_directory(&parent, name)?;
+        let child = ensure_directory(&parent, name, timing)?;
         parent = Arc::new(child);
         directories.insert(prefix.clone(), parent.clone());
     }
@@ -477,6 +508,106 @@ mod tests {
     };
     use cairn_types::{BucketName, ObjectKey, Timestamp, VersionId, traits::BlobStore};
 
+    #[test]
+    fn sampled_namespace_records_each_required_parent_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let timings = ObjectWriteTimings::default();
+        for _ in 0..2 {
+            let root_file = Arc::new(crate::open_readonly_nofollow(root.path()).unwrap());
+            let mut directories = HashMap::from([(String::new(), root_file)]);
+            prepare_path(&mut directories, "bucket/new-file", Some(&timings)).unwrap();
+        }
+        let samples = timings.drain();
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|sample| {
+            sample.stage == ObjectWriteStage::NamespaceParentSync && sample.completed
+        }));
+        assert!(root.path().join("bucket").is_dir());
+    }
+
+    #[tokio::test]
+    async fn admitted_object_keeps_both_root_barriers() {
+        let root = tempfile::tempdir().unwrap();
+        let timing = Arc::new(ObjectWriteTimings::default());
+        for _ in 0..2 {
+            let (_, mut watch, permit) = admitted();
+            let paths = AdmittedPaths::open_sampled(root.path(), permit, Some(timing.clone()))
+                .await
+                .unwrap();
+            assert!(root.path().join(".staging").is_dir());
+            assert!(root.path().join("bucket").is_dir());
+            drop(paths);
+            watch.quiescent().await;
+        }
+        let samples = timing.drain();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
+                .count(),
+            4,
+            "each ordinary plan must complete both root barriers, including EEXIST"
+        );
+        assert!(samples.iter().all(|sample| sample.completed));
+    }
+
+    #[tokio::test]
+    async fn concurrent_admitted_objects_each_complete_both_root_barriers() {
+        let root = tempfile::tempdir().unwrap();
+        let timing = Arc::new(ObjectWriteTimings::default());
+        let root_path = root.path().to_owned();
+        let opens = (0..16).map(|_| {
+            let (_, mut watch, permit) = admitted();
+            let timing = timing.clone();
+            let root_path = root_path.clone();
+            async move {
+                let paths = AdmittedPaths::open_sampled(&root_path, permit, Some(timing))
+                    .await
+                    .unwrap();
+                assert!(paths.final_file.parent.metadata().unwrap().is_dir());
+                drop(paths);
+                watch.quiescent().await;
+            }
+        });
+        futures_util::future::join_all(opens).await;
+        let samples = timing.drain();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
+                .count(),
+            32
+        );
+        assert!(samples.iter().all(|sample| sample.completed));
+    }
+
+    #[tokio::test]
+    async fn admitted_part_keeps_parent_before_child_barriers() {
+        let root = tempfile::tempdir().unwrap();
+        let timing = Arc::new(ObjectWriteTimings::default());
+        let (_, mut watch, permit) = admitted_target(StorageWriteTarget::Part {
+            upload_id: cairn_types::UploadId::generate(),
+            part_number: 1,
+            reservation_id: StorageToken::generate().as_str().to_owned(),
+        });
+        let paths = AdmittedPaths::open_sampled(root.path(), permit, Some(timing.clone()))
+            .await
+            .unwrap();
+        assert!(paths.final_file.parent.metadata().unwrap().is_dir());
+        drop(paths);
+        watch.quiescent().await;
+        let samples = timing.drain();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
+                .count(),
+            3,
+            "root, .staging and multipart require barriers before descendants"
+        );
+        assert!(samples.iter().all(|sample| sample.completed));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn anchored_open_rejects_symlinks_and_parent_escape() {
@@ -625,7 +756,7 @@ mod tests {
             );
             let mut directories = HashMap::from([(String::new(), directory.clone())]);
             assert_eq!(
-                prepare_path(&mut directories, "bucket/new-file")
+                prepare_path(&mut directories, "bucket/new-file", None)
                     .unwrap_err()
                     .raw_os_error(),
                 Some(rustix::io::Errno::XDEV.raw_os_error())

@@ -1,0 +1,2800 @@
+{
+  "schema": 2,
+  "cases": [
+    [
+      "get_1m",
+      "get",
+      "1MiB",
+      16,
+      [
+        "--objects",
+        "64"
+      ]
+    ]
+  ],
+  "pairs": 2,
+  "duration": 12,
+  "metrics_drain_seconds": 17,
+  "diagnostic_sync_probe": false,
+  "engine_selection": "both",
+  "strict_settings": {
+    "cairn": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+    },
+    "rustfs": {
+      "RUSTFS_DURABILITY_MODE": "strict",
+      "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+      "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+    }
+  },
+  "max_seconds": 450,
+  "max_bytes": 10000000000,
+  "binary_sha256": {
+    "cairn": "f6220d3c9294da51e4e06759bbd4e3cf196f18e0556064adaba7bb3a521c9df6",
+    "rustfs": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd",
+    "warp": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+  },
+  "arms": [
+    {
+      "case": "get_1m",
+      "engine": "cairn",
+      "order": 1,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/warp-image",
+        "get",
+        "--host",
+        "127.0.0.1:18001",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/01-cairn-get_1m-_t1cr9ou/warp.csv.zst",
+        "--objects",
+        "64",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 17.13743120500294,
+      "host_io_pressure_delta_us": {
+        "some": 953696,
+        "full": 331990
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 7087638,
+        "read_sectors": 668268295,
+        "read_ms": 3414495,
+        "writes": 11397572,
+        "write_sectors": 1103420584,
+        "write_ms": 23824797,
+        "io_ms": 7755208,
+        "weighted_io_ms": 27301253,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 7088438,
+        "read_sectors": 668403863,
+        "read_ms": 3415501,
+        "writes": 11415275,
+        "write_sectors": 1103924952,
+        "write_ms": 23861627,
+        "io_ms": 7758664,
+        "weighted_io_ms": 27339090,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 800,
+        "read_sectors": 135568,
+        "read_ms": 1006,
+        "writes": 17703,
+        "write_sectors": 504368,
+        "write_ms": 36830,
+        "io_ms": 3456,
+        "weighted_io_ms": 37837
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0344096930057276,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.28,
+              "rss_bytes": 33689600
+            },
+            "client": {
+              "cpu_seconds": 0.53,
+              "rss_bytes": 85315584
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 4.890000000000001,
+            "top": [
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 3.14
+              },
+              {
+                "pid": 52,
+                "name": "kcompactd0",
+                "cpu_seconds": 0.91
+              },
+              {
+                "pid": 814590,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.3
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532452589,
+            "full": 1515369065
+          },
+          "host_volume_diskstats": {
+            "reads": 7087673,
+            "read_sectors": 668269159,
+            "read_ms": 3414644,
+            "writes": 11401727,
+            "write_sectors": 1103683736,
+            "write_ms": 23838677,
+            "io_ms": 7757080,
+            "weighted_io_ms": 27315282,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.051908747002017,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.3,
+              "rss_bytes": 33701888
+            },
+            "client": {
+              "cpu_seconds": 0.53,
+              "rss_bytes": 85381120
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 5.19,
+            "top": [
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 4.0
+              },
+              {
+                "pid": 814590,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.69
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.07
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532626663,
+            "full": 1515476438
+          },
+          "host_volume_diskstats": {
+            "reads": 7087782,
+            "read_sectors": 668270679,
+            "read_ms": 3414917,
+            "writes": 11406524,
+            "write_sectors": 1103729400,
+            "write_ms": 23845715,
+            "io_ms": 7757872,
+            "weighted_io_ms": 27322593,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.082323234004434,
+          "processes": {
+            "server": {
+              "cpu_seconds": 3.12,
+              "rss_bytes": 50376704
+            },
+            "client": {
+              "cpu_seconds": 1.67,
+              "rss_bytes": 82886656
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 3.12,
+            "top": [
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 2.25
+              },
+              {
+                "pid": 814590,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.24
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 52,
+                "name": "kcompactd0",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532792392,
+            "full": 1515536567
+          },
+          "host_volume_diskstats": {
+            "reads": 7088422,
+            "read_sectors": 668403495,
+            "read_ms": 3415483,
+            "writes": 11415075,
+            "write_sectors": 1103891808,
+            "write_ms": 23861273,
+            "io_ms": 7758564,
+            "weighted_io_ms": 27338718,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.115847713997937,
+          "processes": {
+            "server": {
+              "cpu_seconds": 7.41,
+              "rss_bytes": 52596736
+            },
+            "client": {
+              "cpu_seconds": 4.3,
+              "rss_bytes": 94904320
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.53,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532794133,
+            "full": 1515536808
+          },
+          "host_volume_diskstats": {
+            "reads": 7088430,
+            "read_sectors": 668403559,
+            "read_ms": 3415490,
+            "writes": 11415079,
+            "write_sectors": 1103891864,
+            "write_ms": 23861283,
+            "io_ms": 7758576,
+            "weighted_io_ms": 27338734,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.151078063005116,
+          "processes": {
+            "server": {
+              "cpu_seconds": 11.53,
+              "rss_bytes": 50982912
+            },
+            "client": {
+              "cpu_seconds": 6.82,
+              "rss_bytes": 104333312
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.72,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 193,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532794253,
+            "full": 1515536808
+          },
+          "host_volume_diskstats": {
+            "reads": 7088431,
+            "read_sectors": 668403567,
+            "read_ms": 3415490,
+            "writes": 11415081,
+            "write_sectors": 1103891880,
+            "write_ms": 23861284,
+            "io_ms": 7758576,
+            "weighted_io_ms": 27338736,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.18168494400743,
+          "processes": {
+            "server": {
+              "cpu_seconds": 15.8,
+              "rss_bytes": 48779264
+            },
+            "client": {
+              "cpu_seconds": 9.43,
+              "rss_bytes": 119320576
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.52,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 4
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532805897,
+            "full": 1515538230
+          },
+          "host_volume_diskstats": {
+            "reads": 7088438,
+            "read_sectors": 668403863,
+            "read_ms": 3415501,
+            "writes": 11415174,
+            "write_sectors": 1103923112,
+            "write_ms": 23861525,
+            "io_ms": 7758628,
+            "weighted_io_ms": 27338987,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.225205124006607,
+          "processes": {
+            "server": {
+              "cpu_seconds": 20.03,
+              "rss_bytes": 47902720
+            },
+            "client": {
+              "cpu_seconds": 12.06,
+              "rss_bytes": 124624896
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.48000000000000004,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532805962,
+            "full": 1515538230
+          },
+          "host_volume_diskstats": {
+            "reads": 7088438,
+            "read_sectors": 668403863,
+            "read_ms": 3415501,
+            "writes": 11415175,
+            "write_sectors": 1103923120,
+            "write_ms": 23861529,
+            "io_ms": 7758632,
+            "weighted_io_ms": 27338991,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.253262516998802,
+          "processes": {
+            "server": {
+              "cpu_seconds": 24.25,
+              "rss_bytes": 48054272
+            },
+            "client": {
+              "cpu_seconds": 14.82,
+              "rss_bytes": 125849600
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.55,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 190,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2532806894,
+            "full": 1515538562
+          },
+          "host_volume_diskstats": {
+            "reads": 7088438,
+            "read_sectors": 668403863,
+            "read_ms": 3415501,
+            "writes": 11415180,
+            "write_sectors": 1103923360,
+            "write_ms": 23861534,
+            "io_ms": 7758636,
+            "weighted_io_ms": 27338996,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.2,
+        "top": [
+          {
+            "pid": 97058,
+            "name": "chrome",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.04
+          },
+          {
+            "pid": 814434,
+            "name": "libkrun VM",
+            "cpu_seconds": 0.04
+          },
+          {
+            "pid": 2217,
+            "name": "codex",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 190,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 16.200000000000003,
+      "unrelated_process_cpu_valid_intervals": 9,
+      "server_cpu_seconds": 25.990000000000002,
+      "client_cpu_seconds": 14.81,
+      "server_peak_rss": 53506048,
+      "client_peak_rss": 150736896,
+      "peak_bytes": 437972992,
+      "peak_inodes": 80,
+      "server_last_cpu": 24.25,
+      "client_last_cpu": 14.82,
+      "summary": "* Average: 2047.87 MiB/s, 2047.87 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 2047.87,
+      "mib_per_second": 2047.87,
+      "reports": {
+        "GET": {
+          "summary": "* Average: 2047.87 MiB/s, 2047.87 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 7.8,
+            "p50": 7.0,
+            "p90": 13.0,
+            "p99": 21.7
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: GET. Concurrency: 16. Ran: 9s\n * Average: 2047.87 MiB/s, 2047.87 obj/s\n * Reqs: Avg: 7.8ms, 50%: 7.0ms, 90%: 13.0ms, 99%: 21.7ms, Fastest: 1.0ms, Slowest: 59.1ms, StdDev: 4.2ms\n * TTFB: Avg: 5ms, Best: 1ms, 25th: 3ms, Median: 5ms, 75th: 7ms, 90th: 9ms, 99th: 17ms, Worst: 59ms StdDev: 3ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 2160.4MiB/s, 2160.44 obj/s\n * 50% Median: 2076.1MiB/s, 2076.10 obj/s\n * Slowest: 1940.5MiB/s, 1940.50 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "metrics_after_drain": [
+        "cairn_blob_object_write_timing_dropped_total 0",
+        "cairn_writer_queue_depth 0",
+        "cairn_wal_bytes 5310712",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0\"} 0.000005491",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.5\"} 0.00297800988796507",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.9\"} 0.013383937040722806",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.95\"} 0.02437737045525389",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.99\"} 0.03652712966364354",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.999\"} 0.03652712966364354",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"1\"} 0.037367016",
+        "cairn_writer_stage_seconds_sum{stage=\"commit\",result=\"ok\"} 2.3864346500000004",
+        "cairn_writer_stage_seconds_count{stage=\"commit\",result=\"ok\"} 124",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0\"} 0.000009936",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.5\"} 0.0015559017054089578",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.9\"} 0.003584629979556254",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.95\"} 0.004648084764155943",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.99\"} 0.005079715501466512",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.999\"} 0.005079715501466512",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"1\"} 0.005419474",
+        "cairn_writer_stage_seconds_sum{stage=\"queue\",result=\"ok\"} 7.993639166999999",
+        "cairn_writer_stage_seconds_count{stage=\"queue\",result=\"ok\"} 496",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0\"} 0.000000048",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.5\"} 0.00000041098872578121826",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.9\"} 0.0000008740746513448652",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.95\"} 0.0000009729821977825942",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.99\"} 0.000001054019032216915",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.999\"} 0.000001054019032216915",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"1\"} 0.000001077",
+        "cairn_writer_stage_seconds_sum{stage=\"admission\",result=\"ok\"} 0.00016554299999999993",
+        "cairn_writer_stage_seconds_count{stage=\"admission\",result=\"ok\"} 496",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0\"} 0.000021341",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.5\"} 0.00009189168274813618",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.9\"} 0.00026789912905781315",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.95\"} 0.0007082594835862228",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.99\"} 0.0017911453094030098",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.999\"} 0.0017911453094030098",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"1\"} 0.002091628",
+        "cairn_writer_stage_seconds_sum{stage=\"apply\",result=\"ok\"} 0.07630927099999998",
+        "cairn_writer_stage_seconds_count{stage=\"apply\",result=\"ok\"} 124",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0\"} 0.00001039",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.5\"} 0.00001917122614665519",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.9\"} 0.000026725295605617044",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.95\"} 0.00002870325463069927",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.99\"} 0.000056351593592953426",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.999\"} 0.000056351593592953426",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"1\"} 0.00007045",
+        "cairn_writer_stage_seconds_sum{stage=\"begin\",result=\"ok\"} 0.002966859",
+        "cairn_writer_stage_seconds_count{stage=\"begin\",result=\"ok\"} 124",
+        "cairn_writer_commit_seconds{quantile=\"0\"} 0.000005445",
+        "cairn_writer_commit_seconds{quantile=\"0.5\"} 0.0029774143455417196",
+        "cairn_writer_commit_seconds{quantile=\"0.9\"} 0.013383937040722806",
+        "cairn_writer_commit_seconds{quantile=\"0.95\"} 0.02437737045525389",
+        "cairn_writer_commit_seconds{quantile=\"0.99\"} 0.03652712966364354",
+        "cairn_writer_commit_seconds{quantile=\"0.999\"} 0.03652712966364354",
+        "cairn_writer_commit_seconds{quantile=\"1\"} 0.037366597",
+        "cairn_writer_commit_seconds_sum 2.386407402",
+        "cairn_writer_commit_seconds_count 124",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0\"} 0.008798359",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.5\"} 0.008799151164085996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.9\"} 0.008799151164085996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.95\"} 0.008799151164085996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.99\"} 0.008799151164085996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.999\"} 0.008799151164085996",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"1\"} 0.009134431",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_hash\",result=\"ok\"} 0.01793279",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_hash\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0\"} 0.000000383",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.5\"} 0.00000038297349483333",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.9\"} 0.00000038297349483333",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.95\"} 0.00000038297349483333",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.99\"} 0.00000038297349483333",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.999\"} 0.00000038297349483333",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"1\"} 0.000000541",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"permit_wait\",result=\"ok\"} 0.000000924",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"permit_wait\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0\"} 0.017831435",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.5\"} 0.017833081801753366",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.9\"} 0.017833081801753366",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.95\"} 0.017833081801753366",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.99\"} 0.017833081801753366",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.999\"} 0.017833081801753366",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"1\"} 0.022504891",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body\",result=\"ok\"} 0.040336326",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0\"} 0.00759022",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.5\"} 0.007590179629379999",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.9\"} 0.007590179629379999",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.95\"} 0.007590179629379999",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.99\"} 0.007590179629379999",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.999\"} 0.007590179629379999",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"1\"} 0.008020329",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_input_wait\",result=\"ok\"} 0.015610549",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_input_wait\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0\"} 0.027597912",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.5\"} 0.027595570259979954",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.9\"} 0.027595570259979954",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.95\"} 0.027595570259979954",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.99\"} 0.027595570259979954",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.999\"} 0.027595570259979954",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"1\"} 0.111832116",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace\",result=\"ok\"} 0.13943002799999998",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0\"} 0.01542498",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.5\"} 0.015426013305928226",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.9\"} 0.015426013305928226",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.95\"} 0.015426013305928226",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.99\"} 0.015426013305928226",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.999\"} 0.015426013305928226",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"1\"} 0.042760489",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"directory_sync\",result=\"ok\"} 0.058185469",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"directory_sync\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0\"} 0.018279115",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.5\"} 0.01828087187838079",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.9\"} 0.01828087187838079",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.95\"} 0.01828087187838079",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.99\"} 0.01828087187838079",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.999\"} 0.01828087187838079",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"1\"} 0.040396169",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize\",result=\"ok\"} 0.058675284",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0\"} 0.000281523",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.5\"} 0.00028152197985264983",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.9\"} 0.00028152197985264983",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.95\"} 0.00028152197985264983",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.99\"} 0.00028152197985264983",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.999\"} 0.00028152197985264983",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"1\"} 0.000381596",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"staging_create\",result=\"ok\"} 0.000663119",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"staging_create\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0\"} 0.00066236",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.5\"} 0.0006623608702031715",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.9\"} 0.0006623608702031715",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.95\"} 0.0006623608702031715",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.99\"} 0.0006623608702031715",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.999\"} 0.0006623608702031715",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"1\"} 0.006101501",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_sink\",result=\"ok\"} 0.0067638609999999995",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_sink\",result=\"ok\"} 2",
+        "cairn_writer_batch_size{quantile=\"0\"} 1",
+        "cairn_writer_batch_size{quantile=\"0.5\"} 0.9998999999999999",
+        "cairn_writer_batch_size{quantile=\"0.9\"} 5.000310449291975",
+        "cairn_writer_batch_size{quantile=\"0.95\"} 6.999928967377545",
+        "cairn_writer_batch_size{quantile=\"0.99\"} 27.001704833335125",
+        "cairn_writer_batch_size{quantile=\"0.999\"} 27.001704833335125",
+        "cairn_writer_batch_size{quantile=\"1\"} 32",
+        "cairn_writer_batch_size_sum 496",
+        "cairn_writer_batch_size_count 124"
+      ],
+      "status": "PASS"
+    },
+    {
+      "case": "get_1m",
+      "engine": "rustfs",
+      "order": 2,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/warp-image",
+        "get",
+        "--host",
+        "127.0.0.1:18002",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/02-rustfs-get_1m-3jtkvoug/warp.csv.zst",
+        "--objects",
+        "64",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "strict_settings": {
+        "RUSTFS_DURABILITY_MODE": "strict",
+        "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+        "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 17.470346146990778,
+      "host_io_pressure_delta_us": {
+        "some": 712749,
+        "full": 523189
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 7088584,
+        "read_sectors": 668411479,
+        "read_ms": 3415657,
+        "writes": 11415661,
+        "write_sectors": 1103943288,
+        "write_ms": 23861993,
+        "io_ms": 7758980,
+        "weighted_io_ms": 27339621,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 7088816,
+        "read_sectors": 668420367,
+        "read_ms": 3415993,
+        "writes": 11416677,
+        "write_sectors": 1104118680,
+        "write_ms": 23865239,
+        "io_ms": 7761620,
+        "weighted_io_ms": 27343217,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 232,
+        "read_sectors": 8888,
+        "read_ms": 336,
+        "writes": 1016,
+        "write_sectors": 175392,
+        "write_ms": 3246,
+        "io_ms": 2640,
+        "weighted_io_ms": 3596
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0240019009943353,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.37,
+              "rss_bytes": 227622912
+            },
+            "client": {
+              "cpu_seconds": 0.5,
+              "rss_bytes": 89255936
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.7000000000000001,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.07
+              }
+            ],
+            "processes_seen": 193,
+            "exited_since_previous": 3
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533124525,
+            "full": 1515729197
+          },
+          "host_volume_diskstats": {
+            "reads": 7088776,
+            "read_sectors": 668418871,
+            "read_ms": 3415848,
+            "writes": 11416261,
+            "write_sectors": 1104100744,
+            "write_ms": 23863413,
+            "io_ms": 7759920,
+            "weighted_io_ms": 27341241,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.072251934994711,
+          "processes": {
+            "server": {
+              "cpu_seconds": 2.26,
+              "rss_bytes": 271204352
+            },
+            "client": {
+              "cpu_seconds": 0.8,
+              "rss_bytes": 89460736
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.56,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533132906,
+            "full": 1515734746
+          },
+          "host_volume_diskstats": {
+            "reads": 7088781,
+            "read_sectors": 668419711,
+            "read_ms": 3415866,
+            "writes": 11416261,
+            "write_sectors": 1104100744,
+            "write_ms": 23863413,
+            "io_ms": 7759936,
+            "weighted_io_ms": 27341259,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.114539998001419,
+          "processes": {
+            "server": {
+              "cpu_seconds": 7.26,
+              "rss_bytes": 268771328
+            },
+            "client": {
+              "cpu_seconds": 2.69,
+              "rss_bytes": 87195648
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.84,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.18
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              }
+            ],
+            "processes_seen": 191,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533137655,
+            "full": 1515735314
+          },
+          "host_volume_diskstats": {
+            "reads": 7088791,
+            "read_sectors": 668419791,
+            "read_ms": 3415884,
+            "writes": 11416263,
+            "write_sectors": 1104100760,
+            "write_ms": 23863426,
+            "io_ms": 7759968,
+            "weighted_io_ms": 27341289,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.167492544991546,
+          "processes": {
+            "server": {
+              "cpu_seconds": 12.33,
+              "rss_bytes": 278376448
+            },
+            "client": {
+              "cpu_seconds": 4.58,
+              "rss_bytes": 95084544
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.7,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.19
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533150729,
+            "full": 1515736786
+          },
+          "host_volume_diskstats": {
+            "reads": 7088800,
+            "read_sectors": 668419983,
+            "read_ms": 3415927,
+            "writes": 11416265,
+            "write_sectors": 1104101336,
+            "write_ms": 23863453,
+            "io_ms": 7760016,
+            "weighted_io_ms": 27341360,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.197887802001787,
+          "processes": {
+            "server": {
+              "cpu_seconds": 17.38,
+              "rss_bytes": 265158656
+            },
+            "client": {
+              "cpu_seconds": 6.47,
+              "rss_bytes": 103936000
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.79,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.19
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.16
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533172931,
+            "full": 1515740345
+          },
+          "host_volume_diskstats": {
+            "reads": 7088813,
+            "read_sectors": 668420327,
+            "read_ms": 3415973,
+            "writes": 11416273,
+            "write_sectors": 1104101688,
+            "write_ms": 23863519,
+            "io_ms": 7760100,
+            "weighted_io_ms": 27341473,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.241160499994294,
+          "processes": {
+            "server": {
+              "cpu_seconds": 22.37,
+              "rss_bytes": 270249984
+            },
+            "client": {
+              "cpu_seconds": 8.32,
+              "rss_bytes": 112746496
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.67,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 194,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533173008,
+            "full": 1515740345
+          },
+          "host_volume_diskstats": {
+            "reads": 7088813,
+            "read_sectors": 668420327,
+            "read_ms": 3415973,
+            "writes": 11416275,
+            "write_sectors": 1104101704,
+            "write_ms": 23863520,
+            "io_ms": 7760100,
+            "weighted_io_ms": 27341474,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.28592032699089,
+          "processes": {
+            "server": {
+              "cpu_seconds": 27.43,
+              "rss_bytes": 265043968
+            },
+            "client": {
+              "cpu_seconds": 10.3,
+              "rss_bytes": 115228672
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.6,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 2
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533180430,
+            "full": 1515741513
+          },
+          "host_volume_diskstats": {
+            "reads": 7088814,
+            "read_sectors": 668420351,
+            "read_ms": 3415983,
+            "writes": 11416358,
+            "write_sectors": 1104102416,
+            "write_ms": 23863654,
+            "io_ms": 7760120,
+            "weighted_io_ms": 27341618,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.309271773003275,
+          "processes": {
+            "server": {
+              "cpu_seconds": 31.23,
+              "rss_bytes": 269062144
+            },
+            "client": {
+              "cpu_seconds": 11.71,
+              "rss_bytes": 109649920
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.61,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.07
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2533324947,
+            "full": 1515870438
+          },
+          "host_volume_diskstats": {
+            "reads": 7088816,
+            "read_sectors": 668420367,
+            "read_ms": 3415993,
+            "writes": 11416427,
+            "write_sectors": 1104105592,
+            "write_ms": 23864215,
+            "io_ms": 7760656,
+            "weighted_io_ms": 27342189,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.39,
+        "top": [
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.09
+          },
+          {
+            "pid": 241,
+            "name": "jbd2/sda1-8",
+            "cpu_seconds": 0.05
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.05
+          },
+          {
+            "pid": 814434,
+            "name": "libkrun VM",
+            "cpu_seconds": 0.05
+          },
+          {
+            "pid": 2217,
+            "name": "codex",
+            "cpu_seconds": 0.04
+          }
+        ],
+        "processes_seen": 192,
+        "exited_since_previous": 0
+      },
+      "unrelated_process_cpu_observed_seconds": 5.859999999999999,
+      "unrelated_process_cpu_valid_intervals": 9,
+      "server_cpu_seconds": 31.27,
+      "client_cpu_seconds": 11.71,
+      "server_peak_rss": 278376448,
+      "client_peak_rss": 121962496,
+      "peak_bytes": 434319360,
+      "peak_inodes": 445,
+      "server_last_cpu": 31.23,
+      "client_last_cpu": 11.71,
+      "summary": "* Average: 1246.99 MiB/s, 1246.99 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 1246.99,
+      "mib_per_second": 1246.99,
+      "reports": {
+        "GET": {
+          "summary": "* Average: 1246.99 MiB/s, 1246.99 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 12.7,
+            "p50": 12.3,
+            "p90": 19.1,
+            "p99": 28.2
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: GET. Concurrency: 16. Ran: 9s\n * Average: 1246.99 MiB/s, 1246.99 obj/s\n * Reqs: Avg: 12.7ms, 50%: 12.3ms, 90%: 19.1ms, 99%: 28.2ms, Fastest: 1.8ms, Slowest: 53.4ms, StdDev: 5.3ms\n * TTFB: Avg: 7ms, Best: 1ms, 25th: 5ms, Median: 7ms, 75th: 9ms, 90th: 11ms, 99th: 19ms, Worst: 53ms StdDev: 4ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 1298.1MiB/s, 1298.14 obj/s\n * 50% Median: 1265.3MiB/s, 1265.25 obj/s\n * Slowest: 1153.4MiB/s, 1153.42 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "get_1m",
+      "engine": "rustfs",
+      "order": 3,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/warp-image",
+        "get",
+        "--host",
+        "127.0.0.1:18003",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/03-rustfs-get_1m-ghda0byf/warp.csv.zst",
+        "--objects",
+        "64",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "strict_settings": {
+        "RUSTFS_DURABILITY_MODE": "strict",
+        "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+        "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 16.94235493899032,
+      "host_io_pressure_delta_us": {
+        "some": 772639,
+        "full": 322149
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 7088829,
+        "read_sectors": 668420783,
+        "read_ms": 3416447,
+        "writes": 11416800,
+        "write_sectors": 1104125016,
+        "write_ms": 23866145,
+        "io_ms": 7762500,
+        "weighted_io_ms": 27344586,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 7089213,
+        "read_sectors": 668428647,
+        "read_ms": 3417150,
+        "writes": 11418497,
+        "write_sectors": 1104309464,
+        "write_ms": 23871039,
+        "io_ms": 7764988,
+        "weighted_io_ms": 27350204,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 384,
+        "read_sectors": 7864,
+        "read_ms": 703,
+        "writes": 1697,
+        "write_sectors": 184448,
+        "write_ms": 4894,
+        "io_ms": 2488,
+        "weighted_io_ms": 5618
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0226765439874725,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.38,
+              "rss_bytes": 220315648
+            },
+            "client": {
+              "cpu_seconds": 0.53,
+              "rss_bytes": 90378240
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.75,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.08
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534387209,
+            "full": 1516645771
+          },
+          "host_volume_diskstats": {
+            "reads": 7089205,
+            "read_sectors": 668428311,
+            "read_ms": 3417105,
+            "writes": 11417139,
+            "write_sectors": 1104270800,
+            "write_ms": 23867769,
+            "io_ms": 7763680,
+            "weighted_io_ms": 27346883,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.04242510999029,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.38,
+              "rss_bytes": 220315648
+            },
+            "client": {
+              "cpu_seconds": 0.53,
+              "rss_bytes": 90378240
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.46,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534391189,
+            "full": 1516649168
+          },
+          "host_volume_diskstats": {
+            "reads": 7089206,
+            "read_sectors": 668428319,
+            "read_ms": 3417120,
+            "writes": 11417141,
+            "write_sectors": 1104270816,
+            "write_ms": 23867770,
+            "io_ms": 7763696,
+            "weighted_io_ms": 27346898,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.088257792987861,
+          "processes": {
+            "server": {
+              "cpu_seconds": 6.09,
+              "rss_bytes": 271032320
+            },
+            "client": {
+              "cpu_seconds": 2.2,
+              "rss_bytes": 86978560
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.0,
+            "top": [
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.2
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.19
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534432290,
+            "full": 1516652586
+          },
+          "host_volume_diskstats": {
+            "reads": 7089209,
+            "read_sectors": 668428351,
+            "read_ms": 3417140,
+            "writes": 11417626,
+            "write_sectors": 1104280288,
+            "write_ms": 23868701,
+            "io_ms": 7763860,
+            "weighted_io_ms": 27347849,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.127122306992533,
+          "processes": {
+            "server": {
+              "cpu_seconds": 10.97,
+              "rss_bytes": 272154624
+            },
+            "client": {
+              "cpu_seconds": 4.15,
+              "rss_bytes": 88588288
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.76,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.16
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534591483,
+            "full": 1516671250
+          },
+          "host_volume_diskstats": {
+            "reads": 7089209,
+            "read_sectors": 668428351,
+            "read_ms": 3417140,
+            "writes": 11417950,
+            "write_sectors": 1104289504,
+            "write_ms": 23870128,
+            "io_ms": 7764488,
+            "weighted_io_ms": 27349277,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.162780879996717,
+          "processes": {
+            "server": {
+              "cpu_seconds": 15.59,
+              "rss_bytes": 247123968
+            },
+            "client": {
+              "cpu_seconds": 6.0,
+              "rss_bytes": 95342592
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.04,
+            "top": [
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.2
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.19
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.19
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534592573,
+            "full": 1516671253
+          },
+          "host_volume_diskstats": {
+            "reads": 7089210,
+            "read_sectors": 668428495,
+            "read_ms": 3417144,
+            "writes": 11417950,
+            "write_sectors": 1104289504,
+            "write_ms": 23870128,
+            "io_ms": 7764492,
+            "weighted_io_ms": 27349281,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.226896012987709,
+          "processes": {
+            "server": {
+              "cpu_seconds": 20.64,
+              "rss_bytes": 247701504
+            },
+            "client": {
+              "cpu_seconds": 8.01,
+              "rss_bytes": 98144256
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.73,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.18
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534596331,
+            "full": 1516671435
+          },
+          "host_volume_diskstats": {
+            "reads": 7089210,
+            "read_sectors": 668428495,
+            "read_ms": 3417144,
+            "writes": 11417977,
+            "write_sectors": 1104290016,
+            "write_ms": 23870157,
+            "io_ms": 7764504,
+            "weighted_io_ms": 27349311,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.299369341999409,
+          "processes": {
+            "server": {
+              "cpu_seconds": 25.63,
+              "rss_bytes": 245673984
+            },
+            "client": {
+              "cpu_seconds": 10.01,
+              "rss_bytes": 114094080
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.8,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.21
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.09
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534606818,
+            "full": 1516671921
+          },
+          "host_volume_diskstats": {
+            "reads": 7089212,
+            "read_sectors": 668428639,
+            "read_ms": 3417149,
+            "writes": 11418152,
+            "write_sectors": 1104292456,
+            "write_ms": 23870568,
+            "io_ms": 7764540,
+            "weighted_io_ms": 27349727,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 16.375768732992583,
+          "processes": {
+            "server": {
+              "cpu_seconds": 30.32,
+              "rss_bytes": 247820288
+            },
+            "client": {
+              "cpu_seconds": 11.78,
+              "rss_bytes": 108646400
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.97,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.18
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              }
+            ],
+            "processes_seen": 195,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2534623037,
+            "full": 1516686375
+          },
+          "host_volume_diskstats": {
+            "reads": 7089213,
+            "read_sectors": 668428647,
+            "read_ms": 3417150,
+            "writes": 11418202,
+            "write_sectors": 1104294768,
+            "write_ms": 23870632,
+            "io_ms": 7764608,
+            "weighted_io_ms": 27349793,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.38,
+        "top": [
+          {
+            "pid": 44594,
+            "name": "codex",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.05
+          },
+          {
+            "pid": 2217,
+            "name": "codex",
+            "cpu_seconds": 0.05
+          },
+          {
+            "pid": 241,
+            "name": "jbd2/sda1-8",
+            "cpu_seconds": 0.04
+          },
+          {
+            "pid": 97058,
+            "name": "chrome",
+            "cpu_seconds": 0.04
+          }
+        ],
+        "processes_seen": 192,
+        "exited_since_previous": 3
+      },
+      "unrelated_process_cpu_observed_seconds": 6.89,
+      "unrelated_process_cpu_valid_intervals": 9,
+      "server_cpu_seconds": 30.41,
+      "client_cpu_seconds": 11.78,
+      "server_peak_rss": 272334848,
+      "client_peak_rss": 114094080,
+      "peak_bytes": 434266112,
+      "peak_inodes": 438,
+      "server_last_cpu": 30.32,
+      "client_last_cpu": 11.78,
+      "summary": "* Average: 942.89 MiB/s, 942.89 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 942.89,
+      "mib_per_second": 942.89,
+      "reports": {
+        "GET": {
+          "summary": "* Average: 942.89 MiB/s, 942.89 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 16.6,
+            "p50": 16.0,
+            "p90": 25.5,
+            "p99": 38.4
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: GET. Concurrency: 16. Ran: 9s\n * Average: 942.89 MiB/s, 942.89 obj/s\n * Reqs: Avg: 16.6ms, 50%: 16.0ms, 90%: 25.5ms, 99%: 38.4ms, Fastest: 2.1ms, Slowest: 65.7ms, StdDev: 7.0ms\n * TTFB: Avg: 9ms, Best: 1ms, 25th: 6ms, Median: 8ms, 75th: 11ms, 90th: 15ms, 99th: 26ms, Worst: 53ms StdDev: 5ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 1017.7MiB/s, 1017.71 obj/s\n * 50% Median: 969.0MiB/s, 969.03 obj/s\n * Slowest: 787.8MiB/s, 787.84 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "get_1m",
+      "engine": "cairn",
+      "order": 4,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/warp-image",
+        "get",
+        "--host",
+        "127.0.0.1:18004",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-adoption2-7gRRmk/04-cairn-get_1m-9q0x8j72/warp.csv.zst",
+        "--objects",
+        "64",
+        "--obj.size",
+        "1MiB"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 15.915373969997745,
+      "host_io_pressure_delta_us": {
+        "some": 318637,
+        "full": 79569
+      },
+      "host_volume_device": {
+        "major": 8,
+        "minor": 1
+      },
+      "host_volume_diskstats_before": {
+        "reads": 7089213,
+        "read_sectors": 668428647,
+        "read_ms": 3417150,
+        "writes": 11418690,
+        "write_sectors": 1104318488,
+        "write_ms": 23871222,
+        "io_ms": 7765152,
+        "weighted_io_ms": 27350391,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 7090665,
+        "read_sectors": 668592247,
+        "read_ms": 3418685,
+        "writes": 11419331,
+        "write_sectors": 1104471592,
+        "write_ms": 23872209,
+        "io_ms": 7768088,
+        "weighted_io_ms": 27352914,
+        "name": "sda1"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 1452,
+        "read_sectors": 163600,
+        "read_ms": 1535,
+        "writes": 641,
+        "write_sectors": 153104,
+        "write_ms": 987,
+        "io_ms": 2936,
+        "weighted_io_ms": 2523
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0252163960103644,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.44,
+              "rss_bytes": 36544512
+            },
+            "client": {
+              "cpu_seconds": 0.56,
+              "rss_bytes": 90980352
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.88,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.27
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535006254,
+            "full": 1516874120
+          },
+          "host_volume_diskstats": {
+            "reads": 7089813,
+            "read_sectors": 668455687,
+            "read_ms": 3417988,
+            "writes": 11419200,
+            "write_sectors": 1104468376,
+            "write_ms": 23872092,
+            "io_ms": 7765828,
+            "weighted_io_ms": 27352099,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 4.060665698008961,
+          "processes": {
+            "server": {
+              "cpu_seconds": 1.9,
+              "rss_bytes": 52424704
+            },
+            "client": {
+              "cpu_seconds": 0.8,
+              "rss_bytes": 91287552
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.51,
+            "top": [
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535046986,
+            "full": 1516881573
+          },
+          "host_volume_diskstats": {
+            "reads": 7090344,
+            "read_sectors": 668587511,
+            "read_ms": 3418435,
+            "writes": 11419207,
+            "write_sectors": 1104468664,
+            "write_ms": 23872103,
+            "io_ms": 7765948,
+            "weighted_io_ms": 27352557,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 6.111517006997019,
+          "processes": {
+            "server": {
+              "cpu_seconds": 6.16,
+              "rss_bytes": 54489088
+            },
+            "client": {
+              "cpu_seconds": 3.34,
+              "rss_bytes": 92614656
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.6,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.15
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.06
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535047059,
+            "full": 1516881573
+          },
+          "host_volume_diskstats": {
+            "reads": 7090344,
+            "read_sectors": 668587511,
+            "read_ms": 3418435,
+            "writes": 11419209,
+            "write_sectors": 1104468680,
+            "write_ms": 23872106,
+            "io_ms": 7765948,
+            "weighted_io_ms": 27352560,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 8.22262276300171,
+          "processes": {
+            "server": {
+              "cpu_seconds": 10.19,
+              "rss_bytes": 56651776
+            },
+            "client": {
+              "cpu_seconds": 5.79,
+              "rss_bytes": 99336192
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.06,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.18
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.17
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.15
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535051072,
+            "full": 1516881713
+          },
+          "host_volume_diskstats": {
+            "reads": 7090349,
+            "read_sectors": 668587575,
+            "read_ms": 3418442,
+            "writes": 11419292,
+            "write_sectors": 1104469392,
+            "write_ms": 23872160,
+            "io_ms": 7767924,
+            "weighted_io_ms": 27352622,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 10.284466015000362,
+          "processes": {
+            "server": {
+              "cpu_seconds": 14.05,
+              "rss_bytes": 55877632
+            },
+            "client": {
+              "cpu_seconds": 8.0,
+              "rss_bytes": 113209344
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.52,
+            "top": [
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 1.01
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.13
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535080561,
+            "full": 1516885974
+          },
+          "host_volume_diskstats": {
+            "reads": 7090661,
+            "read_sectors": 668591823,
+            "read_ms": 3418678,
+            "writes": 11419301,
+            "write_sectors": 1104469808,
+            "write_ms": 23872172,
+            "io_ms": 7768052,
+            "weighted_io_ms": 27352869,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 12.382534967007814,
+          "processes": {
+            "server": {
+              "cpu_seconds": 18.37,
+              "rss_bytes": 49225728
+            },
+            "client": {
+              "cpu_seconds": 10.35,
+              "rss_bytes": 118607872
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.87,
+            "top": [
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.22
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.16
+              },
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 44594,
+                "name": "codex",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535080741,
+            "full": 1516886015
+          },
+          "host_volume_diskstats": {
+            "reads": 7090662,
+            "read_sectors": 668591831,
+            "read_ms": 3418678,
+            "writes": 11419302,
+            "write_sectors": 1104469816,
+            "write_ms": 23872173,
+            "io_ms": 7768052,
+            "weighted_io_ms": 27352871,
+            "name": "sda1"
+          }
+        },
+        {
+          "elapsed_seconds": 14.426263018001919,
+          "processes": {
+            "server": {
+              "cpu_seconds": 22.67,
+              "rss_bytes": 49696768
+            },
+            "client": {
+              "cpu_seconds": 13.04,
+              "rss_bytes": 135544832
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.64,
+            "top": [
+              {
+                "pid": 97058,
+                "name": "chrome",
+                "cpu_seconds": 0.14
+              },
+              {
+                "pid": 2217,
+                "name": "codex",
+                "cpu_seconds": 0.12
+              },
+              {
+                "pid": 2138,
+                "name": "herdr",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 814434,
+                "name": "libkrun VM",
+                "cpu_seconds": 0.1
+              },
+              {
+                "pid": 31177,
+                "name": "codex",
+                "cpu_seconds": 0.05
+              }
+            ],
+            "processes_seen": 192,
+            "exited_since_previous": 1
+          },
+          "host_io_pressure_totals_us": {
+            "some": 2535085012,
+            "full": 1516886201
+          },
+          "host_volume_diskstats": {
+            "reads": 7090665,
+            "read_sectors": 668592247,
+            "read_ms": 3418685,
+            "writes": 11419311,
+            "write_sectors": 1104470336,
+            "write_ms": 23872184,
+            "io_ms": 7768064,
+            "weighted_io_ms": 27352889,
+            "name": "sda1"
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.5,
+        "top": [
+          {
+            "pid": 97058,
+            "name": "chrome",
+            "cpu_seconds": 0.15
+          },
+          {
+            "pid": 2138,
+            "name": "herdr",
+            "cpu_seconds": 0.09
+          },
+          {
+            "pid": 31177,
+            "name": "codex",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 814434,
+            "name": "libkrun VM",
+            "cpu_seconds": 0.06
+          },
+          {
+            "pid": 2217,
+            "name": "codex",
+            "cpu_seconds": 0.04
+          }
+        ],
+        "processes_seen": 192,
+        "exited_since_previous": 1
+      },
+      "unrelated_process_cpu_observed_seconds": 6.58,
+      "unrelated_process_cpu_valid_intervals": 8,
+      "server_cpu_seconds": 25.72,
+      "client_cpu_seconds": 13.04,
+      "server_peak_rss": 57860096,
+      "client_peak_rss": 139198464,
+      "peak_bytes": 438013952,
+      "peak_inodes": 80,
+      "server_last_cpu": 22.67,
+      "client_last_cpu": 13.04,
+      "summary": "* Average: 1647.51 MiB/s, 1647.51 obj/s",
+      "analyzed_seconds": 9.0,
+      "objects_per_second": 1647.51,
+      "mib_per_second": 1647.51,
+      "reports": {
+        "GET": {
+          "summary": "* Average: 1647.51 MiB/s, 1647.51 obj/s",
+          "analyzed_seconds": 9.0,
+          "request_latency_ms": {
+            "avg": 9.3,
+            "p50": 8.4,
+            "p90": 15.5,
+            "p99": 25.4
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: GET. Concurrency: 16. Ran: 9s\n * Average: 1647.51 MiB/s, 1647.51 obj/s\n * Reqs: Avg: 9.3ms, 50%: 8.4ms, 90%: 15.5ms, 99%: 25.4ms, Fastest: 1.0ms, Slowest: 56.1ms, StdDev: 4.9ms\n * TTFB: Avg: 6ms, Best: 1ms, 25th: 4ms, Median: 5ms, 75th: 8ms, 90th: 11ms, 99th: 20ms, Worst: 49ms StdDev: 4ms\n\nThroughput, split into 9 x 1s:\n * Fastest: 1833.9MiB/s, 1833.90 obj/s\n * 50% Median: 1672.8MiB/s, 1672.77 obj/s\n * Slowest: 1450.0MiB/s, 1449.99 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "metrics_after_drain": [
+        "cairn_blob_object_write_timing_dropped_total 0",
+        "cairn_wal_bytes 5430192",
+        "cairn_writer_queue_depth 0",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0\"} 0.000017023",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.5\"} 0.0009159946551297712",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.9\"} 0.004934519272453803",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.95\"} 0.005033196434519933",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.99\"} 0.005535906101074827",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"0.999\"} 0.005535906101074827",
+        "cairn_writer_stage_seconds{stage=\"queue\",result=\"ok\",quantile=\"1\"} 0.005572724",
+        "cairn_writer_stage_seconds_sum{stage=\"queue\",result=\"ok\"} 1.7872091369999998",
+        "cairn_writer_stage_seconds_count{stage=\"queue\",result=\"ok\"} 498",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0\"} 0.000004371",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.5\"} 0.000024973381500217684",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.9\"} 0.000027511676593699803",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.95\"} 0.000029271387942081608",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.99\"} 0.000029271387942081608",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"0.999\"} 0.000029271387942081608",
+        "cairn_writer_stage_seconds{stage=\"begin\",result=\"ok\",quantile=\"1\"} 0.000034444",
+        "cairn_writer_stage_seconds_sum{stage=\"begin\",result=\"ok\"} 0.0034377189999999997",
+        "cairn_writer_stage_seconds_count{stage=\"begin\",result=\"ok\"} 149",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0\"} 0.000005749",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.5\"} 0.00002559534547880568",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.9\"} 0.00009408611896551748",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.95\"} 0.00013694926425209577",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.99\"} 0.00013694926425209577",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"0.999\"} 0.00013694926425209577",
+        "cairn_writer_stage_seconds{stage=\"apply\",result=\"ok\",quantile=\"1\"} 0.000214978",
+        "cairn_writer_stage_seconds_sum{stage=\"apply\",result=\"ok\"} 0.05613930700000002",
+        "cairn_writer_stage_seconds_count{stage=\"apply\",result=\"ok\"} 149",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0\"} 0.000003508",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.5\"} 0.000007276212847010313",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.9\"} 0.00002271011721125607",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.95\"} 0.0028975201616594994",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.99\"} 0.0028975201616594994",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"0.999\"} 0.0028975201616594994",
+        "cairn_writer_stage_seconds{stage=\"commit\",result=\"ok\",quantile=\"1\"} 0.004809049",
+        "cairn_writer_stage_seconds_sum{stage=\"commit\",result=\"ok\"} 0.6782919139999999",
+        "cairn_writer_stage_seconds_count{stage=\"commit\",result=\"ok\"} 149",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0\"} 0.000000056",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.5\"} 0.0000005469545907443327",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.9\"} 0.0000008819768296962583",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.95\"} 0.0000010639735239660223",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.99\"} 0.000001116066563929574",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"0.999\"} 0.000001116066563929574",
+        "cairn_writer_stage_seconds{stage=\"admission\",result=\"ok\",quantile=\"1\"} 0.000001135",
+        "cairn_writer_stage_seconds_sum{stage=\"admission\",result=\"ok\"} 0.00016601200000000002",
+        "cairn_writer_stage_seconds_count{stage=\"admission\",result=\"ok\"} 498",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0\"} 0.008165018",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.5\"} 0.00816498800997881",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.9\"} 0.00816498800997881",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.95\"} 0.00816498800997881",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.99\"} 0.00816498800997881",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"0.999\"} 0.00816498800997881",
+        "cairn_blob_object_write_stage_seconds{stage=\"finalize\",result=\"ok\",quantile=\"1\"} 0.008818602",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"finalize\",result=\"ok\"} 0.016983619999999998",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"finalize\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0\"} 0.007018199",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.5\"} 0.007017838449535446",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.9\"} 0.007017838449535446",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.95\"} 0.007017838449535446",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.99\"} 0.007017838449535446",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"0.999\"} 0.007017838449535446",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_input_wait\",result=\"ok\",quantile=\"1\"} 0.045323311",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_input_wait\",result=\"ok\"} 0.05234151",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_input_wait\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0\"} 0.022133422",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.5\"} 0.02213268026500522",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.9\"} 0.02213268026500522",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.95\"} 0.02213268026500522",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.99\"} 0.02213268026500522",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"0.999\"} 0.02213268026500522",
+        "cairn_blob_object_write_stage_seconds{stage=\"body\",result=\"ok\",quantile=\"1\"} 0.087812516",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body\",result=\"ok\"} 0.109945938",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0\"} 0.004287618",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.5\"} 0.004287291818273462",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.9\"} 0.004287291818273462",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.95\"} 0.004287291818273462",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.99\"} 0.004287291818273462",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"0.999\"} 0.004287291818273462",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_sink\",result=\"ok\",quantile=\"1\"} 0.020732136",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_sink\",result=\"ok\"} 0.025019754",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_sink\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0\"} 0.015092892",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.5\"} 0.015093365252401049",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.9\"} 0.015093365252401049",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.95\"} 0.015093365252401049",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.99\"} 0.015093365252401049",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"0.999\"} 0.015093365252401049",
+        "cairn_blob_object_write_stage_seconds{stage=\"directory_sync\",result=\"ok\",quantile=\"1\"} 0.022977346",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"directory_sync\",result=\"ok\"} 0.038070238",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"directory_sync\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0\"} 0.000380585",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.5\"} 0.0003805473178947791",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.9\"} 0.0003805473178947791",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.95\"} 0.0003805473178947791",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.99\"} 0.0003805473178947791",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"0.999\"} 0.0003805473178947791",
+        "cairn_blob_object_write_stage_seconds{stage=\"staging_create\",result=\"ok\",quantile=\"1\"} 0.025382658",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"staging_create\",result=\"ok\"} 0.025763242999999998",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"staging_create\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0\"} 0.000000653",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.5\"} 0.0000006529925918860842",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.9\"} 0.0000006529925918860842",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.95\"} 0.0000006529925918860842",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.99\"} 0.0000006529925918860842",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"0.999\"} 0.0000006529925918860842",
+        "cairn_blob_object_write_stage_seconds{stage=\"permit_wait\",result=\"ok\",quantile=\"1\"} 0.000013279",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"permit_wait\",result=\"ok\"} 0.000013932",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"permit_wait\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0\"} 0.010796753",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.5\"} 0.010796859004216296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.9\"} 0.010796859004216296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.95\"} 0.010796859004216296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.99\"} 0.010796859004216296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"0.999\"} 0.010796859004216296",
+        "cairn_blob_object_write_stage_seconds{stage=\"body_hash\",result=\"ok\",quantile=\"1\"} 0.021744453",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"body_hash\",result=\"ok\"} 0.032541206",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"body_hash\",result=\"ok\"} 2",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0\"} 0.000193207",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.5\"} 0.00019321634592925753",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.9\"} 0.00019321634592925753",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.95\"} 0.00019321634592925753",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.99\"} 0.00019321634592925753",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"0.999\"} 0.00019321634592925753",
+        "cairn_blob_object_write_stage_seconds{stage=\"namespace\",result=\"ok\",quantile=\"1\"} 0.01219784",
+        "cairn_blob_object_write_stage_seconds_sum{stage=\"namespace\",result=\"ok\"} 0.012391047",
+        "cairn_blob_object_write_stage_seconds_count{stage=\"namespace\",result=\"ok\"} 2",
+        "cairn_writer_batch_size{quantile=\"0\"} 1",
+        "cairn_writer_batch_size{quantile=\"0.5\"} 0.9998999999999999",
+        "cairn_writer_batch_size{quantile=\"0.9\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"0.95\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"0.99\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"0.999\"} 3.000263141522573",
+        "cairn_writer_batch_size{quantile=\"1\"} 3",
+        "cairn_writer_batch_size_sum 498",
+        "cairn_writer_batch_size_count 149",
+        "cairn_writer_commit_seconds{quantile=\"0\"} 0.000003462",
+        "cairn_writer_commit_seconds{quantile=\"0.5\"} 0.000007226902444862849",
+        "cairn_writer_commit_seconds{quantile=\"0.9\"} 0.000022655678282612635",
+        "cairn_writer_commit_seconds{quantile=\"0.95\"} 0.0028969407155717765",
+        "cairn_writer_commit_seconds{quantile=\"0.99\"} 0.0028969407155717765",
+        "cairn_writer_commit_seconds{quantile=\"0.999\"} 0.0028969407155717765",
+        "cairn_writer_commit_seconds{quantile=\"1\"} 0.004808851",
+        "cairn_writer_commit_seconds_sum 0.6782565449999998",
+        "cairn_writer_commit_seconds_count 149"
+      ],
+      "status": "PASS"
+    }
+  ],
+  "elapsed_seconds": 104.5598174110055
+}

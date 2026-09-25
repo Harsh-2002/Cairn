@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "max_client_seconds": 300,
+  "max_bytes": 10000000000,
+  "duration": 12,
+  "host_capacity": {
+    "memtotal_kib": 10371500,
+    "swaptotal_kib": 0,
+    "logical_cpus": 4
+  },
+  "allow_ballooning": true,
+  "profile": "put_timing",
+  "metrics_drain_seconds": 16,
+  "binaries": {
+    "candidate": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+      "sha256": "df20f397c746d1081ab5cdbaa22d2147609bf34d354c2d1ea50255022b0780e6"
+    },
+    "control": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-control",
+      "sha256": "68afac8ba3e6bb2b2cb015a2f60e59fcb4edee5e9326640e820645611cc428c5"
+    },
+    "rustfs": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/rustfs",
+      "sha256": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd"
+    },
+    "warp": {
+      "path": "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+      "sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+    }
+  },
+  "phases": [
+    {
+      "name": "timing_ab",
+      "status": "PASS",
+      "wall_cap_seconds": 270,
+      "command": [
+        "/usr/bin/python3",
+        "/home/dev/Cairn/conformance/cairn_put_ab.py",
+        "--control",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-control",
+        "--candidate",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+        "--root",
+        "/var/tmp/cairn-performance-balloon-snRQxHrf",
+        "--warp",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+        "--case",
+        "put_1m",
+        "--pairs",
+        "3",
+        "--duration",
+        "12",
+        "--metrics-drain-seconds",
+        "16",
+        "--max-seconds",
+        "270",
+        "--max-bytes",
+        "10000000000",
+        "--allow-ballooning"
+      ],
+      "started_unix_seconds": 1790318706.0891886,
+      "host_capacity_after": {
+        "memtotal_kib": 10770248,
+        "swaptotal_kib": 0,
+        "logical_cpus": 4
+      },
+      "client_seconds": 95.58167789799973,
+      "raw_report": "/var/tmp/cairn-performance-balloon-snRQxHrf/root-barrier-timing_ab-raw.json",
+      "raw_sha256": "d3d42274b7b42a097c3c2aaee52b8b3812d27ce41c49b0f6b72da9479ce80fdc",
+      "exit_code": 0,
+      "finished_unix_seconds": 1790318904.1579962
+    },
+    {
+      "name": "timing_rustfs",
+      "status": "PASS",
+      "wall_cap_seconds": 130,
+      "command": [
+        "/usr/bin/python3",
+        "/home/dev/Cairn/conformance/rustfs_compare.py",
+        "--cairn",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/cairn-candidate",
+        "--rustfs",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/rustfs",
+        "--root",
+        "/var/tmp/cairn-performance-balloon-snRQxHrf",
+        "--warp",
+        "/var/tmp/cairn-performance-timing-ni5ZpdEu/warp",
+        "--case",
+        "put_1m",
+        "--pairs",
+        "1",
+        "--duration",
+        "12",
+        "--metrics-drain-seconds",
+        "16",
+        "--max-seconds",
+        "130",
+        "--max-bytes",
+        "10000000000",
+        "--allow-ballooning"
+      ],
+      "started_unix_seconds": 1790318904.1624048,
+      "host_capacity_after": {
+        "memtotal_kib": 10486776,
+        "swaptotal_kib": 0,
+        "logical_cpus": 4
+      },
+      "client_seconds": 61.55715679400009,
+      "raw_report": "/var/tmp/cairn-performance-balloon-snRQxHrf/root-barrier-timing_rustfs-raw.json",
+      "raw_sha256": "f7a5d672d0fe461c55a24afa6e6e3ef350c655145cef402ee4081a751a045789",
+      "exit_code": 0,
+      "finished_unix_seconds": 1790318984.354305
+    }
+  ],
+  "client_seconds": 157.13883469199982,
+  "status": "PASS"
+}

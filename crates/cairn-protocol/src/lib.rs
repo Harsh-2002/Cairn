@@ -8,6 +8,7 @@ pub mod chunked;
 pub mod error_map;
 mod httpdate;
 pub mod keyprovider;
+mod put_timing;
 pub mod request;
 pub mod service;
 mod storage_write;
@@ -15,6 +16,7 @@ mod storage_write;
 pub use chunked::{ChunkDecoder, ChunkVerifier, DecodeError};
 pub use error_map::error_response;
 pub use keyprovider::{KeyProvider, LocalRingProvider};
+pub use put_timing::{PutStage, PutTiming};
 pub use request::{S3Body, S3Request, S3Response};
 pub use service::S3Service;
 pub use storage_write::{

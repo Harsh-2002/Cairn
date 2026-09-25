@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "date": "2026-09-23",
+  "source_revision": "f6fde5a6",
+  "durability": "CAIRN_META_SYNCHRONOUS=full",
+  "binary_sha256": {
+    "cairn": "5da61ca38c18ac7ba91faafedcc1e7bd68688c4b7c546dcc67aaac03bde52c5b",
+    "warp": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b",
+    "sync_probe_v2": "18f15993d013eb42a3de72bc6a97b90fada75b403b3e1dd900ea8e59f7f64177"
+  },
+  "conditions": {
+    "workload": "Warp 1.8.0 1MiB PUT, concurrency 16, fresh bucket and store",
+    "comparison": "Cairn-only diagnostic; no RustFS control or instrumented/uninstrumented overhead gate",
+    "measurement_scope": "process-wide libc sync calls, not exclusive scored-window or per-PUT cost"
+  },
+  "arms": [
+    {
+      "requested_seconds": 30,
+      "analyzed_seconds": 27,
+      "invocation_elapsed_seconds": 54.031400416002725,
+      "mib_per_second": 49.30,
+      "reported_errors": 0,
+      "capture_scope": "server start through Warp exit",
+      "fsync_dir": {"calls": 6302, "total_ms": 128413.2142},
+      "fsync_other": {"calls": 1081, "total_ms": 27791.582766},
+      "fdatasync": {"calls": 1453, "total_ms": 45307.821984},
+      "writer_after_drain": {
+        "commit_count": 1573,
+        "commit_p50_ms": 35.08786214444064,
+        "queue_p50_ms": 21.890554912149512,
+        "apply_p50_ms": 0.17772022145920397,
+        "batch_size_sum": 10183
+      }
+    },
+    {
+      "requested_seconds": 20,
+      "analyzed_seconds": 18,
+      "invocation_elapsed_seconds": 26.695562502995017,
+      "mib_per_second": 73.68,
+      "reported_errors": 0,
+      "capture_scope": "Warp process start through exit, including preparation and tail",
+      "fsync_dir": {"calls": 6494, "total_ms": 73584.888564},
+      "fsync_other": {"calls": 1331, "total_ms": 18087.629031},
+      "fdatasync": {"calls": 1507, "total_ms": 26044.866483},
+      "host_io_pressure_some_delta_us": 7015883
+    },
+    {
+      "requested_seconds": 12,
+      "analyzed_seconds": 9,
+      "load_elapsed_seconds": 16.350665756996023,
+      "invocation_elapsed_seconds": 17.892059562000213,
+      "mib_per_second": 39.10,
+      "put_p50_ms": 386.2,
+      "put_p99_ms": 545.3,
+      "reported_errors": 0,
+      "capture_scope": "Warp process start through exit, including preparation and tail",
+      "fsync_root": {"calls": 958, "total_ms": 22714.900276},
+      "fsync_staging": {"calls": 787, "total_ms": 17939.988882999998},
+      "fsync_other_dir": {"calls": 219, "total_ms": 6059.411005},
+      "fsync_other": {"calls": 358, "total_ms": 11322.691579999999},
+      "fdatasync": {"calls": 479, "total_ms": 17472.413316},
+      "host_io_pressure_some_delta_us": 4536610,
+      "host_io_pressure_full_delta_us": 1085296
+    }
+  ],
+  "pretraffic_startup_failures": 2,
+  "campaign_remaining_seconds_approx": 22
+}
