@@ -624,7 +624,14 @@ impl Config {
         &self,
     ) -> Result<crate::proxy::TrustedProxies, ConfigError> {
         crate::proxy::TrustedProxies::parse(self.trusted_proxies.as_deref())
-            .map_err(|reason| ConfigError::Invalid(format!("CAIRN_TRUSTED_PROXIES {reason}")))
+            // Startup errors reach stderr (and often a service manager's persistent journal).
+            // A malformed environment value may contain a secret pasted into the wrong knob.
+            .map_err(|_| {
+                ConfigError::Invalid(
+                    "CAIRN_TRUSTED_PROXIES must contain canonical IP addresses or CIDR networks"
+                        .into(),
+                )
+            })
     }
 
     /// Resolve the validated import timeout seconds into the shared runtime representation.
@@ -1557,12 +1564,18 @@ mod tests {
             "127.0.0.1,",
             "10.42.9.8/16",
             "0.0.0.0/0",
+            "pasted-secret-DO-NOT-LOG\nsecond-line",
         ] {
             c.trusted_proxies = Some(invalid.to_owned());
             let error = c.validate().unwrap_err().to_string();
             assert!(
                 error.contains("CAIRN_TRUSTED_PROXIES"),
                 "error must name the environment variable: {error}"
+            );
+            assert!(
+                (invalid.is_empty() || !error.contains(invalid))
+                    && !error.contains("pasted-secret-DO-NOT-LOG"),
+                "error must not echo the rejected configuration value: {error}"
             );
         }
     }
@@ -1581,9 +1594,11 @@ mod tests {
             Ok(())
         });
         figment::Jail::expect_with(|jail| {
-            jail.set_env("CAIRN_TRUSTED_PROXIES", "proxy.internal");
+            let rejected = "pasted-secret-DO-NOT-LOG";
+            jail.set_env("CAIRN_TRUSTED_PROXIES", rejected);
             let error = Config::load().unwrap_err().to_string();
             assert!(error.contains("CAIRN_TRUSTED_PROXIES"));
+            assert!(!error.contains(rejected));
             Ok(())
         });
     }
