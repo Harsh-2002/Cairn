@@ -1562,15 +1562,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
-            .unwrap();
+            .unwrap()
+            .with_io_uring(false);
         let timings = store.clone();
         let bucket = BucketName::parse("bkt").unwrap();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
-        let first = futures_util::stream::once(async move {
-            let _ = polled_tx.send(());
+        let first = futures_util::stream::once(async {
             Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"started"))
         });
-        let body: cairn_types::BodyStream = Box::pin(first.chain(futures_util::stream::pending()));
+        let mut polled_tx = Some(polled_tx);
+        let pending = futures_util::stream::poll_fn(move |_| {
+            if let Some(tx) = polled_tx.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending
+        });
+        let body: cairn_types::BodyStream = Box::pin(first.chain(pending));
 
         let task = tokio::spawn(async move {
             store
@@ -1768,7 +1775,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
-            .unwrap();
+            .unwrap()
+            .with_io_uring(false);
         let bucket = BucketName::parse("bkt").unwrap();
         for _ in 0..2 {
             store
@@ -1833,7 +1841,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
             .await
-            .unwrap();
+            .unwrap()
+            .with_io_uring(false);
         store
             .stage_fixture(
                 &BucketName::parse("bkt").unwrap(),
