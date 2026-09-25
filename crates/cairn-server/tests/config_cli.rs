@@ -26,3 +26,19 @@ fn invalid_environment_values_are_not_printed_by_validate_config() {
         );
     }
 }
+
+#[test]
+fn unsupported_backup_topology_does_not_echo_configured_values() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cairn"))
+        .args(["backup", "/tmp/cairn-unused-backup-destination"])
+        .env_clear()
+        .env("CAIRN_META_SHARDS", "2")
+        .output()
+        .expect("run backup topology preflight");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"backup/restore supports only CAIRN_META_BACKEND=sqlite with CAIRN_META_SHARDS=1\n"
+    );
+}

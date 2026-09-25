@@ -3,6 +3,7 @@
 Cairn's supported snapshot format is deliberately narrow: **one local SQLite metadata database**
 (`CAIRN_META_BACKEND=sqlite`, `CAIRN_META_SHARDS=1`) and its POSIX blob tree. The command refuses
 libSQL, Turso, and sharded SQLite instead of producing a partial backup.
+The refusal identifies the required topology without printing configured environment values.
 
 Both operations are **offline**. Stop the server first; `cairn backup`, `cairn restore`, `serve`,
 and every other node-local command take the same non-waiting advisory locks over the data root and

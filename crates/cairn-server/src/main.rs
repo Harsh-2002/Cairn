@@ -1023,11 +1023,12 @@ fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
 /// until a topology-aware manifest exists.
 fn require_canonical_backup_topology(cfg: &Config) -> Result<(), String> {
     if cfg.meta_backend != "sqlite" || cfg.meta_shards != 1 {
-        return Err(format!(
-            "backup/restore supports only CAIRN_META_BACKEND=sqlite with \
-             CAIRN_META_SHARDS=1; configured backend={:?}, shards={}",
-            cfg.meta_backend, cfg.meta_shards
-        ));
+        // This error reaches CLI stderr. Keep it independent of environment-derived values, even
+        // when the current validation restricts backend names to a small known set.
+        return Err(
+            "backup/restore supports only CAIRN_META_BACKEND=sqlite with CAIRN_META_SHARDS=1"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -3149,16 +3150,19 @@ mod tests {
         require_canonical_backup_topology(&cfg).unwrap();
 
         cfg.meta_shards = 2;
-        assert!(
-            require_canonical_backup_topology(&cfg)
-                .unwrap_err()
-                .contains("CAIRN_META_SHARDS=1")
+        let expected =
+            "backup/restore supports only CAIRN_META_BACKEND=sqlite with CAIRN_META_SHARDS=1";
+        assert_eq!(
+            require_canonical_backup_topology(&cfg).unwrap_err(),
+            expected
         );
         cfg.meta_shards = 1;
         for backend in ["libsql", "turso"] {
             cfg.meta_backend = backend.to_owned();
-            let error = require_canonical_backup_topology(&cfg).unwrap_err();
-            assert!(error.contains("CAIRN_META_BACKEND=sqlite"), "{error}");
+            assert_eq!(
+                require_canonical_backup_topology(&cfg).unwrap_err(),
+                expected
+            );
         }
     }
 
