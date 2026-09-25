@@ -10,6 +10,7 @@ fn invalid_environment_values_are_not_printed_by_validate_config() {
             "pasted-secret-DO-NOT-LOG\nsecond-line",
         ),
         ("CAIRN_API_ADDR", "pasted-secret-DO-NOT-LOG"),
+        ("CAIRN_LISTEN_ADDR", "pasted-secret-DO-NOT-LOG"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cairn"))
             .arg("validate-config")

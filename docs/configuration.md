@@ -109,4 +109,4 @@ An explicit public URL wins. Otherwise, requests may use their own listener's ve
 
 The remote Cairn CLI uses `--api-endpoint` or `CAIRN_API_ENDPOINT` for both management and S3, defaulting to `http://127.0.0.1:7373`. This is a client setting, not a server bind setting. Credentials remain `CAIRN_ACCESS_KEY` and `CAIRN_SECRET_KEY`. AWS CLI uses its standard `--endpoint-url` against the API origin.
 
-The old `CAIRN_LISTEN_ADDR`, `CAIRN_WEB_ADDR`, `CAIRN_PUBLIC_BASE_URL`, `CAIRN_ENDPOINT` and `CAIRN_S3_ENDPOINT` names are rejected, with a replacement message. No aliases are supported. See the migration table in [upgrade-rollback.md](./upgrade-rollback.md).
+The old `CAIRN_LISTEN_ADDR`, `CAIRN_WEB_ADDR`, `CAIRN_PUBLIC_BASE_URL`, `CAIRN_ENDPOINT` and `CAIRN_S3_ENDPOINT` names are rejected. Startup prints a generic configuration error without echoing environment values; no aliases are supported. Use the migration table in [upgrade-rollback.md](./upgrade-rollback.md) to find replacements.
