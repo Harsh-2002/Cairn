@@ -1594,9 +1594,11 @@ mod tests {
             Ok(())
         });
         figment::Jail::expect_with(|jail| {
-            jail.set_env("CAIRN_TRUSTED_PROXIES", "proxy.internal");
+            let rejected = "pasted-secret-DO-NOT-LOG";
+            jail.set_env("CAIRN_TRUSTED_PROXIES", rejected);
             let error = Config::load().unwrap_err().to_string();
             assert!(error.contains("CAIRN_TRUSTED_PROXIES"));
+            assert!(!error.contains(rejected));
             Ok(())
         });
     }
