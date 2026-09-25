@@ -206,12 +206,14 @@ fn main() -> ExitCode {
     // Node-local commands need the environment-only config.
     let cfg = match Config::load() {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
             if matches!(&command, Command::Healthcheck) {
                 eprintln!("health check: invalid node configuration");
                 return ExitCode::FAILURE;
             }
-            eprintln!("configuration error: {e}");
+            // Figment and validation errors may contain raw environment values. A pasted secret
+            // must never reach a service journal through the startup failure path.
+            eprintln!("configuration error: invalid CAIRN_* environment configuration");
             return ExitCode::from(2);
         }
     };
