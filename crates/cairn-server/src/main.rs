@@ -3142,6 +3142,29 @@ mod tests {
     }
 
     #[test]
+    fn bucket_ttl_command_parses_show_and_set() {
+        Cli::try_parse_from(["cairn", "bucket", "ttl", "show", "b"]).expect("ttl show parses");
+        Cli::try_parse_from(["cairn", "bucket", "ttl", "set", "b", "--max-days", "7"])
+            .expect("ttl set parses");
+        Cli::try_parse_from(["cairn", "bucket", "ttl", "set", "b", "--disable"])
+            .expect("ttl disable parses");
+        assert!(
+            Cli::try_parse_from([
+                "cairn",
+                "bucket",
+                "ttl",
+                "set",
+                "b",
+                "--max-days",
+                "7",
+                "--disable",
+            ])
+            .is_err(),
+            "max-days and disable are mutually exclusive"
+        );
+    }
+
+    #[test]
     fn backup_restore_rejects_every_noncanonical_metadata_topology() {
         let mut cfg = Config {
             meta_backend: "sqlite".to_owned(),

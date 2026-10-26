@@ -82,7 +82,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 rand = "0.8"
 
 # --- compression ---
-zstd = "0.13"
+zstd = "0.14"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 
 # --- ids & time ---

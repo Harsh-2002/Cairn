@@ -256,6 +256,7 @@ export function BucketSettings() {
     secret: "",
     ca_cert: "",
     insecure_skip_verify: false,
+    reject_ttl_objects: false,
   };
   const [targetForm, setTargetForm] = useState(blankTarget);
   const [addingTarget, setAddingTarget] = useState(false);
@@ -508,6 +509,7 @@ export function BucketSettings() {
         secret: f.secret,
         ca_cert: caCert || undefined,
         insecure_skip_verify: f.insecure_skip_verify,
+        reject_ttl_objects: f.reject_ttl_objects,
       });
       toast.success("Remote target added");
       setTargetForm(blankTarget);
@@ -1060,6 +1062,7 @@ export function BucketSettings() {
                           {t.region} · key {t.access_key_id}
                           {t.has_ca_cert ? " · custom CA" : ""}
                           {t.insecure_skip_verify ? " · TLS verify off" : ""}
+                          {t.reject_ttl_objects ? " · TTL rejected" : ""}
                         </p>
                       </div>
                       <Button
@@ -1217,6 +1220,32 @@ export function BucketSettings() {
                       </span>
                     </span>
                   </label>
+                  <div className="space-y-3 border-t pt-4">
+                    <p className="text-sm font-medium">Replication behavior</p>
+                    <label className="flex items-start gap-3">
+                      <Checkbox
+                        checked={targetForm.reject_ttl_objects ?? false}
+                        onCheckedChange={(v) =>
+                          setTargetForm({
+                            ...targetForm,
+                            reject_ttl_objects: v === true,
+                          })
+                        }
+                        aria-label="Reject objects with a TTL"
+                        className="mt-0.5"
+                      />
+                      <span>
+                        <span className="block text-sm">
+                          Reject objects with a TTL
+                        </span>
+                        <span className="block text-[13px] text-muted-foreground">
+                          Fail closed instead of replicating a TTL-bearing object
+                          to a destination that may not enforce it. Leave off for
+                          metadata-only replication.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
                 </div>
               </div>
             </CardContent>

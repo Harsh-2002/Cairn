@@ -236,11 +236,37 @@ pub enum BucketCmd {
         #[command(subcommand)]
         cmd: BucketConfigCmd,
     },
+    /// Per-object TTL settings.
+    Ttl {
+        #[command(subcommand)]
+        cmd: BucketTtlCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BucketTtlCmd {
+    /// Show the bucket's object-TTL setting.
+    Show {
+        /// The bucket name.
+        name: String,
+    },
+    /// Enable or disable the bucket's object-TTL setting.
+    Set {
+        /// The bucket name.
+        name: String,
+        /// Maximum TTL in days (default 365; allowed 1..=3650).
+        #[arg(long)]
+        max_days: Option<u64>,
+        /// Disable object TTL for the bucket.
+        #[arg(long, conflicts_with = "max_days")]
+        disable: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum BucketConfigCmd {
-    /// Read a configuration aspect (one of: policy, cors, lifecycle, replication, tagging).
+    /// Read a configuration aspect (one of: policy, cors, lifecycle, replication, tagging,
+    /// object_ttl).
     Get {
         /// The bucket name.
         name: String,
@@ -928,6 +954,7 @@ async fn bucket(client: &HttpClient, cfg: &ClientConfig, cmd: BucketCmd) -> Resu
             Ok(())
         }
         BucketCmd::Config { cmd } => bucket_config(client, cfg, cmd).await,
+        BucketCmd::Ttl { cmd } => bucket_ttl(client, cfg, cmd).await,
     }
 }
 
@@ -939,7 +966,7 @@ async fn bucket_config(
     match cmd {
         BucketConfigCmd::Get { name, aspect } => {
             let field = config_aspect_field(&aspect).ok_or_else(|| {
-                format!("unknown config aspect '{aspect}' (expected one of: policy, cors, lifecycle, replication, tagging)")
+                format!("unknown config aspect '{aspect}' (expected one of: policy, cors, lifecycle, replication, tagging, object_ttl)")
             })?;
             let subpath = format!("/buckets/{}/config", pct_encode_segment(&name));
             let resp = api_get(client, cfg, &subpath).await?;
@@ -964,7 +991,7 @@ async fn bucket_config(
             let subpath = config_set_subpath(&name, &aspect).ok_or_else(|| {
                 format!(
                     "setting config aspect '{aspect}' is not supported by the management API \
-                     (only 'policy' can be set)"
+                     (only 'policy' and 'object_ttl' can be set)"
                 )
             })?;
             let body = std::fs::read(&file)
@@ -979,6 +1006,72 @@ async fn bucket_config(
                 });
             } else {
                 println!("set {aspect} on bucket {name}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn bucket_ttl(
+    client: &HttpClient,
+    cfg: &ClientConfig,
+    cmd: BucketTtlCmd,
+) -> Result<(), String> {
+    match cmd {
+        BucketTtlCmd::Show { name } => {
+            let subpath = format!("/buckets/{}/config", pct_encode_segment(&name));
+            let resp = api_get(client, cfg, &subpath).await?;
+            let doc: serde_json::Value = decode(&resp)?;
+            let value = doc
+                .get("object_ttl")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if cfg.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_owned())
+                );
+            } else if value.is_null() {
+                println!("object TTL: disabled");
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                );
+            }
+            Ok(())
+        }
+        BucketTtlCmd::Set {
+            name,
+            max_days,
+            disable,
+        } => {
+            let body = if disable {
+                serde_json::json!({ "enabled": false })
+            } else {
+                let days = max_days.unwrap_or(365);
+                if !(1..=3_650).contains(&days) {
+                    return Err("max_days must be between 1 and 3650".to_owned());
+                }
+                serde_json::json!({
+                    "enabled": true,
+                    "max_ttl_secs": days.saturating_mul(86_400),
+                })
+            }
+            .to_string();
+            let subpath = format!("/buckets/{}/object-ttl", pct_encode_segment(&name));
+            let resp =
+                api_send(client, cfg, Method::PUT, &subpath, Some(Bytes::from(body))).await?;
+            if cfg.json {
+                print_json_body(if resp.body.is_empty() {
+                    br#"{"updated":true}"#
+                } else {
+                    &resp.body
+                });
+            } else if disable {
+                println!("object TTL disabled on bucket {name}");
+            } else {
+                println!("object TTL enabled on bucket {name}");
             }
             Ok(())
         }

@@ -104,6 +104,7 @@ export async function runReplicationTests() {
         region: "us-east-1",
         access_key_id: "public-id",
         insecure_skip_verify: false,
+        reject_ttl_objects: false,
         has_ca_cert: false,
       })),
     };
