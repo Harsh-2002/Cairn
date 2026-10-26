@@ -35,6 +35,11 @@ authorizes.
 | Server-side encryption (GetBucketEncryption / PutBucketEncryption / DeleteBucketEncryption; SSE headers on write/read) | ✅ | `?encryption` bucket subresource (`ServerSideEncryptionConfiguration` XML, validated). `x-amz-server-side-encryption: AES256` (SSE-S3) or `aws:kms` (SSE-KMS: `-aws-kms-key-id`, `-bucket-key-enabled`) on PutObject / CreateMultipartUpload / CopyObject, echoed on PUT/GET/HEAD/Copy/Complete. Multipart parts are encrypted at rest (per-part DEK). `aws:kms` is a **validated label over the same master-key ring — not distinct key material / not tenant isolation** (see `s3-api.md` §13.5, `security-errors.md` §27.6/27.8). Optional transparent at-rest encryption via `CAIRN_ENCRYPT_AT_REST` (advertises nothing) and a mandatory-SSE `required` flag. |
 | website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
 
+**Lifecycle expiry visibility.** `PutObject`, `CopyObject`, `CompleteMultipartUpload`, `HeadObject`,
+and `GetObject` emit the standard `x-amz-expiration` header for the current version when an enabled
+`Expiration` rule matches. The value reports the earliest matching rule; noncurrent versions and
+delete markers do not carry it. The header is informational — deletion remains asynchronous.
+
 **Checksum scope.** Single-object checksums are full-object; multipart objects carry a **COMPOSITE**
 checksum-of-part-checksums composed at CompleteMultipartUpload from the per-part digests, echoed with
 `x-amz-checksum-type: COMPOSITE` on Complete and returned by `GetObjectAttributes` (CRC-64/NVME, which

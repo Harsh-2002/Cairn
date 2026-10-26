@@ -21,6 +21,7 @@ interface Draft {
   id: string;
   enabled: boolean;
   prefix: string;
+  tags: s3.LifecycleTag[];
   expirationDays: string;
   noncurrentDays: string;
   abortDays: string;
@@ -31,6 +32,7 @@ function ruleToDraft(r: s3.LifecycleRule): Draft {
     id: r.id,
     enabled: r.enabled,
     prefix: r.prefix,
+    tags: r.tags,
     expirationDays: r.expirationDays ? String(r.expirationDays) : "",
     noncurrentDays: r.noncurrentDays ? String(r.noncurrentDays) : "",
     abortDays: r.abortDays ? String(r.abortDays) : "",
@@ -42,6 +44,7 @@ function emptyDraft(n: number): Draft {
     id: `rule-${n}`,
     enabled: true,
     prefix: "",
+    tags: [],
     expirationDays: "",
     noncurrentDays: "",
     abortDays: "",
@@ -74,6 +77,60 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
     );
   }
 
+  function patchTag(i: number, j: number, change: Partial<s3.LifecycleTag>) {
+    setRules((rs) =>
+      rs
+        ? rs.map((r, ri) =>
+            ri === i
+              ? {
+                  ...r,
+                  tags: r.tags.map((tag, tj) =>
+                    tj === j ? { ...tag, ...change } : tag,
+                  ),
+                }
+              : r,
+          )
+        : rs,
+    );
+  }
+
+  function addTag(i: number) {
+    setRules((rs) =>
+      rs
+        ? rs.map((r, ri) =>
+            ri === i ? { ...r, tags: [...r.tags, { key: "", value: "" }] } : r,
+          )
+        : rs,
+    );
+  }
+
+  function removeTag(i: number, j: number) {
+    setRules((rs) =>
+      rs
+        ? rs.map((r, ri) =>
+            ri === i
+              ? { ...r, tags: r.tags.filter((_, tj) => tj !== j) }
+              : r,
+          )
+        : rs,
+    );
+  }
+
+  function addTtlDraft() {
+    setRules((rs) => {
+      const n = (rs?.length ?? 0) + 1;
+      return [
+        ...(rs ?? []),
+        {
+          ...emptyDraft(n),
+          id: `ttl-7d-${n}`,
+          tags: [{ key: "ttl", value: "7d" }],
+          expirationDays: "7",
+        },
+      ];
+    });
+  }
+
   async function save() {
     if (!rules) return;
     setErr(null);
@@ -85,10 +142,16 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
       const ab = numField(d.abortDays);
       if (!exp && !nc && !ab)
         return setErr(`Rule "${d.id}" needs at least one action`);
+      const tags = d.tags
+        .map((tag) => ({ key: tag.key.trim(), value: tag.value.trim() }))
+        .filter((tag) => tag.key || tag.value);
+      if (tags.some((tag) => !tag.key || !tag.value))
+        return setErr(`Rule "${d.id}" has an incomplete tag filter`);
       out.push({
         id: d.id.trim(),
         enabled: d.enabled,
         prefix: d.prefix.trim(),
+        tags,
         expirationDays: exp,
         noncurrentDays: nc,
         abortDays: ab,
@@ -118,7 +181,9 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
       {err ? <FieldError>{err}</FieldError> : null}
       <p className="text-[13px] text-muted-foreground">
         Expire objects, expire noncurrent versions, and abort stale multipart
-        uploads. Storage-class transitions are not supported.
+        uploads. Add a tag filter such as <code>ttl=7d</code> with an expiration
+        action to give matching objects a per-object TTL. Storage-class
+        transitions are not supported.
       </p>
 
       {rules && rules.length === 0 ? (
@@ -167,6 +232,52 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
               onChange={(e) => patch(i, { prefix: e.target.value })}
             />
           </div>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-[13px]">Tag filters (all must match)</Label>
+              <Button
+                variant="ghost"
+                size="xs"
+                disabled={busy}
+                onClick={() => addTag(i)}
+              >
+                <Plus className="size-3" /> Add tag
+              </Button>
+            </div>
+            {r.tags.length === 0 ? (
+              <p className="text-[12px] text-muted-foreground">
+                Optional. A tag such as <code>ttl=7d</code> plus an expiration
+                action scopes the rule to objects carrying that tag.
+              </p>
+            ) : null}
+            {r.tags.map((tag, j) => (
+              <div key={j} className="flex flex-wrap items-center gap-2">
+                <Input
+                  value={tag.key}
+                  className="h-8 min-w-32 flex-1"
+                  placeholder="ttl"
+                  aria-label={`Tag ${j + 1} key`}
+                  onChange={(e) => patchTag(i, j, { key: e.target.value })}
+                />
+                <Input
+                  value={tag.value}
+                  className="h-8 min-w-32 flex-1"
+                  placeholder="7d"
+                  aria-label={`Tag ${j + 1} value`}
+                  onChange={(e) => patchTag(i, j, { value: e.target.value })}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`Remove tag ${tag.key || j + 1}`}
+                  disabled={busy}
+                  onClick={() => removeTag(i, j)}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            ))}
+          </div>
           <div className="grid gap-3 sm:grid-cols-3">
             <div className="space-y-1.5">
               <Label className="text-[13px]">Expire after (days)</Label>
@@ -199,16 +310,21 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
         </div>
       ))}
 
-      <div className="flex items-center justify-between border-t pt-4">
-        <Button
-          variant="outline"
-          disabled={busy}
-          onClick={() =>
-            setRules((rs) => [...(rs ?? []), emptyDraft((rs?.length ?? 0) + 1)])
-          }
-        >
-          <Plus className="size-4" /> Add rule
-        </Button>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="outline"
+            disabled={busy}
+            onClick={() =>
+              setRules((rs) => [...(rs ?? []), emptyDraft((rs?.length ?? 0) + 1)])
+            }
+          >
+            <Plus className="size-4" /> Add rule
+          </Button>
+          <Button variant="outline" disabled={busy} onClick={addTtlDraft}>
+            <CalendarClock className="size-4" /> Add 7-day TTL
+          </Button>
+        </div>
         <Button disabled={busy} onClick={save}>
           {busy ? "Saving…" : "Save lifecycle"}
         </Button>

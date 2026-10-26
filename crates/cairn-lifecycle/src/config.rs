@@ -12,6 +12,7 @@
 //! `cairn-xml`.
 
 use cairn_types::Error;
+use cairn_types::time::Timestamp;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -118,6 +119,41 @@ pub enum Expiration {
     /// Expire on or after this absolute time (seconds since the Unix epoch).
     Date(i64),
 }
+
+/// The earliest enabled current-object expiration that applies to an object.
+///
+/// Mirrors the lifecycle scanner's filter and age semantics: a rule matches when its filter
+/// accepts the key, size, and tags; a `Days` threshold ages from `last_modified`, while a `Date`
+/// threshold is absolute. Returns the expiry instant together with the matching rule identifier.
+/// Disabled rules and non-expiration actions are ignored; when several rules match, the earliest
+/// expiry wins (configuration order breaks ties).
+#[must_use]
+pub fn earliest_expiration<'a>(
+    rules: &'a [LifecycleRule],
+    key: &str,
+    size: u64,
+    tags: &[(String, String)],
+    last_modified: Timestamp,
+) -> Option<(Timestamp, &'a str)> {
+    rules
+        .iter()
+        .filter(|rule| rule.enabled && rule.filter.matches(key, size, tags))
+        .flat_map(|rule| {
+            rule.actions.iter().filter_map(move |action| match action {
+                Action::Expiration(Expiration::Days(days)) => Some((
+                    last_modified.plus_secs(i64::from(*days) * SECS_PER_DAY),
+                    rule.id.as_str(),
+                )),
+                Action::Expiration(Expiration::Date(secs)) => {
+                    Some((Timestamp::from_secs(*secs), rule.id.as_str()))
+                }
+                _ => None,
+            })
+        })
+        .min_by_key(|(expires, _)| *expires)
+}
+
+const SECS_PER_DAY: i64 = 86_400;
 
 /// The threshold for a cold-tier transition (parsed but not acted on in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
