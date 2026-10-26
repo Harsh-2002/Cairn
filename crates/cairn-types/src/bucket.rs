@@ -64,6 +64,33 @@ pub enum ConfigAspect {
     /// The bucket event-notification (webhook) configuration: the list of webhook endpoints and
     /// their event/prefix/suffix filters (`crate::notification::NotificationConfig`).
     Notification,
+    /// The bucket's opt-in per-object TTL setting (`ObjectTtlConfig`).
+    ObjectTtl,
+}
+
+/// Per-bucket opt-in for the per-object TTL extension (`X-Amz-Meta-Object-Expires`).
+///
+/// The setting only enables interpretation of the header. It never assigns a TTL to an object;
+/// an object without the header never expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectTtlConfig {
+    /// Whether the bucket accepts the TTL header.
+    pub enabled: bool,
+    /// The largest accepted TTL, in seconds. Defaults to 365 days.
+    #[serde(default = "default_object_ttl_max_secs")]
+    pub max_ttl_secs: u64,
+}
+
+/// The smallest configurable per-bucket TTL ceiling (one hour).
+pub const OBJECT_TTL_MIN_SECS: u64 = 3_600;
+/// The hard ceiling for a per-bucket TTL (ten years).
+pub const OBJECT_TTL_MAX_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+/// The default per-bucket TTL ceiling (365 days).
+pub const OBJECT_TTL_DEFAULT_MAX_SECS: u64 = 365 * 24 * 60 * 60;
+
+fn default_object_ttl_max_secs() -> u64 {
+    OBJECT_TTL_DEFAULT_MAX_SECS
 }
 
 /// How long a bucket's default Object Lock retention lasts, as a period from object creation.

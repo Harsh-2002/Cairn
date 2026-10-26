@@ -12,7 +12,9 @@ use cairn_replication::{
 };
 use cairn_types::auth::{Principal, Role};
 use cairn_types::bucket::{
-    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
+    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc,
+    OBJECT_TTL_DEFAULT_MAX_SECS, OBJECT_TTL_MAX_SECS, OBJECT_TTL_MIN_SECS, ObjectTtlConfig,
+    VersioningState,
 };
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use cairn_types::meta::{
@@ -397,6 +399,9 @@ impl ControlService {
             }
             (&Method::PUT, ["buckets", name, "encryption"]) => {
                 self.set_encryption(name, &body, principal).await
+            }
+            (&Method::PUT, ["buckets", name, "object-ttl"]) => {
+                self.set_object_ttl(name, &body, principal).await
             }
             (&Method::GET, ["buckets", name, "notifications"]) => {
                 self.get_notifications(name).await
@@ -1198,7 +1203,7 @@ impl ControlService {
 
         // Each aspect is an opaque stored document; surface it as parsed JSON so the web console can
         // render it, falling back to a JSON string if it is not itself JSON.
-        let (policy, cors, tagging, lifecycle, acl, public_access_block, encryption) =
+        let (policy, cors, tagging, lifecycle, acl, public_access_block, encryption, object_ttl) =
             match self.read_aspects(&bucket_name).await {
                 Ok(aspects) => aspects,
                 Err(e) => return ControlResponse::error_internal(&e),
@@ -1224,11 +1229,12 @@ impl ControlService {
                 acl,
                 public_access_block,
                 encryption,
+                object_ttl,
             },
         )
     }
 
-    /// Read the seven exposed config aspects of a bucket, each rendered as JSON (or `None` when
+    /// Read the eight exposed config aspects of a bucket, each rendered as JSON (or `None` when
     /// unset). Returns the documents in the response's declared order, or an error string on a
     /// store failure.
     #[allow(clippy::type_complexity)]
@@ -1237,6 +1243,7 @@ impl ControlService {
         bucket: &BucketName,
     ) -> Result<
         (
+            Option<serde_json::Value>,
             Option<serde_json::Value>,
             Option<serde_json::Value>,
             Option<serde_json::Value>,
@@ -1262,6 +1269,7 @@ impl ControlService {
             read(ConfigAspect::Acl).await?,
             read(ConfigAspect::PublicAccessBlock).await?,
             read(ConfigAspect::Encryption).await?,
+            read(ConfigAspect::ObjectTtl).await?,
         ))
     }
 
@@ -1466,6 +1474,63 @@ impl ControlService {
 
         self.record_activity(
             "SetBucketEncryption",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::no_content()
+    }
+
+    /// `PUT /buckets/{name}/object-ttl`: enable or disable the per-object TTL extension.
+    ///
+    /// `enabled: false` clears the bucket setting. `enabled: true` stores the optional ceiling,
+    /// defaulting to 365 days and rejecting values outside 1 hour..10 years. The setting only
+    /// enables interpretation of `X-Amz-Meta-Object-Expires`; it never assigns a TTL by itself.
+    async fn set_object_ttl(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let req: wire::SetObjectTtlReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        let doc = if req.enabled {
+            let max_ttl_secs = req.max_ttl_secs.unwrap_or(OBJECT_TTL_DEFAULT_MAX_SECS);
+            if !(OBJECT_TTL_MIN_SECS..=OBJECT_TTL_MAX_SECS).contains(&max_ttl_secs) {
+                return ControlResponse::bad_request(&format!(
+                    "max_ttl_secs must be between {OBJECT_TTL_MIN_SECS} and {OBJECT_TTL_MAX_SECS}"
+                ));
+            }
+            let config = ObjectTtlConfig {
+                enabled: true,
+                max_ttl_secs,
+            };
+            Some(ConfigDoc(
+                serde_json::to_string(&config).expect("ObjectTtlConfig serializes"),
+            ))
+        } else {
+            None
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::ObjectTtl,
+                doc,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity(
+            "SetBucketObjectTtl",
             Some(bucket_name.as_str()),
             None,
             principal,

@@ -3183,6 +3183,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Encryption => "encryption",
         ObjectLock => "object_lock",
         Notification => "notification",
+        ObjectTtl => "object_ttl",
     }
 }
 

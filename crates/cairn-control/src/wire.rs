@@ -616,6 +616,18 @@ pub struct BucketConfigResp {
     /// The default server-side-encryption document (`{"algorithm":"AES256"}`), or `null` when
     /// new uploads are stored unencrypted by default.
     pub encryption: Option<Value>,
+    /// The opt-in per-object TTL document (`{"enabled":true,"max_ttl_secs":31536000}`), or `null`
+    /// when the extension is disabled for this bucket.
+    pub object_ttl: Option<Value>,
+}
+
+/// `PUT /buckets/{name}/object-ttl` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetObjectTtlReq {
+    /// Whether the bucket accepts `X-Amz-Meta-Object-Expires`.
+    pub enabled: bool,
+    /// Optional ceiling in seconds; defaults to 365 days and is bounded to 1 hour..10 years.
+    pub max_ttl_secs: Option<u64>,
 }
 
 /// `PUT /buckets/{name}/encryption` request body.
