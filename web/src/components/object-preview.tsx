@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
+  CalendarClock,
   Download,
   File as FileIcon,
   ImageOff,
@@ -41,7 +42,7 @@ import {
   type PreviewKind,
   TEXT_MAX_BYTES,
 } from "@/lib/preview";
-import { getObjectText, previewUrl, type TextSlice } from "@/lib/s3";
+import { getObjectText, objectExpiry, previewUrl, type TextSlice } from "@/lib/s3";
 import { cn } from "@/lib/utils";
 
 export interface PreviewItem {
@@ -170,10 +171,25 @@ export function ObjectPreview({
   // An image reports its natural aspect once decoded so the dialog can take that shape. Reset it
   // whenever the shown object changes, or a portrait photo would briefly inherit the last one's box.
   const [imgAspect, setImgAspect] = useState<number | null>(null);
+  const [expireAt, setExpireAt] = useState<string | null>(null);
   const currentKey = current?.key;
+  const currentVersion = current?.versionId;
   useEffect(() => {
     setImgAspect(null);
   }, [currentKey]);
+  useEffect(() => {
+    if (!open || !currentKey) {
+      setExpireAt(null);
+      return;
+    }
+    let live = true;
+    objectExpiry(bucket, currentKey, currentVersion)
+      .then((value) => live && setExpireAt(value))
+      .catch(() => live && setExpireAt(null));
+    return () => {
+      live = false;
+    };
+  }, [open, bucket, currentKey, currentVersion]);
 
   if (!current) return null;
 
@@ -233,6 +249,12 @@ export function ObjectPreview({
                 </>
               )}
             </p>
+            {expireAt ? (
+              <p className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                <CalendarClock aria-hidden="true" className="size-3" />
+                Expires {new Date(expireAt).toLocaleString()}
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-1">
             <Button

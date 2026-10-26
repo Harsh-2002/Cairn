@@ -187,14 +187,23 @@ Prometheus metrics `/metrics`. Signals to watch:
 
 ### Per-object TTL
 
-Per-object TTL is opt-in per bucket (`PUT /api/v1/buckets/{name}/object-ttl`, or the console's
-**Object TTL** card). It is off by default, and an object uploaded without
-`X-Amz-Meta-Object-Expires` never expires. Expired objects disappear from GET/HEAD and listings at
-the deadline; the background sweep (`CAIRN_OBJECT_TTL_INTERVAL_SECS`, default 60s) reclaims bytes
-and inserts versioned-bucket delete markers. If the sweep log shows errors, check metadata
-reachability and Object Lock state: TTL and Object Lock are mutually exclusive per object. When a
-bucket is replicated to a generic S3 destination, the TTL header is preserved only as user metadata;
-configure the destination's own lifecycle if it must delete the replica.
+Per-object TTL is opt-in per bucket (`PUT /api/v1/buckets/{name}/object-ttl`, the console's
+**Object TTL** card, or `cairn bucket ttl show|set`). It is off by default, and an object uploaded
+without `X-Amz-Meta-Object-Expires` never expires. For example:
+
+```sh
+cairn bucket ttl show my-bucket
+cairn bucket ttl set my-bucket --max-days 7
+cairn bucket ttl set my-bucket --disable
+```
+
+Expired objects disappear from GET/HEAD and listings at the deadline; the background sweep
+(`CAIRN_OBJECT_TTL_INTERVAL_SECS`, default 60s) reclaims bytes and inserts versioned-bucket delete
+markers. If the sweep log shows errors, check metadata reachability and Object Lock state: TTL and
+Object Lock are mutually exclusive per object. When a bucket is replicated to a generic S3
+destination, the TTL header is preserved only as user metadata; configure the destination's own
+lifecycle if it must delete the replica, or enable **Reject objects with a TTL** on the replication
+target to fail closed.
 
 On **shutdown** (SIGTERM or SIGINT), Cairn first changes `/readyz` to not-ready, then stops accepting
 connections and tells every worker to stop before its next scan, pass, or claim batch. Existing HTTP

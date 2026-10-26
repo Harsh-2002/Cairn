@@ -299,6 +299,17 @@ export interface TextSlice {
  * A Range request keeps a huge log out of the DOM. The bytes are rendered as inert text by the caller
  * — never navigated to, never innerHTML — so they can't become active content (audit #13).
  */
+export async function objectExpiry(
+  bucket: string,
+  key: string,
+  versionId?: string,
+): Promise<string | null> {
+  const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
+  const res = await dataFetch(objectPath(bucket, key) + q, { method: "HEAD" });
+  if (!res.ok) return null;
+  return res.headers.get("x-amz-meta-object-expires");
+}
+
 export async function getObjectText(
   bucket: string,
   key: string,

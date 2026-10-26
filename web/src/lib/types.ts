@@ -310,6 +310,8 @@ export interface ReplicationTarget {
   access_key_id: string;
   /** TLS certificate verification is skipped for this destination (testing only). */
   insecure_skip_verify: boolean;
+  /** TTL-bearing objects are refused instead of replicated without destination enforcement. */
+  reject_ttl_objects: boolean;
   /** A custom CA certificate is trusted for this destination's TLS. */
   has_ca_cert: boolean;
 }
@@ -329,6 +331,8 @@ export interface CreateReplicationTargetReq {
   ca_cert?: string;
   /** Skip TLS certificate verification (testing only; mutually exclusive with ca_cert). */
   insecure_skip_verify?: boolean;
+  /** Fail closed instead of replicating a TTL-bearing object to this target. */
+  reject_ttl_objects?: boolean;
 }
 
 export interface ReplicationStatusError {
