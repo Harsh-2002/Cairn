@@ -316,10 +316,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   Allow at least 16 GiB working space for native multipart staging plus MinIO replicas. Crash/debt coverage is
   tracked separately in Phase 4C; this harness covers healthy delivery, not real AWS credentials.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
-  host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs weekly or manually
-  (`Extended checks` benchmark job → job-summary table + CSV/JSON artifact). **Report-not-gate**: the signal is
-  the Cairn/MinIO ratio, and it fails ONLY on warp operation errors (not on who is faster), because a
-  contended runner has large throughput variance. Parses the MEASURED op, not warp's prepare-PUT.
+  host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Manual only; it is
+  not wired into CI. **Report-not-gate**: the signal is the Cairn/MinIO ratio, and it fails ONLY on
+  warp operation errors (not on who is faster), because throughput variance is large. Parses the
+  MEASURED op, not warp's prepare-PUT.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.

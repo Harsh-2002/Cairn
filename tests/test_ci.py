@@ -167,8 +167,9 @@ class VerdictTests(unittest.TestCase):
         validation=(ROOT/'.github/workflows/validate.yml').read_text()
         extended=(ROOT/'.github/workflows/extended.yml').read_text()
         self.assertIn('conformance/replication_large.sh',validation)
+        # The MinIO head-to-head is a manual harness; it must not re-enter a scheduled or PR workflow.
         self.assertNotIn('conformance/bench_compare.sh',validation)
-        self.assertIn('conformance/bench_compare.sh',extended)
+        self.assertNotIn('conformance/bench_compare.sh',extended)
         self.assertNotIn('conformance/replication_large.sh',extended)
         large=validation.split('\n  large-replication:\n',1)[1].split('\n  codeql:\n',1)[0]
         self.assertNotIn('upload-artifact',large)
