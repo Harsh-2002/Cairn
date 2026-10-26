@@ -29,8 +29,13 @@ case "${1:?CI task required}" in
     tar -xzf "$archive" -C "$RUNNER_TEMP"
     ;;
   rust-audit-2)
-    "${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit
-    "${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit --file conformance/storage_lab/Cargo.lock
+    audit="${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit"
+    "$audit" audit
+    "$audit" audit --file conformance/storage_lab/Cargo.lock
+    # Fuzz crates detach into their own workspaces, so their lockfiles need explicit coverage.
+    for lock in crates/*/fuzz/Cargo.lock; do
+      "$audit" audit --file "$lock"
+    done
     ;;
   workspace-tests)
     EXTRA=()
