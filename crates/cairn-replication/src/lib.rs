@@ -760,6 +760,7 @@ impl ReplicationEngine {
             content_disposition: row.content_disposition.clone(),
             content_language: row.content_language.clone(),
             expires: row.expires.clone(),
+            expire_at: row.expire_at,
             storage_class: row.storage_class,
             checksums: row.checksums.clone(),
             client_encrypted,

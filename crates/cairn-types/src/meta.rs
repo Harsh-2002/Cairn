@@ -1378,6 +1378,9 @@ pub struct MultipartReplicaIntent {
     pub content_language: Option<String>,
     /// Stored Expires.
     pub expires: Option<String>,
+    /// Absolute per-object TTL expiry (milliseconds since the Unix epoch), when the source version
+    /// carries one. Replicas preserve this so a Cairn destination can enforce the same deadline.
+    pub expire_at: Option<Timestamp>,
     /// Expected whole-object supplementary checksums (never composite part checksums).
     pub checksums: Vec<ChecksumValue>,
 }

@@ -43,6 +43,7 @@ fn row(bucket: &str, key: &str, size: u64) -> ObjectVersionRow {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(StoragePath::generate(&b)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,

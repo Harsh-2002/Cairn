@@ -274,6 +274,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
         content_disposition: row.get::<_, Option<String>>("content_disposition")?,
         content_language: row.get::<_, Option<String>>("content_language")?,
         expires: row.get::<_, Option<String>>("expires")?,
+        expire_at: row.get::<_, Option<i64>>("expire_at")?.map(Timestamp),
         storage_path: row
             .get::<_, Option<String>>("storage_path")?
             .map(StoragePath::from_string),

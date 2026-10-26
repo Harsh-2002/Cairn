@@ -167,6 +167,7 @@ async fn put_object(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,

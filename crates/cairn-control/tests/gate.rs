@@ -256,6 +256,7 @@ async fn put_object_with_lock(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -2162,6 +2163,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()
@@ -3024,6 +3026,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()
@@ -3523,6 +3526,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()

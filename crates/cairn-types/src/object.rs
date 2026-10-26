@@ -220,6 +220,9 @@ pub struct ObjectVersionRow {
     pub content_language: Option<String>,
     /// The `Expires` header to echo on GET/HEAD (None if not supplied).
     pub expires: Option<String>,
+    /// Absolute per-object TTL expiry (milliseconds since the Unix epoch), or `None` when the
+    /// version has no TTL. Set only by the opt-in object-TTL extension.
+    pub expire_at: Option<Timestamp>,
     /// The opaque blob path (None for delete markers).
     pub storage_path: Option<StoragePath>,
     /// How the blob is compressed.

@@ -1071,6 +1071,7 @@ impl S3Service {
             content_disposition: header_owned("content-disposition"),
             content_language: header_owned("content-language"),
             expires: header_owned("expires"),
+            expire_at: None,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1691,6 +1692,7 @@ impl S3Service {
                 content_disposition: req.header("content-disposition").map(str::to_owned),
                 content_language: req.header("content-language").map(str::to_owned),
                 expires: req.header("expires").map(str::to_owned),
+                expire_at: None,
                 checksums,
             })
         } else {
@@ -2554,6 +2556,10 @@ impl S3Service {
                 .replica_intent
                 .as_ref()
                 .and_then(|intent| intent.expires.clone()),
+            expire_at: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.expire_at),
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -3048,6 +3054,7 @@ impl S3Service {
             content_disposition: sys("content-disposition", &src_row.content_disposition),
             content_language: sys("content-language", &src_row.content_language),
             expires: sys("expires", &src_row.expires),
+            expire_at: None,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -6847,6 +6854,7 @@ fn replica_marker_row(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: None,
         compression: cairn_types::object::CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,

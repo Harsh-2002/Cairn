@@ -35,6 +35,8 @@ pub struct ReplicatedObject<'a> {
     pub content_language: Option<String>,
     /// `Expires` header.
     pub expires: Option<String>,
+    /// Absolute per-object TTL expiry, preserved on a Cairn destination.
+    pub expire_at: Option<crate::time::Timestamp>,
     /// The object's storage class, re-emitted on the replica.
     pub storage_class: StorageClass,
     /// Client-supplied flexible checksums, re-emitted as `x-amz-checksum-*` so a checksum-mode GET of

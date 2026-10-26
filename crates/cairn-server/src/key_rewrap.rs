@@ -1114,6 +1114,7 @@ mod tests {
                         content_disposition: None,
                         content_language: None,
                         expires: None,
+                        expire_at: None,
                         storage_path: Some(StoragePath::generate(&bucket)),
                         compression: CompressionDescriptor::Uncompressed,
                         storage_class: StorageClass::Standard,

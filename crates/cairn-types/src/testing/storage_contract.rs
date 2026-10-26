@@ -352,6 +352,7 @@ pub(super) fn object_row(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(plan.final_path().unwrap().clone()),
         compression: crate::CompressionDescriptor::Uncompressed,
         storage_class: crate::StorageClass::Standard,

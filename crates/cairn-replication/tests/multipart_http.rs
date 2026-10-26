@@ -316,6 +316,7 @@ fn object<'a>(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_class: cairn_types::StorageClass::Standard,
         checksums: vec![],
         client_encrypted: false,
