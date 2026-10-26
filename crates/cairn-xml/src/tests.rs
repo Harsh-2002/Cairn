@@ -27,6 +27,7 @@ fn summary(key: &str, etag: &str, size: u64) -> ObjectSummary {
         etag: ETag::from_md5_hex(etag.to_owned()),
         size,
         last_modified: Timestamp(1_750_000_000_000),
+        expire_at: None,
         storage_class: StorageClass::Standard,
         owner_id: UserId("owner-1".to_owned()),
     }

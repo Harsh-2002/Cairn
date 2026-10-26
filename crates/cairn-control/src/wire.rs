@@ -616,6 +616,18 @@ pub struct BucketConfigResp {
     /// The default server-side-encryption document (`{"algorithm":"AES256"}`), or `null` when
     /// new uploads are stored unencrypted by default.
     pub encryption: Option<Value>,
+    /// The opt-in per-object TTL document (`{"enabled":true,"max_ttl_secs":31536000}`), or `null`
+    /// when the extension is disabled for this bucket.
+    pub object_ttl: Option<Value>,
+}
+
+/// `PUT /buckets/{name}/object-ttl` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetObjectTtlReq {
+    /// Whether the bucket accepts `X-Amz-Meta-Object-Expires`.
+    pub enabled: bool,
+    /// Optional ceiling in seconds; defaults to 365 days and is bounded to 1 hour..10 years.
+    pub max_ttl_secs: Option<u64>,
 }
 
 /// `PUT /buckets/{name}/encryption` request body.
@@ -747,6 +759,9 @@ pub struct CreateReplicationTargetReq {
     /// endpoint). Mutually exclusive with `ca_cert`.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Refuse to replicate TTL-bearing objects to this destination (fail-closed mode).
+    #[serde(default)]
+    pub reject_ttl_objects: bool,
 }
 
 /// `POST /buckets/{name}/replication/targets` response body: just the minted ARN. The secret is
@@ -773,6 +788,8 @@ pub struct ReplicationTargetEntry {
     pub access_key_id: String,
     /// Whether TLS certificate verification is skipped for this destination (testing only).
     pub insecure_skip_verify: bool,
+    /// Whether this target refuses TTL-bearing objects.
+    pub reject_ttl_objects: bool,
     /// Whether a custom CA certificate is trusted for this destination's TLS.
     pub has_ca_cert: bool,
 }

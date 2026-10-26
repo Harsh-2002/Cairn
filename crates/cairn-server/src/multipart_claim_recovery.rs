@@ -329,6 +329,7 @@ mod tests {
             content_disposition: None,
             content_language: None,
             expires: None,
+            expire_at: None,
             storage_path: Some(plan.final_path().unwrap().clone()),
             compression: cairn_types::CompressionDescriptor::Uncompressed,
             storage_class: cairn_types::StorageClass::Standard,

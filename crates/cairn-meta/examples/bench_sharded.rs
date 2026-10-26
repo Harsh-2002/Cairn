@@ -62,6 +62,7 @@ fn row(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(plan.final_path().unwrap().clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,

@@ -99,6 +99,9 @@ pub enum MetaError {
     /// Persisted or requested Object Lock state is malformed, incomplete, or inconsistent.
     #[error("invalid object lock state")]
     InvalidObjectLockState,
+    /// The request combined per-object TTL with Object Lock protection on the same version.
+    #[error("object TTL conflicts with object lock")]
+    ObjectTtlConflict,
 }
 
 /// Failures of authentication.
@@ -352,6 +355,9 @@ impl From<MetaError> for Error {
             MetaError::OutOfSpace | MetaError::QuotaExceeded => Error::InsufficientStorage,
             MetaError::MultipartNotActive => Error::NoSuchUpload,
             MetaError::NotEmpty => Error::BucketNotEmpty,
+            MetaError::ObjectTtlConflict => {
+                Error::InvalidArgument("object TTL cannot be combined with Object Lock".to_owned())
+            }
             other => Error::Internal(other.to_string()),
         }
     }

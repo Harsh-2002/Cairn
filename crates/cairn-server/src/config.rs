@@ -103,6 +103,10 @@ pub struct Config {
     pub allow_insecure: bool,
     /// How often the lifecycle scanner applies each bucket's rules, in seconds.
     pub lifecycle_interval_secs: u64,
+    /// How often the per-object TTL sweep applies due expirations, in seconds
+    /// (`CAIRN_OBJECT_TTL_INTERVAL_SECS`). Defaults to 60s: TTL visibility is enforced on read,
+    /// while physical reclamation is bounded by this interval.
+    pub object_ttl_interval_secs: u64,
     /// How often the webhook event-notification worker drains the delivery outbox to the configured
     /// per-bucket endpoints, in seconds (`CAIRN_WEBHOOK_INTERVAL_SECS`, ARCH 20-style). The claim is a
     /// cheap indexed query, so the loop is a no-op for buckets without notifications; default 15s.
@@ -456,6 +460,7 @@ impl Default for Config {
             dev_auth: false,
             allow_insecure: false,
             lifecycle_interval_secs: 3600,
+            object_ttl_interval_secs: 60,
             webhook_interval_secs: 15,
             multipart_sweep_interval_secs: 3600,
             multipart_max_active_uploads_per_bucket: 1_000,
@@ -953,6 +958,11 @@ impl Config {
         if self.lifecycle_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "lifecycle_interval_secs must be positive".into(),
+            ));
+        }
+        if self.object_ttl_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "object_ttl_interval_secs must be positive".into(),
             ));
         }
         if self.webhook_interval_secs == 0 {

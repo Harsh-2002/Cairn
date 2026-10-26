@@ -154,6 +154,8 @@ export interface BucketConfigResp {
   /** SSE document ({"algorithm":"AES256","required":true}) or null when off. `required` mandates
    * encryption: a client PUT that would store a plaintext object is refused. */
   encryption: { algorithm?: string; required?: boolean } | null;
+  /** Per-object TTL opt-in; null when disabled. */
+  object_ttl: { enabled: boolean; max_ttl_secs: number } | null;
 }
 
 // --- Webhook event notifications (ARCH 20.6) ---

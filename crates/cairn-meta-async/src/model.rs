@@ -30,7 +30,7 @@ pub const OBJECT_VERSION_COLS: &str = "id, bucket_name, key, version_id, is_late
      is_delete_marker, size_logical, size_physical, etag, content_type, storage_path, \
      compression, storage_class, cold_locator, owner_id, user_metadata, acl, checksums, \
      sse_descriptor, replication_status, created_at, updated_at, content_encoding, cache_control, \
-     content_disposition, content_language, expires, replicated_at, internal_sha256";
+     content_disposition, content_language, expires, replicated_at, internal_sha256, expire_at";
 
 /// `buckets` columns in mapper order.
 pub const BUCKET_COLS: &str =
@@ -65,7 +65,7 @@ pub const SHARE_COLS: &str = "id, token_hash, bucket_name, key, version_id, expi
 
 /// `object_summary` listing columns in mapper order.
 pub const SUMMARY_COLS: &str = "key, version_id, is_latest, is_delete_marker, etag, size_logical, \
-     updated_at, storage_class, owner_id, id";
+     updated_at, storage_class, owner_id, id, expire_at";
 
 fn json_col<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, MetaError> {
     serde_json::from_str(s).map_err(|e| MetaError::Engine(format!("json column decode: {e}")))
@@ -251,6 +251,7 @@ pub fn object_version_from_row(row: &Row) -> Result<ObjectVersionRow, MetaError>
         content_disposition: row.get_opt_text(24),
         content_language: row.get_opt_text(25),
         expires: row.get_opt_text(26),
+        expire_at: row.get_opt_i64(29).map(Timestamp),
         storage_path: row.get_opt_text(10).map(StoragePath::from_string),
         compression,
         storage_class: storage_class_from(&row.get_text(12)),
@@ -278,6 +279,7 @@ pub fn object_summary_from_row(row: &Row) -> Result<ObjectSummary, MetaError> {
         etag: ETag::from_string(row.get_text(4)),
         size: row.get_i64(5) as u64,
         last_modified: Timestamp(row.get_i64(6)),
+        expire_at: row.get_opt_i64(10).map(Timestamp),
         storage_class: storage_class_from(&row.get_text(7)),
         owner_id: UserId(row.get_text(8)),
     })

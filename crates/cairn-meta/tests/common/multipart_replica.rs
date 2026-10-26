@@ -24,6 +24,7 @@ pub async fn preserves_replica_intent(store: &dyn MetadataStore) {
         content_disposition: None,
         content_language: Some("en".to_owned()),
         expires: None,
+        expire_at: None,
         checksums: vec![cairn_types::object::ChecksumValue {
             algorithm: cairn_types::object::ChecksumAlgorithm::Sha256,
             value: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned(),

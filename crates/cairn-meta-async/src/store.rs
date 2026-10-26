@@ -198,6 +198,7 @@ async fn list_impl(
             vid_marker
                 .as_ref()
                 .map(|(key, version)| (key.as_str(), version.as_str())),
+            query.visible_at,
             LIST_BATCH + 1,
         )
         .await?;
@@ -264,6 +265,10 @@ async fn list_impl(
     Ok(page)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal listing helper; parameters mirror the SQL paging shape"
+)]
 async fn fetch_rows(
     driver: &dyn AsyncSqlDriver,
     bucket: &str,
@@ -271,6 +276,7 @@ async fn fetch_rows(
     upper: Option<&str>,
     latest_only: bool,
     version_marker: Option<(&str, &str)>,
+    visible_at: Option<Timestamp>,
     limit: usize,
 ) -> Result<Vec<ObjectSummary>, MetaError> {
     let mut sql =
@@ -287,6 +293,10 @@ async fn fetch_rows(
         // the marker key while leaving every later key eligible.
         sql.push_str(" AND (key > ?5 OR (key = ?5 AND version_id < ?6))");
     }
+    let visible_param = if version_marker.is_some() { "?7" } else { "?5" };
+    sql.push_str(&format!(
+        " AND (expire_at IS NULL OR expire_at > {visible_param})"
+    ));
     if latest_only {
         sql.push_str(" ORDER BY key ASC");
     } else {
@@ -305,6 +315,9 @@ async fn fetch_rows(
         params.push(Value::Text(key.to_owned()));
         params.push(Value::Text(version.to_owned()));
     }
+    params.push(Value::Int(
+        visible_at.map_or(i64::MAX, Timestamp::as_millis),
+    ));
     let rows = driver.query(&sql, params).await?;
     rows.iter().map(model::object_summary_from_row).collect()
 }

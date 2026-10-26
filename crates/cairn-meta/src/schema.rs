@@ -956,6 +956,24 @@ ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER 
         name: "multipart download filename metadata",
         sql: "ALTER TABLE multipart_uploads ADD COLUMN content_disposition TEXT;",
     },
+    Migration {
+        version: 40,
+        name: "object TTL expiry",
+        sql: r#"
+ALTER TABLE object_versions ADD COLUMN expire_at INTEGER;
+-- A due-expiry sweep must seek only rows that carry a TTL, never scan every version.
+CREATE INDEX idx_object_versions_expire ON object_versions
+    (expire_at, bucket_name, key, version_id)
+    WHERE expire_at IS NOT NULL;
+-- Phase 3 filters expired rows from current listings. Keep that hot projection index-only by
+-- carrying the expiry alongside the row identity and response metadata.
+DROP INDEX IF EXISTS idx_ov_latest_cover;
+CREATE INDEX idx_ov_latest_cover ON object_versions
+    (bucket_name, key, version_id, id, is_delete_marker, etag, size_logical, updated_at,
+     storage_class, owner_id, expire_at)
+    WHERE is_latest = 1;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -2069,6 +2087,7 @@ mod tests {
                 "updated_at",
                 "storage_class",
                 "owner_id",
+                "expire_at",
             ]
         );
 
@@ -2088,6 +2107,39 @@ mod tests {
         assert!(
             plan.contains("COVERING INDEX idx_ov_latest_cover"),
             "row-identity listing must remain index-only, plan was: {plan}"
+        );
+    }
+
+    #[test]
+    fn migration_v40_adds_object_ttl_storage() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 39);
+        run_migrations(&conn).unwrap();
+
+        let ttl_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('object_versions')
+                 WHERE name = 'expire_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ttl_column, 1, "object_versions must gain expire_at");
+        assert!(
+            index_exists(&conn, "idx_object_versions_expire"),
+            "the TTL sweep needs a due-expiry index"
+        );
+
+        let columns = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|column| column == "expire_at"),
+            "the current-listing cover must carry expire_at for expiry filtering"
         );
     }
 

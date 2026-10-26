@@ -54,6 +54,9 @@ pub struct RemoteTarget {
     /// Dangerous — for testing against a self-signed endpoint only; emits a loud warning when used.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Refuse to replicate an object carrying an active TTL.
+    #[serde(default)]
+    pub reject_ttl_objects: bool,
 }
 
 /// The plaintext creation input for a remote target: what an operator supplies when registering a
@@ -76,6 +79,10 @@ pub struct RemoteTargetInput {
     /// Skip TLS certificate verification (testing only).
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Refuse to replicate an object carrying an active TTL. The default is false (the header is
+    /// metadata-only on a generic destination); operators that need fail-closed behavior set this.
+    #[serde(default)]
+    pub reject_ttl_objects: bool,
 }
 
 /// An **opened** remote target: the same connection parameters as [`RemoteTarget`] but with the
@@ -97,6 +104,8 @@ pub struct OpenTarget {
     pub ca_cert_pem: Option<String>,
     /// Skip TLS certificate verification (testing only).
     pub insecure_skip_verify: bool,
+    /// Refuse to replicate TTL-bearing objects.
+    pub reject_ttl_objects: bool,
 }
 
 /// Seal a [`RemoteTargetInput`] into a storable [`RemoteTarget`]: encrypt the secret under the
@@ -129,6 +138,7 @@ pub fn seal_target(
         nonce: Vec::new(),
         ca_cert_pem: input.ca_cert_pem,
         insecure_skip_verify: input.insecure_skip_verify,
+        reject_ttl_objects: input.reject_ttl_objects,
     })
 }
 
@@ -196,6 +206,7 @@ pub fn open_target(
         secret: SecretString::new(secret),
         ca_cert_pem: t.ca_cert_pem.clone(),
         insecure_skip_verify: t.insecure_skip_verify,
+        reject_ttl_objects: t.reject_ttl_objects,
     })
 }
 
@@ -216,6 +227,7 @@ mod tests {
             secret: "super-secret-key".into(),
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
         }
     }
 

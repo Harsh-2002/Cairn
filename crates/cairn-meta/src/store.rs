@@ -780,6 +780,7 @@ fn list_impl(
             vid_marker
                 .as_ref()
                 .map(|(key, version)| (key.as_str(), version.as_str())),
+            query.visible_at,
             LIST_BATCH + 1,
         )?;
         if rows.is_empty() {
@@ -853,6 +854,10 @@ fn list_impl(
     Ok(page)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal listing helper; parameters mirror the SQL paging shape"
+)]
 fn fetch_rows(
     conn: &Connection,
     bucket: &str,
@@ -860,11 +865,13 @@ fn fetch_rows(
     upper: Option<&str>,
     latest_only: bool,
     version_marker: Option<(&str, &str)>,
+    visible_at: Option<Timestamp>,
     limit: usize,
 ) -> Result<Vec<ObjectSummary>, MetaError> {
+    let visible_at = visible_at.map_or(i64::MAX, Timestamp::as_millis);
     let mut sql = String::from(
         "SELECT key, version_id, is_latest, is_delete_marker, etag, size_logical, updated_at, \
-         storage_class, owner_id, id FROM object_versions WHERE bucket_name = ?1 AND key >= ?2",
+         storage_class, owner_id, id, expire_at FROM object_versions WHERE bucket_name = ?1 AND key >= ?2",
     );
     if latest_only {
         sql.push_str(" AND is_latest = 1 AND is_delete_marker = 0");
@@ -878,6 +885,10 @@ fn fetch_rows(
         // the marker key while leaving every later key eligible.
         sql.push_str(" AND (key > ?5 OR (key = ?5 AND version_id < ?6))");
     }
+    let visible_param = if version_marker.is_some() { "?7" } else { "?5" };
+    sql.push_str(&format!(
+        " AND (expire_at IS NULL OR expire_at > {visible_param})"
+    ));
     if latest_only {
         sql.push_str(" ORDER BY key ASC");
     } else {
@@ -889,15 +900,27 @@ fn fetch_rows(
     let limit = limit as i64;
     let map = model::object_summary_from_row;
     let rows = match (upper, version_marker) {
-        (Some(ub), Some((key, version))) => {
-            stmt.query_map(params![bucket, seek, ub, limit, key, version], map)
-        }
-        (None, Some((key, version))) => stmt.query_map(
-            params![bucket, seek, rusqlite::types::Null, limit, key, version],
+        (Some(ub), Some((key, version))) => stmt.query_map(
+            params![bucket, seek, ub, limit, key, version, visible_at],
             map,
         ),
-        (Some(ub), None) => stmt.query_map(params![bucket, seek, ub, limit], map),
-        (None, None) => stmt.query_map(params![bucket, seek, rusqlite::types::Null, limit], map),
+        (None, Some((key, version))) => stmt.query_map(
+            params![
+                bucket,
+                seek,
+                rusqlite::types::Null,
+                limit,
+                key,
+                version,
+                visible_at
+            ],
+            map,
+        ),
+        (Some(ub), None) => stmt.query_map(params![bucket, seek, ub, limit, visible_at], map),
+        (None, None) => stmt.query_map(
+            params![bucket, seek, rusqlite::types::Null, limit, visible_at],
+            map,
+        ),
     }
     .map_err(engine_err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()

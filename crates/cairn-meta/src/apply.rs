@@ -230,6 +230,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 content_disposition: None,
                 content_language: None,
                 expires: None,
+                expire_at: None,
                 storage_path: None,
                 compression: cairn_types::object::CompressionDescriptor::Uncompressed,
                 storage_class: cairn_types::object::StorageClass::Standard,
@@ -734,6 +735,9 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         } => {
             require_object_version(conn, &bucket, &key, &version_id)?;
             require_object_lock_enabled(conn, &bucket)?;
+            if retention.is_some() && object_version_has_ttl(conn, &bucket, &key, &version_id)? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             if retention.is_some_and(|value| value.retain_until <= now) {
                 return Err(MetaError::InvalidObjectLockState);
             }
@@ -751,6 +755,9 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         } => {
             require_object_version(conn, &bucket, &key, &version_id)?;
             require_object_lock_enabled(conn, &bucket)?;
+            if on && object_version_has_ttl(conn, &bucket, &key, &version_id)? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let mut state = read_object_lock_state(conn, &bucket, &key, &version_id)?;
             state.legal_hold = on;
             write_object_lock_state(conn, &bucket, &key, &version_id, state)?;
@@ -1829,6 +1836,25 @@ fn require_object_version(
     }
 }
 
+fn object_version_has_ttl(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<bool> {
+    let expires: Option<i64> = conn
+        .query_row(
+            "SELECT expire_at FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            params![bucket.as_str(), key.as_str(), version_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    Ok(expires.is_some())
+}
+
 fn replacement_is_protected(
     conn: &Connection,
     bucket: &BucketName,
@@ -2039,6 +2065,9 @@ fn put_version(
             )?,
         )
     };
+    if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
+        return Err(MetaError::ObjectTtlConflict);
+    }
     let bucket = row.bucket.clone();
     let key = row.key.clone();
     let version_id = row.version_id.clone();
@@ -2322,8 +2351,8 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
           etag, content_type, content_encoding, cache_control, content_disposition, content_language,
           expires, storage_path, compression, storage_class, cold_locator, owner_id,
-          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256, expire_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
     )
     .map_err(engine_err)?
     .execute(params![
@@ -2355,6 +2384,7 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.created_at.0,
             row.updated_at.0,
             row.internal_sha256,
+            row.expire_at.map(|expires| expires.0),
         ])
     .map_err(engine_err)?;
     // Maintain the roll-up counters in lockstep: this new row adds one version and its bytes.
@@ -3181,6 +3211,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Encryption => "encryption",
         ObjectLock => "object_lock",
         Notification => "notification",
+        ObjectTtl => "object_ttl",
     }
 }
 
@@ -3281,6 +3312,7 @@ mod tests {
             content_disposition: None,
             content_language: None,
             expires: None,
+            expire_at: None,
             storage_path: Some(StoragePath::from_string(format!(
                 "{bucket}/{}",
                 StorageToken::generate().as_str()

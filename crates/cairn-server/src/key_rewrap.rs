@@ -1114,6 +1114,7 @@ mod tests {
                         content_disposition: None,
                         content_language: None,
                         expires: None,
+                        expire_at: None,
                         storage_path: Some(StoragePath::generate(&bucket)),
                         compression: CompressionDescriptor::Uncompressed,
                         storage_class: StorageClass::Standard,
@@ -1148,6 +1149,7 @@ mod tests {
             nonce: Vec::new(),
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
         }]);
         store
             .submit(Mutation::SetBucketConfig {

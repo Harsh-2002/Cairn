@@ -618,6 +618,7 @@ dependencies = [
  "cairn-crypto",
  "cairn-net",
  "cairn-types",
+ "cairn-xml",
  "futures-util",
  "hex",
  "http",

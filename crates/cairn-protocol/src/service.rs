@@ -6,6 +6,7 @@ use crate::chunked::{ChunkDecoder, ChunkVerifier, decode_stream};
 use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
+use crate::object_ttl::{self, TtlSpec};
 use crate::put_timing::{PutStage, PutTiming, PutTimings};
 use crate::request::{S3Body, S3Request, S3Response};
 use crate::storage_write::{PreparedStorageWrite, StorageWriteGuard, StorageWriteRuntime};
@@ -18,7 +19,7 @@ use cairn_types::authz::{
 };
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{
-    Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
+    Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, ObjectTtlConfig, VersioningState,
 };
 use cairn_types::error::Error;
 use cairn_types::id::{
@@ -751,6 +752,7 @@ impl S3Service {
             version_id_marker: None,
             start_after: start_after.map(str::to_owned),
             limit: max_keys,
+            visible_at: Some(self.clock.now()),
         };
         // `max-keys=0` is legal S3 and means zero keys: KeyCount=0, IsTruncated=false, and no
         // NextContinuationToken. Answer it from an empty page rather than from the store, whose
@@ -819,6 +821,9 @@ impl S3Service {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
+        // The opt-in TTL header is parsed before staging so a malformed value cannot leave an
+        // orphaned blob. Relative durations are anchored at the commit timestamp below.
+        let ttl_request = self.object_ttl_for_write(&bucket.name, &req).await?;
 
         // Parse all explicit WORM state before touching the filesystem. Bucket defaults remain a
         // Writer-time decision so a concurrent configuration update has one serial outcome.
@@ -840,7 +845,12 @@ impl S3Service {
             .to_owned();
         let extra = requested_checksums(&req);
         let precond = precondition(&req);
-        let user_metadata = user_metadata(&req);
+        let mut user_metadata = user_metadata(&req);
+        if ttl_request.is_some() {
+            // The extension consumes this key rather than storing it twice; GET/HEAD synthesizes it
+            // from `expire_at` once the object is visible.
+            user_metadata.retain(|(name, _)| name != "object-expires");
+        }
         // Decode any client Content-MD5 up front, BEFORE staging: a syntactically invalid header must
         // be rejected before a blob is written, so a malformed digest can never leave an orphaned
         // staged blob (mirrors the inline-tag validation below). Byte-compared after staging.
@@ -1031,6 +1041,17 @@ impl S3Service {
         // also re-validates explicit retention against it, so time spent staging can neither shorten
         // default WORM protection nor let an explicit deadline expire before the object is visible.
         let now = self.clock.now();
+        let expire_at = match ttl_request {
+            Some((spec, max_ttl_secs)) => match spec.resolve(now, max_ttl_secs) {
+                Ok(expires) => Some(expires),
+                Err(error) => {
+                    self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                        .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). `is_replica` was resolved by the authorize-vs-dispatch classifier before the
@@ -1071,6 +1092,7 @@ impl S3Service {
             content_disposition: header_owned("content-disposition"),
             content_language: header_owned("content-language"),
             expires: header_owned("expires"),
+            expire_at,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1183,6 +1205,12 @@ impl S3Service {
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
+                if let Some(expires) = expire_at {
+                    resp = resp.with_header(
+                        "x-amz-meta-object-expires",
+                        cairn_xml::format_iso8601(expires),
+                    );
+                }
                 if let Some(value) = self
                     .lifecycle_expiration_header(
                         &bucket.name,
@@ -1217,6 +1245,16 @@ impl S3Service {
             ReadTarget::Object(row) => *row,
             ReadTarget::DeleteMarker(resp) => return Ok(resp),
         };
+        if row
+            .expire_at
+            .is_some_and(|expires| expires <= self.clock.now())
+        {
+            return Err(if req.query("versionId").is_some() {
+                Error::NoSuchVersion
+            } else {
+                Error::NoSuchKey
+            });
+        }
         if let Some(resp) = conditional_short_circuit(req, &row) {
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
         }
@@ -1308,6 +1346,16 @@ impl S3Service {
             ReadTarget::Object(row) => *row,
             ReadTarget::DeleteMarker(resp) => return Ok(resp),
         };
+        if row
+            .expire_at
+            .is_some_and(|expires| expires <= self.clock.now())
+        {
+            return Err(if req.query("versionId").is_some() {
+                Error::NoSuchVersion
+            } else {
+                Error::NoSuchKey
+            });
+        }
         if let Some(resp) = conditional_short_circuit(req, &row) {
             // Conditional HEAD returns the bare 304/412 status (no body, per S3).
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
@@ -1654,6 +1702,9 @@ impl S3Service {
     async fn create_multipart(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
+        // Validate an opted-in TTL header before a session is created. The raw header stays in the
+        // session's pinned user metadata and is resolved at completion.
+        let _ttl = self.object_ttl_for_write(&bucket.name, req).await?;
         let replica_intent = if is_replica {
             if bucket.versioning != VersioningState::Enabled {
                 return Err(Error::InvalidRequest(
@@ -1691,6 +1742,7 @@ impl S3Service {
                 content_disposition: req.header("content-disposition").map(str::to_owned),
                 content_language: req.header("content-language").map(str::to_owned),
                 expires: req.header("expires").map(str::to_owned),
+                expire_at: None,
                 checksums,
             })
         } else {
@@ -2526,6 +2578,56 @@ impl S3Service {
             object_checksums.clone_from(&intent.checksums);
         }
         let now = self.clock.now();
+        // Resolve the opt-in TTL pinned in the session's user metadata (or the replica intent).
+        // A client-supplied TTL is anchored at completion; a replica carries an absolute deadline.
+        let mut assembled_user_metadata = session.user_metadata.clone();
+        let replica_expiry = session
+            .replica_intent
+            .as_ref()
+            .and_then(|intent| intent.expire_at);
+        let ttl_value = assembled_user_metadata
+            .iter()
+            .find(|(name, _)| name == "object-expires")
+            .map(|(_, value)| value.clone());
+        let expire_at = if let Some(expires) = replica_expiry {
+            Some(expires)
+        } else if let Some(value) = ttl_value.as_deref() {
+            match self.object_ttl_config(&bucket.name).await {
+                Ok(Some(config)) => {
+                    let resolved = object_ttl::parse(value)
+                        .and_then(|spec| spec.resolve(now, config.max_ttl_secs));
+                    match resolved {
+                        Ok(expires) => Some(expires),
+                        Err(error) => {
+                            return Err(self
+                                .multipart_failure_after_claim(
+                                    &upload_id,
+                                    &claim_token,
+                                    error,
+                                    &mut claim_guard,
+                                )
+                                .await);
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    return Err(self
+                        .multipart_failure_after_claim(
+                            &upload_id,
+                            &claim_token,
+                            error,
+                            &mut claim_guard,
+                        )
+                        .await);
+                }
+            }
+        } else {
+            None
+        };
+        if expire_at.is_some() {
+            assembled_user_metadata.retain(|(name, _)| name != "object-expires");
+        }
         let row = ObjectVersionRow {
             id: row_id,
             bucket: bucket.name.clone(),
@@ -2554,12 +2656,13 @@ impl S3Service {
                 .replica_intent
                 .as_ref()
                 .and_then(|intent| intent.expires.clone()),
+            expire_at,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
             cold_locator: None,
             owner_id: bucket.owner_id.clone(),
-            user_metadata: session.user_metadata.clone(),
+            user_metadata: assembled_user_metadata.clone(),
             acl: (bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced)
                 .then(|| session.intended_acl.clone())
                 .flatten(),
@@ -2662,6 +2765,12 @@ impl S3Service {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
+                if let Some(expires) = expire_at {
+                    resp = resp.with_header(
+                        "x-amz-meta-object-expires",
+                        cairn_xml::format_iso8601(expires),
+                    );
+                }
                 if let Some(value) = self
                     .lifecycle_expiration_header(
                         &bucket.name,
@@ -2906,6 +3015,16 @@ impl S3Service {
                 )));
             }
         };
+        // Parse an explicit destination TTL before staging, and decide whether a COPY directive
+        // carries the source version's absolute deadline. A bucket that has not opted in does not
+        // carry it: the extension is bucket-scoped, not object metadata.
+        let ttl_request = self.object_ttl_for_write(&dest_bucket.name, req).await?;
+        let carry_source_ttl = ttl_request.is_none() && !replace && src_row.expire_at.is_some();
+        let dest_ttl_config = if carry_source_ttl {
+            self.object_ttl_config(&dest_bucket.name).await?
+        } else {
+            None
+        };
         // `x-amz-tagging-directive` is independent of the metadata directive (AWS semantics): COPY
         // (default) carries the SOURCE version's tag set; REPLACE takes the inline `x-amz-tagging`.
         let tag_replace = match req.header("x-amz-tagging-directive") {
@@ -2937,11 +3056,14 @@ impl S3Service {
         } else {
             src_row.content_type.clone()
         };
-        let user_meta = if replace {
+        let mut user_meta = if replace {
             user_metadata(req)
         } else {
             src_row.user_metadata.clone()
         };
+        if ttl_request.is_some() {
+            user_meta.retain(|(name, _)| name != "object-expires");
+        }
 
         // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH 27).
         let src_cipher = match src_row.sse_descriptor.as_deref() {
@@ -3012,6 +3134,28 @@ impl S3Service {
             .await?;
         let staged = self.blob.stage(creation, src_stream, opts).await?;
         let now = self.clock.now();
+        let expire_at = match ttl_request {
+            Some((spec, max_ttl_secs)) => match spec.resolve(now, max_ttl_secs) {
+                Ok(expires) => Some(expires),
+                Err(error) => {
+                    self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                        .await;
+                    return Err(error);
+                }
+            },
+            None if carry_source_ttl && dest_ttl_config.is_some() => {
+                let source_expires = src_row
+                    .expire_at
+                    .expect("carry_source_ttl requires a source expire_at");
+                if source_expires <= now {
+                    self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                        .await;
+                    return Err(Error::NoSuchKey);
+                }
+                Some(source_expires)
+            }
+            None => None,
+        };
 
         let dest_key_for_event = dest_key.clone();
         // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
@@ -3048,6 +3192,7 @@ impl S3Service {
             content_disposition: sys("content-disposition", &src_row.content_disposition),
             content_language: sys("content-language", &src_row.content_language),
             expires: sys("expires", &src_row.expires),
+            expire_at,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -3136,6 +3281,12 @@ impl S3Service {
                 resp = with_sse_headers(resp, dest_sse_descriptor.as_deref());
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
+                }
+                if let Some(expires) = expire_at {
+                    resp = resp.with_header(
+                        "x-amz-meta-object-expires",
+                        cairn_xml::format_iso8601(expires),
+                    );
                 }
                 if let Some(value) = self
                     .lifecycle_expiration_header(
@@ -3663,6 +3814,7 @@ impl S3Service {
             version_id_marker: version_id_marker.map(str::to_owned),
             start_after: start_after.map(str::to_owned),
             limit: max,
+            visible_at: Some(self.clock.now()),
         };
         // `max-keys=0` short-circuits here too — see `list_objects`.
         let page = if max == 0 {
@@ -4612,6 +4764,48 @@ impl S3Service {
             Err(error) => return Err(error.into()),
         }
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// Load the bucket's object-TTL configuration when the extension is enabled.
+    ///
+    /// A malformed stored document is a server configuration error, not a client error: fail
+    /// closed rather than silently treating TTL as disabled.
+    async fn object_ttl_config(&self, bucket: &BucketName) -> Result<Option<ObjectTtlConfig>> {
+        let Some(doc) = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::ObjectTtl)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let config: ObjectTtlConfig = serde_json::from_str(&doc.0).map_err(|error| {
+            tracing::error!(
+                bucket = %bucket.as_str(),
+                error = %error,
+                "invalid object TTL bucket configuration"
+            );
+            Error::Internal("invalid object TTL configuration".to_owned())
+        })?;
+        Ok(config.enabled.then_some(config))
+    }
+
+    /// Parse and validate the opt-in object TTL header for a write.
+    ///
+    /// Returns `None` when the header is absent or the bucket has not opted in. In that case the
+    /// header remains ordinary user metadata, matching S3's treatment of unknown `x-amz-meta-*`
+    /// keys.
+    async fn object_ttl_for_write(
+        &self,
+        bucket: &BucketName,
+        req: &S3Request,
+    ) -> Result<Option<(TtlSpec, u64)>> {
+        let Some(value) = req.header("x-amz-meta-object-expires") else {
+            return Ok(None);
+        };
+        let Some(config) = self.object_ttl_config(bucket).await? else {
+            return Ok(None);
+        };
+        Ok(Some((object_ttl::parse(value)?, config.max_ttl_secs)))
     }
 
     /// The standard `x-amz-expiration` value for a current object under the bucket's lifecycle
@@ -6032,6 +6226,14 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if let Some(v) = &row.expires {
         resp = resp.with_header("expires", v.clone());
     }
+    if let Some(expires) = row.expire_at {
+        // The extension consumes the request metadata key into a typed deadline; echo the absolute
+        // value so a client can round-trip it. Enforcement lands in the TTL phase.
+        resp = resp.with_header(
+            "x-amz-meta-object-expires",
+            cairn_xml::format_iso8601(expires),
+        );
+    }
     // Echo the SSE algorithm (and, for SSE-KMS, the key id + BucketKeyEnabled) on GET/HEAD for a
     // server-side-encrypted object (ARCH 27). A transparent `AtRest` object advertises nothing.
     resp = with_sse_headers(resp, row.sse_descriptor.as_deref());
@@ -6847,6 +7049,7 @@ fn replica_marker_row(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: None,
         compression: cairn_types::object::CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,

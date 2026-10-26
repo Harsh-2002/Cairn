@@ -242,6 +242,83 @@ impl LifecycleScanner {
         Ok(report)
     }
 
+    /// Apply due per-object TTLs for the supplied buckets.
+    ///
+    /// This is intentionally independent of lifecycle rules: a bucket may opt into TTL without a
+    /// lifecycle configuration. It pages the version listing and expires every due version,
+    /// inserting a delete marker for a current version in a versioned bucket and permanently
+    /// deleting noncurrent versions or unversioned objects.
+    ///
+    /// # Errors
+    /// Returns a [`MetaError`] only when a bounded enumeration itself fails; per-item failures are
+    /// counted in the report so one protected or racing version cannot stall the sweep.
+    pub async fn run_ttl_once<M, B, C>(
+        &self,
+        meta: &M,
+        blob: &B,
+        clock: &C,
+        buckets: &[BucketName],
+    ) -> Result<LifecycleReport, MetaError>
+    where
+        M: MetadataStore + ?Sized,
+        B: BlobStore + ?Sized,
+        C: Clock + ?Sized,
+    {
+        let mut report = LifecycleReport::default();
+        let now = clock.now();
+        for bucket_name in buckets {
+            let Some(bucket) = meta.get_bucket(bucket_name).await? else {
+                continue;
+            };
+            let versioned = matches!(bucket.versioning, VersioningState::Enabled);
+            let mut cursor: Option<String> = None;
+            let mut version_marker: Option<String> = None;
+            loop {
+                let query = ListQuery {
+                    cursor: cursor.clone(),
+                    version_id_marker: version_marker.clone(),
+                    limit: PAGE_LIMIT,
+                    ..Default::default()
+                };
+                let page = meta.list_versions(&bucket.name, &query).await?;
+                for obj in &page.items {
+                    let Some(expires) = obj.expire_at else {
+                        continue;
+                    };
+                    if expires > now || obj.is_delete_marker {
+                        continue;
+                    }
+                    if obj.is_latest && versioned {
+                        match self.insert_delete_marker(meta, &bucket, obj, now).await {
+                            Ok(true) => report.objects_expired += 1,
+                            Ok(false) => {}
+                            Err(_) => report.errors += 1,
+                        }
+                    } else {
+                        match self
+                            .delete_version(meta, blob, &bucket.name, obj, now)
+                            .await
+                        {
+                            Ok(true) if obj.is_latest => report.objects_expired += 1,
+                            Ok(true) => report.versions_expired += 1,
+                            Ok(false) => {}
+                            Err(_) => report.errors += 1,
+                        }
+                    }
+                }
+                if !page.truncated {
+                    break;
+                }
+                cursor = page.next_cursor;
+                version_marker = page.next_version_id_marker;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Current-object expiration (ARCH 19.3). Pages `list_current` (which excludes delete
     /// markers), and for each object due under some enabled `Expiration` rule whose filter
     /// matches, either permanently deletes it (unversioned/suspended) or inserts a delete
@@ -814,6 +891,7 @@ mod outcome_tests {
                     etag: ETag::from_string("missing".to_owned()),
                     size: 0,
                     last_modified: Timestamp::EPOCH,
+                    expire_at: None,
                     storage_class: StorageClass::Standard,
                     owner_id: UserId("missing-owner".to_owned()),
                 },

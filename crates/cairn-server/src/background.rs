@@ -8,7 +8,7 @@ use crate::stack::AppStack;
 use cairn_crypto::SystemClock;
 use cairn_lifecycle::{BucketLifecycle, LifecycleScanner};
 use cairn_replication::{BucketRoutedSink, HttpS3Sink, SinkRouter};
-use cairn_types::bucket::ConfigAspect;
+use cairn_types::bucket::{ConfigAspect, ObjectTtlConfig};
 use cairn_types::error::{MetaError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::meta::{MultipartTerminalOutcome, Mutation, MutationOutcome};
@@ -364,6 +364,14 @@ pub(crate) fn spawn(
     tasks.spawn(
         "lifecycle scanner",
         lifecycle_loop(stack.clone(), lifecycle_interval, shutdown.clone()),
+    );
+    tasks.spawn(
+        "object TTL scanner",
+        ttl_loop(
+            stack.clone(),
+            Duration::from_secs(cfg.object_ttl_interval_secs),
+            shutdown.clone(),
+        ),
     );
     tasks.spawn(
         "webhook delivery",
@@ -915,6 +923,7 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
             insecure_skip_verify: false,
             allow_internal_endpoints: cfg.allow_internal_endpoints,
             allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
+            reject_ttl_objects: false,
         }),
         _ => None,
     }
@@ -1279,6 +1288,7 @@ fn target_sink_cfg(
         ca_cert_path: target.ca_path.clone(),
         ca_cert_pem: None,
         insecure_skip_verify: target.insecure_skip_verify,
+        reject_ttl_objects: false,
         allow_internal_endpoints,
         allow_plaintext_sse_over_http,
     }
@@ -2027,6 +2037,7 @@ async fn scrub_loop(
                     version_id_marker: vmarker.clone(),
                     start_after: None,
                     limit: 500,
+                    visible_at: None,
                 };
                 let page = match stack.meta.list_versions(&bucket.name, &query).await {
                     Ok(p) => p,
@@ -2358,6 +2369,65 @@ async fn lifecycle_loop(
     }
 }
 
+/// Periodically apply due per-object TTLs.
+///
+/// This is separate from lifecycle because a bucket can opt into TTL without any lifecycle rules.
+/// The read path hides an expired version immediately; this loop reclaims the bytes and inserts
+/// versioned-bucket delete markers.
+async fn ttl_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watch::Receiver<bool>) {
+    let scanner = LifecycleScanner::new();
+    let clock = SystemClock::new();
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
+        if *shutdown.borrow() {
+            return;
+        }
+        let buckets = match stack.meta.list_buckets(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "object TTL: listing buckets failed");
+                continue;
+            }
+        };
+        let mut ttl_buckets = Vec::new();
+        for bucket in buckets {
+            if *shutdown.borrow() {
+                return;
+            }
+            if let Ok(Some(doc)) = stack
+                .meta
+                .get_bucket_config(&bucket.name, ConfigAspect::ObjectTtl)
+                .await
+            {
+                if serde_json::from_str::<ObjectTtlConfig>(&doc.0)
+                    .is_ok_and(|config| config.enabled)
+                {
+                    ttl_buckets.push(bucket.name);
+                }
+            }
+        }
+        if ttl_buckets.is_empty() {
+            continue;
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+        match scanner
+            .run_ttl_once(&*stack.meta, &*stack.blob, &clock, &ttl_buckets)
+            .await
+        {
+            Ok(report) => {
+                metrics::counter!("cairn_object_ttl_expired_objects_total")
+                    .increment(report.objects_expired);
+                metrics::counter!("cairn_object_ttl_expired_versions_total")
+                    .increment(report.versions_expired);
+                metrics::counter!("cairn_object_ttl_sweep_errors_total").increment(report.errors);
+                tracing::info!(?report, "object TTL sweep complete");
+            }
+            Err(e) => tracing::warn!(error = %e, "object TTL sweep failed"),
+        }
+    }
+}
+
 /// The webhook event-notification delivery worker: drains the `events_outbox` to the configured
 /// per-bucket endpoints on a fixed interval (ARCH 20-style). The claim is a cheap indexed query, so
 /// the loop is harmless when no bucket has notifications configured (it claims nothing and sleeps).
@@ -2652,6 +2722,7 @@ mod tests {
                 content_disposition: None,
                 content_language: None,
                 expires: None,
+                expire_at: None,
                 storage_path: Some(staged.storage_path.clone()),
                 compression: staged.compression,
                 storage_class: cairn_types::StorageClass::Standard,
@@ -2923,6 +2994,7 @@ mod tests {
                     ca_cert_path: None,
                     ca_cert_pem: None,
                     insecure_skip_verify: false,
+                    reject_ttl_objects: false,
                     allow_internal_endpoints: false,
                     allow_plaintext_sse_over_http: false,
                 },
@@ -3061,6 +3133,7 @@ mod tests {
                     ca_cert_path: None,
                     ca_cert_pem: None,
                     insecure_skip_verify: false,
+                    reject_ttl_objects: false,
                     allow_internal_endpoints: false,
                     allow_plaintext_sse_over_http: false,
                 },
@@ -3218,6 +3291,7 @@ mod tests {
                 content_disposition: None,
                 content_language: None,
                 expires: None,
+                expire_at: None,
                 storage_path: Some(path),
                 compression,
                 storage_class: StorageClass::Standard,

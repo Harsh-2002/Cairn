@@ -892,6 +892,21 @@ ALTER TABLE storage_recovery_state ADD COLUMN legacy_release_authorized INTEGER 
         name: "multipart download filename metadata",
         sql: "ALTER TABLE multipart_uploads ADD COLUMN content_disposition TEXT;",
     },
+    Migration {
+        version: 40,
+        name: "object TTL expiry",
+        sql: r#"
+ALTER TABLE object_versions ADD COLUMN expire_at INTEGER;
+CREATE INDEX idx_object_versions_expire ON object_versions
+    (expire_at, bucket_name, key, version_id)
+    WHERE expire_at IS NOT NULL;
+DROP INDEX IF EXISTS idx_ov_latest_cover;
+CREATE INDEX idx_ov_latest_cover ON object_versions
+    (bucket_name, key, version_id, id, is_delete_marker, etag, size_logical, updated_at,
+     storage_class, owner_id, expire_at)
+    WHERE is_latest = 1;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -1134,7 +1149,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 39);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 40);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
@@ -1420,6 +1435,7 @@ mod tests {
                 "updated_at",
                 "storage_class",
                 "owner_id",
+                "expire_at",
             ]
         );
     }

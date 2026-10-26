@@ -37,6 +37,7 @@ fn row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -123,6 +124,7 @@ async fn drain_store(
             version_id_marker: None,
             start_after: None,
             limit: max_keys,
+            visible_at: None,
         };
         let page = store.list_current(bucket, &query).await.unwrap();
         pages += 1;

@@ -18791,3 +18791,529 @@ async fn lifecycle_expiration_header_is_current_version_only() {
         "S3 reports x-amz-expiration only for the current version"
     );
 }
+
+#[tokio::test]
+async fn object_ttl_header_is_stored_only_when_the_bucket_opts_in() {
+    let (h, meta, clock) = in_memory_harness_with_clock().await;
+    for bucket in ["ttl-opt-in", "ttl-off"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    meta.submit(cairn_types::Mutation::SetBucketConfig {
+        bucket: BucketName::parse("ttl-opt-in").unwrap(),
+        aspect: cairn_types::bucket::ConfigAspect::ObjectTtl,
+        doc: Some(cairn_types::bucket::ConfigDoc(
+            r#"{"enabled":true,"max_ttl_secs":7200}"#.to_owned(),
+        )),
+    })
+    .await
+    .unwrap();
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-opt-in"),
+                Some("expiring.txt"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+    let row = meta
+        .get_version(
+            &BucketName::parse("ttl-opt-in").unwrap(),
+            &ObjectKey::parse("expiring.txt").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .expect("object row");
+    assert_eq!(row.expire_at, Some(clock.now().plus_secs(3_600)));
+    assert!(
+        !row.user_metadata
+            .iter()
+            .any(|(name, _)| name == "object-expires"),
+        "the opt-in header is consumed into expire_at, not retained as user metadata"
+    );
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("ttl-opt-in"),
+                Some("expiring.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+
+    // Over the bucket ceiling and zero are rejected before publication.
+    for value in ["+3h", "+0s"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("ttl-opt-in"),
+                    Some("rejected.txt"),
+                    &[],
+                    &[("x-amz-meta-object-expires", value)],
+                    b"body".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{value} must be rejected");
+    }
+
+    // A bucket that has not opted in treats the header as ordinary user metadata.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-off"),
+                Some("ordinary.txt"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = meta
+        .get_version(
+            &BucketName::parse("ttl-off").unwrap(),
+            &ObjectKey::parse("ordinary.txt").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .expect("object row");
+    assert_eq!(row.expire_at, None);
+    assert!(
+        row.user_metadata
+            .iter()
+            .any(|(name, value)| name == "object-expires" && value == "+1h"),
+        "a non-opted-in bucket keeps the header as user metadata"
+    );
+}
+
+#[tokio::test]
+async fn copy_object_carries_ttl_only_into_an_opted_in_destination() {
+    let (h, meta, _clock) = in_memory_harness_with_clock().await;
+    for bucket in ["ttl-copy", "ttl-copy-target", "ttl-off-target"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for bucket in ["ttl-copy", "ttl-copy-target"] {
+        meta.submit(cairn_types::Mutation::SetBucketConfig {
+            bucket: BucketName::parse(bucket).unwrap(),
+            aspect: cairn_types::bucket::ConfigAspect::ObjectTtl,
+            doc: Some(cairn_types::bucket::ConfigDoc(
+                r#"{"enabled":true,"max_ttl_secs":7200}"#.to_owned(),
+            )),
+        })
+        .await
+        .unwrap();
+    }
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-copy"),
+                Some("src"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let source = meta
+        .get_version(
+            &BucketName::parse("ttl-copy").unwrap(),
+            &ObjectKey::parse("src").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let source_expiry = source.expire_at.expect("source TTL");
+
+    // COPY carries the absolute deadline into an opted-in destination.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-copy-target"),
+                Some("copied"),
+                &[],
+                &[("x-amz-copy-source", "/ttl-copy/src")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+    let copied = meta
+        .get_version(
+            &BucketName::parse("ttl-copy-target").unwrap(),
+            &ObjectKey::parse("copied").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(copied.expire_at, Some(source_expiry));
+
+    // REPLACE without a fresh TTL clears it.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-copy-target"),
+                Some("replaced"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/ttl-copy/src"),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let replaced = meta
+        .get_version(
+            &BucketName::parse("ttl-copy-target").unwrap(),
+            &ObjectKey::parse("replaced").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replaced.expire_at, None);
+
+    // A destination that has not opted in does not inherit an active TTL.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-off-target"),
+                Some("copied"),
+                &[],
+                &[("x-amz-copy-source", "/ttl-copy/src")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let dropped = meta
+        .get_version(
+            &BucketName::parse("ttl-off-target").unwrap(),
+            &ObjectKey::parse("copied").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.expire_at, None);
+}
+
+#[tokio::test]
+async fn multipart_ttl_is_pinned_at_initiate_and_resolved_at_complete() {
+    let (h, meta, clock) = in_memory_harness_with_clock().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ttl-mpu"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    meta.submit(cairn_types::Mutation::SetBucketConfig {
+        bucket: BucketName::parse("ttl-mpu").unwrap(),
+        aspect: cairn_types::bucket::ConfigAspect::ObjectTtl,
+        doc: Some(cairn_types::bucket::ConfigDoc(
+            r#"{"enabled":true,"max_ttl_secs":7200}"#.to_owned(),
+        )),
+    })
+    .await
+    .unwrap();
+
+    // A malformed TTL is rejected before a session is created.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("ttl-mpu"),
+                Some("bad"),
+                &[("uploads", "")],
+                &[("x-amz-meta-object-expires", "+0s")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("ttl-mpu"),
+                Some("big.bin"),
+                &[("uploads", "")],
+                &[("x-amz-meta-object-expires", "+1h")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    let part = vec![b'a'; 5 * 1024 * 1024];
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-mpu"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag = header(&hdrs, "etag").unwrap().to_owned();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("ttl-mpu"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[("content-type", "application/xml")],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+    let row = meta
+        .get_version(
+            &BucketName::parse("ttl-mpu").unwrap(),
+            &ObjectKey::parse("big.bin").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .expect("completed object row");
+    assert_eq!(row.expire_at, Some(clock.now().plus_secs(3_600)));
+    assert!(
+        !row.user_metadata
+            .iter()
+            .any(|(name, _)| name == "object-expires"),
+        "completion consumes the pinned TTL header"
+    );
+}
+
+#[tokio::test]
+async fn expired_ttl_objects_disappear_from_reads_and_listings() {
+    let (h, meta, clock) = in_memory_harness_with_clock().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ttl-visible"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    meta.submit(cairn_types::Mutation::SetBucketConfig {
+        bucket: BucketName::parse("ttl-visible").unwrap(),
+        aspect: cairn_types::bucket::ConfigAspect::ObjectTtl,
+        doc: Some(cairn_types::bucket::ConfigDoc(
+            r#"{"enabled":true,"max_ttl_secs":7200}"#.to_owned(),
+        )),
+    })
+    .await
+    .unwrap();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-visible"),
+                Some("short.txt"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Visible before the deadline.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("ttl-visible"),
+                Some("short.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    clock.advance_secs(3_600);
+    for method in [Method::GET, Method::HEAD] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    method.clone(),
+                    Some("ttl-visible"),
+                    Some("short.txt"),
+                    &[],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "{method} hides the expired object"
+        );
+    }
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("ttl-visible"),
+                None,
+                &[("list-type", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !String::from_utf8(body).unwrap().contains("<Contents>"),
+        "ListObjectsV2 must omit expired keys"
+    );
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("ttl-visible"),
+                None,
+                &[("versions", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !String::from_utf8(body).unwrap().contains("<Version>"),
+        "ListObjectVersions must omit expired versions"
+    );
+}

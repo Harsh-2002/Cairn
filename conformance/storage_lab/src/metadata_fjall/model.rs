@@ -87,6 +87,7 @@ impl Summary {
                 etag: row.etag.clone(),
                 size: row.size_logical,
                 last_modified: row.updated_at,
+                expire_at: row.expire_at,
                 storage_class: row.storage_class,
                 owner_id: row.owner_id.clone(),
             },

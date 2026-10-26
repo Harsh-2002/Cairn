@@ -232,6 +232,7 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
                 content_disposition: None,
                 content_language: None,
                 expires: None,
+                expire_at: None,
                 storage_path: None,
                 compression: cairn_types::object::CompressionDescriptor::Uncompressed,
                 storage_class: cairn_types::object::StorageClass::Standard,
@@ -588,6 +589,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
                 .await?;
                 (initial_state.tags, lock_state)
             };
+            if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let version_id = row.version_id.clone();
             let superseded = upsert_version(driver, *row).await?;
             replace_object_tags(driver, &bucket, &key, &version_id, &initial_tags).await?;
@@ -829,6 +833,11 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         } => {
             ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
             require_object_lock_bucket(driver, &bucket).await?;
+            if retention.is_some()
+                && object_version_has_ttl(driver, &bucket, &key, &version_id).await?
+            {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             if retention.is_some_and(|candidate| candidate.retain_until <= now) {
                 return Err(MetaError::InvalidObjectLockState);
             }
@@ -846,6 +855,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         } => {
             ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
             require_object_lock_bucket(driver, &bucket).await?;
+            if on && object_version_has_ttl(driver, &bucket, &key, &version_id).await? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let mut state = read_object_lock_state(driver, &bucket, &key, &version_id).await?;
             state.legal_hold = on;
             write_object_lock_state(driver, &bucket, &key, &version_id, state).await?;
@@ -1945,6 +1957,26 @@ async fn ensure_object_version_exists(
     }
 }
 
+async fn object_version_has_ttl(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<bool> {
+    let row = query_one(
+        driver,
+        "SELECT expire_at FROM object_versions
+         WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        vec![
+            Value::Text(bucket.as_str().to_owned()),
+            Value::Text(key.as_str().to_owned()),
+            Value::Text(version_id.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    Ok(row.is_some_and(|row| row.get_opt_i64(0).is_some()))
+}
+
 async fn replacement_is_protected(
     driver: &dyn AsyncSqlDriver,
     bucket: &BucketName,
@@ -2423,8 +2455,8 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
              (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
               etag, content_type, storage_path, compression, storage_class, cold_locator, owner_id,
               user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at,
-              content_encoding, cache_control, content_disposition, content_language, expires, internal_sha256)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+              content_encoding, cache_control, content_disposition, content_language, expires, internal_sha256, expire_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.bucket.as_str().to_owned()),
@@ -2454,6 +2486,7 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
                 opt_text(row.content_language.clone()),
                 opt_text(row.expires.clone()),
                 opt_text(row.internal_sha256.clone()),
+                row.expire_at.map_or(Value::Null, |expires| Value::Int(expires.0)),
             ],
         )
         .await?;
@@ -3356,6 +3389,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Encryption => "encryption",
         ObjectLock => "object_lock",
         Notification => "notification",
+        ObjectTtl => "object_ttl",
     }
 }
 

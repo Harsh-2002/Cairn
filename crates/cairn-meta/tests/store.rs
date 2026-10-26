@@ -37,6 +37,7 @@ fn row(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: with_blob.then(|| StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -5679,4 +5680,173 @@ async fn internal_integrity_digest_round_trips_through_writer() {
         assert_eq!(got.internal_sha256, digest);
         assert!(got.checksums.is_empty());
     }
+}
+
+#[tokio::test]
+async fn object_ttl_and_object_lock_are_mutually_exclusive() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let bucket = bucket("ttl-lock-bucket");
+    let bucket_name = bucket.name.clone();
+    store
+        .submit(Mutation::CreateObjectLockBucket(Box::new(bucket)))
+        .await
+        .unwrap();
+    let key = ObjectKey::parse("ttl.bin").unwrap();
+    let version = VersionId::from_string("ttl-v1".to_owned());
+    let mut ttl_row = row(&bucket_name, "ttl.bin", version.clone(), "etag", false);
+    ttl_row.expire_at = Some(Timestamp(10_000));
+
+    // Explicit protection on the same put is rejected.
+    assert!(matches!(
+        store
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(ttl_row.clone()),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: Vec::new(),
+                        lock_intent: ExplicitObjectLockIntent {
+                            retention: None,
+                            legal_hold: Some(true),
+                        },
+                    },
+                    replication: Vec::new(),
+                },
+            )
+            .await,
+        Err(MetaError::ObjectTtlConflict)
+    ));
+
+    // Without lock protection the TTL row is accepted.
+    store
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(ttl_row),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Locking an existing TTL version in either direction is rejected.
+    assert!(matches!(
+        store
+            .submit(Mutation::SetObjectRetention {
+                bucket: bucket_name.clone(),
+                key: key.clone(),
+                version_id: version.clone(),
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until: Timestamp(20_000),
+                }),
+                now: Timestamp(1_000),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await,
+        Err(MetaError::ObjectTtlConflict)
+    ));
+    assert!(matches!(
+        store
+            .submit(Mutation::SetObjectLegalHold {
+                bucket: bucket_name.clone(),
+                key,
+                version_id: version,
+                on: true,
+            })
+            .await,
+        Err(MetaError::ObjectTtlConflict)
+    ));
+
+    // A bucket default retention protects a new TTL row just like explicit intent.
+    store
+        .submit(Mutation::UpdateObjectLockConfiguration {
+            bucket: bucket_name.clone(),
+            default_retention: Some(day_retention(ObjectLockMode::Compliance, 1)),
+        })
+        .await
+        .unwrap();
+    let mut second = row(
+        &bucket_name,
+        "ttl-2.bin",
+        VersionId::from_string("ttl-v2".to_owned()),
+        "etag-2",
+        false,
+    );
+    second.expire_at = Some(Timestamp(10_000));
+    assert!(matches!(
+        store
+            .submit_fixture(
+                &fixture,
+                Mutation::PutObjectVersion {
+                    row: Box::new(second),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState::default(),
+                    replication: Vec::new(),
+                },
+            )
+            .await,
+        Err(MetaError::ObjectTtlConflict)
+    ));
+}
+
+#[tokio::test]
+async fn listing_visible_at_omits_expired_versions() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let bucket = bucket("list-ttl");
+    let bucket_name = bucket.name.clone();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket)))
+        .await
+        .unwrap();
+    let mut object = row(
+        &bucket_name,
+        "short.txt",
+        VersionId::from_string("v1".to_owned()),
+        "etag",
+        false,
+    );
+    object.expire_at = Some(Timestamp(1_000));
+    store
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let visible = store
+        .list_current(
+            &bucket_name,
+            &ListQuery {
+                limit: 10,
+                visible_at: Some(Timestamp(500)),
+                ..ListQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible.items.len(), 1);
+    let hidden = store
+        .list_current(
+            &bucket_name,
+            &ListQuery {
+                limit: 10,
+                visible_at: Some(Timestamp(1_000)),
+                ..ListQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(hidden.items.is_empty());
 }

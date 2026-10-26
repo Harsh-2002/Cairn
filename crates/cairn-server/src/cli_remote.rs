@@ -712,6 +712,7 @@ fn config_aspect_field(aspect: &str) -> Option<&'static str> {
         "lifecycle" => Some("lifecycle"),
         "tagging" => Some("tagging"),
         "replication" => Some("replication"),
+        "object_ttl" => Some("object_ttl"),
         _ => None,
     }
 }
@@ -721,6 +722,7 @@ fn config_aspect_field(aspect: &str) -> Option<&'static str> {
 fn config_set_subpath(name: &str, aspect: &str) -> Option<String> {
     match aspect {
         "policy" => Some(format!("/buckets/{}/policy", pct_encode_segment(name))),
+        "object_ttl" => Some(format!("/buckets/{}/object-ttl", pct_encode_segment(name))),
         _ => None,
     }
 }
@@ -1918,14 +1920,19 @@ mod tests {
         assert_eq!(config_aspect_field("lifecycle"), Some("lifecycle"));
         assert_eq!(config_aspect_field("tagging"), Some("tagging"));
         assert_eq!(config_aspect_field("replication"), Some("replication"));
+        assert_eq!(config_aspect_field("object_ttl"), Some("object_ttl"));
         assert_eq!(config_aspect_field("bogus"), None);
     }
 
     #[test]
-    fn config_set_subpath_only_policy_supported() {
+    fn config_set_subpath_only_policy_and_object_ttl_supported() {
         assert_eq!(
             config_set_subpath("b", "policy").as_deref(),
             Some("/buckets/b/policy")
+        );
+        assert_eq!(
+            config_set_subpath("b", "object_ttl").as_deref(),
+            Some("/buckets/b/object-ttl")
         );
         assert_eq!(config_set_subpath("b", "cors"), None);
     }

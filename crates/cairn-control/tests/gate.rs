@@ -256,6 +256,7 @@ async fn put_object_with_lock(
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -1527,6 +1528,7 @@ async fn bucket_config_get_reflects_aspects() {
     assert!(v["lifecycle"].is_null());
     assert!(v["acl"].is_null());
     assert!(v["public_access_block"].is_null());
+    assert!(v["object_ttl"].is_null());
 
     // Missing bucket -> 404.
     let resp = h
@@ -2162,6 +2164,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()
@@ -3024,6 +3027,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()
@@ -3383,6 +3387,118 @@ async fn bucket_encryption_default_round_trips() {
 }
 
 #[tokio::test]
+async fn bucket_object_ttl_round_trips() {
+    let h = harness().await;
+    let a = admin();
+    make_bucket(&h, &a, "ttl").await;
+
+    // Off by default.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/ttl/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["object_ttl"].is_null());
+
+    // Enable with an explicit ceiling.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/ttl/object-ttl",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"enabled":true,"max_ttl_secs":86400}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/ttl/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    let v = json(&resp);
+    assert_eq!(v["object_ttl"]["enabled"], true);
+    assert_eq!(v["object_ttl"]["max_ttl_secs"], 86400);
+
+    // The ceiling defaults to 365 days when omitted.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/ttl/object-ttl",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"enabled":true}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/ttl/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(json(&resp)["object_ttl"]["max_ttl_secs"], 31_536_000);
+
+    // Below one hour and above ten years are rejected.
+    for body in [
+        br#"{"enabled":true,"max_ttl_secs":3599}"#.as_slice(),
+        br#"{"enabled":true,"max_ttl_secs":315360001}"#.as_slice(),
+    ] {
+        let resp = h
+            .svc
+            .handle(
+                &Method::PUT,
+                "/buckets/ttl/object-ttl",
+                &[],
+                Some(&a),
+                Bytes::copy_from_slice(body),
+            )
+            .await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    }
+
+    // Disabling clears the document.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/ttl/object-ttl",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"enabled":false}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/ttl/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["object_ttl"].is_null());
+}
+
+#[tokio::test]
 async fn list_objects_with_delimiter_folds_folders() {
     let h = harness().await;
     let a = admin();
@@ -3523,6 +3639,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         content_disposition: None,
         content_language: None,
         expires: None,
+        expire_at: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(format!(
             "repl/{}",
             StorageToken::generate().as_str()

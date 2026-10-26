@@ -495,6 +495,19 @@ impl ReplicationEngine {
             .await?;
             return Ok(EntryOutcome::Failed);
         };
+        if row.expire_at.is_some_and(|expires| expires <= clock.now()) {
+            // The TTL elapsed before this entry shipped. Sending it would resurrect an expired
+            // object at the destination; the source sweep owns reclamation and marker propagation.
+            self.mark_failed(
+                meta,
+                entry,
+                "object TTL expired before replication",
+                None,
+                clock.now(),
+            )
+            .await?;
+            return Ok(EntryOutcome::Failed);
+        }
 
         // Loop prevention: never re-replicate an object that arrived here *via* replication — drain
         // the entry without contacting the sink (ARCH 20.4). We deliberately do NOT skip on a
@@ -760,6 +773,7 @@ impl ReplicationEngine {
             content_disposition: row.content_disposition.clone(),
             content_language: row.content_language.clone(),
             expires: row.expires.clone(),
+            expire_at: row.expire_at,
             storage_class: row.storage_class,
             checksums: row.checksums.clone(),
             client_encrypted,

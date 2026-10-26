@@ -1270,6 +1270,8 @@ pub struct ListQuery {
     pub start_after: Option<String>,
     /// Page size (clamped to the S3 ceiling by the caller).
     pub limit: u32,
+    /// When set, omit versions whose absolute TTL has expired at this instant.
+    pub visible_at: Option<Timestamp>,
 }
 
 /// One page of a bounded listing.
@@ -1330,6 +1332,8 @@ pub struct ObjectSummary {
     pub size: u64,
     /// Last-modified time.
     pub last_modified: Timestamp,
+    /// Absolute per-object TTL expiry, when the version carries one.
+    pub expire_at: Option<Timestamp>,
     /// The storage class.
     pub storage_class: StorageClass,
     /// The owner.
@@ -1378,6 +1382,9 @@ pub struct MultipartReplicaIntent {
     pub content_language: Option<String>,
     /// Stored Expires.
     pub expires: Option<String>,
+    /// Absolute per-object TTL expiry (milliseconds since the Unix epoch), when the source version
+    /// carries one. Replicas preserve this so a Cairn destination can enforce the same deadline.
+    pub expire_at: Option<Timestamp>,
     /// Expected whole-object supplementary checksums (never composite part checksums).
     pub checksums: Vec<ChecksumValue>,
 }
@@ -2260,6 +2267,7 @@ mod object_summary_tests {
             etag: ETag::from_string("etag".to_owned()),
             size: 1,
             last_modified: Timestamp(1),
+            expire_at: None,
             storage_class: StorageClass::Standard,
             owner_id: UserId("owner".to_owned()),
         };
