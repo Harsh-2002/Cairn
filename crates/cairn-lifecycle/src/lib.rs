@@ -28,7 +28,9 @@
 mod config;
 mod scanner;
 
-pub use config::{Action, Expiration, Filter, LifecycleRule, Transition, parse_lifecycle};
+pub use config::{
+    Action, Expiration, Filter, LifecycleRule, Transition, earliest_expiration, parse_lifecycle,
+};
 pub use scanner::{BucketLifecycle, LifecycleReport, LifecycleScanner};
 
 #[cfg(test)]

@@ -1015,10 +1015,16 @@ export async function deleteCors(bucket: string): Promise<void> {
 // --- Lifecycle (S3 ?lifecycle) — expiration / noncurrent / abort-incomplete only;
 //     storage-class transition is not implemented by Cairn (the server rejects it). ---
 
+export interface LifecycleTag {
+  key: string;
+  value: string;
+}
+
 export interface LifecycleRule {
   id: string;
   enabled: boolean;
   prefix: string;
+  tags: LifecycleTag[];
   expirationDays?: number;
   noncurrentDays?: number;
   abortDays?: number;
@@ -1047,10 +1053,15 @@ export async function getLifecycle(bucket: string): Promise<LifecycleRule[]> {
     enabled:
       (r.getElementsByTagName("Status")[0]?.textContent ?? "").trim() ===
       "Enabled",
-    prefix:
-      (
-        r.getElementsByTagName("Prefix")[0]?.textContent ?? ""
-      ).trim(),
+    prefix: (
+      r.getElementsByTagName("Prefix")[0]?.textContent ?? ""
+    ).trim(),
+    tags: Array.from(r.getElementsByTagName("Tag"))
+      .map((tag) => ({
+        key: (tag.getElementsByTagName("Key")[0]?.textContent ?? "").trim(),
+        value: (tag.getElementsByTagName("Value")[0]?.textContent ?? "").trim(),
+      }))
+      .filter((tag) => tag.key && tag.value),
     expirationDays: intOf(r, ["Expiration", "Days"]),
     noncurrentDays: intOf(r, ["NoncurrentVersionExpiration", "NoncurrentDays"]),
     abortDays: intOf(r, [
@@ -1075,10 +1086,22 @@ export async function putLifecycle(
           actions += `<NoncurrentVersionExpiration><NoncurrentDays>${r.noncurrentDays}</NoncurrentDays></NoncurrentVersionExpiration>`;
         if (r.abortDays)
           actions += `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${r.abortDays}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`;
+        const tags = r.tags.filter((tag) => tag.key.trim() && tag.value.trim());
+        const prefix = r.prefix.trim()
+          ? `<Prefix>${xmlEscape(r.prefix)}</Prefix>`
+          : "";
+        const filter = tags.length
+          ? `<Filter><And>${prefix}${tags
+              .map(
+                (tag) =>
+                  `<Tag><Key>${xmlEscape(tag.key)}</Key><Value>${xmlEscape(tag.value)}</Value></Tag>`,
+              )
+              .join("")}</And></Filter>`
+          : `<Filter><Prefix>${xmlEscape(r.prefix)}</Prefix></Filter>`;
         return (
           `<Rule><ID>${xmlEscape(r.id)}</ID>` +
           `<Status>${r.enabled ? "Enabled" : "Disabled"}</Status>` +
-          `<Filter><Prefix>${xmlEscape(r.prefix)}</Prefix></Filter>` +
+          filter +
           actions +
           `</Rule>`
         );

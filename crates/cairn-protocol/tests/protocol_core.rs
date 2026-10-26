@@ -5709,6 +5709,79 @@ async fn copy_object_works() {
     assert_eq!(body, b"original");
 }
 
+#[tokio::test]
+async fn copy_object_reports_lifecycle_expiration_for_the_destination() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cpb-ttl"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let lifecycle = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Rule><ID>two-days</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>
+            <Expiration><Days>2</Days></Expiration></Rule>
+    </LifecycleConfiguration>"#;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpb-ttl"),
+                None,
+                &[("lifecycle", "")],
+                &[("content-type", "application/xml")],
+                lifecycle.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpb-ttl"),
+                Some("src.txt"),
+                &[],
+                &[],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpb-ttl"),
+                Some("dst.txt"),
+                &[],
+                &[("x-amz-copy-source", "/cpb-ttl/src.txt")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        header(&hdrs, "x-amz-expiration")
+            .is_some_and(|value| value.contains("rule-id=\"two-days\"")),
+        "CopyObject should report the destination bucket's lifecycle expiration"
+    );
+}
+
 /// The six system response headers of a copy source (ARCH 13.4 / 21.6). Under the default COPY
 /// metadata directive they must all be carried onto the destination — audit 2026-07 found five of
 /// them hard-coded `None` in `copy_object`'s row literal, so every copy silently lost them.
@@ -18470,4 +18543,251 @@ async fn missing_replica_multipart_cleanup_requires_replication_authority() {
             "missing-session authority only covers cleanup probes"
         );
     }
+}
+
+#[tokio::test]
+async fn lifecycle_expiration_header_reports_current_matching_rules() {
+    let (h, _meta, _clock) = in_memory_harness_with_clock().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ttl-bucket"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let lifecycle = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Rule><ID>two-days</ID><Filter><Prefix>docs/</Prefix></Filter><Status>Enabled</Status>
+            <Expiration><Days>2</Days></Expiration></Rule>
+        <Rule><ID>tagged</ID><Filter><Tag><Key>ttl</Key><Value>1d</Value></Tag></Filter><Status>Enabled</Status>
+            <Expiration><Days>1</Days></Expiration></Rule>
+    </LifecycleConfiguration>"#;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-bucket"),
+                None,
+                &[("lifecycle", "")],
+                &[("content-type", "application/xml")],
+                lifecycle.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // Prefix rule: the header appears on the PUT and is stable on HEAD/GET.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-bucket"),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                b"prefix".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let expected = "expiry-date=\"Thu, 16 Nov 2023 22:13:20 GMT\", rule-id=\"two-days\"";
+    assert_eq!(header(&hdrs, "x-amz-expiration"), Some(expected));
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("ttl-bucket"),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-expiration"), Some(expected));
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("ttl-bucket"),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-expiration"), Some(expected));
+
+    // Tag rule: the tag query is used when the lifecycle configuration has tag filters.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-bucket"),
+                Some("other.txt"),
+                &[],
+                &[("x-amz-tagging", "ttl=1d")],
+                b"tagged".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-expiration"),
+        Some("expiry-date=\"Wed, 15 Nov 2023 22:13:20 GMT\", rule-id=\"tagged\"")
+    );
+
+    // No matching prefix/tag: no header.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-bucket"),
+                Some("plain.txt"),
+                &[],
+                &[],
+                b"plain".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-expiration"), None);
+}
+
+#[tokio::test]
+async fn lifecycle_expiration_header_is_current_version_only() {
+    let (h, _meta, _clock) = in_memory_harness_with_clock().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("versioned"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let versioning = br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("versioned"),
+                None,
+                &[("versioning", "")],
+                &[("content-type", "application/xml")],
+                versioning.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let lifecycle = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Rule><ID>two-days</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>
+            <Expiration><Days>2</Days></Expiration></Rule>
+    </LifecycleConfiguration>"#;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("versioned"),
+                None,
+                &[("lifecycle", "")],
+                &[("content-type", "application/xml")],
+                lifecycle.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("versioned"),
+                Some("key.txt"),
+                &[],
+                &[],
+                b"one".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let first_version = header(&hdrs, "x-amz-version-id")
+        .expect("versioned PUT returns a version id")
+        .to_owned();
+    assert!(header(&hdrs, "x-amz-expiration").is_some());
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("versioned"),
+                Some("key.txt"),
+                &[],
+                &[],
+                b"two".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("versioned"),
+                Some("key.txt"),
+                &[("versionId", first_version.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-expiration"),
+        None,
+        "S3 reports x-amz-expiration only for the current version"
+    );
 }

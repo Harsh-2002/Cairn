@@ -3,7 +3,8 @@
 //! doubles with a [`TestClock`] so all age and date math is reproducible.
 
 use crate::{
-    Action, BucketLifecycle, Expiration, Filter, LifecycleRule, LifecycleScanner, parse_lifecycle,
+    Action, BucketLifecycle, Expiration, Filter, LifecycleRule, LifecycleScanner,
+    earliest_expiration, parse_lifecycle,
 };
 use cairn_types::storage::{StorageToken, StorageWriteTarget};
 use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
@@ -1891,5 +1892,75 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
         blob.get_bytes(protected.storage_path.as_ref().unwrap())
             .unwrap(),
         b"body-0"
+    );
+}
+
+#[test]
+fn earliest_expiration_matches_filters_and_chooses_earliest() {
+    let last_modified = Timestamp::from_secs(1_700_000_000);
+    let rules = vec![
+        LifecycleRule {
+            id: "disabled".to_owned(),
+            enabled: false,
+            filter: Filter::default(),
+            actions: vec![Action::Expiration(Expiration::Days(1))],
+        },
+        LifecycleRule {
+            id: "prefix".to_owned(),
+            enabled: true,
+            filter: Filter {
+                prefix: Some("logs/".to_owned()),
+                ..Filter::default()
+            },
+            actions: vec![Action::Expiration(Expiration::Days(7))],
+        },
+        LifecycleRule {
+            id: "tags".to_owned(),
+            enabled: true,
+            filter: Filter {
+                tags: vec![("ttl".to_owned(), "1d".to_owned())],
+                ..Filter::default()
+            },
+            actions: vec![Action::Expiration(Expiration::Days(1))],
+        },
+        LifecycleRule {
+            id: "date".to_owned(),
+            enabled: true,
+            filter: Filter::default(),
+            actions: vec![Action::Expiration(Expiration::Date(1_800_000_000))],
+        },
+    ];
+
+    assert_eq!(
+        earliest_expiration(&rules, "other", 10, &[], last_modified),
+        Some((Timestamp::from_secs(1_800_000_000), "date")),
+        "disabled rules are ignored and a matching date is used"
+    );
+    assert_eq!(
+        earliest_expiration(&rules, "logs/a", 10, &[], last_modified),
+        Some((last_modified.plus_secs(7 * DAY), "prefix")),
+        "a prefix rule ages from the object's last-modified time"
+    );
+    assert_eq!(
+        earliest_expiration(
+            &rules,
+            "logs/a",
+            10,
+            &[("ttl".to_owned(), "1d".to_owned())],
+            last_modified
+        ),
+        Some((last_modified.plus_secs(DAY), "tags")),
+        "the earliest matching rule wins"
+    );
+    assert_eq!(
+        earliest_expiration(
+            &rules,
+            "other",
+            10,
+            &[("ttl".to_owned(), "wrong".to_owned())],
+            last_modified
+        ),
+        Some((Timestamp::from_secs(1_800_000_000), "date")),
+        "tag values must match exactly"
     );
 }

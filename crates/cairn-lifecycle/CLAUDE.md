@@ -5,7 +5,8 @@ rules and applies the due ones over the trait spine — expiration, noncurrent-v
 expired-object-delete-marker removal, and abort-incomplete-multipart.
 
 ## Layout (`src/`)
-- `config.rs` — `parse_lifecycle` (XML → `Vec<LifecycleRule>`), the `Action`/`Expiration`/`Filter`
+- `config.rs` — `parse_lifecycle` (XML → `Vec<LifecycleRule>`), `earliest_expiration` (the
+  `x-amz-expiration` matcher shared with the protocol layer), the `Action`/`Expiration`/`Filter`
   types, and a SAX-style `drive` over quick-xml. Total function: any malformed body folds to
   `Error::MalformedXml`, never a panic. The driver coalesces text/CDATA/reference events and accepts
   only numeric references plus XML's predefined entities.

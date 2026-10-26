@@ -38,6 +38,7 @@ use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::storage::{
     StorageAdmission, StorageCreationPermit, StorageMutation, StorageWriteTarget,
 };
+use cairn_types::time::Timestamp;
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use std::sync::Arc;
@@ -1182,6 +1183,18 @@ impl S3Service {
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
+                if let Some(value) = self
+                    .lifecycle_expiration_header(
+                        &bucket.name,
+                        &key,
+                        &version_id,
+                        staged.size_logical,
+                        now,
+                    )
+                    .await
+                {
+                    resp = resp.with_header("x-amz-expiration", value);
+                }
                 if let Some(timer) = total_timer {
                     timer.complete();
                 }
@@ -1271,6 +1284,21 @@ impl S3Service {
         resp = self
             .append_lock_headers(resp, &bucket_name, &key, &row.version_id)
             .await?;
+        let expiration = if row.is_latest {
+            self.lifecycle_expiration_header(
+                &bucket_name,
+                &key,
+                &row.version_id,
+                row.size_logical,
+                row.updated_at,
+            )
+            .await
+        } else {
+            None
+        };
+        if let Some(value) = expiration {
+            resp = resp.with_header("x-amz-expiration", value);
+        }
         Ok(resp.with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -1301,6 +1329,23 @@ impl S3Service {
         let resp = self
             .append_lock_headers(resp, &bucket_name, &key, &row.version_id)
             .await?;
+        let expiration = if row.is_latest {
+            self.lifecycle_expiration_header(
+                &bucket_name,
+                &key,
+                &row.version_id,
+                row.size_logical,
+                row.updated_at,
+            )
+            .await
+        } else {
+            None
+        };
+        let resp = if let Some(value) = expiration {
+            resp.with_header("x-amz-expiration", value)
+        } else {
+            resp
+        };
         Ok(resp)
     }
 
@@ -2617,6 +2662,18 @@ impl S3Service {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
+                if let Some(value) = self
+                    .lifecycle_expiration_header(
+                        &bucket.name,
+                        &key,
+                        &version_id,
+                        staged.size_logical,
+                        now,
+                    )
+                    .await
+                {
+                    resp = resp.with_header("x-amz-expiration", value);
+                }
                 Ok(resp)
             }
             Ok(
@@ -3079,6 +3136,18 @@ impl S3Service {
                 resp = with_sse_headers(resp, dest_sse_descriptor.as_deref());
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
+                }
+                if let Some(value) = self
+                    .lifecycle_expiration_header(
+                        &dest_bucket.name,
+                        &dest_key_for_event,
+                        &version_id,
+                        staged.size_logical,
+                        now,
+                    )
+                    .await
+                {
+                    resp = resp.with_header("x-amz-expiration", value);
                 }
                 Ok(resp)
             }
@@ -4545,6 +4614,70 @@ impl S3Service {
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
+    /// The standard `x-amz-expiration` value for a current object under the bucket's lifecycle
+    /// rules.
+    ///
+    /// Best-effort: a lifecycle read or parse failure omits the header rather than failing an
+    /// object request that has already succeeded. S3 reports this header only for current
+    /// versions, so callers must check `is_latest` before using it.
+    async fn lifecycle_expiration_header(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+        size: u64,
+        last_modified: Timestamp,
+    ) -> Option<String> {
+        let doc = match self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::Lifecycle)
+            .await
+        {
+            Ok(Some(doc)) => doc,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    bucket = %bucket.as_str(),
+                    error = %error,
+                    "lifecycle expiration header: bucket configuration read failed"
+                );
+                return None;
+            }
+        };
+        let rules = match cairn_lifecycle::parse_lifecycle(doc.0.as_bytes()) {
+            Ok(rules) => rules,
+            Err(error) => {
+                tracing::warn!(
+                    bucket = %bucket.as_str(),
+                    error = %error,
+                    "lifecycle expiration header: stored lifecycle configuration is invalid"
+                );
+                return None;
+            }
+        };
+        let tags = if rules
+            .iter()
+            .any(|rule| rule.enabled && !rule.filter.tags.is_empty())
+        {
+            match self.meta.get_object_tags(bucket, key, version).await {
+                Ok(tags) => tags,
+                Err(error) => {
+                    tracing::warn!(
+                        bucket = %bucket.as_str(),
+                        error = %error,
+                        "lifecycle expiration header: object tags read failed"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let (expires, rule_id) =
+            cairn_lifecycle::earliest_expiration(&rules, key.as_str(), size, &tags, last_modified)?;
+        Some(format_expiration_header(expires, rule_id))
+    }
+
     /// Append `x-amz-object-lock-*` headers to a GET/HEAD response when the bucket has Object Lock
     /// enabled and the version carries protection. Buckets without Object Lock pay only one cached
     /// config read; the per-version lock read happens only for lock-enabled buckets.
@@ -5837,6 +5970,38 @@ impl S3Service {
     }
 }
 
+/// Format the standard `x-amz-expiration` response header from an expiry instant and rule id.
+///
+/// The rule id is URL-encoded as S3 specifies; an empty id is omitted rather than emitting an
+/// empty `rule-id` parameter.
+fn format_expiration_header(expires: Timestamp, rule_id: &str) -> String {
+    let expiry_date = http_date(expires);
+    if rule_id.is_empty() {
+        format!("expiry-date=\"{expiry_date}\"")
+    } else {
+        format!(
+            "expiry-date=\"{expiry_date}\", rule-id=\"{}\"",
+            percent_encode_rule_id(rule_id)
+        )
+    }
+}
+
+/// Percent-encode a lifecycle rule id for the `rule-id` parameter using RFC 3986 unreserved bytes.
+fn percent_encode_rule_id(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[(byte >> 4) as usize]));
+            out.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    out
+}
+
 fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     let mut resp = resp
         .with_header("etag", quoted(&row.etag))
@@ -6958,5 +7123,33 @@ mod prealloc_clamp_tests {
         // Exactly at the ceiling is preserved; absent header stays absent (no preallocation).
         assert_eq!(clamp_prealloc_len(Some(4096), 4096), Some(4096));
         assert_eq!(clamp_prealloc_len(None, 4096), None);
+    }
+}
+
+#[cfg(test)]
+mod expiration_header_tests {
+    use super::{format_expiration_header, percent_encode_rule_id};
+    use cairn_types::time::Timestamp;
+
+    #[test]
+    fn formats_expiration_header_with_encoded_rule_id() {
+        assert_eq!(
+            format_expiration_header(Timestamp::from_secs(1_369_353_600), "logs 1/2"),
+            "expiry-date=\"Fri, 24 May 2013 00:00:00 GMT\", rule-id=\"logs%201%2F2\""
+        );
+    }
+
+    #[test]
+    fn omits_an_empty_rule_id() {
+        assert_eq!(
+            format_expiration_header(Timestamp::from_secs(1_369_353_600), ""),
+            "expiry-date=\"Fri, 24 May 2013 00:00:00 GMT\""
+        );
+    }
+
+    #[test]
+    fn percent_encoding_leaves_unreserved_bytes_alone() {
+        assert_eq!(percent_encode_rule_id("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(percent_encode_rule_id("a b+c%"), "a%20b%2Bc%25");
     }
 }
