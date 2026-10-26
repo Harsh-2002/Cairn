@@ -167,12 +167,11 @@ feature and coverage builds remain separate. Temporary binaries/bundles expire a
 are deleted at run completion where token permissions permit. Only superseded runs of the same PR
 are cancelled; validations of distinct `main` commits do not cancel one another.
 
-`Extended checks` runs weekly on Monday at 03:17 UTC or by manual dispatch. It runs the comparative
-MinIO benchmark and CodeQL on `main`; the encrypted 2 GiB/5 GiB replication correctness harness stays
-in ordinary full validation. CodeQL uses an explicit workflow instead of duplicate default-setup
-scans. `main` requires PRs, the GitHub Actions `required` check and an up-to-date base; force pushes
-and branch deletion are disallowed. An authorized bootstrap/direct push has no reusable PR evidence
-and therefore receives full validation.
+`Extended checks` runs weekly on Monday at 03:17 UTC or by manual dispatch. It runs CodeQL on `main`;
+the encrypted 2 GiB/5 GiB replication correctness harness stays in ordinary full validation. CodeQL
+uses an explicit workflow instead of duplicate default-setup scans. `main` requires PRs, the GitHub
+Actions `required` check and an up-to-date base; force pushes and branch deletion are disallowed. An
+authorized bootstrap/direct push has no reusable PR evidence and therefore receives full validation.
 
 ---
 
