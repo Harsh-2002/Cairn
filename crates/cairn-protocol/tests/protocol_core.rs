@@ -18791,3 +18791,140 @@ async fn lifecycle_expiration_header_is_current_version_only() {
         "S3 reports x-amz-expiration only for the current version"
     );
 }
+
+#[tokio::test]
+async fn object_ttl_header_is_stored_only_when_the_bucket_opts_in() {
+    let (h, meta, clock) = in_memory_harness_with_clock().await;
+    for bucket in ["ttl-opt-in", "ttl-off"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    meta.submit(cairn_types::Mutation::SetBucketConfig {
+        bucket: BucketName::parse("ttl-opt-in").unwrap(),
+        aspect: cairn_types::bucket::ConfigAspect::ObjectTtl,
+        doc: Some(cairn_types::bucket::ConfigDoc(
+            r#"{"enabled":true,"max_ttl_secs":7200}"#.to_owned(),
+        )),
+    })
+    .await
+    .unwrap();
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-opt-in"),
+                Some("expiring.txt"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+    let row = meta
+        .get_version(
+            &BucketName::parse("ttl-opt-in").unwrap(),
+            &ObjectKey::parse("expiring.txt").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .expect("object row");
+    assert_eq!(row.expire_at, Some(clock.now().plus_secs(3_600)));
+    assert!(
+        !row.user_metadata
+            .iter()
+            .any(|(name, _)| name == "object-expires"),
+        "the opt-in header is consumed into expire_at, not retained as user metadata"
+    );
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("ttl-opt-in"),
+                Some("expiring.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-meta-object-expires"),
+        Some("2023-11-14T23:13:20.000Z")
+    );
+
+    // Over the bucket ceiling and zero are rejected before publication.
+    for value in ["+3h", "+0s"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("ttl-opt-in"),
+                    Some("rejected.txt"),
+                    &[],
+                    &[("x-amz-meta-object-expires", value)],
+                    b"body".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{value} must be rejected");
+    }
+
+    // A bucket that has not opted in treats the header as ordinary user metadata.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ttl-off"),
+                Some("ordinary.txt"),
+                &[],
+                &[("x-amz-meta-object-expires", "+1h")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = meta
+        .get_version(
+            &BucketName::parse("ttl-off").unwrap(),
+            &ObjectKey::parse("ordinary.txt").unwrap(),
+            &VersionId::null(),
+        )
+        .await
+        .unwrap()
+        .expect("object row");
+    assert_eq!(row.expire_at, None);
+    assert!(
+        row.user_metadata
+            .iter()
+            .any(|(name, value)| name == "object-expires" && value == "+1h"),
+        "a non-opted-in bucket keeps the header as user metadata"
+    );
+}

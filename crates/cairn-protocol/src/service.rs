@@ -6,6 +6,7 @@ use crate::chunked::{ChunkDecoder, ChunkVerifier, decode_stream};
 use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
+use crate::object_ttl::{self, TtlSpec};
 use crate::put_timing::{PutStage, PutTiming, PutTimings};
 use crate::request::{S3Body, S3Request, S3Response};
 use crate::storage_write::{PreparedStorageWrite, StorageWriteGuard, StorageWriteRuntime};
@@ -18,7 +19,7 @@ use cairn_types::authz::{
 };
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{
-    Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
+    Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, ObjectTtlConfig, VersioningState,
 };
 use cairn_types::error::Error;
 use cairn_types::id::{
@@ -819,6 +820,9 @@ impl S3Service {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
+        // The opt-in TTL header is parsed before staging so a malformed value cannot leave an
+        // orphaned blob. Relative durations are anchored at the commit timestamp below.
+        let ttl_request = self.object_ttl_for_write(&bucket.name, &req).await?;
 
         // Parse all explicit WORM state before touching the filesystem. Bucket defaults remain a
         // Writer-time decision so a concurrent configuration update has one serial outcome.
@@ -840,7 +844,12 @@ impl S3Service {
             .to_owned();
         let extra = requested_checksums(&req);
         let precond = precondition(&req);
-        let user_metadata = user_metadata(&req);
+        let mut user_metadata = user_metadata(&req);
+        if ttl_request.is_some() {
+            // The extension consumes this key rather than storing it twice; GET/HEAD synthesizes it
+            // from `expire_at` once the object is visible.
+            user_metadata.retain(|(name, _)| name != "object-expires");
+        }
         // Decode any client Content-MD5 up front, BEFORE staging: a syntactically invalid header must
         // be rejected before a blob is written, so a malformed digest can never leave an orphaned
         // staged blob (mirrors the inline-tag validation below). Byte-compared after staging.
@@ -1031,6 +1040,17 @@ impl S3Service {
         // also re-validates explicit retention against it, so time spent staging can neither shorten
         // default WORM protection nor let an explicit deadline expire before the object is visible.
         let now = self.clock.now();
+        let expire_at = match ttl_request {
+            Some((spec, max_ttl_secs)) => match spec.resolve(now, max_ttl_secs) {
+                Ok(expires) => Some(expires),
+                Err(error) => {
+                    self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                        .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). `is_replica` was resolved by the authorize-vs-dispatch classifier before the
@@ -1071,7 +1091,7 @@ impl S3Service {
             content_disposition: header_owned("content-disposition"),
             content_language: header_owned("content-language"),
             expires: header_owned("expires"),
-            expire_at: None,
+            expire_at,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1184,6 +1204,12 @@ impl S3Service {
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
+                if let Some(expires) = expire_at {
+                    resp = resp.with_header(
+                        "x-amz-meta-object-expires",
+                        cairn_xml::format_iso8601(expires),
+                    );
+                }
                 if let Some(value) = self
                     .lifecycle_expiration_header(
                         &bucket.name,
@@ -4621,6 +4647,40 @@ impl S3Service {
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
+    /// Parse and validate the opt-in object TTL header for a write.
+    ///
+    /// Returns `None` when the header is absent or the bucket has not opted in. In that case the
+    /// header remains ordinary user metadata, matching S3's treatment of unknown `x-amz-meta-*`
+    /// keys.
+    async fn object_ttl_for_write(
+        &self,
+        bucket: &BucketName,
+        req: &S3Request,
+    ) -> Result<Option<(TtlSpec, u64)>> {
+        let Some(value) = req.header("x-amz-meta-object-expires") else {
+            return Ok(None);
+        };
+        let Some(doc) = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::ObjectTtl)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let config: ObjectTtlConfig = serde_json::from_str(&doc.0).map_err(|error| {
+            tracing::error!(
+                bucket = %bucket.as_str(),
+                error = %error,
+                "invalid object TTL bucket configuration"
+            );
+            Error::Internal("invalid object TTL configuration".to_owned())
+        })?;
+        if !config.enabled {
+            return Ok(None);
+        }
+        Ok(Some((object_ttl::parse(value)?, config.max_ttl_secs)))
+    }
+
     /// The standard `x-amz-expiration` value for a current object under the bucket's lifecycle
     /// rules.
     ///
@@ -6038,6 +6098,14 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     }
     if let Some(v) = &row.expires {
         resp = resp.with_header("expires", v.clone());
+    }
+    if let Some(expires) = row.expire_at {
+        // The extension consumes the request metadata key into a typed deadline; echo the absolute
+        // value so a client can round-trip it. Enforcement lands in the TTL phase.
+        resp = resp.with_header(
+            "x-amz-meta-object-expires",
+            cairn_xml::format_iso8601(expires),
+        );
     }
     // Echo the SSE algorithm (and, for SSE-KMS, the key id + BucketKeyEnabled) on GET/HEAD for a
     // server-side-encrypted object (ARCH 27). A transparent `AtRest` object advertises nothing.

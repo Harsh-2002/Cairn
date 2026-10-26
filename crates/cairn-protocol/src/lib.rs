@@ -8,6 +8,7 @@ pub mod chunked;
 pub mod error_map;
 mod httpdate;
 pub mod keyprovider;
+mod object_ttl;
 mod put_timing;
 pub mod request;
 pub mod service;
