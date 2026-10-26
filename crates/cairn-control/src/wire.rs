@@ -759,6 +759,9 @@ pub struct CreateReplicationTargetReq {
     /// endpoint). Mutually exclusive with `ca_cert`.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Refuse to replicate TTL-bearing objects to this destination (fail-closed mode).
+    #[serde(default)]
+    pub reject_ttl_objects: bool,
 }
 
 /// `POST /buckets/{name}/replication/targets` response body: just the minted ARN. The secret is
@@ -785,6 +788,8 @@ pub struct ReplicationTargetEntry {
     pub access_key_id: String,
     /// Whether TLS certificate verification is skipped for this destination (testing only).
     pub insecure_skip_verify: bool,
+    /// Whether this target refuses TTL-bearing objects.
+    pub reject_ttl_objects: bool,
     /// Whether a custom CA certificate is trusted for this destination's TLS.
     pub has_ca_cert: bool,
 }

@@ -78,6 +78,12 @@ per sampled object, not emitted per chunk; an active cancelled phase is `interru
 `body_sink` does not include residual buffer flushing, which remains in `finalize`. Encoded writes
 retain only the aggregate `body` stage, so substage counts must not be read as all-write counts.
 
+The object-TTL sweep publishes `cairn_object_ttl_expired_objects_total`,
+`cairn_object_ttl_expired_versions_total`, and `cairn_object_ttl_sweep_errors_total` once per pass
+for the buckets that opted in. Expired objects are hidden from reads and listings immediately; the
+sweep counters describe physical reclamation and versioned-bucket delete-marker creation, not
+read-path rejections. The sweep logs a structured report with the same counts.
+
 The protocol service additionally publishes `cairn_put_stage_seconds{stage,result}`
 for one in every 32 ordinary PUT handlers. All stages of a selected PUT use the same
 sampling decision, independently of the blob sampler. The fixed stages are `total`,

@@ -288,6 +288,7 @@ fn sink(endpoint: String, timeout: Duration) -> HttpS3Sink {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
         },

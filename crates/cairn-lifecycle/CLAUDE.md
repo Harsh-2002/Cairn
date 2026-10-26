@@ -10,7 +10,8 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
   types, and a SAX-style `drive` over quick-xml. Total function: any malformed body folds to
   `Error::MalformedXml`, never a panic. The driver coalesces text/CDATA/reference events and accepts
   only numeric references plus XML's predefined entities.
-- `scanner.rs` — `LifecycleScanner::run_once` (the periodic apply pass) and `LifecycleReport`.
+- `scanner.rs` — `LifecycleScanner::run_once` (the periodic apply pass), `run_ttl_once` (the
+  independent per-object TTL sweep), and `LifecycleReport`.
 - `lib.rs` re-exports; `tests.rs` is the whole suite (against the in-memory doubles).
 
 ## Notes

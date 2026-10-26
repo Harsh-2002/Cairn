@@ -275,6 +275,8 @@ pub struct S3SinkConfig {
     /// been on an unauthenticated link. Turning that on silently would be a security regression
     /// introduced by a correctness fix.
     pub allow_plaintext_sse_over_http: bool,
+    /// Refuse to replicate an object carrying an active TTL (per-target fail-closed mode).
+    pub reject_ttl_objects: bool,
 }
 
 /// A production replication sink issuing SigV4-signed S3 requests to a remote endpoint over
@@ -699,6 +701,7 @@ pub fn sink_for_target(
             insecure_skip_verify: open.insecure_skip_verify,
             allow_internal_endpoints,
             allow_plaintext_sse_over_http,
+            reject_ttl_objects: open.reject_ttl_objects,
         },
         runtime,
     )
@@ -939,6 +942,12 @@ impl HttpS3Sink {
         source_bucket: &str,
         object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError> {
+        if object.expire_at.is_some() && self.config.reject_ttl_objects {
+            return Err(ReplicationError::Terminal(format!(
+                "target refuses TTL-bearing object {:?} (ttl_replication=reject)",
+                object.key.as_str()
+            )));
+        }
         // Refuse to put a CLIENT-encrypted object's decrypted body on an unauthenticated link,
         // before a byte is read (so nothing is buffered and nothing is dialled). See
         // `S3SinkConfig::allow_plaintext_sse_over_http`.
@@ -1022,6 +1031,12 @@ impl HttpS3Sink {
             if let Some(v) = val {
                 user_headers.push((name.to_owned(), v.clone()));
             }
+        }
+        if let Some(expires) = object.expire_at {
+            user_headers.push((
+                "x-amz-meta-object-expires".to_owned(),
+                cairn_xml::format_iso8601(expires),
+            ));
         }
         // Storage class (STANDARD is the default and is omitted, matching AWS).
         if !matches!(object.storage_class, StorageClass::Standard) {
@@ -1932,6 +1947,7 @@ mod tests {
             insecure_skip_verify: false,
             allow_internal_endpoints: false,
             allow_plaintext_sse_over_http: false,
+            reject_ttl_objects: false,
         }
     }
 
@@ -1990,6 +2006,7 @@ mod tests {
             insecure_skip_verify: false,
             allow_internal_endpoints: false,
             allow_plaintext_sse_over_http: false,
+            reject_ttl_objects: false,
         };
         let sink = HttpS3Sink::new(cfg, runtime()).unwrap();
         // Mapped sources resolve to their explicit destinations.

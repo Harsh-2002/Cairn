@@ -369,6 +369,7 @@ export async function runReplicationTests() {
       acl: null,
       public_access_block: null,
       encryption: null,
+      object_ttl: null,
     });
     api.getBucket = async () => {
       throw new Error("fixture compression unavailable");

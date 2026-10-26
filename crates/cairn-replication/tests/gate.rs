@@ -2375,6 +2375,7 @@ async fn plaintext_small_read_frame_survives_signed_http_delivery() {
             insecure_skip_verify: false,
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
+            reject_ttl_objects: false,
         },
         cairn_replication::ReplicationSinkRuntime::new(1024 * 1024, Duration::from_secs(5))
             .unwrap(),

@@ -101,7 +101,7 @@ A bucket's lifecycle configuration is a list of rules, each with an identifier, 
 
 Current-object expiration is reported to clients through the standard `x-amz-expiration` response header on `PutObject`, `CopyObject`, `CompleteMultipartUpload`, `HeadObject`, and `GetObject`. The header carries the earliest matching enabled `Expiration` rule as `expiry-date="<HTTP date>", rule-id="<url-encoded id>"`; only the current version of a key carries it, and noncurrent versions and delete markers never do. The date is the scanner's eligibility instant, not a promise that the object is removed at that exact second.
 
-A per-object TTL can be expressed with standard S3 by tagging the object and using a tag-filtered expiration rule. For example, upload with `x-amz-tagging: ttl=7d` and save a rule whose filter is the tag `ttl=7d` with `<Expiration><Days>7</Days></Expiration>`. The age is measured from the object's last-modified time, so re-tagging an existing object does not restart the clock, and each distinct TTL value needs its own rule. This is the interoperable alternative to a future opt-in `X-Amz-Meta-Object-Expires` extension, which is not part of the standard S3 surface.
+A per-object TTL can be expressed with standard S3 by tagging the object and using a tag-filtered expiration rule. For example, upload with `x-amz-tagging: ttl=7d` and save a rule whose filter is the tag `ttl=7d` with `<Expiration><Days>7</Days></Expiration>`. The age is measured from the object's last-modified time, so re-tagging an existing object does not restart the clock, and each distinct TTL value needs its own rule. This is the interoperable alternative to the opt-in `X-Amz-Meta-Object-Expires` extension in Section 19.6, which is not part of the standard S3 surface.
 
 ### 19.2 The scanner engine
 
@@ -120,6 +120,37 @@ A lifecycle rule can specify that incomplete multipart uploads be aborted a numb
 > **Implementation status (deferred).** As of this revision the lifecycle engine parses and validates `Transition` actions but performs no data movement — it is a documented no-op, tracked as future work alongside the io_uring blob engine in Section 32, Phase 15. The design below is the intended shape; the remote-backed blob-store implementation it relies on is not yet built. All other lifecycle actions (current and noncurrent expiration, expired-delete-marker removal, incomplete-multipart abort) are implemented.
 
 Transition moves an object's bytes off the local disk to a configured remote S3-compatible destination after the object has aged, trading read latency for lower local storage cost, which is how an operator keeps a long tail of rarely-accessed data without consuming local capacity. When an object transitions, Cairn streams its bytes to the remote destination through the same S3-client facility that replication uses, records on the object version that it now lives in the cold tier together with the remote locator, and reclaims the local blob; the object's metadata, size, ETag, and identity are unchanged, so to a client the object still exists with the same attributes. A read of a transitioned object is served by Cairn fetching the bytes from the remote destination and streaming them to the client transparently, so the client continues to get the object from Cairn without knowing it now originates remotely; this is why the blob-store interface admits a remote-backed implementation, and the cold tier is realised as such an implementation selected for transitioned objects. The cost of this transparency is that reads of cold objects carry the remote's latency and the operator's egress considerations, which the documentation makes explicit, and v1 treats transition as effectively one-way with reads served from the cold tier rather than implementing an explicit restore-to-local workflow, which is noted as a future refinement. Because compressed blobs are self-describing, a transitioned compressed object remains readable from the cold tier by the same decompression path.
+
+### 19.6 Per-object TTL extension
+
+Cairn also supports an opt-in per-object TTL for clients that need an arbitrary deadline rather than
+a bucket-wide lifecycle rule. The bucket setting is disabled by default and is managed through the
+management API (`PUT /api/v1/buckets/{name}/object-ttl`, body
+`{"enabled":true,"max_ttl_secs":31536000}`). The setting only enables interpretation of the header;
+it never assigns a TTL to an existing object, and an object uploaded without the header never
+expires.
+
+The header is the Storj-compatible `X-Amz-Meta-Object-Expires`. It accepts a headed relative
+duration (`+2h`, `+1.5h`, `+2h45m`, `+7d`, `+1w`) or an RFC3339 UTC timestamp
+(`2026-11-01T00:00:00Z`). Relative values are anchored at the object's commit timestamp; absolute
+values must still be in the future then. The default ceiling is 365 days and the server allows
+1 hour through 10 years.
+
+The deadline is stored on the object version. Once it passes, GET/HEAD return 404 (or
+`NoSuchVersion` for a named version), listings omit the version, and a background sweep reclaims
+the bytes. In a versioning-enabled bucket a due current version becomes a delete marker; a due
+noncurrent version is permanently removed. An object with a TTL cannot be protected by Object Lock
+and a locked version cannot receive a TTL.
+
+`CopyObject` with the default `COPY` metadata directive carries the absolute deadline into an
+opted-in destination; `REPLACE` clears it unless the copy request supplies a new header. Multipart
+uploads pin the header at initiation and resolve it at completion. Replication carries the
+absolute deadline: another Cairn destination with TTL enabled enforces it, while a generic S3
+destination stores the header as ordinary user metadata and needs its own lifecycle configuration.
+A target may set `reject_ttl_objects: true` to fail closed instead, terminating TTL-bearing entries
+with a clear reason rather than shipping a replica that will not expire.
+
+The standard `Expires` header is unrelated and remains cache metadata.
 
 ---
 

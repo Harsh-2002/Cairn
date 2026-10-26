@@ -240,6 +240,7 @@ fn sink_for_with_runtime(
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
@@ -766,6 +767,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
@@ -858,6 +860,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
@@ -1045,6 +1048,7 @@ async fn the_opt_in_allows_a_client_encrypted_object_over_http() {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: true,
         },

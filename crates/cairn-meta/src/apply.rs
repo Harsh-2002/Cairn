@@ -735,6 +735,9 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         } => {
             require_object_version(conn, &bucket, &key, &version_id)?;
             require_object_lock_enabled(conn, &bucket)?;
+            if retention.is_some() && object_version_has_ttl(conn, &bucket, &key, &version_id)? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             if retention.is_some_and(|value| value.retain_until <= now) {
                 return Err(MetaError::InvalidObjectLockState);
             }
@@ -752,6 +755,9 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         } => {
             require_object_version(conn, &bucket, &key, &version_id)?;
             require_object_lock_enabled(conn, &bucket)?;
+            if on && object_version_has_ttl(conn, &bucket, &key, &version_id)? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let mut state = read_object_lock_state(conn, &bucket, &key, &version_id)?;
             state.legal_hold = on;
             write_object_lock_state(conn, &bucket, &key, &version_id, state)?;
@@ -1830,6 +1836,25 @@ fn require_object_version(
     }
 }
 
+fn object_version_has_ttl(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<bool> {
+    let expires: Option<i64> = conn
+        .query_row(
+            "SELECT expire_at FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            params![bucket.as_str(), key.as_str(), version_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    Ok(expires.is_some())
+}
+
 fn replacement_is_protected(
     conn: &Connection,
     bucket: &BucketName,
@@ -2040,6 +2065,9 @@ fn put_version(
             )?,
         )
     };
+    if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
+        return Err(MetaError::ObjectTtlConflict);
+    }
     let bucket = row.bucket.clone();
     let key = row.key.clone();
     let version_id = row.version_id.clone();

@@ -15,6 +15,7 @@ authorizes.
 | GetBucketCors / PutBucketCors / DeleteBucketCors | ✅ | Per-bucket config (validated). |
 | GetBucketTagging / PutBucketTagging / DeleteBucketTagging | ✅ | |
 | GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal. **Storage-class transition/tiering is not supported**: a Put containing a `Transition` rule is rejected (`NotImplemented`) rather than silently no-op'd. |
+| Object TTL extension | ✅ | Opt-in per bucket (`PUT /api/v1/buckets/{name}/object-ttl`). `X-Amz-Meta-Object-Expires` accepts a headed duration (`+2h`) or RFC3339; exact read/listing hiding, asynchronous reclamation, versioned delete-marker semantics, per-object Object Lock exclusion. Off by default; no default TTL. |
 | GetBucketReplication / Put / Delete | ✅ | Enqueue-on-write + worker drains the outbox to a configured remote via a real SigV4-signing sink (verified node→node); one or more named targets (`CAIRN_REPLICATION_TARGETS`) with per-rule destinations. |
 | ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |

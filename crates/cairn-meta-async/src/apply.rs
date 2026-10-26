@@ -589,6 +589,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
                 .await?;
                 (initial_state.tags, lock_state)
             };
+            if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let version_id = row.version_id.clone();
             let superseded = upsert_version(driver, *row).await?;
             replace_object_tags(driver, &bucket, &key, &version_id, &initial_tags).await?;
@@ -830,6 +833,11 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         } => {
             ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
             require_object_lock_bucket(driver, &bucket).await?;
+            if retention.is_some()
+                && object_version_has_ttl(driver, &bucket, &key, &version_id).await?
+            {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             if retention.is_some_and(|candidate| candidate.retain_until <= now) {
                 return Err(MetaError::InvalidObjectLockState);
             }
@@ -847,6 +855,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         } => {
             ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
             require_object_lock_bucket(driver, &bucket).await?;
+            if on && object_version_has_ttl(driver, &bucket, &key, &version_id).await? {
+                return Err(MetaError::ObjectTtlConflict);
+            }
             let mut state = read_object_lock_state(driver, &bucket, &key, &version_id).await?;
             state.legal_hold = on;
             write_object_lock_state(driver, &bucket, &key, &version_id, state).await?;
@@ -1944,6 +1955,26 @@ async fn ensure_object_version_exists(
     } else {
         Err(MetaError::ObjectVersionNotFound)
     }
+}
+
+async fn object_version_has_ttl(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<bool> {
+    let row = query_one(
+        driver,
+        "SELECT expire_at FROM object_versions
+         WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        vec![
+            Value::Text(bucket.as_str().to_owned()),
+            Value::Text(key.as_str().to_owned()),
+            Value::Text(version_id.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    Ok(row.is_some_and(|row| row.get_opt_i64(0).is_some()))
 }
 
 async fn replacement_is_protected(

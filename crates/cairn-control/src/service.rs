@@ -2898,6 +2898,7 @@ impl ControlService {
             secret: req.secret,
             ca_cert_pem,
             insecure_skip_verify: req.insecure_skip_verify,
+            reject_ttl_objects: req.reject_ttl_objects,
         };
         // Seal the destination secret under the master key via the Crypto trait spine and mint the
         // stable ARN, exactly as `cairn_replication::seal_target` does (it needs the concrete
@@ -2950,6 +2951,7 @@ impl ControlService {
                 dest_bucket: t.dest_bucket,
                 access_key_id: t.access_key_id,
                 insecure_skip_verify: t.insecure_skip_verify,
+                reject_ttl_objects: t.reject_ttl_objects,
                 has_ca_cert: t.ca_cert_pem.is_some(),
             })
             .collect();
@@ -3272,6 +3274,7 @@ impl ControlService {
             nonce: Vec::new(),
             ca_cert_pem: input.ca_cert_pem,
             insecure_skip_verify: input.insecure_skip_verify,
+            reject_ttl_objects: input.reject_ttl_objects,
         })
     }
 
@@ -3763,6 +3766,7 @@ async fn backfill_replication(
             version_id_marker: None,
             start_after: None,
             limit: PAGE_LIMIT,
+            visible_at: None,
         };
         let page = match meta.list_current(&bucket, &query).await {
             Ok(p) => p,

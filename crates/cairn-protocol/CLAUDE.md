@@ -140,3 +140,8 @@ Clock/Crypto>`) — never a concrete engine.
 
 - PUT, copy, and multipart completion persist the staged internal plaintext SHA-256 with the
   object row. Imports and replicas share these paths. Do not surface it as an unsolicited S3 checksum.
+- **Per-object TTL** (`object_ttl.rs`) is off unless the bucket's `ObjectTtl` aspect is enabled.
+  `X-Amz-Meta-Object-Expires` is consumed into `ObjectVersionRow.expire_at` on PUT/COPY/MPU and
+  synthesized on reads; a non-opted-in bucket keeps it as ordinary user metadata. GET/HEAD hide an
+  expired version and listings filter with `ListQuery.visible_at`; the lifecycle scanner's
+  `run_ttl_once` reclaims it. TTL and Object Lock are mutually exclusive per object at the writer.

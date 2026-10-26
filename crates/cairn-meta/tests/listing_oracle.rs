@@ -124,6 +124,7 @@ async fn drain_store(
             version_id_marker: None,
             start_after: None,
             limit: max_keys,
+            visible_at: None,
         };
         let page = store.list_current(bucket, &query).await.unwrap();
         pages += 1;

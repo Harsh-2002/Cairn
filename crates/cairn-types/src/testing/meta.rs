@@ -692,6 +692,7 @@ fn summarize(r: &ObjectVersionRow) -> ObjectSummary {
         etag: r.etag.clone(),
         size: r.size_logical,
         last_modified: r.updated_at,
+        expire_at: r.expire_at,
         storage_class: r.storage_class,
         owner_id: r.owner_id.clone(),
     }
@@ -1127,7 +1128,14 @@ impl MetadataStore for InMemoryMetadataStore {
         let rows: Vec<&ObjectVersionRow> = st
             .versions
             .values()
-            .filter(|r| r.bucket.as_str() == bucket.as_str() && r.is_latest && !r.is_delete_marker)
+            .filter(|r| {
+                r.bucket.as_str() == bucket.as_str()
+                    && r.is_latest
+                    && !r.is_delete_marker
+                    && query
+                        .visible_at
+                        .is_none_or(|now| r.expire_at.is_none_or(|expires| expires > now))
+            })
             .collect();
         Ok(page_rows(rows, query, false))
     }
@@ -1141,7 +1149,12 @@ impl MetadataStore for InMemoryMetadataStore {
         let rows: Vec<&ObjectVersionRow> = st
             .versions
             .values()
-            .filter(|r| r.bucket.as_str() == bucket.as_str())
+            .filter(|r| {
+                r.bucket.as_str() == bucket.as_str()
+                    && query
+                        .visible_at
+                        .is_none_or(|now| r.expire_at.is_none_or(|expires| expires > now))
+            })
             .collect();
         Ok(page_rows(rows, query, true))
     }

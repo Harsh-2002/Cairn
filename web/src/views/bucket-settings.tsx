@@ -47,6 +47,7 @@ import { JsonEditor } from "@/components/json-editor";
 import { LifecycleCard } from "@/components/lifecycle-card";
 import { NotificationsCard } from "@/components/notifications-card";
 import { ObjectLockCard } from "@/components/object-lock-card";
+import { ObjectTtlCard } from "@/components/object-ttl-card";
 import { StatusBadge } from "@/components/status-badge";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { bytes, count } from "@/lib/format";
@@ -1583,6 +1584,21 @@ export function BucketSettings() {
             footer={null}
           >
             <LifecycleCard bucket={name} />
+          </SettingsCard>
+          )}
+
+          {/* ---- Object TTL ---- */}
+          {tab === "protection" && (
+            <SettingsCard
+            title={
+              <>
+                <CalendarClock aria-hidden="true" className="size-4" /> Object TTL
+              </>
+            }
+            description="Opt in to per-object expiry through the X-Amz-Meta-Object-Expires header. Objects without the header never expire."
+            footer={null}
+          >
+            <ObjectTtlCard bucket={name} />
           </SettingsCard>
           )}
 

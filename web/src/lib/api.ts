@@ -399,6 +399,12 @@ export const api = {
   // the bucket mandates encryption: a client PUT that would store a plaintext object is refused.
   setEncryption: (name: string, algorithm: string, required = false) =>
     request<null>("PUT", `/buckets/${enc(name)}/encryption`, { algorithm, required }),
+  // Per-object TTL is an opt-in extension; max_ttl_secs defaults to 365 days on the server.
+  setObjectTtl: (name: string, enabled: boolean, maxTtlSecs?: number) =>
+    request<null>("PUT", `/buckets/${enc(name)}/object-ttl`, {
+      enabled,
+      max_ttl_secs: maxTtlSecs,
+    }),
   // The policy body is a raw policy JSON document sent verbatim.
   setPolicy: (name: string, rawBody: string) =>
     requestRaw<null>("PUT", `/buckets/${enc(name)}/policy`, rawBody),

@@ -119,6 +119,30 @@ async fn put_object(
     created_secs: i64,
     version_id: VersionId,
 ) -> StoragePath {
+    put_object_with_ttl(
+        fixture,
+        meta,
+        blob,
+        key,
+        body,
+        created_secs,
+        version_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn put_object_with_ttl(
+    fixture: &PublicationFixture,
+    meta: &InMemoryMetadataStore,
+    blob: &InMemoryBlobStore,
+    key: &str,
+    body: &[u8],
+    created_secs: i64,
+    version_id: VersionId,
+    expire_at: Option<Timestamp>,
+) -> StoragePath {
     let ts = Timestamp::from_secs(created_secs);
     let row_id = StorageToken::generate().as_str().to_owned();
     let planned = blob
@@ -167,7 +191,7 @@ async fn put_object(
         content_disposition: None,
         content_language: None,
         expires: None,
-        expire_at: None,
+        expire_at,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -1963,5 +1987,89 @@ fn earliest_expiration_matches_filters_and_chooses_earliest() {
         ),
         Some((Timestamp::from_secs(1_800_000_000), "date")),
         "tag values must match exactly"
+    );
+}
+
+#[tokio::test]
+async fn ttl_sweep_deletes_expired_noncurrent_and_marks_expired_current() {
+    let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(1_700_000_000);
+    make_bucket(&meta, VersioningState::Enabled).await;
+    let key = ObjectKey::parse("ttl-key").unwrap();
+    let v1 = VersionId::from_string("v1".to_owned());
+    let v2 = VersionId::from_string("v2".to_owned());
+
+    // A noncurrent version whose TTL has passed is permanently deleted.
+    put_object_with_ttl(
+        &fixture,
+        &meta,
+        &blob,
+        "ttl-key",
+        b"old",
+        1_699_999_000,
+        v1.clone(),
+        Some(Timestamp::from_secs(1_699_999_600)),
+    )
+    .await;
+    put_object(
+        &fixture,
+        &meta,
+        &blob,
+        "ttl-key",
+        b"new",
+        1_699_999_500,
+        v2.clone(),
+    )
+    .await;
+    let report = LifecycleScanner::new()
+        .run_ttl_once(&meta, &blob, &clock, &[bucket_name()])
+        .await
+        .unwrap();
+    assert_eq!(report.versions_expired, 1);
+    assert!(
+        meta.get_version(&bucket_name(), &key, &v1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        meta.get_version(&bucket_name(), &key, &v2)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // A current version whose TTL has passed is hidden behind a delete marker.
+    let current_key = ObjectKey::parse("ttl-current").unwrap();
+    let v3 = VersionId::from_string("v3".to_owned());
+    put_object_with_ttl(
+        &fixture,
+        &meta,
+        &blob,
+        "ttl-current",
+        b"current",
+        1_699_999_000,
+        v3.clone(),
+        Some(Timestamp::from_secs(1_699_999_600)),
+    )
+    .await;
+    let report = LifecycleScanner::new()
+        .run_ttl_once(&meta, &blob, &clock, &[bucket_name()])
+        .await
+        .unwrap();
+    assert_eq!(report.objects_expired, 1);
+    let marker = meta
+        .current_version(&bucket_name(), &current_key)
+        .await
+        .unwrap()
+        .expect("current version");
+    assert!(marker.is_delete_marker);
+    assert!(
+        meta.get_version(&bucket_name(), &current_key, &v3)
+            .await
+            .unwrap()
+            .is_some()
     );
 }

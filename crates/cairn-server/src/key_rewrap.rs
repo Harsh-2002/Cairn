@@ -1149,6 +1149,7 @@ mod tests {
             nonce: Vec::new(),
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            reject_ttl_objects: false,
         }]);
         store
             .submit(Mutation::SetBucketConfig {
