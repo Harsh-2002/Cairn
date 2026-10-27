@@ -68,7 +68,7 @@ candidate swapped), 12-second arms:
 | Paired log-ratio SD | 0.52 |
 
 The interval spans a 23% regression and a 46% improvement. A strong arm-order effect was visible:
-in the first invocation the second arm of the pair won four of five pairs, which the alternating
+in the first invocation the second arm of the pair won three of five pairs, which the alternating
 design does not cancel when drift is this large. This run establishes neither a win nor a
 regression.
 
