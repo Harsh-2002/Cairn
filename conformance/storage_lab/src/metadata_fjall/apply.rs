@@ -355,7 +355,9 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             Ok(outcome)
         }
         Mutation::PublishStorageWrite {
-            plan, operation, ..
+            plan,
+            operation,
+            index_spool,
         } => {
             plan.validate_publication(&operation)?;
             if !journal::publication_allowed(view, &plan)? {
@@ -375,7 +377,7 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
                 } => multipart::record(view, upload_id, attempt_id, part)?,
                 _ => return Err(kv::error("candidate publication shape is unsupported")),
             };
-            journal::resolve(view, &plan)?;
+            journal::resolve(view, &plan, index_spool)?;
             Ok(outcome)
         }
         Mutation::ResolveObjectWrite {

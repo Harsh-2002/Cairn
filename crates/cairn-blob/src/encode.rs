@@ -132,15 +132,15 @@ impl StagedEncoder {
         mut self,
         sink: &mut Staging,
     ) -> Result<(u64, IndexSpoolState), BlobError> {
-        // The spool is created and unlinked lazily, so only the encoder knows whether this write
-        // ever materialized the admitted alias.
+        let tail = self.encoder.finish_parts()?;
+        // The final partial block can be the append that spills the buffered index, so the state
+        // must be sampled after this append, never before it.
+        self.index.append(&tail.index).await?;
         let index_spool = if self.index.file.is_some() {
             IndexSpoolState::Materialized
         } else {
             IndexSpoolState::NeverCreated
         };
-        let tail = self.encoder.finish_parts()?;
-        self.index.append(&tail.index).await?;
         sink.write_all(&tail.payload).await?;
         let index_len = self.index.append_to(sink).await?;
         sink.write_all(&tail.footer).await?;
@@ -307,6 +307,36 @@ mod tests {
         };
         assert!(matches!(outcome, Err(BlobError::OutOfSpace)));
         sink.abort().await;
+    }
+
+    /// The last partial block is appended inside `finish`, so a spool that stays buffered through
+    /// `feed` can still be materialized by that final append. Sampling the state before it would
+    /// report `NeverCreated` for a name that exists.
+    #[tokio::test]
+    async fn final_partial_block_materializes_the_index_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CompressionPolicy {
+            algorithm: CompressionAlgorithm::Zstd,
+            block_size: 1024,
+        };
+        // 7,281 full blocks fill the 64-KiB index buffer to 65,529 bytes; one final byte adds the
+        // entry that spills it.
+        let data = vec![42; 7_281 * 1024 + 1];
+        let path = dir.path().join("output.tmp");
+        let mut sink = sink(&path).await;
+        let mut encoder = StagedEncoder::new(
+            policy,
+            None,
+            AnchoredPath::fixture(&dir.path().join("encoding.index.tmp")),
+            test_lease(),
+        );
+        encoder.feed(&data, &mut sink).await.unwrap();
+        assert!(
+            encoder.index.file.is_none(),
+            "the buffered index must not have spilled yet"
+        );
+        let (_, index_spool) = encoder.finish(&mut sink).await.unwrap();
+        assert_eq!(index_spool, IndexSpoolState::Materialized);
     }
 
     #[tokio::test]

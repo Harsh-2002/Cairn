@@ -227,7 +227,11 @@ pub fn publication_allowed(view: &dyn View, plan: &StorageWritePlan) -> Result<b
     }
     Ok(true)
 }
-pub fn resolve(view: &mut Overlay<'_>, plan: &StorageWritePlan) -> Result<(), MetaError> {
+pub fn resolve(
+    view: &mut Overlay<'_>,
+    plan: &StorageWritePlan,
+    index_spool: cairn_types::blob::IndexSpoolState,
+) -> Result<(), MetaError> {
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().map(|p| p.as_str().to_owned()))
         .transpose()?;
@@ -263,6 +267,11 @@ pub fn resolve(view: &mut Overlay<'_>, plan: &StorageWritePlan) -> Result<(), Me
         }
     }
     for path in &plan.paths {
+        if path.role == cairn_types::storage::StoragePathRole::IndexSpool
+            && index_spool == cairn_types::blob::IndexSpoolState::NeverCreated
+        {
+            continue;
+        }
         if !referenced(view, &path.path)? {
             enqueue(
                 view,
@@ -410,7 +419,11 @@ pub fn apply(
                 && intent.plan.bucket == *bucket
                 && &intent.plan.generation == quiescence.generation()
             {
-                resolve(view, &intent.plan)?;
+                resolve(
+                    view,
+                    &intent.plan,
+                    cairn_types::blob::IndexSpoolState::Materialized,
+                )?;
                 true
             } else {
                 false
@@ -427,7 +440,11 @@ pub fn apply(
                 && intent.plan.bucket == *bucket
                 && &intent.plan.generation == quiescence.generation()
             {
-                resolve(view, &intent.plan)?;
+                resolve(
+                    view,
+                    &intent.plan,
+                    cairn_types::blob::IndexSpoolState::Materialized,
+                )?;
                 true
             } else {
                 false

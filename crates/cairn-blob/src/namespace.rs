@@ -1368,6 +1368,41 @@ mod tests {
         assert!(root.path().join(".staging/multipart").exists());
     }
 
+    /// Four claims into one directory unlink, complete the shared absence barrier and prune in
+    /// that order. This pins the split unlink/barrier/prune composition under concurrency.
+    #[tokio::test]
+    async fn concurrent_cleanups_share_the_absence_barrier_and_prune_once() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            crate::LocalBlobStore::open(root.path(), cairn_types::testing::fixture_storage_io())
+                .await
+                .unwrap()
+                .with_io_uring(false);
+        std::fs::create_dir(root.path().join("bucket")).unwrap();
+        let mut claims = Vec::new();
+        for _ in 0..4 {
+            let (plan, _watch, permit) = admitted();
+            drop(permit);
+            let path = plan.final_path().unwrap().clone();
+            std::fs::write(root.path().join(path.as_str()), b"debt").unwrap();
+            claims.push(claim(&plan, path));
+        }
+        let results = futures_util::future::join_all(
+            claims
+                .iter()
+                .map(|claim| store.cleanup_storage(claim, cleanup_lease(claim))),
+        )
+        .await;
+        assert!(
+            results.into_iter().all(|result| result.is_ok()),
+            "every concurrent cleanup must complete its own claim"
+        );
+        assert!(
+            !root.path().join("bucket").exists(),
+            "the last absence barrier must precede the prune of the now-empty directory"
+        );
+    }
+
     #[cfg(feature = "failpoints")]
     #[tokio::test]
     async fn unlink_without_namespace_sync_is_retryable_even_when_the_name_is_absent() {
@@ -1384,7 +1419,7 @@ mod tests {
         std::fs::create_dir(absolute.parent().unwrap()).unwrap();
         std::fs::write(&absolute, b"debt").unwrap();
         let cleanup = claim(&plan, path);
-        fail::cfg("blob_before_storage_dirsync", "return").unwrap();
+        fail::cfg("blob_before_coalesced_dirsync", "return").unwrap();
         assert!(
             store
                 .cleanup_storage(&cleanup, cleanup_lease(&cleanup))
@@ -1398,7 +1433,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        fail::remove("blob_before_storage_dirsync");
+        fail::remove("blob_before_coalesced_dirsync");
         store
             .cleanup_storage(&cleanup, cleanup_lease(&cleanup))
             .await
