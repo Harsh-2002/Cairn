@@ -301,43 +301,44 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             {
                 return Err(MetaError::QuotaExceeded);
             }
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO multipart_uploads
                  (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata,
                   sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id,
                   sse_bucket_key_enabled, created_at, updated_at, initiated_by, initial_tags,
                   lock_mode, retain_until, legal_hold, object_lock_intent_known, replica_intent, content_disposition)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
-                params![
-                    s.upload_id.as_str(),
-                    s.bucket.as_str(),
-                    s.key.as_str(),
-                    s.content_type,
-                    model::mp_status_str(s.status),
-                    s.owner_id.0,
-                    s.intended_acl.as_ref().map(to_json),
-                    to_json(&s.user_metadata),
-                    s.sse_requested as i64,
-                    s.encrypt_parts as i64,
-                    s.sse_kms_requested as i64,
-                    s.sse_kms_key_id,
-                    s.sse_bucket_key_enabled as i64,
-                    s.created_at.0,
-                    s.updated_at.0,
-                    s.initiated_by.0,
-                    to_json(&s.initial_tags),
-                    s.lock_intent
-                        .retention
-                        .map(|retention| model::lock_mode_str(retention.mode)),
-                    s.lock_intent
-                        .retention
-                        .map(|retention| retention.retain_until.0),
-                    s.lock_intent.legal_hold.map(i64::from),
-                    1_i64,
-                    s.replica_intent.as_ref().map(to_json),
-                    s.content_disposition,
-                ],
             )
+            .map_err(engine_err)?
+            .execute(params![
+                s.upload_id.as_str(),
+                s.bucket.as_str(),
+                s.key.as_str(),
+                s.content_type,
+                model::mp_status_str(s.status),
+                s.owner_id.0,
+                s.intended_acl.as_ref().map(to_json),
+                to_json(&s.user_metadata),
+                s.sse_requested as i64,
+                s.encrypt_parts as i64,
+                s.sse_kms_requested as i64,
+                s.sse_kms_key_id,
+                s.sse_bucket_key_enabled as i64,
+                s.created_at.0,
+                s.updated_at.0,
+                s.initiated_by.0,
+                to_json(&s.initial_tags),
+                s.lock_intent
+                    .retention
+                    .map(|retention| model::lock_mode_str(retention.mode)),
+                s.lock_intent
+                    .retention
+                    .map(|retention| retention.retain_until.0),
+                s.lock_intent.legal_hold.map(i64::from),
+                1_i64,
+                s.replica_intent.as_ref().map(to_json),
+                s.content_disposition,
+            ])
             .map_err(engine_err)?;
             adjust_multipart_stats(conn, s.bucket.as_str(), s.initiated_by.0.as_str(), 1, 0)?;
             Ok(MutationOutcome::MultipartCreated(s.upload_id))
@@ -397,27 +398,29 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 return Err(MetaError::QuotaExceeded);
             }
             enforce_multipart_reservation_quota(conn, &context, reserved_bytes)?;
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO multipart_part_reservations
                  (attempt_id, upload_id, part_number, reserved_bytes, created_at)
                  VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    attempt_id,
-                    upload_id.as_str(),
-                    part_number,
-                    reserved_bytes as i64,
-                    now.0,
-                ],
             )
+            .map_err(engine_err)?
+            .execute(params![
+                attempt_id,
+                upload_id.as_str(),
+                part_number,
+                reserved_bytes as i64,
+                now.0,
+            ])
             .map_err(|error| match engine_err(error) {
                 MetaError::Conflict => MetaError::QuotaExceeded,
                 other => other,
             })?;
-            conn.execute(
+            conn.prepare_cached(
                 "UPDATE multipart_uploads SET updated_at=?2
                  WHERE id=?1 AND status='active'",
-                params![upload_id.as_str(), now.0],
             )
+            .map_err(engine_err)?
+            .execute(params![upload_id.as_str(), now.0])
             .map_err(engine_err)?;
             adjust_multipart_stats(
                 conn,
@@ -478,12 +481,13 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             claim_token,
         } => {
             let released = conn
-                .execute(
+                .prepare_cached(
                     "UPDATE multipart_uploads
                      SET status='active', completion_claim_token=NULL
                      WHERE id=?1 AND status='completing' AND completion_claim_token=?2",
-                    params![upload_id.as_str(), claim_token.as_str()],
                 )
+                .map_err(engine_err)?
+                .execute(params![upload_id.as_str(), claim_token.as_str()])
                 .map_err(engine_err)?;
             Ok(MutationOutcome::MultipartClaimRelease(if released == 1 {
                 ClaimReleaseOutcome::Released
@@ -1779,11 +1783,12 @@ fn write_object_lock_state(
     state: ObjectLockState,
 ) -> R<()> {
     if state == ObjectLockState::default() {
-        conn.execute(
+        conn.prepare_cached(
             "DELETE FROM object_locks
              WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-            params![bucket.as_str(), key.as_str(), version_id.as_str()],
         )
+        .map_err(engine_err)?
+        .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
         .map_err(engine_err)?;
         return Ok(());
     }
@@ -1791,7 +1796,7 @@ fn write_object_lock_state(
         .retention
         .map(|retention| model::lock_mode_str(retention.mode));
     let until = state.retention.map(|retention| retention.retain_until.0);
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO object_locks
          (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
          VALUES (?1,?2,?3,?4,?5,?6)
@@ -1799,15 +1804,16 @@ fn write_object_lock_state(
              lock_mode=excluded.lock_mode,
              retain_until=excluded.retain_until,
              legal_hold=excluded.legal_hold",
-        params![
-            bucket.as_str(),
-            key.as_str(),
-            version_id.as_str(),
-            mode,
-            until,
-            i64::from(state.legal_hold),
-        ],
     )
+    .map_err(engine_err)?
+    .execute(params![
+        bucket.as_str(),
+        key.as_str(),
+        version_id.as_str(),
+        mode,
+        until,
+        i64::from(state.legal_hold),
+    ])
     .map_err(engine_err)?;
     Ok(())
 }
@@ -1912,24 +1918,26 @@ fn replace_object_tags(
     version_id: &VersionId,
     tags: &[(String, String)],
 ) -> R<()> {
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-        params![bucket.as_str(), key.as_str(), version_id.as_str()],
     )
+    .map_err(engine_err)?
+    .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
     for (tag_key, tag_value) in tags {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO object_tags
              (bucket_name, key, version_id, tag_key, tag_value)
              VALUES (?1,?2,?3,?4,?5)",
-            params![
-                bucket.as_str(),
-                key.as_str(),
-                version_id.as_str(),
-                tag_key,
-                tag_value,
-            ],
         )
+        .map_err(engine_err)?
+        .execute(params![
+            bucket.as_str(),
+            key.as_str(),
+            version_id.as_str(),
+            tag_key,
+            tag_value,
+        ])
         .map_err(engine_err)?;
     }
     Ok(())
@@ -2618,31 +2626,35 @@ pub(crate) fn adjust_multipart_stats(
     active_delta: i64,
     bytes_delta: i64,
 ) -> R<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO multipart_bucket_stats
          (bucket_name, active_uploads, staged_bytes) VALUES (?1,0,0)",
-        params![bucket],
     )
+    .map_err(engine_err)?
+    .execute(params![bucket])
     .map_err(engine_err)?;
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE multipart_bucket_stats
          SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
          WHERE bucket_name=?1",
-        params![bucket, active_delta, bytes_delta],
     )
+    .map_err(engine_err)?
+    .execute(params![bucket, active_delta, bytes_delta])
     .map_err(engine_err)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO multipart_principal_stats
          (principal_id, active_uploads, staged_bytes) VALUES (?1,0,0)",
-        params![principal],
     )
+    .map_err(engine_err)?
+    .execute(params![principal])
     .map_err(engine_err)?;
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE multipart_principal_stats
          SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
          WHERE principal_id=?1",
-        params![principal, active_delta, bytes_delta],
     )
+    .map_err(engine_err)?
+    .execute(params![principal, active_delta, bytes_delta])
     .map_err(engine_err)?;
     Ok(())
 }
@@ -2741,10 +2753,11 @@ fn release_multipart_reservation(
     let Some((bucket, principal, bytes)) = row else {
         return Ok(());
     };
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM multipart_part_reservations WHERE attempt_id=?1 AND upload_id=?2",
-        params![attempt_id, upload_id.as_str()],
     )
+    .map_err(engine_err)?
+    .execute(params![attempt_id, upload_id.as_str()])
     .map_err(engine_err)?;
     adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
 }
@@ -2791,63 +2804,65 @@ fn record_part(
         created_at: Timestamp(reserved_at),
     });
     if let Some(debt) = &cleanup {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO multipart_staging_cleanups
              (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at, storage_protocol)
              VALUES (?1,?2,?3,?4,?5,?6,?7,2)",
-            params![
-                debt.id,
-                debt.upload_id.as_str(),
-                debt.bucket.as_str(),
-                debt.principal_id.0,
-                debt.bytes as i64,
-                debt.storage_path.as_ref().map(StoragePath::as_str),
-                debt.created_at.0,
-            ],
         )
+        .map_err(engine_err)?
+        .execute(params![
+            debt.id,
+            debt.upload_id.as_str(),
+            debt.bucket.as_str(),
+            debt.principal_id.0,
+            debt.bytes as i64,
+            debt.storage_path.as_ref().map(StoragePath::as_str),
+            debt.created_at.0,
+        ])
         .map_err(engine_err)?;
         let path = debt
             .storage_path
             .as_ref()
             .ok_or_else(|| MetaError::Engine("missing superseded part path".into()))?;
         crate::storage::link_quota(conn, &debt.bucket, path, &debt.id)?;
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE multipart_parts
              SET size=?3, etag=?4, storage_path=?5, checksum=?6, part_dek=?7
              WHERE upload_id=?1 AND part_number=?2",
-            params![
-                upload_id.as_str(),
-                part.part_number,
-                part.size as i64,
-                part.etag,
-                part.storage_path.as_str(),
-                part.checksum.as_ref().map(to_json),
-                part.part_dek,
-            ],
         )
+        .map_err(engine_err)?
+        .execute(params![
+            upload_id.as_str(),
+            part.part_number,
+            part.size as i64,
+            part.etag,
+            part.storage_path.as_str(),
+            part.checksum.as_ref().map(to_json),
+            part.part_dek,
+        ])
         .map_err(engine_err)?;
     } else {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO multipart_parts
              (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
              VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                upload_id.as_str(),
-                part.part_number,
-                part.size as i64,
-                part.etag,
-                part.storage_path.as_str(),
-                part.checksum.as_ref().map(to_json),
-                part.part_dek,
-            ],
         )
+        .map_err(engine_err)?
+        .execute(params![
+            upload_id.as_str(),
+            part.part_number,
+            part.size as i64,
+            part.etag,
+            part.storage_path.as_str(),
+            part.checksum.as_ref().map(to_json),
+            part.part_dek,
+        ])
         .map_err(engine_err)?;
     }
-    conn.execute(
-        "DELETE FROM multipart_part_reservations WHERE attempt_id=?1",
-        params![attempt_id],
-    )
-    .map_err(engine_err)?;
+    conn.prepare_cached("DELETE FROM multipart_part_reservations WHERE attempt_id=?1")
+        .map_err(engine_err)?
+        .execute(params![attempt_id])
+        .map_err(engine_err)?;
     adjust_multipart_stats(
         conn,
         &context.bucket,
@@ -2873,10 +2888,11 @@ fn release_multipart_cleanup(conn: &Connection, cleanup_id: &str) -> R<()> {
     let Some((bucket, principal, bytes)) = row else {
         return Ok(());
     };
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM multipart_staging_cleanups WHERE id=?1 AND storage_protocol=1",
-        params![cleanup_id],
     )
+    .map_err(engine_err)?
+    .execute(params![cleanup_id])
     .map_err(engine_err)?;
     adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
 }
@@ -2900,10 +2916,11 @@ fn release_multipart_upload_cleanups(
     let Some((bucket, principal, bytes)) = row else {
         return Ok(());
     };
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1 AND storage_protocol=1",
-        params![upload_id.as_str()],
     )
+    .map_err(engine_err)?
+    .execute(params![upload_id.as_str()])
     .map_err(engine_err)?;
     adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
 }
@@ -2919,11 +2936,10 @@ fn retire_multipart_session(conn: &Connection, upload_id: &cairn_types::UploadId
         &context.principal,
         context.updated_at,
     )?;
-    conn.execute(
-        "DELETE FROM multipart_uploads WHERE id=?1",
-        params![upload_id.as_str()],
-    )
-    .map_err(engine_err)?;
+    conn.prepare_cached("DELETE FROM multipart_uploads WHERE id=?1")
+        .map_err(engine_err)?
+        .execute(params![upload_id.as_str()])
+        .map_err(engine_err)?;
     adjust_multipart_stats(conn, &context.bucket, &context.principal, -1, 0)
 }
 
@@ -2990,12 +3006,13 @@ fn claim_multipart(
         .map_err(engine_err)?;
     let outcome = match status.as_deref() {
         Some("active") => {
-            conn.execute(
+            conn.prepare_cached(
                 "UPDATE multipart_uploads
                  SET status='completing', completion_claim_token=?2, updated_at=updated_at
                  WHERE id=?1",
-                params![upload_id.as_str(), claim_token.as_str()],
             )
+            .map_err(engine_err)?
+            .execute(params![upload_id.as_str(), claim_token.as_str()])
             .map_err(engine_err)?;
             let session = conn
                 .query_row(

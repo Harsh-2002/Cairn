@@ -754,7 +754,9 @@ pub fn claim(
 }
 
 pub(crate) fn x(db: &DB, sql: &str, parameters: Vec<Cell>) -> R<u64> {
-    db.execute(sql, rusqlite::params_from_iter(parameters))
+    db.prepare_cached(sql)
+        .map_err(crate::model::engine_err)?
+        .execute(rusqlite::params_from_iter(parameters))
         .map(|changed| changed as u64)
         .map_err(crate::model::engine_err)
 }
