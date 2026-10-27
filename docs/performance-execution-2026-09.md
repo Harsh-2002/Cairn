@@ -278,4 +278,4 @@ window is used, so no mechanism change to durable write work is claimed. Compact
 Two measurement traps are recorded rather than repeated: pair arms by `variant`/binary SHA, never by
 array position, and do not divide a full-load sync-probe count by Warp's narrower analyzed-operation
 count. The corrected October screen remains in
-[`performance-put-flush-screen-2026-10.md`](performance-put-flush-screen-2026-10.md).
+[`performance-put-flush-screen-2026-10.md`](https://github.com/Harsh-2002/Cairn/blob/f91b2cf/docs/performance-put-flush-screen-2026-10.md).
