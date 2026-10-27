@@ -533,15 +533,19 @@ async fn write_staged(
 enum StreamInput {
     Raw(PathBuf),
     Container(Box<CompressedReader<std::fs::File>>),
+    /// A descriptor the probe already opened and validated. Using it avoids a second path
+    /// resolution/open and the window in which the name could be replaced after validation.
+    File(Arc<std::fs::File>),
 }
 
 /// Probe output owns its memory reservation too: a completed blocking task can retain this
 /// result after its awaiting request is cancelled. Drop buffers before releasing that lease.
 struct ReadProbe {
     logical_len: u64,
-    reuse_file: Option<std::fs::File>,
+    reuse_file: Option<Arc<std::fs::File>>,
     whole: Option<Bytes>,
     prepared: Option<Box<CompressedReader<std::fs::File>>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
     _lease: Option<ReadBufferLease>,
 }
 
@@ -571,6 +575,26 @@ fn stream_input(
                 if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
                     return Ok(());
                 }
+            }
+        }
+        StreamInput::File(file) => {
+            let mut position = offset;
+            let mut remaining = len;
+            let mut buf = vec![0u8; READ_CHUNK];
+            while remaining > 0 {
+                let want = remaining.min(READ_CHUNK as u64) as usize;
+                let n = read_at(&file, &mut buf[..want], position).map_err(io_err)?;
+                if n == 0 {
+                    break;
+                }
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                position = position.saturating_add(n as u64);
+                remaining -= n as u64;
             }
         }
         StreamInput::Raw(path) => {
@@ -812,6 +836,42 @@ impl LocalBlobStore {
     }
 }
 
+/// Read at an absolute position without mutating a shared file cursor. The descriptor is shared
+/// with the optional zero-copy hint, so a cursor-based read could race the kernel transfer.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// Portable fallback: the anchored descriptor is not shared with a concurrent transfer off Unix,
+/// so a cursor read is safe there.
+#[cfg(not(unix))]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 /// Bound a coalesced read by the length already checked against metadata, even if a local writer
 /// grows the file after fstat. A fixed slice also avoids read_to_end's speculative capacity growth.
 fn read_small(reader: &mut impl std::io::Read, len: u64) -> Result<Bytes, BlobError> {
@@ -862,6 +922,11 @@ impl LocalBlobStore {
         // channel that otherwise dominate a tiny GET (such an object is below the kernel sendfile floor
         // anyway, so it would never take the zero-copy path). This is the small-object GET fast path.
         let small_read_max = self.small_read_max;
+        // Admit the read before opening the blob. The probe itself opens a descriptor, reads a
+        // small object whole, and validates framing; doing that outside the pool let a flood of
+        // slow readers start unbounded probe work before admission. The same permit travels with
+        // the resulting body, so admission still covers the transfer.
+        let permit = self.acquire_io_owned().await?;
         let probe_path = file_path.clone();
         let plaintext_length_mismatch = self.plaintext_length_mismatch.clone();
         let probe_cipher = cipher.clone();
@@ -872,9 +937,11 @@ impl LocalBlobStore {
             reuse_file,
             whole,
             prepared,
+            permit,
             _lease: _probe_result_lease,
         } = tokio::task::spawn_blocking(move || -> Result<ReadProbe, BlobError> {
             let _lease = probe_lease;
+            let _probe_permit = permit;
             let mut f = match std::fs::File::open(&probe_path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -912,13 +979,14 @@ impl LocalBlobStore {
             } else if file_len <= small_read_max {
                 (file_len, None, Some(read_small(&mut f, file_len)?), None)
             } else {
-                (file_len, Some(f), None, None)
+                (file_len, Some(Arc::new(f)), None, None)
             };
             Ok(ReadProbe {
                 logical_len,
                 reuse_file,
                 whole,
                 prepared,
+                permit: _probe_permit,
                 _lease,
             })
         })
@@ -960,7 +1028,6 @@ impl LocalBlobStore {
             // this, a small-object GET fast path is unbounded — a flood of slow readers of
             // below-floor objects could hold far more transient memory than `read_permits` was
             // sized to allow (a read-side slow-loris, the exact class this pool exists to bound).
-            let permit = self.acquire_io_owned().await?;
             enum SmallState {
                 Item(Bytes, tokio::sync::OwnedSemaphorePermit),
                 Held(tokio::sync::OwnedSemaphorePermit),
@@ -976,19 +1043,23 @@ impl LocalBlobStore {
             ));
             (body, None)
         } else {
-            // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
-            // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
-            let permit = self.acquire_io_owned().await?;
+            // The probe's admission permit stays with the streamed transfer (ARCH 7.4) and is
+            // released when the read task finishes. (The kernel sendfile fast path below is
+            // bounded separately by the server.)
             let input = match prepared {
                 Some(reader) => StreamInput::Container(reader),
-                None => StreamInput::Raw(file_path.clone()),
+                None => match reuse_file.as_ref() {
+                    // Serve the descriptor the probe validated instead of reopening the path.
+                    Some(file) => StreamInput::File(Arc::clone(file)),
+                    None => StreamInput::Raw(file_path.clone()),
+                },
             };
             let body = read_stream(input, offset, len, (permit, lease.clone()));
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
             // fd the probe opened. Encrypted blobs are always block-formatted (`is_container`), so
             // `reuse_file` is `None` for them and the kernel never sees ciphertext.
             let zero_copy = reuse_file.map(|f| ZeroCopyRead {
-                file: Arc::new(f),
+                file: f,
                 offset,
                 len,
             });
