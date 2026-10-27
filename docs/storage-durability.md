@@ -59,7 +59,9 @@ startup recovery. A timeout or a lost acknowledgement is never evidence that byt
 Cleanup uses exact Writer claims bound to a generation, claim token and expiry. Claims recheck
 that no authoritative reference or active intent owns the path. The blob layer rejects a still
 locked file, unlinks only the claimed filename, synchronizes its directory, and prunes only empty
-supported parents with parent synchronization. Already-absent names still require a namespace
+supported parents with parent synchronization. Concurrent claims whose paths share a directory
+complete one coalesced absence barrier, so each claim still waits for a full directory sync
+without issuing its own. Already-absent names still require a namespace
 barrier. The one exception is the optional index-spool alias: live publication states whether
 the write ever opened it, and a write that never did created no name to retire. Recovery always
 treats that alias as materialized because it cannot know. The Writer retires debt and associated quota only after durable absence and a matching,
