@@ -99,6 +99,58 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
 }
 
 #[tokio::test]
+async fn raw_stream_reuses_the_probed_descriptor_after_path_replacement() {
+    use futures_util::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("raw-anchored-read").unwrap();
+    // Larger than the small-object cutoff, so the probe hands the descriptor to the streamed path.
+    let original = vec![b'a'; 512 * 1024 + 7];
+    let staged = store
+        .stage_fixture(&bucket, body(original.clone()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let mut handle = store
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await
+        .unwrap();
+    assert!(
+        handle.zero_copy.is_some(),
+        "an uncompressed large object carries the descriptor hint"
+    );
+    let replacement = store
+        .stage_fixture(
+            &bucket,
+            body(vec![b'b'; original.len()]),
+            opts(None, "text/plain"),
+        )
+        .await
+        .unwrap();
+    tokio::fs::rename(
+        dir.path().join(replacement.storage_path.as_str()),
+        dir.path().join(staged.storage_path.as_str()),
+    )
+    .await
+    .unwrap();
+    let mut received = Vec::new();
+    while let Some(chunk) = handle.body.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(
+        received, original,
+        "the stream must serve the descriptor the probe validated, not reopen the replaced path"
+    );
+}
+
+#[tokio::test]
 async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
