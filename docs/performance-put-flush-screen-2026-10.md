@@ -1,12 +1,23 @@
 # PUT flush-reduction screen — 2026-10-27
 
-Status: **mechanism confirmed; throughput inconclusive on this host.** This is not an adoption
+Status: **captured call mix changed; throughput inconclusive on this host.** This is not an adoption
 claim and not a Cairn-versus-RustFS score.
+
+## Recomputed evidence — 2026-10-27
+
+An independent [identity/window cross-check](https://github.com/Harsh-2002/Cairn/blob/117dc8c/research_notes/Cairn%20single%20node%20performance%20plan/evidence-crosscheck.md)
+supersedes this report's original arithmetic and attribution. The original text reported GM
+1.057, median 1.133 and interval 0.766–1.459; correct binary-aware pairing gives **1.139036,
+1.189077 and Student-t 95% interval 0.793619–1.634795**. The original per-successful-PUT sync
+normalization (7.11→4.73, −33.5%) mixed capture and scored windows and is withdrawn, not refined.
+The corrected tables below preserve the historical binaries and all four evidence JSON files
+unchanged. No new load or fault reproduction was performed. See the
+[final single-node plan](https://github.com/Harsh-2002/Cairn/blob/117dc8c/docs/performance-single-node-architecture-plan-2026-10.md) for the decision.
 
 ## Question
 
-Does the unmerged `perf/put-cleanup-debt` + `perf/audit-co-commit` stack reduce the durable work of
-a plain 1-MiB PUT, and does that translate into throughput on this node?
+Does the unmerged `perf/put-cleanup-debt` + `perf/audit-co-commit` stack change captured sync-call
+composition for plain 1-MiB PUT, and does that translate into throughput on this node?
 
 ## Binaries and client
 
@@ -20,38 +31,51 @@ a plain 1-MiB PUT, and does that translate into throughput on this node?
 Every arm used a fresh store, `CAIRN_META_SYNCHRONOUS=full`, one shard, zero Writer linger, and
 path-style SigV4. All arms completed with zero reported errors and passed the runner's capacity
 policy under `--allow-ballooning`.
+This is a within-arm capacity policy, not an A/A equivalence gate. Across the twenty throughput
+arms, retained MemTotal spans 8,833,784–9,982,912 KiB; swap capacity is 4,194,300 KiB. Neither
+fixed cache capacity nor actual paging can be inferred from the host shorthand above.
 
-## Mechanism: fewer sync calls per PUT
+## Mechanism: captured counters, not calls per PUT
 
-Two alternating control/candidate pairs with the glibc sync interposer, 12-second arms. Counts are
-libc `fsync`/`fdatasync` calls during the scored load divided by successful PUTs
-(`objects_per_second × analyzed_seconds`).
+Two alternating pairs with the glibc sync interposer, 12-second requested arms, in actual order
+main/branch/branch/main. Counts are pooled by executable identity. Capture begins before Warp
+creation and ends after Warp exit and analyzer reduction; scored rates cover a narrower interval.
+Exact successful full-capture operation counts and post-probe timestamps are absent. Thus
+`objects_per_second × analyzed_seconds` is not a matching denominator.
 
-| Sync class | Control, calls/PUT | Candidate, calls/PUT | Delta |
-| --- | ---: | ---: | ---: |
-| `fdatasync` (staged file) | 1.48 | 1.42 | −4% |
-| `fsync` other (WAL/DB) | 1.11 | 0.90 | −19% |
-| `fsync` other directory | 0.86 | 0.68 | −21% |
-| `fsync` data root | 1.48 | 1.42 | −4% |
-| `fsync` `.staging` (cleanup) | **2.18** | **0.31** | **−86%** |
-| **Total** | **7.11** | **4.73** | **−33.5%** |
+| Captured class | Main calls | Branch calls | Main / captured fdatasync | Branch / captured fdatasync |
+| --- | ---: | ---: | ---: | ---: |
+| `fdatasync`, descriptor role unknown | 1,427 | 1,772 | 1.000000 | 1.000000 |
+| `fsync`, regular/unknown | 1,070 | 1,143 | 0.749825 | 0.645034 |
+| `fsync`, other directory | 831 | 840 | 0.582341 | 0.474041 |
+| `fsync`, exact data root | 1,427 | 1,772 | 1.000000 | 1.000000 |
+| `fsync`, `.staging`-classified | **2,080** | **386** | **1.457603** | **0.217833** |
+| **Total intercepted calls** | **6,835** | **5,913** | **4.789769** | **3.336907** |
 
-The staging collapse is the index-spool debt removal plus the coalesced absence barrier: a plain
-write no longer retires a name it never created, and concurrent cleanups share one fsync. The small
-`fsync other` drop is consistent with removing the separate activity commit. The staged-file and
-root barriers are unchanged, as designed.
+The total-call/fdatasync ratio is **30.3326% lower**, and staging/fdatasync is **85.0554% lower**.
+These are captured call-composition ratios, not per-object savings or physical flush counts.
+The probe counts attempts, including failures; it cannot identify WAL/DB descriptors, cleanup
+origin, successful objects or bypassed/raw syscalls. Summed syscall wall times overlap across
+threads. See [probe semantics](../conformance/sync_probe.c) and
+[runner boundaries](../conformance/rustfs_compare.py).
 
-This is deterministic evidence that the branch performs less durable work. It is not evidence of
-higher throughput.
+Source/tests separately support the intended never-created-spool, shared-absence and activity
+mechanisms. These combined process-wide captures do not isolate their causal contributions,
+prove less durable work per success, or establish higher throughput/equal physical persistence.
 
 ## Noise floor
 
-Three A/A pairs (identical candidate binary on both sides), 12-second arms:
-paired ratios 1.360, 0.987, 0.756; **paired log-ratio SD 0.294**; arm range 65.80–99.75 MiB/s.
-A 30-second A/A run hit the measured-load cap after five arms and was not used.
+Three A/A pairs (identical candidate binary on both sides), 12-second requested arms:
+**CLI candidate/control** ratios 1.360, **1.013**, 0.756; sample log-ratio SD **0.293508**.
+Chronological second/first ratios are instead 1.360, 0.987, 0.756. The arm range is
+65.80–99.75 MiB/s; the label-consistent GM t95 interval is 0.488870–2.101324, not equivalence.
+The originally reported interrupted 30-second A/A has no retained arm sequence in these JSON.
 
-At that noise level a five-pair run cannot resolve a 10–15% effect. About 30 pairs would be needed
-for a 15% effect at 80% power, and roughly 100 for 10%.
+Conditional iid stationary normal-log planning (two-sided alpha .05, 80% power, test against zero
+improvement) gives **35/75 pairs for 15%/10%** using A/A SD, or **103/221** using actual A/B SD.
+Three A/A pairs estimate noise poorly; these are not prescribed counts or permission for more
+traffic. Proving a gain exceeds 10% needs the true-effect-minus-margin signal and multiplicity/
+session-aware planning, not this zero-effect calculation.
 
 ## Throughput
 
@@ -61,25 +85,30 @@ candidate swapped), 12-second arms:
 | Statistic | Value |
 | --- | ---: |
 | Pairs | 10 |
-| Candidate/main geomean | 1.057 |
-| Median paired ratio | 1.133 |
-| 95% CI (paired log-ratio) | 0.766 – 1.459 |
+| Candidate/main geomean | 1.139036 |
+| Median paired ratio | 1.189077 |
+| 95% Student-t interval for GM (df=9) | 0.793619 – 1.634795 |
 | Paired wins | 5 / 10 |
-| Paired log-ratio SD | 0.52 |
+| Sample paired log-ratio SD | 0.505111 |
 
-The interval spans a 23% regression and a 46% improvement. A strong arm-order effect was visible:
-in the first invocation the second arm of the pair won three of five pairs, which the alternating
-design does not cancel when drift is this large. This run establishes neither a win nor a
-regression.
+Pair chronological arms and join CLI labels to each invocation's binary SHA: invocation B reverses
+the assignments. The interval spans about **−20.6% to +63.5%**, conditional on independent normal
+log-pairs; shared-node dependence/confounding is not corrected. The second arm wins **3/5 in each
+invocation, 6/10 overall**; this does not establish strong arm-order causation. Neither a win nor
+a regression is established. Formula, full pair table and stdlib reproduction are in the cross-check.
 
 ## Interpretation
 
-- The branch does **33.5% fewer libc sync calls per successful PUT**, with the staging barrier
-  dropping by 86%. That is the mechanism the changes were built for.
-- Throughput on this shared node is **not resolvable** at 10–15%: the A/A floor is 29–53% paired
-  SD, and the 10-pair confidence interval covers both directions.
+- Captured sync composition changed; per-success and physical-flush savings are **unmeasured**.
+- Throughput remains **INCONCLUSIVE**; log SD is not a percentage throughput SD.
 - No merge decision should cite these throughput numbers. The next measurement needs a quiet host
-  or a dedicated virtual disk, or a paired design that gates on `/proc/pressure/io`.
+  and a preregistered A/A/observer gate. Do not cherry-pick low-pressure winning arms or discard
+  candidate-caused pressure after observing scores.
+
+Read-only CI verification on 2026-10-27: [run 40521968061](https://github.com/Harsh-2002/Cairn/actions/runs/40521968061)
+**succeeded for exact `12a5d0c381477070810f750737e2663d9c813772`**. This is historical branch CI,
+not new performance evidence, production-readiness certification or authorization to merge drafts
+#125/#126. This documentation correction has not itself been committed or run through remote CI.
 
 ## Evidence
 

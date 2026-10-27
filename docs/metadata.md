@@ -133,9 +133,10 @@ An absent, stale or cancelled owner returns `StoragePublicationNotApplied`. Dire
 publication preserves the original preconditions, tags, Object Lock and outbox behavior; its
 savepoint commits those effects, consumes the intent and records cleanup for unreferenced planned
 paths, except an index-spool alias the caller reports it never opened. A successful publication may
-also carry the operator activity row: it commits in the same savepoint, a recoverable activity
-failure is logged without revoking the object, and a multi-shard router submits it to the global
-shard after publication. Replacement and deletion record cleanup debt in the same savepoint as
+also carry the operator activity row: it commits in the same savepoint, a duplicate activity id is
+ignored because the audit intent is already satisfied, and any other activity error fails the
+publication instead of acknowledging a transaction whose state is no longer trustworthy. A
+multi-shard router submits the row to the global shard after publication. Replacement and deletion record cleanup debt in the same savepoint as
 removing a live reference. Returned superseded paths are descriptive outcomes, not authority for
 direct unlink. A late failure rolls back publication, intent consumption and cleanup changes
 together.

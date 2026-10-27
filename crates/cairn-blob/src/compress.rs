@@ -416,13 +416,6 @@ impl BlockEncoder {
             return Err(e);
         }
         check_encoded_len(self.logical_len, self.block_size as u64, self.index_limit)?;
-        eprintln!(
-            "finish probe buf={} index={} block_index={} logical={}",
-            self.buf.len(),
-            self.index.len(),
-            self.block_index,
-            self.logical_len
-        );
         let mut out = Vec::new();
         if !self.buf.is_empty() {
             let block = std::mem::take(&mut self.buf);

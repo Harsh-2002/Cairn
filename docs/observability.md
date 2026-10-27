@@ -96,7 +96,10 @@ post-stage validations, row construction and replication intent; `publication` i
 the authoritative Writer await; `notification` is the remaining best-effort post-commit
 await. A successful PUT's `audit` row is co-committed with publication, so the `audit`
 stage no longer records a post-commit sample for that operation; the label stays defined
-for existing series and for operations that still submit activity separately.
+for existing series and for operations that still submit activity separately. Co-commit
+treats a duplicate activity id as satisfied; any other activity failure fails the
+publication, so an acknowledged PUT never comes from a transaction with a failed audit
+insert.
 `notification` marks completion when its await returns, even if its internal
 best-effort operation failed. The exclusive stages do not include
 every small synchronous instruction between boundaries, so their sum may be less

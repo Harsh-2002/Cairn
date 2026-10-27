@@ -93,12 +93,19 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     )
             ) {
                 crate::storage::consume_published(driver, &plan, index_spool).await?;
-                // Best-effort: a duplicate id or a recoverable insert failure must not revoke an
-                // object whose blob and metadata already committed in this savepoint.
-                if let Some(entry) = activity
-                    && let Err(error) = insert_activity(driver, &entry).await
-                {
-                    tracing::warn!(%error, "co-committed activity write failed; publication stands");
+                // A retried or duplicate activity id is the only failure that leaves the
+                // publication intact: the row already exists, so the audit intent is satisfied.
+                // Any other error can have aborted the enclosing transaction or be a real capacity
+                // failure, so it must fail the publication instead of acknowledging an object from
+                // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
+                if let Some(entry) = activity {
+                    match insert_activity(driver, &entry).await {
+                        Ok(()) => {}
+                        Err(cairn_types::MetaError::Conflict) => {
+                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Ok(outcome)
