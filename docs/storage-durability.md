@@ -33,6 +33,12 @@ through actual job completion.
 Acquisition rechecks the directory's name/inode after taking its lock and reopens if a pruner won
 the race; an unlinked descriptor is never accepted as a creation target.
 
+Preparing several sibling directories for one write completes one parent barrier per distinct
+parent, deduplicated by device and inode: the ordinary `.staging` and bucket directories under the
+data root cost one root fsync, not one each. The recorded barriers still complete inside the same
+non-cancellable preparation job, after every sibling entry exists and before any dependent file is
+opened.
+
 Cancellation does not synchronously unlink admitted paths. A bounded recovery slot and an exact
 plan guard are acquired before admission can reach the Writer, covering a lost admission
 acknowledgement as well as cancellation during staging, checksum validation and publication.

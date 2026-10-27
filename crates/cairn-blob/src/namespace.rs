@@ -96,6 +96,52 @@ fn ensure_directory(
     Ok(directory)
 }
 
+/// Parents whose new child entry must be durable before any dependent file is created.
+///
+/// Sibling directories share one parent barrier: an ordinary PUT prepares `.staging` and its
+/// bucket directory under the same data root, so one fsync of that root persists both entries.
+/// Barriers are deduplicated by device and inode and still complete inside the same
+/// non-cancellable preparation job, before [`AnchoredPath`] can create a file.
+#[derive(Default)]
+struct ParentBarriers {
+    order: Vec<(u64, u64)>,
+    parents: HashMap<(u64, u64), Arc<File>>,
+}
+
+impl ParentBarriers {
+    fn record(&mut self, parent: &Arc<File>) -> std::io::Result<()> {
+        let stat = fstat(&**parent)?;
+        let key = (stat.st_dev, stat.st_ino);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parents.entry(key) {
+            entry.insert(parent.clone());
+            self.order.push(key);
+        }
+        Ok(())
+    }
+
+    fn sync(&self, timing: Option<&ObjectWriteTimings>) -> std::io::Result<()> {
+        for key in &self.order {
+            let parent = &self.parents[key];
+            let timer = timing.map(|timing| timing.start(ObjectWriteStage::NamespaceParentSync));
+            parent.sync_all()?;
+            if let Some(timer) = timer {
+                timer.complete();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prepare_directory(
+    parent: &Arc<File>,
+    name: &str,
+    barriers: &mut ParentBarriers,
+) -> std::io::Result<File> {
+    let directory = open_directory(parent, name, true)?;
+    barriers.record(parent)?;
+    Ok(directory)
+}
+
 /// Keep the shared lock on this open description, so cloned anchored paths and queued jobs
 /// exclude empty-directory pruning until their final File reference is released.
 fn open_directory(parent: &File, name: &str, create: bool) -> std::io::Result<File> {
@@ -261,11 +307,12 @@ impl AdmittedPaths {
             .map_err(|error| io_err(error.into()))?
             .into();
             let mut directories = HashMap::from([(String::new(), Arc::new(root))]);
+            let mut barriers = ParentBarriers::default();
             let mut staging = None;
             let mut final_file = None;
             let mut spool = None;
             for intent in &plan.paths {
-                let path = prepare_path(&mut directories, intent.path.as_str(), timing.as_deref())
+                let path = prepare_path(&mut directories, intent.path.as_str(), &mut barriers)
                     .map_err(io_err)?;
                 match intent.role {
                     StoragePathRole::Temporary => staging = Some(path),
@@ -273,6 +320,8 @@ impl AdmittedPaths {
                     StoragePathRole::IndexSpool => spool = Some(path),
                 }
             }
+            // Complete every prepared parent barrier before any dependent file is created.
+            barriers.sync(timing.as_deref()).map_err(io_err)?;
             let final_file =
                 final_file.ok_or_else(|| BlobError::Io("missing admitted final path".into()))?;
             let paths = Self {
@@ -298,7 +347,7 @@ impl AdmittedPaths {
 fn prepare_path(
     directories: &mut HashMap<String, Arc<File>>,
     relative: &str,
-    timing: Option<&ObjectWriteTimings>,
+    barriers: &mut ParentBarriers,
 ) -> std::io::Result<AnchoredPath> {
     let mut components = relative.split('/').peekable();
     let mut prefix = String::new();
@@ -319,8 +368,9 @@ fn prepare_path(
             continue;
         }
         // Existing does not imply durable: another creator may have failed its parent sync.
-        // Complete this barrier in the same non-cancellable closure before dependent creation.
-        let child = ensure_directory(&parent, name, timing)?;
+        // Record the barrier here and complete it in the same non-cancellable closure before
+        // dependent creation; sibling directories share one parent fsync (ARCH 8.2).
+        let child = prepare_directory(&parent, name, barriers)?;
         parent = Arc::new(child);
         directories.insert(prefix.clone(), parent.clone());
     }
@@ -515,7 +565,9 @@ mod tests {
         for _ in 0..2 {
             let root_file = Arc::new(crate::open_readonly_nofollow(root.path()).unwrap());
             let mut directories = HashMap::from([(String::new(), root_file)]);
-            prepare_path(&mut directories, "bucket/new-file", Some(&timings)).unwrap();
+            let mut barriers = ParentBarriers::default();
+            prepare_path(&mut directories, "bucket/new-file", &mut barriers).unwrap();
+            barriers.sync(Some(&timings)).unwrap();
         }
         let samples = timings.drain();
         assert_eq!(samples.len(), 2);
@@ -526,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_object_keeps_both_root_barriers() {
+    async fn admitted_object_shares_one_root_barrier_across_sibling_directories() {
         let root = tempfile::tempdir().unwrap();
         let timing = Arc::new(ObjectWriteTimings::default());
         for _ in 0..2 {
@@ -545,14 +597,14 @@ mod tests {
                 .iter()
                 .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
                 .count(),
-            4,
-            "each ordinary plan must complete both root barriers, including EEXIST"
+            2,
+            "one data-root barrier must cover both sibling directory entries, including EEXIST"
         );
         assert!(samples.iter().all(|sample| sample.completed));
     }
 
     #[tokio::test]
-    async fn concurrent_admitted_objects_each_complete_both_root_barriers() {
+    async fn concurrent_admitted_objects_each_complete_one_root_barrier() {
         let root = tempfile::tempdir().unwrap();
         let timing = Arc::new(ObjectWriteTimings::default());
         let root_path = root.path().to_owned();
@@ -576,7 +628,7 @@ mod tests {
                 .iter()
                 .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
                 .count(),
-            32
+            16
         );
         assert!(samples.iter().all(|sample| sample.completed));
     }
@@ -755,8 +807,9 @@ mod tests {
                 fstat(&*directory).unwrap().st_dev
             );
             let mut directories = HashMap::from([(String::new(), directory.clone())]);
+            let mut barriers = ParentBarriers::default();
             assert_eq!(
-                prepare_path(&mut directories, "bucket/new-file", None)
+                prepare_path(&mut directories, "bucket/new-file", &mut barriers)
                     .unwrap_err()
                     .raw_os_error(),
                 Some(rustix::io::Errno::XDEV.raw_os_error())

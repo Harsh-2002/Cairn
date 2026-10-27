@@ -1792,13 +1792,18 @@ mod tests {
             assert!(dir.path().join("bkt").is_dir());
         }
         let samples = store.drain_object_write_timings();
-        assert_eq!(samples.len(), 17);
+        assert_eq!(samples.len(), 16);
         assert_eq!(
             samples
                 .iter()
                 .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
                 .count(),
-            2
+            1,
+            "one shared data-root barrier per staged object: {:?}",
+            samples
+                .iter()
+                .map(|sample| sample.stage)
+                .collect::<Vec<_>>()
         );
         assert!(samples.iter().any(|sample| {
             sample.stage == ObjectWriteStage::NamespaceQueue && sample.completed
@@ -1857,13 +1862,14 @@ mod tests {
             .await
             .unwrap();
         let samples = store.drain_object_write_timings();
-        assert_eq!(samples.len(), 14);
+        assert_eq!(samples.len(), 13);
         assert_eq!(
             samples
                 .iter()
                 .filter(|sample| sample.stage == ObjectWriteStage::NamespaceParentSync)
                 .count(),
-            2
+            1,
+            "sibling staging and bucket directories share one data-root barrier"
         );
         assert!(
             samples
