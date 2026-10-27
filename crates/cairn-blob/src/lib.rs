@@ -1241,13 +1241,22 @@ impl BlobStore for LocalBlobStore {
         let operation = lease.try_child()?;
         let root = self.data_root.clone();
         let path = cleanup.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let _lease = lease;
+        let namespace = tokio::task::spawn_blocking(move || {
             let _operation = operation;
-            namespace::cleanup(&root, &path).map_err(io_err)
+            namespace::cleanup_unlink(&root, &path).map_err(io_err)
         })
         .await
-        .map_err(|error| BlobError::Io(error.to_string()))?
+        .map_err(|error| BlobError::Io(error.to_string()))??;
+        fail::fail_point!("blob_before_storage_dirsync", |_| Err(BlobError::Io(
+            "injected storage directory sync failure".into()
+        )));
+        // Concurrent cleanups into the same directory share one absence barrier. Every row still
+        // carries its own exact claim and identity checks.
+        self.dir_sync.sync_file(namespace.parent(), &lease).await?;
+        tokio::task::spawn_blocking(move || namespace::cleanup_prune(namespace).map_err(io_err))
+            .await
+            .map_err(|error| BlobError::Io(error.to_string()))??;
+        Ok(())
     }
 
     async fn stage_part(

@@ -420,9 +420,27 @@ pub(crate) fn read_file(root: &Path, path: &StoragePath) -> std::io::Result<File
     Err(std::io::Error::other("empty storage input path"))
 }
 
-/// Exact unlink with durable absence, including an already-absent name. The Writer has already
-/// proved that this immutable path has no authoritative reference or active intent owner.
-pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
+/// A completed exact unlink whose namespace barrier is still owed.
+///
+/// The caller must synchronize [`Self::parent`] before retiring the cleanup claim, then call
+/// [`cleanup_prune`]. The open file description is retained so the inode cannot be reused before
+/// the barrier and prune complete.
+pub(crate) struct CleanupNamespace {
+    parent: Arc<File>,
+    chain: Vec<DirectoryLink>,
+    file: Option<File>,
+}
+
+impl CleanupNamespace {
+    /// The directory whose entry is now absent and must be synchronized.
+    pub(crate) fn parent(&self) -> Arc<File> {
+        self.parent.clone()
+    }
+}
+
+/// Exact unlink, including an already-absent name, without the namespace barrier. The Writer has
+/// already proved that this immutable path has no authoritative reference or active intent owner.
+pub(crate) fn cleanup_unlink(root: &Path, path: &StoragePath) -> std::io::Result<CleanupNamespace> {
     let components: Vec<_> = path.as_str().split('/').collect();
     let root: File = open(
         root,
@@ -436,8 +454,11 @@ pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
         let child = match open_directory(&parent, name, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                sync_absence(&parent)?;
-                return prune(chain);
+                return Ok(CleanupNamespace {
+                    parent,
+                    chain,
+                    file: None,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -482,10 +503,28 @@ pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
         unlinkat(&*parent, name, AtFlags::empty())?;
         fail::fail_point!("blob_after_storage_unlink");
     }
-    sync_absence(&parent)?;
+    Ok(CleanupNamespace {
+        parent,
+        chain,
+        file,
+    })
+}
+
+/// Prune empty supported parents after [`CleanupNamespace::parent`] has been synchronized.
+pub(crate) fn cleanup_prune(namespace: CleanupNamespace) -> std::io::Result<()> {
+    let CleanupNamespace { chain, file, .. } = namespace;
     let result = prune(chain);
     drop(file);
     result
+}
+
+/// Unlink, synchronize and prune without sharing a barrier. Retained for tests that exercise the
+/// standalone sequence.
+#[cfg(test)]
+pub(crate) fn cleanup(root: &Path, path: &StoragePath) -> std::io::Result<()> {
+    let namespace = cleanup_unlink(root, path)?;
+    sync_absence(&namespace.parent)?;
+    cleanup_prune(namespace)
 }
 
 fn sync_absence(directory: &File) -> std::io::Result<()> {
