@@ -3,6 +3,7 @@
 
 use crate::driver::{AsyncSqlDriver, Value as Cell};
 use cairn_types::MetaError;
+use cairn_types::blob::IndexSpoolState;
 use cairn_types::id::{BucketName, StoragePath};
 use cairn_types::meta::MutationOutcome;
 use cairn_types::storage::{
@@ -139,7 +140,7 @@ pub async fn apply(
             } else if let Some(plan) =
                 load(db, bucket, quiescence.attempt(), quiescence.generation()).await?
             {
-                resolve(db, &plan).await?;
+                resolve(db, &plan, IndexSpoolState::Materialized).await?;
                 true
             } else {
                 false
@@ -148,7 +149,7 @@ pub async fn apply(
         StorageMutation::ResolveRecovered { current_generation, quiescence } => {
             if current_generation == *quiescence.generation() || !current(db, &current_generation).await? { false }
             else if let Some(plan) = load(db, bucket, quiescence.attempt(), quiescence.generation()).await? {
-                resolve(db, &plan).await?;
+                resolve(db, &plan, IndexSpoolState::Materialized).await?;
                 true
             } else { false }
         }
@@ -272,8 +273,12 @@ pub async fn discard_unacknowledged(db: &DB<'_>, plan: &StorageWritePlan) -> R<(
     Ok(())
 }
 
-pub async fn consume_published(db: &DB<'_>, plan: &StorageWritePlan) -> R<()> {
-    resolve(db, plan).await
+pub async fn consume_published(
+    db: &DB<'_>,
+    plan: &StorageWritePlan,
+    index_spool: IndexSpoolState,
+) -> R<()> {
+    resolve(db, plan, index_spool).await
 }
 
 /// Shared admission prefix for ordinary writes and joint multipart reserve/claim transactions.
@@ -395,7 +400,7 @@ async fn referenced(db: &DB<'_>, path: &StoragePath) -> R<bool> {
 
 /// Enqueue aliases even when rename/unlink probably removed them: retirement still needs the
 /// containing namespace barrier. Reference checks are Writer-serialized, never stale WAL reads.
-async fn resolve(db: &DB<'_>, plan: &StorageWritePlan) -> R<()> {
+async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
     validate_index(db, plan).await?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
@@ -445,6 +450,12 @@ async fn resolve(db: &DB<'_>, plan: &StorageWritePlan) -> R<()> {
         None
     };
     for path in &plan.paths {
+        // A write that never opened the index spool created no name, so its absence owes no
+        // namespace barrier. Recovery keeps the conservative `Materialized` state.
+        if path.role == StoragePathRole::IndexSpool && index_spool == IndexSpoolState::NeverCreated
+        {
+            continue;
+        }
         if !referenced(db, &path.path).await? {
             enqueue_owned(db, &plan.bucket, &path.path, quota.as_deref(), owner).await?;
         }

@@ -1139,15 +1139,18 @@ impl S3Service {
         let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
         let publication = self
             .meta
-            .submit(write_guard.publication(Mutation::PutObjectVersion {
-                row: Box::new(row),
-                precondition: precond,
-                initial_state: InitialObjectState {
-                    tags: initial_tags,
-                    lock_intent,
+            .submit(write_guard.publication(
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: precond,
+                    initial_state: InitialObjectState {
+                        tags: initial_tags,
+                        lock_intent,
+                    },
+                    replication,
                 },
-                replication,
-            }))
+                staged.index_spool,
+            ))
             .await;
         if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
             if let Some(timer) = publication_timer {
@@ -2007,11 +2010,14 @@ impl S3Service {
         };
         let outcome = match self
             .meta
-            .submit(part_guard.publication(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: attempt_id.clone(),
-                part,
-            }))
+            .submit(part_guard.publication(
+                Mutation::RecordPart {
+                    upload_id: upload_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    part,
+                },
+                staged.index_spool,
+            ))
             .await
         {
             Ok(outcome) => outcome,
@@ -2226,11 +2232,14 @@ impl S3Service {
         };
         let outcome = match self
             .meta
-            .submit(part_guard.publication(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: attempt_id.clone(),
-                part,
-            }))
+            .submit(part_guard.publication(
+                Mutation::RecordPart {
+                    upload_id: upload_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    part,
+                },
+                staged.index_spool,
+            ))
             .await
         {
             Ok(outcome) => outcome,
@@ -2705,13 +2714,16 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(claim_guard.publication(Mutation::CompleteMultipart {
-                upload_id: upload_id.clone(),
-                claim_token: claim_token.clone(),
-                row: Box::new(row),
-                precondition: Precondition::default(),
-                replication,
-            }))
+            .submit(claim_guard.publication(
+                Mutation::CompleteMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: claim_token.clone(),
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    replication,
+                },
+                staged.index_spool,
+            ))
             .await
         {
             Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed {
@@ -3235,15 +3247,18 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(write_guard.publication(Mutation::PutObjectVersion {
-                row: Box::new(row),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState {
-                    tags: dest_tags,
-                    lock_intent,
+            .submit(write_guard.publication(
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: dest_tags,
+                        lock_intent,
+                    },
+                    replication,
                 },
-                replication,
-            }))
+                staged.index_spool,
+            ))
             .await
         {
             Ok(MutationOutcome::Put { .. }) => {

@@ -2217,7 +2217,11 @@ impl State {
                     )),
                 }
             }
-            Mutation::PublishStorageWrite { plan, operation } => {
+            Mutation::PublishStorageWrite {
+                plan,
+                operation,
+                index_spool,
+            } => {
                 plan.validate_publication(&operation)?;
                 if !storage::owns_publication(st, &plan)? {
                     return Ok(MutationOutcome::StoragePublicationNotApplied);
@@ -2231,7 +2235,7 @@ impl State {
                             MultipartTerminalOutcome::Completed { .. }
                         )
                 ) {
-                    storage::consume_published(st, &plan)?;
+                    storage::consume_published(st, &plan, index_spool)?;
                 }
                 Ok(outcome)
             }

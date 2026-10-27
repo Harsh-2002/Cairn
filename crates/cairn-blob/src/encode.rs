@@ -8,7 +8,9 @@ use crate::namespace::AnchoredPath;
 use crate::owned_file::{FileOwner, OwnedFile};
 use crate::staging::Staging;
 use cairn_types::storage::io::StorageIoLease;
-use cairn_types::{SecretKey32, bucket::CompressionPolicy, error::BlobError};
+use cairn_types::{
+    SecretKey32, blob::IndexSpoolState, bucket::CompressionPolicy, error::BlobError,
+};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 const BATCH_BYTES: usize = 64 * 1024;
@@ -126,13 +128,26 @@ impl StagedEncoder {
         Ok(physical)
     }
 
-    pub(crate) async fn finish(mut self, sink: &mut Staging) -> Result<u64, BlobError> {
+    pub(crate) async fn finish(
+        mut self,
+        sink: &mut Staging,
+    ) -> Result<(u64, IndexSpoolState), BlobError> {
+        // The spool is created and unlinked lazily, so only the encoder knows whether this write
+        // ever materialized the admitted alias.
+        let index_spool = if self.index.file.is_some() {
+            IndexSpoolState::Materialized
+        } else {
+            IndexSpoolState::NeverCreated
+        };
         let tail = self.encoder.finish_parts()?;
         self.index.append(&tail.index).await?;
         sink.write_all(&tail.payload).await?;
         let index_len = self.index.append_to(sink).await?;
         sink.write_all(&tail.footer).await?;
-        Ok(tail.payload.len() as u64 + index_len + tail.footer.len() as u64)
+        Ok((
+            tail.payload.len() as u64 + index_len + tail.footer.len() as u64,
+            index_spool,
+        ))
     }
 }
 
@@ -322,7 +337,9 @@ mod tests {
             let physical = encoder.feed(&data, &mut sink).await.unwrap();
             assert!(encoder.index.file.is_some());
             assert!(encoder.encoder.take_index().is_empty());
-            let physical = physical + encoder.finish(&mut sink).await.unwrap();
+            let (tail, index_spool) = encoder.finish(&mut sink).await.unwrap();
+            assert_eq!(index_spool, IndexSpoolState::Materialized);
+            let physical = physical + tail;
             sink.fsync_in_place().await.unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().len(), physical);
             let mut reader = CompressedReader::open_with_dek(

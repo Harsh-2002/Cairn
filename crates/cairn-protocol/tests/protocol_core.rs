@@ -273,6 +273,7 @@ async fn seed_plaintext_part(
                 part_dek: None,
             },
         }),
+        index_spool: cairn_types::blob::IndexSpoolState::Materialized,
     })
     .await
     .unwrap();
@@ -9771,6 +9772,7 @@ async fn sse_kms_tampered_descriptor_fails_closed() {
                 initial_state: cairn_types::InitialObjectState::default(),
                 replication: Vec::new(),
             }),
+            index_spool: cairn_types::blob::IndexSpoolState::Materialized,
         })
         .await
         .unwrap();

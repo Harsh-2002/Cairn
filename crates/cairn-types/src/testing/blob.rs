@@ -183,6 +183,7 @@ impl BlobStore for InMemoryBlobStore {
             checksums: Vec::new(),
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
+            index_spool: crate::blob::IndexSpoolState::NeverCreated,
         })
     }
 
@@ -318,6 +319,7 @@ impl BlobStore for InMemoryBlobStore {
             size,
             md5_hex: md5,
             checksums: Vec::new(),
+            index_spool: crate::blob::IndexSpoolState::NeverCreated,
         })
     }
 
@@ -378,6 +380,7 @@ impl BlobStore for InMemoryBlobStore {
             checksums: Vec::new(),
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
+            index_spool: crate::blob::IndexSpoolState::NeverCreated,
         })
     }
 

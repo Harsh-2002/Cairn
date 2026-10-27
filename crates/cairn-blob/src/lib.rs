@@ -47,8 +47,8 @@ use cairn_types::SecretKey32;
 pub use cairn_types::blob::BlobCipher;
 use cairn_types::blob::ReadBufferLease;
 use cairn_types::blob::{
-    BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport,
-    StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
+    BlobProbe, BlobReadHandle, ByteRange, ContentRange, IndexSpoolState, PartRef, ReconcileOpts,
+    ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
 };
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
@@ -416,6 +416,17 @@ fn validate_stage_len(opts: &StageOptions, logical_len: Option<u64>) -> Result<(
     Ok(())
 }
 
+/// One completed streaming pass. The caller turns it into a [`StagedBlob`] or [`StagedPart`].
+struct StagedWrite {
+    logical: u64,
+    physical: u64,
+    md5: String,
+    checksums: Vec<cairn_types::object::ChecksumValue>,
+    compression: CompressionDescriptor,
+    internal_sha256: String,
+    index_spool: IndexSpoolState,
+}
+
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
@@ -425,17 +436,7 @@ async fn write_staged(
     opts: &StageOptions,
     paths: &AdmittedPaths,
     mut raw_body_breakdown: Option<&mut timing::RawBodyBreakdown<'_>>,
-) -> Result<
-    (
-        u64,
-        u64,
-        String,
-        Vec<cairn_types::object::ChecksumValue>,
-        CompressionDescriptor,
-        String,
-    ),
-    BlobError,
-> {
+) -> Result<StagedWrite, BlobError> {
     let (compress, block_pol) = encoding_policies(opts);
     validate_stage_len(opts, opts.content_length)?;
     let mut hashers = Hashers::new(&opts.extra_checksums);
@@ -465,7 +466,8 @@ async fn write_staged(
             hashers.update(&chunk);
             physical += enc.feed(&chunk, file).await?;
         }
-        physical += enc.finish(file).await?;
+        let (tail_bytes, index_spool) = enc.finish(file).await?;
+        physical += tail_bytes;
         let (md5, checks, internal_sha256) = hashers.finalize();
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
@@ -477,7 +479,15 @@ async fn write_staged(
             },
             None => CompressionDescriptor::Uncompressed,
         };
-        Ok((logical, physical, md5, checks, descriptor, internal_sha256))
+        Ok(StagedWrite {
+            logical,
+            physical,
+            md5,
+            checksums: checks,
+            compression: descriptor,
+            internal_sha256,
+            index_spool,
+        })
     } else {
         loop {
             if let Some(detail) = raw_body_breakdown.as_mut() {
@@ -517,14 +527,15 @@ async fn write_staged(
         if let Some(detail) = raw_body_breakdown.as_mut() {
             detail.end(true);
         }
-        Ok((
+        Ok(StagedWrite {
             logical,
             physical,
             md5,
-            checks,
-            CompressionDescriptor::Uncompressed,
+            checksums: checks,
+            compression: CompressionDescriptor::Uncompressed,
             internal_sha256,
-        ))
+            index_spool: IndexSpoolState::NeverCreated,
+        })
     }
 }
 
@@ -1091,7 +1102,7 @@ impl BlobStore for LocalBlobStore {
             }
         }
         drop(raw_body_breakdown);
-        let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
+        let write = match outcome {
             Ok(v) => v,
             Err(e) => {
                 sink.abort().await;
@@ -1124,13 +1135,14 @@ impl BlobStore for LocalBlobStore {
 
         let staged = StagedBlob {
             storage_path,
-            size_logical: logical,
-            size_physical: physical,
-            etag: ETag::from_md5_hex(md5.clone()),
-            md5_hex: md5,
-            checksums,
-            internal_sha256,
-            compression: descriptor,
+            size_logical: write.logical,
+            size_physical: write.physical,
+            etag: ETag::from_md5_hex(write.md5.clone()),
+            md5_hex: write.md5,
+            checksums: write.checksums,
+            internal_sha256: write.internal_sha256,
+            compression: write.compression,
+            index_spool: write.index_spool,
         };
         Ok(staged)
     }
@@ -1275,14 +1287,13 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        let (logical, _phys, md5, checks, _desc, _internal_sha256) =
-            match write_staged(&mut sink, body, &opts, &paths, None).await {
-                Ok(v) => v,
-                Err(e) => {
-                    sink.abort().await;
-                    return Err(e);
-                }
-            };
+        let write = match write_staged(&mut sink, body, &opts, &paths, None).await {
+            Ok(v) => v,
+            Err(e) => {
+                sink.abort().await;
+                return Err(e);
+            }
+        };
         sink.fsync_in_place().await?;
         // fsync the session directory so the new part's directory entry is durable. Without this, a
         // part that was acknowledged 200 OK could lose its dirent on power loss even though its bytes
@@ -1295,9 +1306,10 @@ impl BlobStore for LocalBlobStore {
             .await?;
         Ok(StagedPart {
             storage_path: paths.storage_path.clone(),
-            size: logical,
-            md5_hex: md5,
-            checksums: checks,
+            size: write.logical,
+            md5_hex: write.md5,
+            checksums: write.checksums,
+            index_spool: write.index_spool,
         })
     }
 
@@ -1385,9 +1397,13 @@ impl BlobStore for LocalBlobStore {
             sink.abort().await;
             return Err(e);
         }
+        let mut index_spool = IndexSpoolState::NeverCreated;
         let descriptor = if let Some(e) = enc {
             match e.finish(&mut sink).await {
-                Ok(bytes) => physical += bytes,
+                Ok((bytes, spool)) => {
+                    physical += bytes;
+                    index_spool = spool;
+                }
                 Err(err) => {
                     sink.abort().await;
                     return Err(err);
@@ -1427,6 +1443,7 @@ impl BlobStore for LocalBlobStore {
             checksums,
             internal_sha256,
             compression: descriptor,
+            index_spool,
         };
         Ok(staged)
     }
@@ -1839,6 +1856,36 @@ mod tests {
                 .any(|sample| sample.stage == ObjectWriteStage::BodySink)
         );
         assert!(samples.iter().all(|sample| sample.completed));
+    }
+
+    #[tokio::test]
+    async fn raw_and_small_encoded_writes_never_open_the_index_spool() {
+        for compression in [None, Some(CompressionPolicy::default())] {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap()
+                    .with_io_uring(false);
+            let staged = store
+                .stage_fixture(
+                    &BucketName::parse("bkt").unwrap(),
+                    Box::pin(futures_util::stream::once(async {
+                        Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"payload"))
+                    })),
+                    StageOptions {
+                        compression,
+                        ..StageOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                staged.index_spool,
+                IndexSpoolState::NeverCreated,
+                "a buffered index must not be reported as a created alias"
+            );
+        }
     }
 
     #[tokio::test]

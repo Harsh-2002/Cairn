@@ -2749,6 +2749,7 @@ mod tests {
                             initial_state: InitialObjectState::default(),
                             replication: Vec::new(),
                         }),
+                        index_spool: cairn_types::blob::IndexSpoolState::Materialized,
                     })
                     .await
                     .unwrap(),

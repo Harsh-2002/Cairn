@@ -73,7 +73,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 )),
             }
         }
-        Mutation::PublishStorageWrite { plan, operation } => {
+        Mutation::PublishStorageWrite {
+            plan,
+            operation,
+            index_spool,
+        } => {
             plan.validate_publication(&operation)?;
             if !crate::storage::owns_publication(driver, &plan).await? {
                 return Ok(MutationOutcome::StoragePublicationNotApplied);
@@ -87,7 +91,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         MultipartTerminalOutcome::Completed { .. }
                     )
             ) {
-                crate::storage::consume_published(driver, &plan).await?;
+                crate::storage::consume_published(driver, &plan, index_spool).await?;
             }
             Ok(outcome)
         }

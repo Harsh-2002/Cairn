@@ -2,6 +2,7 @@
 //! Keep the SQL and outcomes identical in cairn-meta-async/src/storage.rs.
 
 use cairn_types::MetaError;
+use cairn_types::blob::IndexSpoolState;
 use cairn_types::id::{BucketName, StoragePath};
 use cairn_types::meta::MutationOutcome;
 use cairn_types::storage::{
@@ -131,7 +132,7 @@ pub fn apply(db: &DB, bucket: &BucketName, operation: StorageMutation) -> R<Muta
             } else if let Some(plan) =
                 load(db, bucket, quiescence.attempt(), quiescence.generation())?
             {
-                resolve(db, &plan)?;
+                resolve(db, &plan, IndexSpoolState::Materialized)?;
                 true
             } else {
                 false
@@ -147,7 +148,7 @@ pub fn apply(db: &DB, bucket: &BucketName, operation: StorageMutation) -> R<Muta
             } else if let Some(plan) =
                 load(db, bucket, quiescence.attempt(), quiescence.generation())?
             {
-                resolve(db, &plan)?;
+                resolve(db, &plan, IndexSpoolState::Materialized)?;
                 true
             } else {
                 false
@@ -270,8 +271,8 @@ pub fn discard_unacknowledged(db: &DB, plan: &StorageWritePlan) -> R<()> {
     Ok(())
 }
 
-pub fn consume_published(db: &DB, plan: &StorageWritePlan) -> R<()> {
-    resolve(db, plan)
+pub fn consume_published(db: &DB, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
+    resolve(db, plan, index_spool)
 }
 
 /// Shared admission prefix for ordinary writes and joint multipart reserve/claim transactions.
@@ -405,7 +406,7 @@ fn referenced(db: &DB, path: &StoragePath) -> R<bool> {
 
 /// Enqueue aliases even when rename/unlink probably removed them: retirement still needs the
 /// containing namespace barrier. Reference checks are Writer-serialized, never stale WAL reads.
-fn resolve(db: &DB, plan: &StorageWritePlan) -> R<()> {
+fn resolve(db: &DB, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
     validate_index(db, plan)?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
@@ -459,6 +460,12 @@ fn resolve(db: &DB, plan: &StorageWritePlan) -> R<()> {
         None
     };
     for path in &plan.paths {
+        // A write that never opened the index spool created no name, so its absence owes no
+        // namespace barrier. Recovery keeps the conservative `Materialized` state.
+        if path.role == StoragePathRole::IndexSpool && index_spool == IndexSpoolState::NeverCreated
+        {
+            continue;
+        }
         if !referenced(db, &path.path)? {
             enqueue_owned(db, &plan.bucket, &path.path, quota.as_deref(), owner)?;
         }

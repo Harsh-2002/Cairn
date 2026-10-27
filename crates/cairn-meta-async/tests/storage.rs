@@ -57,3 +57,15 @@ async fn turso_storage_baseline_native_aliases() {
     let store = cairn_meta_async::open_turso_in_memory().await.unwrap();
     cairn_types::testing::assert_storage_baseline_native_aliases(&store).await;
 }
+
+#[tokio::test]
+async fn libsql_unused_index_spool_is_not_retired() {
+    let store = cairn_meta_async::open_libsql_in_memory().await.unwrap();
+    cairn_types::testing::assert_unused_index_spool_is_not_retired(&store).await;
+}
+
+#[tokio::test]
+async fn turso_unused_index_spool_is_not_retired() {
+    let store = cairn_meta_async::open_turso_in_memory().await.unwrap();
+    cairn_types::testing::assert_unused_index_spool_is_not_retired(&store).await;
+}

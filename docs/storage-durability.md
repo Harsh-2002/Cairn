@@ -60,7 +60,9 @@ Cleanup uses exact Writer claims bound to a generation, claim token and expiry. 
 that no authoritative reference or active intent owns the path. The blob layer rejects a still
 locked file, unlinks only the claimed filename, synchronizes its directory, and prunes only empty
 supported parents with parent synchronization. Already-absent names still require a namespace
-barrier. The Writer retires debt and associated quota only after durable absence and a matching,
+barrier. The one exception is the optional index-spool alias: live publication states whether
+the write ever opened it, and a write that never did created no name to retire. Recovery always
+treats that alias as materialized because it cannot know. The Writer retires debt and associated quota only after durable absence and a matching,
 unexpired acknowledgement. Unknown siblings survive; filesystem errors and stale acknowledgements
 retain debt. Request abort and multipart termination do not authorize recursive session deletion.
 

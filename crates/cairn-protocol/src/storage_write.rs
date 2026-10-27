@@ -1,5 +1,6 @@
 //! Runtime-neutral ownership of one admitted physical write (ARCH 8).
 
+use cairn_types::blob::IndexSpoolState;
 use cairn_types::error::Error;
 use cairn_types::meta::Mutation;
 use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
@@ -144,7 +145,11 @@ pub(crate) struct StorageWriteGuard {
 }
 
 impl StorageWriteGuard {
-    pub(crate) fn publication(&self, operation: Mutation) -> Mutation {
+    pub(crate) fn publication(
+        &self,
+        operation: Mutation,
+        index_spool: IndexSpoolState,
+    ) -> Mutation {
         Mutation::PublishStorageWrite {
             plan: Box::new(
                 self.recovery
@@ -154,6 +159,7 @@ impl StorageWriteGuard {
                     .clone(),
             ),
             operation: Box::new(operation),
+            index_spool,
         }
     }
 
