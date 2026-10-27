@@ -132,6 +132,9 @@ pub enum Mutation {
         /// opened it owes no namespace barrier for that name; recovery always passes
         /// [`crate::blob::IndexSpoolState::Materialized`] because it cannot know.
         index_spool: crate::blob::IndexSpoolState,
+        /// Best-effort activity committed only when this publication applies. A failed insert
+        /// never fails the object; a multi-shard router submits it separately to the global shard.
+        activity: Option<Box<ActivityEntry>>,
     },
     /// Read a bounded page of prior-generation intents through the Writer. This does not resolve
     /// ownership: exclusive restart must probe each plan's actual backend quiescence first.

@@ -77,6 +77,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             plan,
             operation,
             index_spool,
+            activity,
         } => {
             plan.validate_publication(&operation)?;
             if !crate::storage::owns_publication(driver, &plan).await? {
@@ -92,6 +93,13 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     )
             ) {
                 crate::storage::consume_published(driver, &plan, index_spool).await?;
+                // Best-effort: a duplicate id or a recoverable insert failure must not revoke an
+                // object whose blob and metadata already committed in this savepoint.
+                if let Some(entry) = activity
+                    && let Err(error) = insert_activity(driver, &entry).await
+                {
+                    tracing::warn!(%error, "co-committed activity write failed; publication stands");
+                }
             }
             Ok(outcome)
         }
@@ -100,6 +108,29 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             apply_inner(driver, other).await
         }
     }
+}
+
+async fn insert_activity(
+    driver: &dyn AsyncSqlDriver,
+    entry: &cairn_types::meta::ActivityEntry,
+) -> R<()> {
+    driver
+        .execute(
+            "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            vec![
+                Value::Text(entry.id.clone()),
+                Value::Text(entry.action.clone()),
+                opt_text(entry.bucket.clone()),
+                opt_text(entry.key.clone()),
+                entry.size.map_or(Value::Null, |s| Value::Int(s as i64)),
+                opt_text(entry.etag.clone()),
+                opt_text(entry.actor.clone()),
+                Value::Int(entry.at.0),
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
@@ -1627,22 +1658,7 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
             Ok(MutationOutcome::Ack)
         }
         Mutation::RecordActivity(e) => {
-            driver
-                .execute(
-                    "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    vec![
-                        Value::Text(e.id.clone()),
-                        Value::Text(e.action.clone()),
-                        opt_text(e.bucket.clone()),
-                        opt_text(e.key.clone()),
-                        e.size.map_or(Value::Null, |s| Value::Int(s as i64)),
-                        opt_text(e.etag.clone()),
-                        opt_text(e.actor.clone()),
-                        Value::Int(e.at.0),
-                    ],
-                )
-                .await?;
+            insert_activity(driver, &e).await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateShare(s) => {

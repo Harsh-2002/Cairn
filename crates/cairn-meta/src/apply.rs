@@ -75,6 +75,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             plan,
             operation,
             index_spool,
+            activity,
         } => {
             plan.validate_publication(&operation)?;
             if !crate::storage::owns_publication(conn, &plan)? {
@@ -90,6 +91,13 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     )
             ) {
                 crate::storage::consume_published(conn, &plan, index_spool)?;
+                // Best-effort: a duplicate id or a recoverable insert failure must not revoke an
+                // object whose blob and metadata already committed in this savepoint.
+                if let Some(entry) = activity
+                    && let Err(error) = insert_activity(conn, &entry)
+                {
+                    tracing::warn!(%error, "co-committed activity write failed; publication stands");
+                }
             }
             Ok(outcome)
         }
@@ -1524,22 +1532,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::RecordActivity(e) => {
-            conn.prepare_cached(
-                "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            )
-            .map_err(engine_err)?
-            .execute(params![
-                e.id,
-                e.action,
-                e.bucket,
-                e.key,
-                e.size.map(|s| s as i64),
-                e.etag,
-                e.actor,
-                e.at.0
-            ])
-            .map_err(engine_err)?;
+            insert_activity(conn, &e)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateShare(s) => {
@@ -3234,6 +3227,26 @@ fn owns_replication_claim(
         "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
         params![id, token.as_str(), now.0], |row| row.get(0),
     ).map_err(engine_err)
+}
+
+fn insert_activity(conn: &Connection, entry: &cairn_types::meta::ActivityEntry) -> R<()> {
+    conn.prepare_cached(
+        "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+    )
+    .map_err(engine_err)?
+    .execute(params![
+        entry.id,
+        entry.action,
+        entry.bucket,
+        entry.key,
+        entry.size.map(|s| s as i64),
+        entry.etag,
+        entry.actor,
+        entry.at.0
+    ])
+    .map_err(engine_err)?;
+    Ok(())
 }
 
 #[cfg(test)]

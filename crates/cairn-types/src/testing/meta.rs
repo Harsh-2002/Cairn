@@ -2221,6 +2221,7 @@ impl State {
                 plan,
                 operation,
                 index_spool,
+                activity,
             } => {
                 plan.validate_publication(&operation)?;
                 if !storage::owns_publication(st, &plan)? {
@@ -2236,6 +2237,11 @@ impl State {
                         )
                 ) {
                     storage::consume_published(st, &plan, index_spool)?;
+                    if let Some(entry) = activity
+                        && !st.activity.iter().any(|existing| existing.id == entry.id)
+                    {
+                        st.activity.push(*entry);
+                    }
                 }
                 Ok(outcome)
             }

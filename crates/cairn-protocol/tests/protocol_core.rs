@@ -274,6 +274,7 @@ async fn seed_plaintext_part(
             },
         }),
         index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+        activity: None,
     })
     .await
     .unwrap();
@@ -1870,7 +1871,7 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
     let h = harness().await;
     put_simple(&h, "timed", "obj").await;
     let samples = h.svc.drain_put_timings();
-    assert_eq!(samples.len(), 8);
+    assert_eq!(samples.len(), 7);
     assert!(samples.iter().all(|sample| sample.completed));
     for stage in [
         PutStage::Total,
@@ -1880,7 +1881,6 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
         PutStage::PublicationPrep,
         PutStage::Publication,
         PutStage::Notification,
-        PutStage::Audit,
     ] {
         assert_eq!(
             samples
@@ -9773,6 +9773,7 @@ async fn sse_kms_tampered_descriptor_fails_closed() {
                 replication: Vec::new(),
             }),
             index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .unwrap();

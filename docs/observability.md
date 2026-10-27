@@ -93,9 +93,12 @@ before that stage completed. `preflight` includes bucket/config reads and reques
 preparation; `storage_admission` includes plan preparation and the Writer admission
 await; `blob_stage` is the inclusive blob-store await; `publication_prep` includes
 post-stage validations, row construction and replication intent; `publication` is
-the authoritative Writer await; `notification` and `audit` are the two best-effort
-post-commit awaits. The latter two mark completion when their await returns, even
-if their internal best-effort operation failed. The exclusive stages do not include
+the authoritative Writer await; `notification` is the remaining best-effort post-commit
+await. A successful PUT's `audit` row is co-committed with publication, so the `audit`
+stage no longer records a post-commit sample for that operation; the label stays defined
+for existing series and for operations that still submit activity separately.
+`notification` marks completion when its await returns, even if its internal
+best-effort operation failed. The exclusive stages do not include
 every small synchronous instruction between boundaries, so their sum may be less
 than `total`; `total` excludes HTTP authentication, authorization and response
 serialization outside this handler. A bounded 1,024-stage ring is drained by the
