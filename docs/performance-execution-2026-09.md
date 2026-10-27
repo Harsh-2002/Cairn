@@ -249,3 +249,33 @@ The scored cells are descriptive medians of three arms per engine, **not** the f
 Execution amendment: the first scored invocation completed the 36 arms through LIST, then Warp 1.8 rejected the initial DELETE configuration **before measurement** because its default batch/concurrency requires at least 6,400 prepared objects. The failed attempt and full elapsed time are retained. The DELETE pool is raised from 2,000 to 12,000 solely to satisfy that client-side minimum and avoid finishing the finite workload during the 12-second interval. DELETE, mixed and multipart run as separate continuations; their pair order and all other parameters stay fixed. This operational correction is not a selected performance result.
 
 Warp then completed the larger DELETE preparation but emitted `Skipping DELETE too few samples`, so standalone Warp DELETE is **inconclusive**. Its `multipart` command with `--parts 100 --part.size 5MiB` created a 500-MiB object but rejected GET because it expected 5 MiB; the observed client-side size expectation makes that arm unusable as server performance evidence. Both failed arms and their costs stay in the campaign record. A separate, standard-library Python SigV4 client in [`conformance/rustfs_s3_compare.py`](../conformance/rustfs_s3_compare.py) supplies the missing cells with the same three-pair alternating order: 12,000 prepared 4-KiB objects, concurrency 16, then a 12-second standalone DELETE interval; and full initiate→two 5-MiB parts→Complete→byte-verified GET→DELETE cycles, concurrency 4 for 12 seconds. The latter reports completed 10-MiB objects/s and verified MiB/s, not Warp's failed part operation. These cells are labeled by their different client, never pooled with Warp throughput. Exact success responses and complete-object SHA-256 are mandatory. A client-saturated or prematurely exhausted arm is inconclusive.
+
+## 2026-10-27 — first in-contract tranche
+
+The plan in [`Cairn single node performance plan`](https://github.com/Harsh-2002/Cairn/blob/117dc8c/reports/Cairn%20single%20node%20performance%20plan.md) selected four
+small, independently reviewable changes before any structural decision:
+
+| Draft PR | Change | Mechanism |
+| --- | --- | --- |
+| [#127](https://github.com/Harsh-2002/Cairn/pull/127) | response-body completion metrics | distinguishes head latency/declared bytes from produced bytes and `complete`/`error`/`dropped` |
+| [#128](https://github.com/Harsh-2002/Cairn/pull/128) | probed-descriptor reuse | admits the read before the probe; serves the validated descriptor with positioned reads |
+| [#129](https://github.com/Harsh-2002/Cairn/pull/129) | prepared Writer statements | removes recompilation from storage-journal and ordinary PUT/multipart DML |
+| [#130](https://github.com/Harsh-2002/Cairn/pull/130) | demand-sized LIST batches | fetches remaining+1 rows instead of 1,025 for a small page |
+
+[#131](https://github.com/Harsh-2002/Cairn/pull/131) integrates the four for validation; every PR remains draft and unmerged.
+The full workspace gate passed on the integration head: `cargo fmt --all --check`, all-features Clippy,
+**1,541 workspace tests** (5 skipped), doctests and `docs_check.py`.
+
+A correctness smoke ran one 12-second 1-MiB PUT arm on the integration binary and three alternating
+main/integration pairs with the glibc sync probe, fresh stores, `CAIRN_META_SYNCHRONOUS=full`, one shard
+and zero linger. Every arm passed with zero errors. Three pairs are **not** adoption evidence: labelled
+by `variant` (the runner alternates order, so positional pairing is wrong), the ratios were 1.864, 0.539
+and 1.687 — geomean 1.192, 2/3 wins, far inside this host's measured noise. The probe confirms the
+expected parity: main and integration both intercept about the same calls per PUT once the full load
+window is used, so no mechanism change to durable write work is claimed. Compact evidence:
+[`performance-plan-integration-smoke-2026-10-27.json`](performance-evidence/2026-10/performance-plan-integration-smoke-2026-10-27.json).
+
+Two measurement traps are recorded rather than repeated: pair arms by `variant`/binary SHA, never by
+array position, and do not divide a full-load sync-probe count by Warp's narrower analyzed-operation
+count. The corrected October screen remains in
+[`performance-put-flush-screen-2026-10.md`](performance-put-flush-screen-2026-10.md).
