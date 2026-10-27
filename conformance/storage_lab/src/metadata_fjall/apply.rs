@@ -354,7 +354,7 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             multipart::remember_plan(view, &reservation_id, &plan)?;
             Ok(outcome)
         }
-        Mutation::PublishStorageWrite { plan, operation } => {
+        Mutation::PublishStorageWrite { plan, operation, .. } => {
             plan.validate_publication(&operation)?;
             if !journal::publication_allowed(view, &plan)? {
                 return Ok(MutationOutcome::StoragePublicationNotApplied);
