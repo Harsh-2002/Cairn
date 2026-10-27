@@ -964,6 +964,15 @@ async fn handle(
             ),
         };
         let status = resp.status();
+        // The request counters below describe the response head, not the bytes a client received:
+        // a lazily streamed object body can still fail, be dropped by the peer, or end early. Wrap
+        // S3/management bodies so the produced-bytes and completion outcome are observable too.
+        // Infrastructure responses keep their dedicated budget and are left untouched.
+        if !infra {
+            let route_label = classify_route(role, &path);
+            let (parts, body) = resp.into_parts();
+            resp = Response::from_parts(parts, measured_body(body, method.clone(), route_label));
+        }
         let elapsed_dur = start.elapsed();
         let elapsed = elapsed_dur.as_secs_f64();
         // A low-cardinality `route` label (ARCH 26): the request is bucketed into a small fixed set
@@ -1049,13 +1058,183 @@ async fn handle(
 }
 
 /// Read a `content-length` header as a byte count, or `0` when absent/unparseable. Used as the
-/// bounded-cost proxy for the throughput counters (the bodies themselves stream past unbuffered).
+/// bounded-cost proxy for the declared-byte counters (the bodies themselves stream past unbuffered).
 fn content_length(headers: &hyper::HeaderMap) -> u64 {
     headers
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+/// A response body that records what the transport was actually handed.
+///
+/// `cairn_request_duration_seconds` and `cairn_bytes_sent_total` are recorded when the response head
+/// is produced. An object GET streams afterwards, so its declared length is not proof that the body
+/// completed: the blob can fail mid-stream, or the peer can disconnect and drop the body. This
+/// wrapper records produced bytes, a head-to-completion duration, and one bounded outcome label, so
+/// a shorter-than-declared transfer is visible rather than silently counted as a full one.
+struct MeasuredBody {
+    inner: ResponseBody,
+    method: Method,
+    route: &'static str,
+    started: Instant,
+    bytes: u64,
+    finished: bool,
+}
+
+impl MeasuredBody {
+    fn finish(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let method = self.method.to_string();
+        metrics::counter!(
+            "cairn_response_body_completed_total",
+            "method" => method.clone(),
+            "route" => self.route,
+            "outcome" => outcome,
+        )
+        .increment(1);
+        metrics::counter!(
+            "cairn_response_body_bytes_total",
+            "method" => method.clone(),
+            "route" => self.route,
+        )
+        .increment(self.bytes);
+        metrics::histogram!(
+            "cairn_response_body_duration_seconds",
+            "method" => method,
+            "route" => self.route,
+        )
+        .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+impl Drop for MeasuredBody {
+    fn drop(&mut self) {
+        // A body that neither ended nor errored was dropped before completion — typically a client
+        // disconnect or a canceled connection. Record it explicitly instead of losing the sample.
+        self.finish("dropped");
+    }
+}
+
+impl hyper::body::Body for MeasuredBody {
+    type Data = Bytes;
+    type Error = cairn_types::error::BodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(data.len() as u64);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.finish("error");
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.finish("complete");
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn measured_body(inner: ResponseBody, method: Method, route: &'static str) -> ResponseBody {
+    use http_body_util::BodyExt;
+    MeasuredBody {
+        inner,
+        method,
+        route,
+        started: Instant::now(),
+        bytes: 0,
+        finished: false,
+    }
+    .boxed_unsync()
+}
+
+#[cfg(test)]
+mod measured_body_tests {
+    use super::*;
+    use hyper::body::Body as _;
+
+    fn poll_body(body: &mut MeasuredBody) -> (usize, u64) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut frames = 0;
+        let mut bytes = 0u64;
+        loop {
+            match std::pin::Pin::new(&mut *body).poll_frame(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    frames += 1;
+                    if let Some(data) = frame.data_ref() {
+                        bytes += data.len() as u64;
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    panic!("unexpected body error: {error}")
+                }
+                std::task::Poll::Ready(None) => break,
+                std::task::Poll::Pending => panic!("buffered test bodies must not be pending"),
+            }
+        }
+        (frames, bytes)
+    }
+
+    #[test]
+    fn counts_produced_bytes_and_marks_completion() {
+        let mut body = MeasuredBody {
+            inner: full_body(Bytes::from_static(b"hello world")),
+            method: Method::GET,
+            route: "object",
+            started: Instant::now(),
+            bytes: 0,
+            finished: false,
+        };
+        let (frames, bytes) = poll_body(&mut body);
+        assert_eq!(frames, 1);
+        assert_eq!(bytes, 11);
+        assert_eq!(body.bytes, 11);
+        assert!(body.finished, "end of stream marks the body complete");
+    }
+
+    #[test]
+    fn a_dropped_partial_body_is_not_reported_complete() {
+        let mut body = MeasuredBody {
+            inner: full_body(Bytes::from_static(b"hello world")),
+            method: Method::GET,
+            route: "object",
+            started: Instant::now(),
+            bytes: 0,
+            finished: false,
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first = std::pin::Pin::new(&mut body).poll_frame(&mut cx);
+        assert!(matches!(first, std::task::Poll::Ready(Some(Ok(_)))));
+        assert!(!body.finished, "one frame is not a completed response");
+        assert_eq!(body.bytes, 11);
+        drop(body);
+        // `Drop` records the dropped outcome; the assertion is that teardown neither panics nor
+        // treats an unfinished body as complete.
+    }
 }
 
 /// Bucket a request path into a small, fixed set of low-cardinality route classes for the metrics
