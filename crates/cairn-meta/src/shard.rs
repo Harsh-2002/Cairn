@@ -527,6 +527,42 @@ impl MetadataStore for ShardedMetadataStore {
                 self.shards[idx].submit(m).await
             }
 
+            // Activity is global (shard 0) while publication is per-bucket. Keep the co-commit on a
+            // single shard; with more than one, publish first and submit the best-effort activity
+            // to the global shard so it is never written into a bucket shard nobody reads.
+            Mutation::PublishStorageWrite {
+                plan,
+                operation,
+                index_spool,
+                activity,
+            } if activity.is_some() && self.shards.len() > 1 => {
+                let bucket = plan.bucket.clone();
+                let activity = activity.expect("guarded by is_some");
+                let outcome = self
+                    .for_bucket(bucket.as_str())
+                    .submit(Mutation::PublishStorageWrite {
+                        plan,
+                        operation,
+                        index_spool,
+                        activity: None,
+                    })
+                    .await?;
+                if matches!(
+                    &outcome,
+                    MutationOutcome::Put { .. }
+                        | MutationOutcome::PartRecorded { .. }
+                        | MutationOutcome::MultipartTerminal(
+                            cairn_types::meta::MultipartTerminalOutcome::Completed { .. }
+                        )
+                ) {
+                    let _ = self
+                        .global()
+                        .submit(Mutation::RecordActivity(activity))
+                        .await;
+                }
+                Ok(outcome)
+            }
+
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
             | Mutation::ResolveObjectWrite { .. }

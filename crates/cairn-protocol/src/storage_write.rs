@@ -2,7 +2,7 @@
 
 use cairn_types::blob::IndexSpoolState;
 use cairn_types::error::Error;
-use cairn_types::meta::Mutation;
+use cairn_types::meta::{ActivityEntry, Mutation};
 use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
 use cairn_types::storage::{
     PlannedStorageWrite, StorageAdmission, StorageCreationPermit, StorageToken, StorageWritePlan,
@@ -149,6 +149,7 @@ impl StorageWriteGuard {
         &self,
         operation: Mutation,
         index_spool: IndexSpoolState,
+        activity: Option<Box<ActivityEntry>>,
     ) -> Mutation {
         Mutation::PublishStorageWrite {
             plan: Box::new(
@@ -160,6 +161,7 @@ impl StorageWriteGuard {
             ),
             operation: Box::new(operation),
             index_spool,
+            activity,
         }
     }
 

@@ -1152,6 +1152,15 @@ impl S3Service {
                     replication,
                 },
                 staged.index_spool,
+                Some(Box::new(self.activity_entry(
+                    "PutObject",
+                    bucket.name.as_str(),
+                    Some(key.as_str()),
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    req.principal.as_ref(),
+                    now,
+                ))),
             ))
             .await;
         if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
@@ -1182,20 +1191,6 @@ impl S3Service {
                 )
                 .await;
                 if let Some(timer) = notification_timer {
-                    timer.complete();
-                }
-                // Audit the mutation (ARCH 26.3, best-effort).
-                let audit_timer = sampled.then(|| self.put_timings.start(PutStage::Audit));
-                self.audit(
-                    "PutObject",
-                    bucket.name.as_str(),
-                    Some(key.as_str()),
-                    Some(staged.size_logical),
-                    Some(staged.etag.as_str()),
-                    req.principal.as_ref(),
-                )
-                .await;
-                if let Some(timer) = audit_timer {
                     timer.complete();
                 }
                 let mut resp = S3Response::status(StatusCode::OK)
@@ -2023,6 +2018,7 @@ impl S3Service {
                     part,
                 },
                 staged.index_spool,
+                None,
             ))
             .await
         {
@@ -2244,6 +2240,7 @@ impl S3Service {
                     part,
                 },
                 staged.index_spool,
+                None,
             ))
             .await
         {
@@ -2728,6 +2725,7 @@ impl S3Service {
                     replication,
                 },
                 staged.index_spool,
+                None,
             ))
             .await
         {
@@ -3262,6 +3260,7 @@ impl S3Service {
                     replication,
                 },
                 staged.index_spool,
+                None,
             ))
             .await
         {
@@ -4930,6 +4929,32 @@ impl S3Service {
     /// actor", which may legitimately be anonymous). Never bind the principal via a fallible
     /// `require_principal(..)?` around this: an anonymous-permitted mutation carries no principal,
     /// and failing the request for a missing actor would break the very write policy just allowed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the audit identity fields it shares with audit()"
+    )]
+    fn activity_entry(
+        &self,
+        action: &str,
+        bucket: &str,
+        key: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+        principal: Option<&Principal>,
+        at: cairn_types::time::Timestamp,
+    ) -> cairn_types::meta::ActivityEntry {
+        cairn_types::meta::ActivityEntry {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            action: action.to_owned(),
+            bucket: Some(bucket.to_owned()),
+            key: key.map(str::to_owned),
+            size,
+            etag: etag.map(|e| e.trim_matches('"').to_owned()),
+            actor: principal.map(|p| p.access_key_id.clone()),
+            at,
+        }
+    }
+
     async fn audit(
         &self,
         action: &str,
@@ -4939,16 +4964,8 @@ impl S3Service {
         etag: Option<&str>,
         principal: Option<&Principal>,
     ) {
-        let entry = cairn_types::meta::ActivityEntry {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            action: action.to_owned(),
-            bucket: Some(bucket.to_owned()),
-            key: key.map(str::to_owned),
-            size,
-            etag: etag.map(|e| e.trim_matches('"').to_owned()),
-            actor: principal.map(|p| p.access_key_id.clone()),
-            at: self.clock.now(),
-        };
+        let entry =
+            self.activity_entry(action, bucket, key, size, etag, principal, self.clock.now());
         let _ = self
             .meta
             .submit(cairn_types::meta::Mutation::RecordActivity(Box::new(entry)))

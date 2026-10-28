@@ -252,6 +252,7 @@ impl PublicationFixture {
             plan: Box::new(plan),
             operation: Box::new(operation),
             index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
     }
 }

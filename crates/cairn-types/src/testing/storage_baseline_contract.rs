@@ -488,6 +488,7 @@ pub async fn assert_storage_baseline_authority(meta: &dyn MetadataStore) {
                 plan: Box::new(plan.plan().clone()),
                 operation: Box::new(put(row)),
                 index_spool: crate::blob::IndexSpoolState::Materialized,
+                activity: None,
             })
             .await
             .unwrap();

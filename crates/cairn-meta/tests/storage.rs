@@ -126,3 +126,21 @@ async fn sharded_unused_index_spool_is_not_retired() {
     let store = cairn_meta::ShardedMetadataStore::new(shards);
     cairn_types::testing::assert_unused_index_spool_is_not_retired(&store).await;
 }
+
+#[tokio::test]
+async fn sqlite_publication_co_commits_activity() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    cairn_types::testing::assert_publication_co_commits_activity(&store).await;
+}
+
+#[tokio::test]
+async fn sharded_publication_co_commits_activity() {
+    use std::sync::Arc;
+    let shards = (0..4)
+        .map(|_| {
+            Arc::new(cairn_meta::open_in_memory().unwrap()) as Arc<dyn cairn_types::MetadataStore>
+        })
+        .collect();
+    let store = cairn_meta::ShardedMetadataStore::new(shards);
+    cairn_types::testing::assert_publication_co_commits_activity(&store).await;
+}

@@ -358,6 +358,7 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             plan,
             operation,
             index_spool,
+            ..
         } => {
             plan.validate_publication(&operation)?;
             if !journal::publication_allowed(view, &plan)? {

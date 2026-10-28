@@ -75,6 +75,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             plan,
             operation,
             index_spool,
+            activity,
         } => {
             plan.validate_publication(&operation)?;
             if !crate::storage::owns_publication(conn, &plan)? {
@@ -90,6 +91,20 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     )
             ) {
                 crate::storage::consume_published(conn, &plan, index_spool)?;
+                // A retried or duplicate activity id is the only failure that leaves the
+                // publication intact: the row already exists, so the audit intent is satisfied.
+                // Any other error can have aborted the enclosing transaction or be a real capacity
+                // failure, so it must fail the publication instead of acknowledging an object from
+                // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
+                if let Some(entry) = activity {
+                    match insert_activity(conn, &entry) {
+                        Ok(()) => {}
+                        Err(cairn_types::MetaError::Conflict) => {
+                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
             Ok(outcome)
         }
@@ -1528,22 +1543,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::RecordActivity(e) => {
-            conn.prepare_cached(
-                "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            )
-            .map_err(engine_err)?
-            .execute(params![
-                e.id,
-                e.action,
-                e.bucket,
-                e.key,
-                e.size.map(|s| s as i64),
-                e.etag,
-                e.actor,
-                e.at.0
-            ])
-            .map_err(engine_err)?;
+            insert_activity(conn, &e)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateShare(s) => {
@@ -3251,6 +3251,26 @@ fn owns_replication_claim(
         "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
         params![id, token.as_str(), now.0], |row| row.get(0),
     ).map_err(engine_err)
+}
+
+fn insert_activity(conn: &Connection, entry: &cairn_types::meta::ActivityEntry) -> R<()> {
+    conn.prepare_cached(
+        "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+    )
+    .map_err(engine_err)?
+    .execute(params![
+        entry.id,
+        entry.action,
+        entry.bucket,
+        entry.key,
+        entry.size.map(|s| s as i64),
+        entry.etag,
+        entry.actor,
+        entry.at.0
+    ])
+    .map_err(engine_err)?;
+    Ok(())
 }
 
 #[cfg(test)]

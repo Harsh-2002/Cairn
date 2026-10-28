@@ -1403,6 +1403,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_unconsumed_cleanup_result_releases_its_descriptors_and_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let path = StoragePath::from_string("bucket/ab/object".into());
+        let absolute = root.path().join(path.as_str());
+        std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        std::fs::write(&absolute, b"debt").unwrap();
+
+        // The blocking unlink completes, but the caller is cancelled before it consumes the
+        // result. Dropping the completed value must release its directory/file descriptors and
+        // leave the debt claim retryable: the name is absent and no barrier was faked.
+        let root_path = root.path().to_path_buf();
+        let unlink_path = path.clone();
+        let completed =
+            tokio::task::spawn_blocking(move || cleanup_unlink(&root_path, &unlink_path))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!absolute.exists(), "the exact unlink removed the name");
+        drop(completed);
+
+        // Retry: exact absence, then the caller-owned barrier and prune.
+        let root_path = root.path().to_path_buf();
+        let retry = tokio::task::spawn_blocking(move || cleanup_unlink(&root_path, &path))
+            .await
+            .unwrap()
+            .unwrap();
+        retry.parent().sync_all().unwrap();
+        cleanup_prune(retry).unwrap();
+        assert!(!root.path().join("bucket").exists());
+    }
+
     #[cfg(feature = "failpoints")]
     #[tokio::test]
     async fn unlink_without_namespace_sync_is_retryable_even_when_the_name_is_absent() {
