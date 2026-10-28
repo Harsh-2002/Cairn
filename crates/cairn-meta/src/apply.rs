@@ -71,7 +71,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 )),
             }
         }
-        Mutation::PublishStorageWrite { plan, operation } => {
+        Mutation::PublishStorageWrite {
+            plan,
+            operation,
+            index_spool,
+        } => {
             plan.validate_publication(&operation)?;
             if !crate::storage::owns_publication(conn, &plan)? {
                 return Ok(MutationOutcome::StoragePublicationNotApplied);
@@ -85,7 +89,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                         MultipartTerminalOutcome::Completed { .. }
                     )
             ) {
-                crate::storage::consume_published(conn, &plan)?;
+                crate::storage::consume_published(conn, &plan, index_spool)?;
             }
             Ok(outcome)
         }

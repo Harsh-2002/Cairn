@@ -251,6 +251,7 @@ impl PublicationFixture {
         Ok(Mutation::PublishStorageWrite {
             plan: Box::new(plan),
             operation: Box::new(operation),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
     }
 }

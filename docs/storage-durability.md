@@ -59,10 +59,15 @@ startup recovery. A timeout or a lost acknowledgement is never evidence that byt
 Cleanup uses exact Writer claims bound to a generation, claim token and expiry. Claims recheck
 that no authoritative reference or active intent owns the path. The blob layer rejects a still
 locked file, unlinks only the claimed filename, synchronizes its directory, and prunes only empty
-supported parents with parent synchronization. Already-absent names still require a namespace
-barrier. The Writer retires debt and associated quota only after durable absence and a matching,
-unexpired acknowledgement. Unknown siblings survive; filesystem errors and stale acknowledgements
-retain debt. Request abort and multipart termination do not authorize recursive session deletion.
+supported parents with parent synchronization. Concurrent claims whose paths share a directory
+complete one coalesced absence barrier, so each claim still waits for a full directory sync
+without issuing its own. Already-absent names still require a namespace barrier. The one
+exception is the optional index-spool alias: live publication states whether the write ever
+opened it, and a write that never did created no name to retire. Recovery always treats that
+alias as materialized because it cannot know. The Writer retires debt and associated quota only
+after durable absence and a matching, unexpired acknowledgement. Unknown siblings survive;
+filesystem errors and stale acknowledgements retain debt. Request abort and multipart termination
+do not authorize recursive session deletion.
 
 When multipart termination or replacement attaches quota debt to an already-claimed scratch alias,
 the Writer invalidates that obsolete claim and its lease in the same savepoint. A fresh claim may
@@ -226,8 +231,10 @@ indexes spill to a buffered temporary file on the data filesystem at the exact i
 already included in admission. Creation uses the anchored namespace and locks the file; the create
 job unlinks only that newly created inode before returning its leased file owner. Queued writes,
 reads and returned buffers retain that owner after request cancellation. A crash before unlink or
-before its namespace barrier can leave or restore the alias, so publication/recovery records exact
-cleanup even when the spool name appears absent. Full scans protect that debt until its claimed
+before its namespace barrier can leave or restore the alias, so publication or recovery records
+exact cleanup even when the spool name appears absent. The one exception is a live write that
+reports it never opened the alias: no name was ever created, so there is nothing to retire and
+recovery still assumes the conservative state. Full scans protect both cases until a claimed
 cleanup proves durable absence. The spool is flushed and copied in 64-KiB batches into the final blob, followed by its unchanged MAC and trailer, **before** that
 blob's existing file-sync/rename/directory-sync sequence. Scratch data has no separate fsync or
 committed sidecar. Errors, including ENOSPC during spool flush/copy, abort publication.

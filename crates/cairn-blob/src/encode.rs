@@ -8,7 +8,9 @@ use crate::namespace::AnchoredPath;
 use crate::owned_file::{FileOwner, OwnedFile};
 use crate::staging::Staging;
 use cairn_types::storage::io::StorageIoLease;
-use cairn_types::{SecretKey32, bucket::CompressionPolicy, error::BlobError};
+use cairn_types::{
+    SecretKey32, blob::IndexSpoolState, bucket::CompressionPolicy, error::BlobError,
+};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 const BATCH_BYTES: usize = 64 * 1024;
@@ -126,13 +128,26 @@ impl StagedEncoder {
         Ok(physical)
     }
 
-    pub(crate) async fn finish(mut self, sink: &mut Staging) -> Result<u64, BlobError> {
+    pub(crate) async fn finish(
+        mut self,
+        sink: &mut Staging,
+    ) -> Result<(u64, IndexSpoolState), BlobError> {
         let tail = self.encoder.finish_parts()?;
+        // The final partial block can be the append that spills the buffered index, so the state
+        // must be sampled after this append, never before it.
         self.index.append(&tail.index).await?;
+        let index_spool = if self.index.file.is_some() {
+            IndexSpoolState::Materialized
+        } else {
+            IndexSpoolState::NeverCreated
+        };
         sink.write_all(&tail.payload).await?;
         let index_len = self.index.append_to(sink).await?;
         sink.write_all(&tail.footer).await?;
-        Ok(tail.payload.len() as u64 + index_len + tail.footer.len() as u64)
+        Ok((
+            tail.payload.len() as u64 + index_len + tail.footer.len() as u64,
+            index_spool,
+        ))
     }
 }
 
@@ -294,6 +309,36 @@ mod tests {
         sink.abort().await;
     }
 
+    /// The last partial block is appended inside `finish`, so a spool that stays buffered through
+    /// `feed` can still be materialized by that final append. Sampling the state before it would
+    /// report `NeverCreated` for a name that exists.
+    #[tokio::test]
+    async fn final_partial_block_materializes_the_index_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CompressionPolicy {
+            algorithm: CompressionAlgorithm::Zstd,
+            block_size: 1024,
+        };
+        // 7,281 full blocks fill the 64-KiB index buffer to 65,529 bytes; one final byte adds the
+        // entry that spills it.
+        let data = vec![42; 7_281 * 1024 + 1];
+        let path = dir.path().join("output.tmp");
+        let mut sink = sink(&path).await;
+        let mut encoder = StagedEncoder::new(
+            policy,
+            None,
+            AnchoredPath::fixture(&dir.path().join("encoding.index.tmp")),
+            test_lease(),
+        );
+        encoder.feed(&data, &mut sink).await.unwrap();
+        assert!(
+            encoder.index.file.is_none(),
+            "the buffered index must not have spilled yet"
+        );
+        let (_, index_spool) = encoder.finish(&mut sink).await.unwrap();
+        assert_eq!(index_spool, IndexSpoolState::Materialized);
+    }
+
     #[tokio::test]
     async fn encoded_spill_roundtrips_large_caller_chunk_and_final_partial_block() {
         use aes_gcm::aead::KeyInit;
@@ -322,7 +367,9 @@ mod tests {
             let physical = encoder.feed(&data, &mut sink).await.unwrap();
             assert!(encoder.index.file.is_some());
             assert!(encoder.encoder.take_index().is_empty());
-            let physical = physical + encoder.finish(&mut sink).await.unwrap();
+            let (tail, index_spool) = encoder.finish(&mut sink).await.unwrap();
+            assert_eq!(index_spool, IndexSpoolState::Materialized);
+            let physical = physical + tail;
             sink.fsync_in_place().await.unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().len(), physical);
             let mut reader = CompressedReader::open_with_dek(

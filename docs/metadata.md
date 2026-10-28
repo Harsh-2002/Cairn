@@ -132,7 +132,7 @@ An absent, stale or cancelled owner returns `StoragePublicationNotApplied`. Dire
 `PutObjectVersion`, `RecordPart` and `CompleteMultipart` mutations are rejected. The accepted
 publication preserves the original preconditions, tags, Object Lock and outbox behavior; its
 savepoint commits those effects, consumes the intent and records cleanup for unreferenced planned
-paths. Replacement and deletion record cleanup debt in the same savepoint as removing a live
+paths, except an index-spool alias the caller reports it never opened. Replacement and deletion record cleanup debt in the same savepoint as removing a live
 reference. Returned superseded paths are descriptive outcomes, not authority for direct unlink.
 A late failure rolls back publication, intent consumption and cleanup changes together.
 

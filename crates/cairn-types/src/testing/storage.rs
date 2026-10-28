@@ -5,8 +5,8 @@ use crate::MetaError;
 use crate::id::{BucketName, StoragePath};
 use crate::meta::MutationOutcome;
 use crate::storage::{
-    StorageAdmission, StorageCleanup, StorageMutation, StorageToken, StorageWritePlan,
-    StorageWriteTarget,
+    StorageAdmission, StorageCleanup, StorageMutation, StoragePathRole, StorageToken,
+    StorageWritePlan, StorageWriteTarget,
 };
 use crate::storage_baseline::*;
 use crate::time::Timestamp;
@@ -97,7 +97,12 @@ pub(super) fn apply(
             let applied = if journal.baseline.generation.as_ref() == Some(quiescence.generation())
                 && let Some(plan) = plan
             {
-                resolve(st, &mut journal, &plan)?;
+                resolve(
+                    st,
+                    &mut journal,
+                    &plan,
+                    crate::blob::IndexSpoolState::Materialized,
+                )?;
                 true
             } else {
                 false
@@ -119,7 +124,12 @@ pub(super) fn apply(
                 && &current_generation != quiescence.generation()
                 && let Some(plan) = plan
             {
-                resolve(st, &mut journal, &plan)?;
+                resolve(
+                    st,
+                    &mut journal,
+                    &plan,
+                    crate::blob::IndexSpoolState::Materialized,
+                )?;
                 true
             } else {
                 false
@@ -174,9 +184,13 @@ pub(super) fn discard_unacknowledged(st: &mut State, plan: &StorageWritePlan) {
     st.storage.intents.remove(&plan.attempt);
 }
 
-pub(super) fn consume_published(st: &mut State, plan: &StorageWritePlan) -> R<()> {
+pub(super) fn consume_published(
+    st: &mut State,
+    plan: &StorageWritePlan,
+    index_spool: crate::blob::IndexSpoolState,
+) -> R<()> {
     let mut journal = st.storage.clone();
-    resolve(st, &mut journal, plan)?;
+    resolve(st, &mut journal, plan, index_spool)?;
     st.storage = journal;
     Ok(())
 }
@@ -319,7 +333,12 @@ fn create_quota_debt(
     Ok(id)
 }
 
-fn resolve(st: &mut State, journal: &mut Journal, plan: &StorageWritePlan) -> R<()> {
+fn resolve(
+    st: &mut State,
+    journal: &mut Journal,
+    plan: &StorageWritePlan,
+    index_spool: crate::blob::IndexSpoolState,
+) -> R<()> {
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().cloned())
         .transpose()?;
@@ -373,6 +392,13 @@ fn resolve(st: &mut State, journal: &mut Journal, plan: &StorageWritePlan) -> R<
         None
     };
     for path in &plan.paths {
+        // A write that never opened the index spool created no name, so its absence owes no
+        // namespace barrier. Recovery keeps the conservative `Materialized` state.
+        if path.role == StoragePathRole::IndexSpool
+            && index_spool == crate::blob::IndexSpoolState::NeverCreated
+        {
+            continue;
+        }
         if !referenced(st, &path.path) {
             enqueue_owned(
                 journal,

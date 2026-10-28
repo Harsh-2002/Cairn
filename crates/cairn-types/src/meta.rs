@@ -128,6 +128,10 @@ pub enum Mutation {
     PublishStorageWrite {
         plan: Box<crate::storage::StorageWritePlan>,
         operation: Box<Mutation>,
+        /// Whether the caller materialized the planned index-spool alias. A write that never
+        /// opened it owes no namespace barrier for that name; recovery always passes
+        /// [`crate::blob::IndexSpoolState::Materialized`] because it cannot know.
+        index_spool: crate::blob::IndexSpoolState,
     },
     /// Read a bounded page of prior-generation intents through the Writer. This does not resolve
     /// ownership: exclusive restart must probe each plan's actual backend quiescence first.

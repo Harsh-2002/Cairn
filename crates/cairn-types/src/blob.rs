@@ -105,6 +105,20 @@ impl Default for StageOptions {
     }
 }
 
+/// Whether a write materialized its planned index-spool scratch alias.
+///
+/// The alias is only opened when the block encoder spills its index to disk, and it is unlinked
+/// immediately after creation. An unencoded write never opens it, so its name never existed and
+/// no namespace barrier is owed. A materialized alias leaves no directory entry either, but its
+/// absence still needs a directory barrier before cleanup debt can be retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexSpoolState {
+    /// The alias was never opened; nothing was created and nothing needs a barrier.
+    NeverCreated,
+    /// The alias was created and unlinked; its absence needs a directory barrier.
+    Materialized,
+}
+
 /// The result of staging a durable blob. The caller validates the computed hashes against
 /// any client-supplied checksums; the blob store does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +139,8 @@ pub struct StagedBlob {
     pub checksums: Vec<ChecksumValue>,
     /// How the blob was physically stored.
     pub compression: CompressionDescriptor,
+    /// Whether this write created the planned index-spool alias.
+    pub index_spool: IndexSpoolState,
 }
 
 /// The result of staging one multipart part.
@@ -141,6 +157,8 @@ pub struct StagedPart {
     /// validates these against any client-supplied `x-amz-checksum-*` header and persists the
     /// per-part value for later composite/full-object composition at CompleteMultipartUpload.
     pub checksums: Vec<ChecksumValue>,
+    /// Whether this part write created the planned index-spool alias.
+    pub index_spool: IndexSpoolState,
 }
 
 /// A reference to one part during assembly, in part-number order.

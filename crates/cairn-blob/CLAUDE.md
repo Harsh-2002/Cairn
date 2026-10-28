@@ -70,11 +70,13 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   Leases retain the bounded recovery slot and exclusive node lifetime. Recovery waits for lease
   quiescence and probes exact file locks before resolving intent; a timeout is not quiescence.
 - **Reclamation uses exact Writer claims.** Publication and resolution preserve live references
-  and enqueue unreferenced aliases/superseded paths as durable debt. `cleanup_storage` requires the
-  matching claim and lease, acquires the file lock, unlinks only that path and synchronizes its
-  directory, including when the name is already absent. It prunes only empty supported parents and
-  synchronizes their parents. Debt/quota retirement validates generation, token and expiry after
-  durable absence. The raw `delete`, `delete_part_attempt` and recursive `delete_session` APIs
+  and enqueue unreferenced aliases/superseded paths as durable debt, except an index-spool alias a
+  live write reports it never opened (`IndexSpoolState::NeverCreated`); recovery always treats that
+  alias as materialized because it cannot know. `cleanup_storage` requires the matching claim and
+  lease, acquires the file lock, unlinks only that path, then completes its directory's absence
+  barrier through the shared `DirSyncCoalescer`, so concurrent claims in one directory share one
+  fsync. It prunes only empty supported parents and synchronizes their parents. Debt/quota
+  retirement validates generation, token and expiry after durable absence. The raw `delete`, `delete_part_attempt` and recursive `delete_session` APIs
   are removed; do not reintroduce an unleased or unclaimed physical deletion seam. Errors and
   ambiguous acknowledgements retain ownership/debt.
 - **Store construction requires a maintenance lease.** `LocalBlobStore::open(root, lease)` runs

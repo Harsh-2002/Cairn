@@ -1,11 +1,12 @@
 //! The same exact admission/cleanup contract runs against every metadata backend and shard router.
 
+use crate::blob::IndexSpoolState;
 use crate::id::{BucketName, ObjectKey, UserId, VersionId};
 use crate::meta::{Mutation, MutationOutcome};
 use crate::storage::io::StorageIoWatch;
 use crate::storage::{
-    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StorageToken,
-    StorageWriteTarget,
+    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StoragePathRole,
+    StorageToken, StorageWriteTarget,
 };
 use crate::{Bucket, MetadataStore, OwnershipMode, Timestamp, VersioningState};
 use std::sync::Arc;
@@ -413,6 +414,7 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     let publication = Mutation::PublishStorageWrite {
         plan: Box::new(plan.clone()),
         operation: Box::new(put(row.clone())),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
     };
     assert_eq!(
         meta.submit(publication.clone()).await.unwrap(),
@@ -428,7 +430,8 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(plan.clone()),
-            operation: Box::new(put(wrong))
+            operation: Box::new(put(wrong)),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
         .await
         .is_err()
@@ -436,7 +439,8 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(plan.clone()),
-            operation: Box::new(publication.clone())
+            operation: Box::new(publication.clone()),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
         .await
         .is_err()
@@ -478,7 +482,8 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(next.clone()),
-            operation: Box::new(conditional)
+            operation: Box::new(conditional),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
         .await
         .is_err()
@@ -487,7 +492,8 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(matches!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(next.clone()),
-            operation: Box::new(put(row))
+            operation: Box::new(put(row)),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
         .await
         .unwrap(),
@@ -646,6 +652,7 @@ pub(super) fn publish_part(plan: &crate::storage::StorageWritePlan) -> Mutation 
                 part_dek: None,
             },
         }),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
     }
 }
 
@@ -673,6 +680,7 @@ pub async fn assert_prepare_storage_restore(meta: &dyn MetadataStore) {
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(object.plan().clone()),
             operation: Box::new(put(row.clone())),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
         })
         .await
         .unwrap(),
@@ -1052,6 +1060,7 @@ fn publish_completion(plan: &crate::storage::StorageWritePlan, owner: UserId) ->
             precondition: Default::default(),
             replication: Vec::new(),
         }),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
     }
 }
 
@@ -1188,11 +1197,66 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
     assert!(claim(meta, &generation, 100, 4).await.is_empty());
 }
 
+/// A live write reports whether it opened the planned index-spool alias. A write that never
+/// opened it created no name, so only the renamed temporary alias is retired; recovery keeps the
+/// conservative behaviour exercised by `assert_storage_journal`.
+pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-spool-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let owner = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let planned = plan(&bucket, &generation);
+    let plan = planned.plan();
+    admit_object(meta, plan).await;
+    let row = object_row(plan, owner);
+    let outcome = meta
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan.clone()),
+            operation: Box::new(put(row)),
+            index_spool: IndexSpoolState::NeverCreated,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Put { .. }));
+
+    let temporary = plan
+        .paths
+        .iter()
+        .find(|path| path.role == StoragePathRole::Temporary)
+        .expect("temporary alias");
+    let spool = plan
+        .paths
+        .iter()
+        .find(|path| path.role == StoragePathRole::IndexSpool)
+        .expect("index-spool alias");
+    let claimed = claim(meta, &generation, 100, 0).await;
+    assert_eq!(
+        claimed.len(),
+        1,
+        "a write that never opened the index spool owes no barrier for it"
+    );
+    assert_eq!(claimed[0].path, temporary.path);
+    assert_ne!(claimed[0].path, spool.path);
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn in_memory_prepare_storage_restore_contract() {
         super::assert_prepare_storage_restore(&crate::testing::InMemoryMetadataStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_unused_index_spool_is_not_retired() {
+        super::assert_unused_index_spool_is_not_retired(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
     }
 
     #[tokio::test]
