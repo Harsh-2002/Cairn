@@ -890,7 +890,7 @@ mod tests {
             account_bpa: PublicAccessBlock::default(),
             bucket_bpa: PublicAccessBlock::default(),
             policy: None,
-            user_policy: Some(policy),
+            user_policy: Some(std::sync::Arc::new(policy)),
             bucket_acl: None,
             object_acl: None,
             ownership_mode: OwnershipMode::BucketOwnerEnforced,

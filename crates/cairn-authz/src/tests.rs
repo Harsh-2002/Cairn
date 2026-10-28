@@ -167,7 +167,10 @@ fn session_not_widened_by_parent_user_acl() {
 fn session_governed_by_its_own_policy_and_explicit_deny_still_binds() {
     // (a) The session's own scoped policy grants -> Allow (guards against over-restricting).
     let mut i = session_input();
-    i.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    i.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Allow,
+        "s3:GetObject",
+    )])));
     assert_eq!(evaluate(&i), Decision::Allow);
     // (b) An explicit bucket-policy Deny naming the parent still binds the session even though its
     //     own policy grants — fail-closed is intact for sessions.
@@ -226,7 +229,10 @@ fn deny_with_string_not_equals_on_absent_key_denies() {
 fn user_policy_grants_member_scoped_get_not_put() {
     let mut input = base_input();
     input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
-    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    input.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Allow,
+        "s3:GetObject",
+    )])));
     // The identity policy grants GetObject...
     input.action = Action::GetObject;
     assert_eq!(evaluate(&input), Decision::Allow);
@@ -245,7 +251,10 @@ fn user_policy_deny_overrides_bucket_allow() {
         vec![],
     )]));
     // ...but the user's identity policy explicitly Denies it — explicit Deny wins.
-    input.user_policy = Some(policy(vec![user_stmt(Effect::Deny, "s3:GetObject")]));
+    input.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Deny,
+        "s3:GetObject",
+    )])));
     input.action = Action::GetObject;
     assert_eq!(
         evaluate(&input),
@@ -267,7 +276,10 @@ fn user_policy_deny_binds_owner() {
     // An identity Deny binds even an owner/admin acting as themselves (AWS semantics).
     let mut input = base_input();
     input.requester = RequesterClass::OwnerOrAdmin(uid("owner"));
-    input.user_policy = Some(policy(vec![user_stmt(Effect::Deny, "s3:GetObject")]));
+    input.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Deny,
+        "s3:GetObject",
+    )])));
     input.action = Action::GetObject;
     assert_eq!(
         evaluate(&input),
@@ -284,7 +296,10 @@ fn union_of_bucket_and_identity_grants() {
         PrincipalSpec::Users(vec![uid("alice")]),
         vec![],
     )]));
-    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:PutObject")]));
+    input.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Allow,
+        "s3:PutObject",
+    )])));
     // The union grants both; an action neither grants is denied.
     input.action = Action::GetObject;
     assert_eq!(evaluate(&input), Decision::Allow);
@@ -315,7 +330,10 @@ fn user_policy_grant_survives_block_public_access() {
         Decision::Deny(DenyReason::BlockPublicAccess)
     );
     // An identity grant is never public, so it survives BPA → allow.
-    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    input.user_policy = Some(std::sync::Arc::new(policy(vec![user_stmt(
+        Effect::Allow,
+        "s3:GetObject",
+    )])));
     assert_eq!(evaluate(&input), Decision::Allow);
 }
 

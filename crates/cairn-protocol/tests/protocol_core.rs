@@ -308,7 +308,9 @@ fn member(user: &str) -> Principal {
 
 fn member_with_policy(user: &str, policy: &str) -> Principal {
     let mut principal = member(user);
-    principal.user_policy = Some(Box::new(cairn_authz::parse_user_policy(policy).unwrap()));
+    principal.user_policy = Some(std::sync::Arc::new(
+        cairn_authz::parse_user_policy(policy).unwrap(),
+    ));
     principal
 }
 
@@ -10859,7 +10861,7 @@ async fn bulk_delete_replica_marker_cannot_bypass_replication_action_policy() {
     );
 
     let mut denied_admin = admin();
-    denied_admin.user_policy = Some(Box::new(
+    denied_admin.user_policy = Some(std::sync::Arc::new(
         cairn_authz::parse_user_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ReplicateDelete","Resource":"arn:aws:s3:::replbulk/*"}]}"#,
         )
@@ -13935,7 +13937,7 @@ async fn no_webhook_config_emits_nothing() {
 
 /// A session principal for `user` carrying an optional scoped policy (always least-privilege:
 /// Member role, `is_session = true`).
-fn session_of(user: &str, policy: Option<Box<cairn_types::authz::Policy>>) -> Principal {
+fn session_of(user: &str, policy: Option<std::sync::Arc<cairn_types::authz::Policy>>) -> Principal {
     Principal {
         user_id: UserId(user.to_owned()),
         display_name: user.to_owned(),
@@ -14032,7 +14034,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped.clone()))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped.clone()))),
                     ),
                 )
                 .await,
@@ -14054,7 +14056,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped.clone()))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped.clone()))),
                     ),
                 )
                 .await,
@@ -14076,7 +14078,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped))),
                     ),
                 )
                 .await,
@@ -14160,7 +14162,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
     );
 
     let mut admin_deny = admin();
-    admin_deny.user_policy = Some(Box::new(
+    admin_deny.user_policy = Some(std::sync::Arc::new(
         cairn_authz::parse_user_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::admin-denied-create"}]}"#,
         )
@@ -14311,7 +14313,7 @@ async fn session_does_not_inherit_owner_bypass() {
                 &[],
                 &[],
                 vec![],
-                session_of("owner", Some(Box::new(policy))),
+                session_of("owner", Some(std::sync::Arc::new(policy))),
             ),
         )
         .await,
