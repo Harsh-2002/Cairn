@@ -997,13 +997,13 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
         let name = name.as_str().to_owned();
         self.with_read(move |conn| {
-            conn.query_row(
-                "SELECT * FROM buckets WHERE name=?1",
-                params![name],
-                model::bucket_from_row,
-            )
-            .optional()
-            .map_err(engine_err)
+            // Hot on every authenticated request: a cached statement avoids re-parsing the bucket
+            // row projection (and re-mapping its column names) per request.
+            conn.prepare_cached("SELECT * FROM buckets WHERE name=?1")
+                .map_err(engine_err)?
+                .query_row(params![name], model::bucket_from_row)
+                .optional()
+                .map_err(engine_err)
         })
         .await
     }
@@ -1036,14 +1036,14 @@ impl MetadataStore for SqliteMetadataStore {
         let name = name.as_str().to_owned();
         let aspect = crate::apply::aspect_str(aspect);
         self.with_read(move |conn| {
-            conn.query_row(
-                "SELECT doc FROM bucket_config WHERE bucket_name=?1 AND aspect=?2",
-                params![name, aspect],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(engine_err)
-            .map(|o| o.map(ConfigDoc))
+            // Authorization reads several aspects per request; re-preparing this projection every
+            // time was a measurable share of GET CPU.
+            conn.prepare_cached("SELECT doc FROM bucket_config WHERE bucket_name=?1 AND aspect=?2")
+                .map_err(engine_err)?
+                .query_row(params![name, aspect], |r| r.get::<_, String>(0))
+                .optional()
+                .map_err(engine_err)
+                .map(|o| o.map(ConfigDoc))
         })
         .await
     }
@@ -1051,11 +1051,9 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         self.with_read(move |conn| {
             let v: Option<String> = conn
-                .query_row(
-                    "SELECT v FROM account_config WHERE k='public_access_block'",
-                    [],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT v FROM account_config WHERE k='public_access_block'")
+                .map_err(engine_err)?
+                .query_row([], |r| r.get(0))
                 .optional()
                 .map_err(engine_err)?;
             // Fail CLOSED on a present-but-unparseable value: the all-false default disables every
@@ -1079,11 +1077,9 @@ impl MetadataStore for SqliteMetadataStore {
             // `quota_bytes` is a nullable column added in migration v2; the outer `Option`
             // distinguishes "no such bucket", the inner `Option` distinguishes "no quota set".
             let quota: Option<Option<i64>> = conn
-                .query_row(
-                    "SELECT quota_bytes FROM buckets WHERE name=?1",
-                    params![name],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT quota_bytes FROM buckets WHERE name=?1")
+                .map_err(engine_err)?
+                .query_row(params![name], |r| r.get(0))
                 .optional()
                 .map_err(engine_err)?;
             // Both "no such bucket" and "quota NULL" present to the reader as "no quota". A stored
@@ -1122,11 +1118,11 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<Option<ObjectVersionRow>, MetaError> {
         let (b, k) = (bucket.as_str().to_owned(), key.as_str().to_owned());
         self.with_read(move |conn| {
-            conn.query_row(
+            conn.prepare_cached(
                 "SELECT * FROM object_versions WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
-                params![b, k],
-                model::object_version_from_row,
             )
+            .map_err(engine_err)?
+            .query_row(params![b, k], model::object_version_from_row)
             .optional()
             .map_err(engine_err)
         })
@@ -1145,11 +1141,11 @@ impl MetadataStore for SqliteMetadataStore {
             version.as_str().to_owned(),
         );
         self.with_read(move |conn| {
-            conn.query_row(
+            conn.prepare_cached(
                 "SELECT * FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-                params![b, k, v],
-                model::object_version_from_row,
             )
+            .map_err(engine_err)?
+            .query_row(params![b, k, v], model::object_version_from_row)
             .optional()
             .map_err(engine_err)
         })
