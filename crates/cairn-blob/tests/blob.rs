@@ -107,7 +107,10 @@ async fn raw_stream_reuses_the_probed_descriptor_after_path_replacement() {
         .unwrap();
     let bucket = BucketName::parse("raw-anchored-read").unwrap();
     // Larger than the small-object cutoff, so the probe hands the descriptor to the streamed path.
-    let original = vec![b'a'; 512 * 1024 + 7];
+    // 1 MiB + 3 spans 16 full `READ_CHUNK` frames plus a 3-byte tail, so this also pins the raw
+    // stream's per-chunk ownership transfer: every byte must survive the chunked framing exactly,
+    // including the short final frame.
+    let original: Vec<u8> = (0..1024 * 1024 + 3).map(|i| (i % 251) as u8).collect();
     let staged = store
         .stage_fixture(&bucket, body(original.clone()), opts(None, "text/plain"))
         .await
@@ -141,9 +144,20 @@ async fn raw_stream_reuses_the_probed_descriptor_after_path_replacement() {
     .await
     .unwrap();
     let mut received = Vec::new();
+    let mut frames = 0usize;
     while let Some(chunk) = handle.body.next().await {
-        received.extend_from_slice(&chunk.unwrap());
+        let chunk = chunk.unwrap();
+        assert!(!chunk.is_empty(), "the stream must not emit empty frames");
+        assert!(
+            chunk.len() <= 64 * 1024,
+            "frame {} is {} bytes; the 64-KiB chunk size bounds allocator faults",
+            frames,
+            chunk.len()
+        );
+        frames += 1;
+        received.extend_from_slice(&chunk);
     }
+    assert_eq!(frames, 17, "1 MiB + 3 is 16 full chunks plus a 3-byte tail");
     assert_eq!(
         received, original,
         "the stream must serve the descriptor the probe validated, not reopen the replaced path"
