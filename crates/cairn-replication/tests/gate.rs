@@ -83,6 +83,7 @@ async fn stage_blob(
                 content_type: "text/plain".to_owned(),
                 encryption,
                 content_length: None,
+                metadata_seed: None,
             },
         )
         .await

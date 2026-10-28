@@ -236,6 +236,7 @@ async fn put_object_with_lock(
                 content_type: "application/octet-stream".to_owned(),
                 encryption: None,
                 content_length: Some(data.len() as u64),
+                metadata_seed: None,
             },
         )
         .await

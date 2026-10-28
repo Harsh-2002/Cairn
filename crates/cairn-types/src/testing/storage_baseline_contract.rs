@@ -271,7 +271,7 @@ pub async fn assert_storage_baseline(meta: &dyn MetadataStore) {
         .await;
     }
     let recovered = claim(meta, &token.generation, 100, 0).await;
-    assert_eq!(recovered.len(), 3);
+    assert_eq!(recovered.len(), 5);
     for cleanup in recovered {
         update(
             meta,

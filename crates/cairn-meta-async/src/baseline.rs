@@ -2,7 +2,7 @@
 
 use crate::driver::{AsyncSqlDriver, Value as Cell};
 use crate::storage::{integer, optional_string, q, string, text, x};
-use cairn_types::storage::{StorageToken, validate_storage_path};
+use cairn_types::storage::{StorageToken, object_data_path_for_metadata, validate_storage_path};
 use cairn_types::storage_baseline::*;
 use cairn_types::{BucketName, MetaError, MutationOutcome, StoragePath, Timestamp};
 type DB<'a> = dyn AsyncSqlDriver + 'a;
@@ -170,6 +170,29 @@ pub async fn owners(db: &DB<'_>, paths: &[StoragePath]) -> R<Vec<StoragePathOwne
                     return Err(invalid("conflicting retained multipart buckets"));
                 }
                 owner.bucket = Some(bucket);
+            }
+        }
+        // See the SQLite backend: a sidecar is authoritative exactly when its data path is.
+        if let Some(data) = object_data_path_for_metadata(path) {
+            let rows = q(
+                db,
+                "SELECT bucket_name FROM object_versions WHERE storage_path=?1",
+                vec![text(data.as_str())],
+            )
+            .await?;
+            if let Some(row) = rows.first() {
+                let bucket = BucketName::parse(string(row, 0)?)
+                    .map_err(|_| invalid("invalid retained sidecar bucket"))?;
+                validate_storage_path(&bucket, path)?;
+                if owner
+                    .bucket
+                    .as_ref()
+                    .is_some_and(|previous| previous != &bucket)
+                {
+                    return Err(invalid("conflicting retained storage buckets"));
+                }
+                owner.bucket = Some(bucket);
+                owner.authoritative = true;
             }
         }
         result.push(owner);

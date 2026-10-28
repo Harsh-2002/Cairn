@@ -1,7 +1,12 @@
 //! Durable physical-write ownership (storage protocol 2, ARCH 8). Plans contain names, never
 //! file handles. Only an acknowledged admission can turn a fresh plan into a creation permit.
 
+use crate::authz::Acl;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use crate::object::{
+    ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ExplicitObjectLockIntent,
+    StorageClass, UserMetadata,
+};
 use crate::time::Timestamp;
 use crate::{BlobError, MetaError};
 use serde::{Deserialize, Serialize};
@@ -63,8 +68,37 @@ fn upload_name(value: &str) -> bool {
     }
 }
 
-/// Closed grammar for exact cleanup, including legacy flat/nested objects and multipart parts.
-/// Unknown shapes remain for explicit reconciliation; the blob backend also rejects symlinks.
+/// The durable per-object metadata sidecar path for one canonical object data path
+/// (`<bucket>/<uuid>` or `<bucket>/<2hex>/<uuid>`), or `None` for any other path.
+///
+/// Protocol 3 writes the sidecar beside its data file; protocol 2 and legacy objects have none.
+#[must_use]
+pub fn object_metadata_path(data: &StoragePath) -> Option<StoragePath> {
+    let (directory, name) = data.as_str().rsplit_once('/')?;
+    if !uuid_name(name) {
+        return None;
+    }
+    Some(StoragePath::from_string(format!("{directory}/{name}.meta")))
+}
+
+/// The data path a canonical object metadata sidecar belongs to, or `None` for other names.
+#[must_use]
+pub fn object_data_path_for_metadata(metadata: &StoragePath) -> Option<StoragePath> {
+    let (directory, name) = metadata.as_str().rsplit_once('/')?;
+    let id = name.strip_suffix(".meta")?;
+    if !uuid_name(id) {
+        return None;
+    }
+    Some(StoragePath::from_string(format!("{directory}/{id}")))
+}
+
+fn object_name(value: &str) -> bool {
+    uuid_name(value) || value.strip_suffix(".meta").is_some_and(uuid_name)
+}
+
+/// Closed grammar for exact cleanup, including legacy flat/nested objects, protocol-3 object
+/// metadata sidecars and multipart parts. Unknown shapes remain for explicit reconciliation; the
+/// blob backend also rejects symlinks.
 pub fn validate_storage_path(bucket: &BucketName, path: &StoragePath) -> Result<(), MetaError> {
     BucketName::parse(bucket.as_str()).map_err(|_| invalid("invalid storage routing bucket"))?;
     if path.as_str().len() > 256 {
@@ -72,12 +106,13 @@ pub fn validate_storage_path(bucket: &BucketName, path: &StoragePath) -> Result<
     }
     let components: Vec<_> = path.as_str().split('/').collect();
     let valid = match components.as_slice() {
-        [directory, name] if *directory == bucket.as_str() => uuid_name(name),
+        [directory, name] if *directory == bucket.as_str() => object_name(name),
         [directory, prefix, name] if *directory == bucket.as_str() => {
-            uuid_name(name) && prefix.len() == 2 && name.starts_with(prefix)
+            object_name(name) && prefix.len() == 2 && name.starts_with(prefix)
         }
         [".staging", name] => name
             .strip_suffix(".index.tmp")
+            .or_else(|| name.strip_suffix(".meta.tmp"))
             .or_else(|| name.strip_suffix(".tmp"))
             .is_some_and(uuid_name),
         [".staging", "multipart", upload, name] if upload_name(upload) => {
@@ -140,6 +175,21 @@ pub enum StoragePathRole {
     Temporary,
     Final,
     IndexSpool,
+    /// Durable protocol-3 per-object metadata sidecar (`<final>.meta`).
+    ObjectMetadata,
+}
+
+impl StoragePathRole {
+    /// The protocol-2 journal name, or `None` for a protocol-3-only role that has no schema row.
+    #[must_use]
+    pub fn journal_name(self) -> Option<&'static str> {
+        match self {
+            Self::Temporary => Some("temporary"),
+            Self::Final => Some("final"),
+            Self::IndexSpool => Some("index_spool"),
+            Self::ObjectMetadata => None,
+        }
+    }
 }
 
 /// One exact relative filename. Syntax validation does not replace backend no-follow traversal.
@@ -148,6 +198,24 @@ pub enum StoragePathRole {
 pub struct StorageIntentPath {
     pub role: StoragePathRole,
     pub path: StoragePath,
+}
+
+impl StorageIntentPath {
+    /// Protocol-3 sidecar aliases are derived exactly from the target and are intentionally not
+    /// journaled: schema v39's role check predates them, and the deterministic name already binds
+    /// them to the admitted object attempt.
+    #[must_use]
+    pub fn is_object_metadata_sidecar(&self) -> bool {
+        match self.role {
+            StoragePathRole::ObjectMetadata => true,
+            StoragePathRole::Temporary => self
+                .path
+                .as_str()
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| name.ends_with(".meta.tmp")),
+            StoragePathRole::Final | StoragePathRole::IndexSpool => false,
+        }
+    }
 }
 
 /// Serializable admission request. The Writer revalidates its bounded, canonical names.
@@ -171,13 +239,24 @@ impl StorageWritePlan {
     pub fn validate(&self) -> Result<(), MetaError> {
         BucketName::parse(self.bucket.as_str()).map_err(|_| invalid("invalid storage bucket"))?;
         let expected = self.expected_paths()?;
-        if self.paths != expected {
+        // A protocol-2 object intent persisted before sidecars existed remains recoverable. New
+        // plans always carry the sidecar aliases; `PlannedStorageWrite::new` cannot mint this shape.
+        let legacy = self.legacy_object_paths();
+        if self.paths != expected && legacy.as_ref() != Some(&self.paths) {
             return Err(invalid("storage plan paths do not match its exact target"));
         }
         for path in &self.paths {
             validate_storage_path(&self.bucket, &path.path)?;
         }
         Ok(())
+    }
+
+    /// Paths recorded in the protocol-2 intent journal. Protocol-3 sidecars are exact functions of
+    /// the object attempt, so recovery derives them from the plan instead of adding schema rows.
+    pub fn journaled_paths(&self) -> impl Iterator<Item = &StorageIntentPath> {
+        self.paths
+            .iter()
+            .filter(|path| !path.is_object_metadata_sidecar())
     }
 
     /// Restrict joint admission to the exact quota reservation or completion owner.
@@ -292,8 +371,9 @@ impl StorageWritePlan {
     }
 
     fn expected_paths(&self) -> Result<Vec<StorageIntentPath>, MetaError> {
-        let mut paths = Vec::with_capacity(3);
+        let mut paths = Vec::with_capacity(5);
         let id = self.attempt.as_str();
+        let object = matches!(self.target, StorageWriteTarget::Object { .. });
         let final_path = match &self.target {
             StorageWriteTarget::Part {
                 upload_id,
@@ -332,13 +412,25 @@ impl StorageWritePlan {
                     role: StoragePathRole::Temporary,
                     path: StoragePath::from_string(format!(".staging/{id}.tmp")),
                 });
+                if object {
+                    paths.push(StorageIntentPath {
+                        role: StoragePathRole::Temporary,
+                        path: StoragePath::from_string(format!(".staging/{id}.meta.tmp")),
+                    });
+                }
                 format!("{}/{id}", self.bucket)
             }
         };
         paths.push(StorageIntentPath {
             role: StoragePathRole::Final,
-            path: StoragePath::from_string(final_path),
+            path: StoragePath::from_string(final_path.clone()),
         });
+        if object {
+            paths.push(StorageIntentPath {
+                role: StoragePathRole::ObjectMetadata,
+                path: StoragePath::from_string(format!("{final_path}.meta")),
+            });
+        }
         // A small/plain write may never create this optional alias. Reserving it unconditionally
         // keeps the encoder's later spill decision inside the original bounded admission.
         paths.push(StorageIntentPath {
@@ -346,6 +438,28 @@ impl StorageWritePlan {
             path: StoragePath::from_string(format!(".staging/{id}.index.tmp")),
         });
         Ok(paths)
+    }
+
+    /// The protocol-2 object path set, still accepted so pre-sidecar intents can be recovered.
+    fn legacy_object_paths(&self) -> Option<Vec<StorageIntentPath>> {
+        if !matches!(self.target, StorageWriteTarget::Object { .. }) {
+            return None;
+        }
+        let id = self.attempt.as_str();
+        Some(vec![
+            StorageIntentPath {
+                role: StoragePathRole::Temporary,
+                path: StoragePath::from_string(format!(".staging/{id}.tmp")),
+            },
+            StorageIntentPath {
+                role: StoragePathRole::Final,
+                path: StoragePath::from_string(format!("{}/{id}", self.bucket)),
+            },
+            StorageIntentPath {
+                role: StoragePathRole::IndexSpool,
+                path: StoragePath::from_string(format!(".staging/{id}.index.tmp")),
+            },
+        ])
     }
 
     /// Exact final filename after validation.
@@ -356,6 +470,166 @@ impl StorageWritePlan {
             .find(|path| path.role == StoragePathRole::Final)
             .map(|path| &path.path)
             .ok_or_else(|| invalid("missing storage final path"))
+    }
+}
+
+/// Versioned, canonical per-object metadata sidecar format (protocol 3, P1 dual-write).
+///
+/// The sidecar sits beside the data file as `<final>.meta`. It is serialized JSON in v1, bounded by
+/// the existing object-metadata limits, and carries no secret plaintext: an SSE descriptor is the
+/// same sealed record SQLite stores, never a raw data-encryption key.
+pub const OBJECT_METADATA_FORMAT_VERSION: u32 = 1;
+
+/// One durable object metadata sidecar record. SQLite remains the ACK authority in P1; the record
+/// is written with the data file so a later protocol-3 phase can rebuild a missing index row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectMetadataRecord {
+    /// Format generation; v1 is the only accepted value in this phase.
+    pub format_version: u32,
+    /// The owning bucket.
+    pub bucket: BucketName,
+    /// The object key.
+    pub key: ObjectKey,
+    /// The version id.
+    pub version_id: VersionId,
+    /// The immutable object-version row identity.
+    pub row_id: String,
+    /// Whether this record describes a delete marker (always false for a staged object).
+    pub is_delete_marker: bool,
+    /// The plaintext length.
+    pub size_logical: u64,
+    /// The on-disk length after compression/encryption framing.
+    pub size_physical: u64,
+    /// The entity tag.
+    pub etag: ETag,
+    /// The MIME content type.
+    pub content_type: String,
+    /// The stored `Content-Encoding`.
+    pub content_encoding: Option<String>,
+    /// The stored `Cache-Control`.
+    pub cache_control: Option<String>,
+    /// The stored `Content-Disposition`.
+    pub content_disposition: Option<String>,
+    /// The stored `Content-Language`.
+    pub content_language: Option<String>,
+    /// The stored `Expires`.
+    pub expires: Option<String>,
+    /// The absolute object-TTL deadline, when the extension is in use.
+    pub expire_at: Option<Timestamp>,
+    /// The opaque data path (`<bucket>/<uuid>`).
+    pub storage_path: StoragePath,
+    /// The physical compression descriptor.
+    pub compression: CompressionDescriptor,
+    /// The storage class.
+    pub storage_class: StorageClass,
+    /// The version owner.
+    pub owner_id: UserId,
+    /// User-defined metadata.
+    pub user_metadata: UserMetadata,
+    /// The object ACL when ownership keeps ACLs in force.
+    pub acl: Option<Acl>,
+    /// The supplementary checksums persisted on the row.
+    pub checksums: Vec<ChecksumValue>,
+    /// The sealed SSE descriptor, when the data is server-side encrypted.
+    pub sse_descriptor: Option<String>,
+    /// The internal plaintext SHA-256 baseline.
+    pub internal_sha256: Option<String>,
+    /// Creation time captured before staging.
+    pub created_at: Timestamp,
+    /// Last-update time captured before staging.
+    pub updated_at: Timestamp,
+    /// The initial object tag set.
+    pub tags: Vec<(String, String)>,
+    /// The explicit Object Lock intent; bucket defaults remain Writer-authoritative.
+    pub lock_intent: ExplicitObjectLockIntent,
+}
+
+/// Fields known before the body is staged. The blob fills sizes, ETag, checksums, compression,
+/// storage path and internal SHA-256 after the streaming pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectMetadataSeed {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+    pub row_id: String,
+    pub is_delete_marker: bool,
+    pub content_type: String,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<String>,
+    pub expire_at: Option<Timestamp>,
+    pub storage_class: StorageClass,
+    pub owner_id: UserId,
+    pub user_metadata: UserMetadata,
+    pub acl: Option<Acl>,
+    /// Checksum algorithms that belong on the row. Verification-only digests are computed but not
+    /// recorded, matching the protocol's post-stage filtering.
+    pub stored_checksums: ChecksumSet,
+    pub sse_descriptor: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub tags: Vec<(String, String)>,
+    pub lock_intent: ExplicitObjectLockIntent,
+}
+
+impl ObjectMetadataRecord {
+    /// Bind the pre-stage fields to the exact staged blob.
+    #[must_use]
+    pub fn from_staged(seed: &ObjectMetadataSeed, staged: &crate::blob::StagedBlob) -> Self {
+        Self {
+            format_version: OBJECT_METADATA_FORMAT_VERSION,
+            bucket: seed.bucket.clone(),
+            key: seed.key.clone(),
+            version_id: seed.version_id.clone(),
+            row_id: seed.row_id.clone(),
+            is_delete_marker: seed.is_delete_marker,
+            size_logical: staged.size_logical,
+            size_physical: staged.size_physical,
+            etag: staged.etag.clone(),
+            content_type: seed.content_type.clone(),
+            content_encoding: seed.content_encoding.clone(),
+            cache_control: seed.cache_control.clone(),
+            content_disposition: seed.content_disposition.clone(),
+            content_language: seed.content_language.clone(),
+            expires: seed.expires.clone(),
+            expire_at: seed.expire_at,
+            storage_path: staged.storage_path.clone(),
+            compression: staged.compression.clone(),
+            storage_class: seed.storage_class,
+            owner_id: seed.owner_id.clone(),
+            user_metadata: seed.user_metadata.clone(),
+            acl: seed.acl.clone(),
+            checksums: staged
+                .checksums
+                .iter()
+                .filter(|checksum| seed.stored_checksums.0.contains(&checksum.algorithm))
+                .cloned()
+                .collect(),
+            sse_descriptor: seed.sse_descriptor.clone(),
+            internal_sha256: Some(staged.internal_sha256.clone()),
+            created_at: seed.created_at,
+            updated_at: seed.updated_at,
+            tags: seed.tags.clone(),
+            lock_intent: seed.lock_intent,
+        }
+    }
+
+    /// Canonical bytes for the sidecar file.
+    pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
+        serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))
+    }
+
+    /// Parse and reject an unsupported format generation.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MetaError> {
+        let record: Self =
+            serde_json::from_slice(bytes).map_err(|error| MetaError::Engine(error.to_string()))?;
+        if record.format_version != OBJECT_METADATA_FORMAT_VERSION {
+            return Err(invalid("unsupported object metadata format version"));
+        }
+        Ok(record)
     }
 }
 
@@ -531,7 +805,14 @@ mod tests {
     fn plan_is_bounded_exact_and_roundtrips_without_creation_authority() {
         let planned = object_plan();
         let plan = planned.plan();
-        assert_eq!(plan.paths.len(), 3);
+        assert_eq!(plan.paths.len(), 5);
+        assert_eq!(
+            plan.paths
+                .iter()
+                .find(|path| path.role == StoragePathRole::ObjectMetadata)
+                .map(|path| path.path.as_str()),
+            Some(format!("{}.meta", plan.final_path().unwrap().as_str()).as_str())
+        );
         let encoded = serde_json::to_vec(plan).unwrap();
         let decoded: StorageWritePlan = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(&decoded, plan);
@@ -565,6 +846,33 @@ mod tests {
         let mut rerouted = plan.clone();
         rerouted.bucket = BucketName::parse("other-bucket").unwrap();
         assert!(rerouted.validate().is_err());
+    }
+
+    #[test]
+    fn protocol_two_object_plans_remain_recoverable_but_are_not_journaled_twice() {
+        let planned = object_plan();
+        let plan = planned.plan();
+        assert_eq!(plan.journaled_paths().count(), 3);
+        let mut legacy = plan.clone();
+        legacy.paths.retain(|path| {
+            path.role != StoragePathRole::ObjectMetadata
+                && !(path.role == StoragePathRole::Temporary
+                    && path.path.as_str().ends_with(".meta.tmp"))
+        });
+        assert_eq!(legacy.paths.len(), 3);
+        assert!(
+            legacy.validate().is_ok(),
+            "a pre-sidecar journal row must still decode"
+        );
+        let mut widened = legacy.clone();
+        widened.paths.push(StorageIntentPath {
+            role: StoragePathRole::ObjectMetadata,
+            path: StoragePath::from_string(format!("{}.meta", plan.final_path().unwrap().as_str())),
+        });
+        assert!(
+            widened.validate().is_err(),
+            "a partial sidecar set is not a legal plan"
+        );
     }
 
     #[test]

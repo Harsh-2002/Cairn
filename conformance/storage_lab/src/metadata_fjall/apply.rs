@@ -98,7 +98,7 @@ fn put(
             && let Some(path) = previous.storage_path
         {
             view.remove(key(REFERENCE, &[path.as_str()]))?;
-            journal::enqueue(view, &row.bucket, &path, None, None)?;
+            journal::enqueue_object(view, &row.bucket, &path)?;
             superseded = Some(path);
         }
     }
@@ -253,7 +253,7 @@ fn delete(
     let freed = row.storage_path.clone();
     if let Some(path) = &freed {
         view.remove(key(REFERENCE, &[path.as_str()]))?;
-        journal::enqueue(view, &bucket, path, None, None)?;
+        journal::enqueue_object(view, &bucket, path)?;
     }
     let mut promoted_latest = false;
     if row.is_latest {

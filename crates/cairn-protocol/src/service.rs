@@ -37,7 +37,8 @@ use cairn_types::object::{
 };
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::storage::{
-    StorageAdmission, StorageCreationPermit, StorageMutation, StorageWriteTarget,
+    ObjectMetadataSeed, StorageAdmission, StorageCreationPermit, StorageMutation,
+    StorageWriteTarget,
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
@@ -891,6 +892,7 @@ impl S3Service {
                 .then(|| v.to_ascii_lowercase())
         });
         let store_sha256 = extra.0.contains(&ChecksumAlgorithm::Sha256);
+        let stored_checksums = extra.clone();
         let mut stage_checksums = extra;
         if signed_sha256.is_some() && !store_sha256 {
             stage_checksums.0.push(ChecksumAlgorithm::Sha256);
@@ -957,14 +959,6 @@ impl S3Service {
                 .and_then(|v| v.parse::<u64>().ok()),
             self.max_object_size,
         );
-        let opts = StageOptions {
-            compression: bucket.compression,
-            extra_checksums: stage_checksums,
-            size_ceiling: self.max_object_size,
-            content_type: content_type.clone(),
-            encryption: sse_dek,
-            content_length,
-        };
         let versioned = bucket.versioning == VersioningState::Enabled;
         // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
         // a version then has the same identity on every node, and re-delivery is an idempotent
@@ -977,6 +971,63 @@ impl S3Service {
             replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
         };
         let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
+        // instead reproduces the SOURCE grants carried as a base64(JSON) header (ARCH 20.4). Either
+        // way `BucketOwnerEnforced` disables object ACLs, so any ACL — client or replicated — is
+        // dropped under it. Block-Public-Access is enforced at read time uniformly (cairn-authz), so a
+        // replicated public-read ACL is subject to the destination's BPA exactly like a client one;
+        // nothing extra is needed here.
+        let acl = if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
+            None
+        } else if is_replica {
+            replica_acl(&req)
+        } else {
+            req.header("x-amz-acl")
+                .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
+        };
+        // The system response headers (ARCH 13.4) are stored verbatim from the request — except
+        // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
+        let header_owned = |name: &str| req.header(name).map(str::to_owned);
+        // Absolute TTL deadlines are known before staging. Relative deadlines are resolved against
+        // the commit timestamp below; until protocol 3 P2 refreshes the sidecar they remain
+        // SQLite-authoritative.
+        let seed_expire_at = match ttl_request {
+            Some((TtlSpec::Absolute { at }, _)) => Some(at),
+            _ => None,
+        };
+        let metadata_seed = ObjectMetadataSeed {
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            row_id: row_id.clone(),
+            is_delete_marker: false,
+            content_type: content_type.clone(),
+            content_encoding: stored_content_encoding(&req),
+            cache_control: header_owned("cache-control"),
+            content_disposition: header_owned("content-disposition"),
+            content_language: header_owned("content-language"),
+            expires: header_owned("expires"),
+            expire_at: seed_expire_at,
+            storage_class: StorageClass::Standard,
+            owner_id: bucket.owner_id.clone(),
+            user_metadata: user_metadata.clone(),
+            acl: acl.clone(),
+            stored_checksums,
+            sse_descriptor: sse_descriptor.clone(),
+            created_at: intent_validation_now,
+            updated_at: intent_validation_now,
+            tags: initial_tags.clone(),
+            lock_intent,
+        };
+        let opts = StageOptions {
+            compression: bucket.compression,
+            extra_checksums: stage_checksums,
+            size_ceiling: self.max_object_size,
+            content_type: content_type.clone(),
+            encryption: sse_dek,
+            content_length,
+            metadata_seed: Some(metadata_seed),
+        };
         if let Some(timer) = preflight_timer {
             timer.complete();
         }
@@ -1077,23 +1128,6 @@ impl S3Service {
         // version-id handling.
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
-        // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
-        // instead reproduces the SOURCE grants carried as a base64(JSON) header (ARCH 20.4). Either
-        // way `BucketOwnerEnforced` disables object ACLs, so any ACL — client or replicated — is
-        // dropped under it. Block-Public-Access is enforced at read time uniformly (cairn-authz), so a
-        // replicated public-read ACL is subject to the destination's BPA exactly like a client one;
-        // nothing extra is needed here.
-        let acl = if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
-            None
-        } else if is_replica {
-            replica_acl(&req)
-        } else {
-            req.header("x-amz-acl")
-                .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
-        };
-        // The system response headers (ARCH 13.4) are stored verbatim from the request — except
-        // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
-        let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
             id: row_id,
             bucket: bucket.name.clone(),
@@ -2540,6 +2574,8 @@ impl S3Service {
             content_length: None,
             content_type: session.content_type.clone(),
             encryption: sse_dek,
+            // Multipart assembly is unchanged: no protocol-3 sidecar yet.
+            metadata_seed: None,
         };
         // The completion claim owns the session while assembly reads its part files. Abort can only
         // remove `active`, so it cannot delete these bytes after the active->completing transition.
@@ -3136,6 +3172,61 @@ impl S3Service {
         // mutation below — a copy whose destination is SseS3/Kms (explicit header or bucket default)
         // must advertise it, exactly as PUT does. `AtRest` advertises nothing.
         let dest_sse_descriptor = dest_plan.descriptor_json.clone();
+        let versioned = dest_bucket.versioning == VersioningState::Enabled;
+        let version_id = if versioned {
+            VersionId::generate()
+        } else {
+            VersionId::null()
+        };
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
+        // under COPY they are the source version's stored values, under REPLACE this request's.
+        // They were hard-coded `None` before audit 2026-07, so every copy silently lost them.
+        let sys = |name: &str, src: &Option<String>| -> Option<String> {
+            if replace {
+                req.header(name).map(str::to_owned)
+            } else {
+                src.clone()
+            }
+        };
+        // `content-encoding` needs the same normalizer the PUT path uses: under REPLACE the header
+        // may carry the `aws-chunked` TRANSFER coding, which describes how this request's body was
+        // framed on the wire and is not a property of the stored object. Storing it makes every
+        // later GET advertise a coding the response does not use.
+        let content_encoding = if replace {
+            stored_content_encoding(req)
+        } else {
+            src_row.content_encoding.clone()
+        };
+        let seed_expire_at = match ttl_request {
+            Some((TtlSpec::Absolute { at }, _)) => Some(at),
+            _ if carry_source_ttl => src_row.expire_at,
+            _ => None,
+        };
+        let metadata_seed = ObjectMetadataSeed {
+            bucket: dest_bucket.name.clone(),
+            key: dest_key.clone(),
+            version_id: version_id.clone(),
+            row_id: row_id.clone(),
+            is_delete_marker: false,
+            content_type: content_type.clone(),
+            content_encoding: content_encoding.clone(),
+            cache_control: sys("cache-control", &src_row.cache_control),
+            content_disposition: sys("content-disposition", &src_row.content_disposition),
+            content_language: sys("content-language", &src_row.content_language),
+            expires: sys("expires", &src_row.expires),
+            expire_at: seed_expire_at,
+            storage_class: StorageClass::Standard,
+            owner_id: dest_bucket.owner_id.clone(),
+            user_metadata: user_meta.clone(),
+            acl: None,
+            stored_checksums: ChecksumSet::none(),
+            sse_descriptor: dest_sse_descriptor.clone(),
+            created_at: intent_validation_now,
+            updated_at: intent_validation_now,
+            tags: dest_tags.clone(),
+            lock_intent,
+        };
         let opts = StageOptions {
             compression: dest_bucket.compression,
             extra_checksums: ChecksumSet::none(),
@@ -3144,14 +3235,8 @@ impl S3Service {
             encryption: dest_plan.dek,
             // The source object's plaintext size is known, so preallocate the destination blob.
             content_length: Some(src_row.size_logical),
+            metadata_seed: Some(metadata_seed),
         };
-        let versioned = dest_bucket.versioning == VersioningState::Enabled;
-        let version_id = if versioned {
-            VersionId::generate()
-        } else {
-            VersionId::null()
-        };
-        let row_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut write_guard) = self
             .admit_object_storage(
                 dest_bucket,
@@ -3188,16 +3273,6 @@ impl S3Service {
         };
 
         let dest_key_for_event = dest_key.clone();
-        // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
-        // under COPY they are the source version's stored values, under REPLACE this request's.
-        // They were hard-coded `None` before audit 2026-07, so every copy silently lost them.
-        let sys = |name: &str, src: &Option<String>| -> Option<String> {
-            if replace {
-                req.header(name).map(str::to_owned)
-            } else {
-                src.clone()
-            }
-        };
         let row = ObjectVersionRow {
             id: row_id,
             bucket: dest_bucket.name.clone(),
@@ -3209,15 +3284,7 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
-            // `content-encoding` needs the same normalizer the PUT path uses: under REPLACE the
-            // header may carry the `aws-chunked` TRANSFER coding, which describes how this request's
-            // body was framed on the wire and is not a property of the stored object. Storing it
-            // makes every later GET advertise a coding the response does not use.
-            content_encoding: if replace {
-                stored_content_encoding(req)
-            } else {
-                src_row.content_encoding.clone()
-            },
+            content_encoding,
             cache_control: sys("cache-control", &src_row.cache_control),
             content_disposition: sys("content-disposition", &src_row.content_disposition),
             content_language: sys("content-language", &src_row.content_language),
@@ -3233,7 +3300,7 @@ impl S3Service {
             checksums: staged.checksums.clone(),
             // The copy destination's own encryption descriptor (a fresh DEK per the resolver above);
             // `None` when the plan resolved to plaintext.
-            sse_descriptor: dest_plan.descriptor_json,
+            sse_descriptor: dest_sse_descriptor.clone(),
             replication_status: None,
             internal_sha256: Some(staged.internal_sha256.clone()),
             replicated_at: None,

@@ -258,6 +258,15 @@ pub(super) fn enqueue(st: &mut State, bucket: &BucketName, path: &StoragePath) -
     enqueue_owned(&mut st.storage, bucket, path, None, None)
 }
 
+/// A superseded object owns both its data file and its protocol-3 sidecar.
+pub(super) fn enqueue_object(st: &mut State, bucket: &BucketName, path: &StoragePath) -> R<()> {
+    enqueue(st, bucket, path)?;
+    if let Some(metadata) = crate::storage::object_metadata_path(path) {
+        enqueue(st, bucket, &metadata)?;
+    }
+    Ok(())
+}
+
 fn enqueue_owned(
     journal: &mut Journal,
     bucket: &BucketName,
@@ -347,6 +356,8 @@ fn resolve(
     plan: &StorageWritePlan,
     index_spool: crate::blob::IndexSpoolState,
 ) -> R<()> {
+    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
+        && referenced(st, plan.final_path()?);
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().cloned())
         .transpose()?;
@@ -400,6 +411,10 @@ fn resolve(
         None
     };
     for path in &plan.paths {
+        // A live object keeps its durable metadata sidecar; every provisional alias is retired.
+        if path.role == StoragePathRole::ObjectMetadata && published_object {
+            continue;
+        }
         // A write that never opened the index spool created no name, so its absence owes no
         // namespace barrier. Recovery keeps the conservative `Materialized` state.
         if path.role == StoragePathRole::IndexSpool
@@ -686,6 +701,15 @@ pub(super) fn baseline_owners(st: &State, paths: &[StoragePath]) -> R<Vec<Storag
             .filter(|row| row.storage_path.as_ref() == Some(path))
         {
             retain(&row.bucket, 0)?;
+        }
+        if let Some(data) = crate::storage::object_data_path_for_metadata(path) {
+            for row in st
+                .versions
+                .values()
+                .filter(|row| row.storage_path.as_ref() == Some(&data))
+            {
+                retain(&row.bucket, 0)?;
+            }
         }
         for ((upload, _), _) in st.parts.iter().filter(|(_, row)| &row.storage_path == path) {
             let session = st

@@ -2240,7 +2240,7 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
     let result = upsert_version_inner(conn, row)?;
     update_visibility(conn, &bucket, &key, before)?;
     if let Some(path) = &result {
-        crate::storage::enqueue(conn, &bucket, path, None)?;
+        crate::storage::enqueue_object(conn, &bucket, path)?;
     }
     Ok(result)
 }
@@ -2507,7 +2507,7 @@ fn delete_version_inner(
     }
     let freed = storage_path.map(StoragePath::from_string);
     if let Some(path) = &freed {
-        crate::storage::enqueue(conn, bucket, path, None)?;
+        crate::storage::enqueue_object(conn, bucket, path)?;
     }
     let was_latest = latest != 0;
     conn.prepare_cached(

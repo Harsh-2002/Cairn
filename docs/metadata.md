@@ -126,6 +126,17 @@ completion claim in one savepoint. A losing reserve/claim grants no creation aut
 acknowledged matching admission and a live I/O lease can produce the move-only creation permit
 consumed by the blob layer (Section 12.1).
 
+Protocol 3 P1 rewrites object writes as a dual-write: the plan also names the exact
+`<final>.meta` sidecar and its staging alias, the blob layer fsyncs and renames data and sidecar
+under the same directory barrier, and the existing Writer publication still commits the row before
+the client is acknowledged. SQLite therefore remains the read and ACK authority throughout P1; the
+sidecar is durable evidence, not a read source. The deterministic sidecar names are derived from
+the attempt instead of adding `storage_intent_paths` roles, so schema v39 and all four metadata
+backends keep their current mutation and savepoint semantics. Resolution keeps a live object's
+sidecar, retires provisional aliases, and replacement or deletion enqueues the sidecar with its
+data file as two exact cleanup claims. Legacy protocol-2 plans with only the original three paths
+remain decodable so pre-upgrade intents can still be recovered. Section 8.2 defines the ordering.
+
 `PublishStorageWrite` validates the original mutation against that plan, then checks the current
 generation, exact persisted intent and normalized ownership index, and the cancellation flag.
 An absent, stale or cancelled owner returns `StoragePublicationNotApplied`. Direct physical

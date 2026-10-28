@@ -3336,6 +3336,7 @@ mod tests {
                         content_type: "application/octet-stream".to_owned(),
                         encryption: dek,
                         content_length: None,
+                        metadata_seed: None,
                     },
                 )
                 .await

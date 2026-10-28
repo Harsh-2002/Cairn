@@ -2385,7 +2385,7 @@ async fn upsert_version(
     let result = upsert_version_inner(driver, row).await?;
     update_visibility(driver, &bucket, &key, before).await?;
     if let Some(path) = &result {
-        crate::storage::enqueue(driver, &bucket, path, None).await?;
+        crate::storage::enqueue_object(driver, &bucket, path).await?;
     }
     Ok(result)
 }
@@ -2632,7 +2632,7 @@ async fn delete_version_inner(
     }
     let freed = existing.get_opt_text(0).map(StoragePath::from_string);
     if let Some(path) = &freed {
-        crate::storage::enqueue(driver, bucket, path, None).await?;
+        crate::storage::enqueue_object(driver, bucket, path).await?;
     }
     let was_latest = existing.get_i64(1) != 0;
     let removed = (

@@ -169,6 +169,7 @@ async fn put_object_with_ttl(
                 content_type: "application/octet-stream".to_owned(),
                 encryption: None,
                 content_length: None,
+                metadata_seed: None,
             },
         )
         .await

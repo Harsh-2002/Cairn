@@ -85,6 +85,19 @@ pub fn enqueue(
     }
     save(view, &debt)
 }
+
+/// A superseded object owns both its data file and its protocol-3 sidecar.
+pub fn enqueue_object(
+    view: &mut Overlay<'_>,
+    bucket: &BucketName,
+    path: &StoragePath,
+) -> Result<(), MetaError> {
+    enqueue(view, bucket, path, None, None)?;
+    if let Some(metadata) = cairn_types::storage::object_metadata_path(path) {
+        enqueue(view, bucket, &metadata, None, None)?;
+    }
+    Ok(())
+}
 #[allow(clippy::too_many_arguments)]
 pub fn quota_debt(
     view: &mut Overlay<'_>,
@@ -232,6 +245,8 @@ pub fn resolve(
     plan: &StorageWritePlan,
     index_spool: cairn_types::blob::IndexSpoolState,
 ) -> Result<(), MetaError> {
+    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
+        && referenced(view, plan.final_path()?)?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().map(|p| p.as_str().to_owned()))
         .transpose()?;
@@ -267,6 +282,10 @@ pub fn resolve(
         }
     }
     for path in &plan.paths {
+        // A live object keeps its durable metadata sidecar; every provisional alias is retired.
+        if path.role == cairn_types::storage::StoragePathRole::ObjectMetadata && published_object {
+            continue;
+        }
         if path.role == cairn_types::storage::StoragePathRole::IndexSpool
             && index_spool == cairn_types::blob::IndexSpoolState::NeverCreated
         {

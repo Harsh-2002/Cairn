@@ -215,15 +215,15 @@ fn validate_index(db: &DB, plan: &StorageWritePlan) -> R<()> {
         "SELECT role,storage_path FROM storage_intent_paths WHERE attempt_id=?1",
         vec![text(plan.attempt.as_str())],
     )?;
-    if rows.len() != plan.paths.len() {
+    let journaled = plan.journaled_paths().collect::<Vec<_>>();
+    if rows.len() != journaled.len() {
         return Err(invalid("storage intent path count mismatch"));
     }
-    for expected in &plan.paths {
-        let role = match expected.role {
-            StoragePathRole::Temporary => "temporary",
-            StoragePathRole::Final => "final",
-            StoragePathRole::IndexSpool => "index_spool",
-        };
+    for expected in journaled {
+        let role = expected
+            .role
+            .journal_name()
+            .ok_or_else(|| invalid("non-journaled storage role"))?;
         let mut found = false;
         for row in &rows {
             if string(row, 0)? == role && string(row, 1)? == expected.path.as_str() {
@@ -349,12 +349,11 @@ pub fn reserve(
             reservation.map_or(Cell::Null, text),
         ],
     )?;
-    for path in &plan.paths {
-        let role = match path.role {
-            StoragePathRole::Temporary => "temporary",
-            StoragePathRole::Final => "final",
-            StoragePathRole::IndexSpool => "index_spool",
-        };
+    for path in plan.journaled_paths() {
+        let role = path
+            .role
+            .journal_name()
+            .ok_or_else(|| invalid("non-journaled storage role"))?;
         x(
             db,
             "INSERT INTO storage_intent_paths(attempt_id,role,storage_path) VALUES (?1,?2,?3)",
@@ -415,6 +414,8 @@ fn referenced(db: &DB, path: &StoragePath) -> R<bool> {
 /// containing namespace barrier. Reference checks are Writer-serialized, never stale WAL reads.
 fn resolve(db: &DB, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
     validate_index(db, plan)?;
+    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
+        && referenced(db, plan.final_path()?)?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
         .transpose()?;
@@ -467,6 +468,10 @@ fn resolve(db: &DB, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<
         None
     };
     for path in &plan.paths {
+        // A live object keeps its durable metadata sidecar; every provisional alias is retired.
+        if path.role == StoragePathRole::ObjectMetadata && published_object {
+            continue;
+        }
         // A write that never opened the index spool created no name, so its absence owes no
         // namespace barrier. Recovery keeps the conservative `Materialized` state.
         if path.role == StoragePathRole::IndexSpool && index_spool == IndexSpoolState::NeverCreated
@@ -634,6 +639,16 @@ fn retire_quota(db: &DB, debt: &str) -> R<()> {
 
 pub fn enqueue(db: &DB, bucket: &BucketName, path: &StoragePath, quota: Option<&str>) -> R<()> {
     enqueue_owned(db, bucket, path, quota, None)
+}
+
+/// A superseded object owns both its data file and its protocol-3 sidecar. Legacy objects have no
+/// sidecar; the extra exact name is an idempotent absence barrier in that case.
+pub fn enqueue_object(db: &DB, bucket: &BucketName, path: &StoragePath) -> R<()> {
+    enqueue(db, bucket, path, None)?;
+    if let Some(metadata) = cairn_types::storage::object_metadata_path(path) {
+        enqueue(db, bucket, &metadata, None)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn enqueue_owned(

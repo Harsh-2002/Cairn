@@ -200,7 +200,7 @@ pub async fn assert_storage_journal(meta: &dyn MetadataStore) {
     let batch = claim(meta, &next_generation, 100, 2).await;
     assert_eq!(
         batch.len(),
-        3,
+        paths.len(),
         "debt must survive bucket deletion and process generation changes"
     );
     for cleanup in batch {
@@ -300,7 +300,7 @@ pub async fn assert_storage_journal(meta: &dyn MetadataStore) {
         }
     }
     let batch = claim(meta, &restarted, 100, 11).await;
-    assert_eq!(batch.len(), 6);
+    assert_eq!(batch.len(), 10);
     for cleanup in batch {
         update(
             meta,
@@ -458,9 +458,12 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
         MutationOutcome::StoragePublicationNotApplied
     );
     let aliases = claim(meta, &generation, 100, 0).await;
-    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases.len(), 3);
+    let metadata_path = crate::storage::object_metadata_path(plan.final_path().unwrap())
+        .expect("object sidecar path");
     for cleanup in aliases {
         assert_ne!(&cleanup.path, plan.final_path().unwrap());
+        assert_ne!(cleanup.path, metadata_path);
         update(
             meta,
             &bucket,
@@ -505,11 +508,17 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
         MutationOutcome::Put { .. }
     ));
     let aliases = claim(meta, &generation, 100, 2).await;
-    assert_eq!(aliases.len(), 3);
+    assert_eq!(aliases.len(), 5);
     assert!(
         aliases
             .iter()
             .any(|cleanup| &cleanup.path == plan.final_path().unwrap())
+    );
+    let old_metadata = crate::storage::object_metadata_path(plan.final_path().unwrap())
+        .expect("old object sidecar path");
+    assert!(
+        aliases.iter().any(|cleanup| cleanup.path == old_metadata),
+        "a superseded object reclaims its sidecar with its data"
     );
     for cleanup in aliases {
         update(
@@ -536,8 +545,16 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     .await
     .unwrap();
     let deleted = claim(meta, &generation, 100, 4).await;
-    assert_eq!(deleted.len(), 1);
-    assert_eq!(&deleted[0].path, next.final_path().unwrap());
+    assert_eq!(deleted.len(), 2);
+    assert!(
+        deleted
+            .iter()
+            .any(|cleanup| &cleanup.path == next.final_path().unwrap())
+    );
+    assert!(deleted.iter().any(|cleanup| {
+        Some(&cleanup.path)
+            == crate::storage::object_metadata_path(next.final_path().unwrap()).as_ref()
+    }));
     for cleanup in deleted {
         update(
             meta,
@@ -723,7 +740,7 @@ pub async fn assert_prepare_storage_restore(meta: &dyn MetadataStore) {
     assert!(reservations.is_empty());
     assert!(debts.is_empty());
     let old_claims = claim(meta, &generation, 100, 0).await;
-    assert_eq!(old_claims.len(), 5);
+    assert_eq!(old_claims.len(), 6);
     assert!(
         old_claims
             .iter()
@@ -1407,6 +1424,13 @@ pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) 
         .iter()
         .find(|path| path.role == StoragePathRole::Temporary)
         .expect("temporary alias");
+    let metadata_alias = plan
+        .paths
+        .iter()
+        .find(|path| {
+            path.role == StoragePathRole::Temporary && path.path.as_str().ends_with(".meta.tmp")
+        })
+        .expect("temporary metadata alias");
     let spool = plan
         .paths
         .iter()
@@ -1415,11 +1439,16 @@ pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) 
     let claimed = claim(meta, &generation, 100, 0).await;
     assert_eq!(
         claimed.len(),
-        1,
-        "a write that never opened the index spool owes no barrier for it"
+        2,
+        "a write that never opened the index spool owes no barrier for it, but both staging aliases do"
     );
-    assert_eq!(claimed[0].path, temporary.path);
-    assert_ne!(claimed[0].path, spool.path);
+    assert!(claimed.iter().any(|cleanup| cleanup.path == temporary.path));
+    assert!(
+        claimed
+            .iter()
+            .any(|cleanup| cleanup.path == metadata_alias.path)
+    );
+    assert!(!claimed.iter().any(|cleanup| cleanup.path == spool.path));
 }
 
 #[cfg(test)]

@@ -349,7 +349,7 @@ impl State {
         );
         let superseded = self.versions.get(&vk).and_then(|r| r.storage_path.clone());
         if let Some(path) = &superseded {
-            storage::enqueue(self, &row.bucket, path)?;
+            storage::enqueue_object(self, &row.bucket, path)?;
         }
         // A replica carries the source's (uuidv7-ordered) version id, which may be older than a
         // version already here; it is latest only if its id is the max for the key (mirrors the SQL
@@ -2500,7 +2500,7 @@ impl State {
                 st.invalid_lock_rows.remove(&vk);
                 let freed = removed.as_ref().and_then(|r| r.storage_path.clone());
                 if let Some(path) = &freed {
-                    storage::enqueue(st, &bucket, path)?;
+                    storage::enqueue_object(st, &bucket, path)?;
                 }
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;

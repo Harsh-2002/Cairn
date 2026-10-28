@@ -19491,3 +19491,60 @@ async fn expired_ttl_objects_disappear_from_reads_and_listings() {
         "ListObjectVersions must omit expired versions"
     );
 }
+
+#[tokio::test]
+async fn put_writes_a_sidecar_that_matches_the_published_row() {
+    let h = harness().await;
+    let bucket = BucketName::parse("sidecar-identity").unwrap();
+    assert_eq!(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket.as_str()), None, &[], &[], vec![])
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket.as_str()),
+                Some("dir/object"),
+                &[("content-type", "text/plain")],
+                &[],
+                b"sidecar identity".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = h
+        .meta
+        .current_version(&bucket, &ObjectKey::parse("dir/object").unwrap())
+        .await
+        .unwrap()
+        .expect("published row");
+    let data = row.storage_path.clone().expect("physical row");
+    let metadata = cairn_types::storage::object_metadata_path(&data).expect("sidecar path");
+    let bytes = std::fs::read(h._dir.path().join(metadata.as_str())).unwrap();
+    let record = cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap();
+    assert_eq!(record.bucket, row.bucket);
+    assert_eq!(record.key, row.key);
+    assert_eq!(record.version_id, row.version_id);
+    assert_eq!(record.row_id, row.id);
+    assert_eq!(record.storage_path, data);
+    assert_eq!(record.size_logical, row.size_logical);
+    assert_eq!(record.size_physical, row.size_physical);
+    assert_eq!(record.etag, row.etag);
+    assert_eq!(record.content_type, row.content_type);
+    assert_eq!(record.internal_sha256, row.internal_sha256);
+    assert_eq!(record.checksums, row.checksums);
+    assert_eq!(record.sse_descriptor, row.sse_descriptor);
+    assert_eq!(
+        std::fs::read(h._dir.path().join(data.as_str())).unwrap(),
+        b"sidecar identity"
+    );
+}

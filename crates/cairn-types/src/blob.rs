@@ -87,6 +87,11 @@ pub struct StageOptions {
     /// PLAINTEXT length; with compression the physical file may be smaller, which preallocation
     /// tolerates (it reserves blocks without padding the file).
     pub content_length: Option<u64>,
+    /// Optional per-object metadata sidecar seed (protocol 3, P1 dual-write). When present and the
+    /// target is an ordinary object, the blob store writes, fsyncs and renames `<final>.meta`
+    /// beside the data file under the same durability ordering. Parts, assembly and legacy plans
+    /// leave this `None`.
+    pub metadata_seed: Option<crate::storage::ObjectMetadataSeed>,
 }
 
 impl Default for StageOptions {
@@ -101,6 +106,7 @@ impl Default for StageOptions {
             content_type: "application/octet-stream".to_owned(),
             encryption: None,
             content_length: None,
+            metadata_seed: None,
         }
     }
 }

@@ -136,8 +136,16 @@ impl PublicationFixture {
                     path: StoragePath::from_string(format!(".staging/{name}.tmp")),
                 },
                 StorageIntentPath {
+                    role: StoragePathRole::Temporary,
+                    path: StoragePath::from_string(format!(".staging/{name}.meta.tmp")),
+                },
+                StorageIntentPath {
                     role: StoragePathRole::Final,
                     path: path.clone(),
+                },
+                StorageIntentPath {
+                    role: StoragePathRole::ObjectMetadata,
+                    path: StoragePath::from_string(format!("{}.meta", path.as_str())),
                 },
                 StorageIntentPath {
                     role: StoragePathRole::IndexSpool,

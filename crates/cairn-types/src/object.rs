@@ -160,7 +160,7 @@ pub enum GovernanceBypass {
 /// `Some(false)`, which explicitly requests OFF. Bucket default retention is deliberately absent
 /// from this value: the metadata writer resolves it from the current bucket configuration at the
 /// object commit point.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplicitObjectLockIntent {
     /// Explicit retention, which takes precedence over a bucket default.
     pub retention: Option<ObjectRetention>,

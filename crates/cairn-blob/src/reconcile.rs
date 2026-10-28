@@ -114,6 +114,18 @@ fn lower_hex(name: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// A protocol-3 sidecar entry is `<32-hex>.meta`; its existence is owned by the data path.
+fn metadata_name(name: &str) -> bool {
+    name.strip_suffix(".meta")
+        .is_some_and(|id| lower_hex(id, 32))
+}
+
+/// The path the metadata oracle must answer for. A sidecar is live exactly when its data file is.
+fn ownership_path(prefix: &str, name: &str) -> StoragePath {
+    let path = StoragePath::from_string(format!("{prefix}/{name}"));
+    cairn_types::storage::object_data_path_for_metadata(&path).unwrap_or(path)
+}
+
 /// Exclusive full scan. Every directory iterator, namespace operation and abandoned job retains
 /// the caller's maintenance lease. Parallel bucket work remains bounded by the existing options.
 pub(super) async fn run(
@@ -227,6 +239,7 @@ async fn staging(
                 && entry
                     .name
                     .strip_suffix(".index.tmp")
+                    .or_else(|| entry.name.strip_suffix(".meta.tmp"))
                     .or_else(|| entry.name.strip_suffix(".tmp"))
                     .is_some_and(|id| lower_hex(id, 32))
             {
@@ -439,7 +452,9 @@ pub(super) async fn bucket(
         let mut files = Vec::new();
         let mut leaves = Vec::new();
         for entry in entries {
-            if entry.kind == FileType::RegularFile && lower_hex(&entry.name, 32) {
+            if entry.kind == FileType::RegularFile
+                && (lower_hex(&entry.name, 32) || metadata_name(&entry.name))
+            {
                 files.push(entry);
             } else if entry.kind == FileType::Directory && lower_hex(&entry.name, 2) {
                 leaves.push(entry.name);
@@ -527,9 +542,8 @@ async fn leaf_files(
         }
         let mut files = Vec::new();
         for entry in entries {
-            if entry.kind == FileType::RegularFile
-                && lower_hex(&entry.name, 32)
-                && entry.name.starts_with(leaf)
+            let stem = entry.name.strip_suffix(".meta").unwrap_or(&entry.name);
+            if entry.kind == FileType::RegularFile && lower_hex(stem, 32) && stem.starts_with(leaf)
             {
                 files.push(entry);
             } else {
@@ -576,7 +590,7 @@ async fn reclaim(
     }
     let paths = entries
         .iter()
-        .map(|e| StoragePath::from_string(format!("{prefix}/{}", e.name)))
+        .map(|e| ownership_path(prefix, &e.name))
         .collect::<Vec<_>>();
     let live = oracle
         .live_blobs(&paths)
