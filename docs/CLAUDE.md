@@ -31,7 +31,8 @@ Operator runbooks (NOT spec — these number their own local `## 1/2/3` headings
 `scaling-limits.md`, `troubleshooting.md`, `deployment-kubernetes.md`, `backup-restore.md`,
 `disaster-recovery.md`, `migration.md` (import from another S3 store), `s3-api-matrix.md`,
 `benchmarks.md`. Design/product: `design.md` (web console visual system),
-`product.md` (positioning/brand).
+`product.md` (positioning/brand), `storage-metadata-authority-plan-2026-10.md` (protocol-3 object
+metadata authority: phases, format, crash matrix, acceptance).
 
 ## Notes
 

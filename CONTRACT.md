@@ -19,10 +19,14 @@ multi-node HA, no leader election, no shared-nothing sharding across machines. D
 machines is *asynchronous replication* and *backup/restore*, and that is the whole story. This is a
 deliberate product position, not a gap waiting to be filled.
 
-**Metadata — one embedded SQLite database, one writer.** No external database, no Redis, no
-message broker, no queue service, no second store of record. All writes go through the single
-group-committing `Writer`; reads use the WAL pool. If something seems to need its own datastore, it
-needs a human decision first.
+**Metadata — one embedded SQLite database, one writer, plus versioned object-metadata files.**
+No external database, no Redis, no message broker, no queue service. All index and control-plane
+writes go through the single group-committing `Writer`; reads use the WAL pool. From storage
+protocol 3, object bytes and their per-object metadata files are the durable authority for object
+data: SQLite is a rebuildable index for object listings and the authority for control-plane state
+(buckets, policies, users, locks, quotas, replication, activity). Before protocol 3, SQLite remains
+the object authority as well. The object-metadata file is part of the storage format, not a second
+control-plane store. If something seems to need another datastore, it needs a human decision first.
 
 **Configuration — environment variables only.** Every knob is a `CAIRN_*` env var parsed by strict
 Figment. There is no config file, no TOML, no YAML, no CLI flag that sets configuration. Do not add
@@ -33,7 +37,10 @@ There is no down-migration story and none is wanted.
 
 **Durability — the ordering is fixed.** Stage → fsync file → rename → fsync dir → validate hashes →
 commit the metadata transaction → reclaim superseded blobs. Do not reorder these, do not make any
-step conditional, do not "optimise" one away.
+step conditional, do not "optimise" one away. For a protocol-3 ordinary object write, the
+object-metadata file is staged and renamed with the data file, and the same directory barrier makes
+both durable; that file is the object's metadata commit for acknowledgement. The SQLite index fold
+is a post-acknowledgement index update and is not the object durability authority.
 
 **Crypto — fails closed, one ring.** A missing key, a wrong key, or a tampered envelope returns an
 error. Never plaintext, never zeros, never partial data, never a warning-and-continue. Every DEK is
