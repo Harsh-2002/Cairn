@@ -9,8 +9,8 @@
 use cairn_blob::{LocalBlobStore, open_lock_file_nofollow, try_lock_exclusive};
 use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
 use cairn_types::storage::{
-    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageIntentPath, StoragePathRole,
-    StorageToken, StorageWritePlan, StorageWriteTarget,
+    PlannedStorageWrite, StorageCleanup, StorageIntentPath, StoragePathRole, StorageToken,
+    StorageWritePlan, StorageWriteTarget,
 };
 use cairn_types::{
     BodyStream, BucketName, ObjectKey, StageOptions, StoragePath, Timestamp, VersionId,
@@ -243,9 +243,7 @@ fn writer() {
         node.clone(),
     );
     let (_, lease) = StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), node);
-    let permit = planned
-        .admit(StorageAdmission::Granted(Box::new(plan.clone())), lease)
-        .unwrap();
+    let permit = planned.into_object_permit(lease).unwrap();
     let runtime = runtime();
     runtime.block_on(async {
         let store = LocalBlobStore::open(root.join("mount/store"), initialization_lease)
@@ -299,6 +297,7 @@ fn plan_from_ready(path: &Path) -> StorageWritePlan {
         generation: StorageToken::try_from(fields[1].to_owned()).unwrap(),
         bucket: BucketName::parse("bucket").unwrap(),
         bucket_owner: None,
+        bucket_created_at: None,
         target: StorageWriteTarget::Object {
             key: ObjectKey::parse("key").unwrap(),
             version_id: VersionId::null(),
