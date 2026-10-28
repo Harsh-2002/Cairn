@@ -1,11 +1,12 @@
 //! The same exact admission/cleanup contract runs against every metadata backend and shard router.
 
+use crate::blob::IndexSpoolState;
 use crate::id::{BucketName, ObjectKey, UserId, VersionId};
 use crate::meta::{Mutation, MutationOutcome};
 use crate::storage::io::StorageIoWatch;
 use crate::storage::{
-    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StorageToken,
-    StorageWriteTarget,
+    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StoragePathRole,
+    StorageToken, StorageWriteTarget,
 };
 use crate::{Bucket, MetadataStore, OwnershipMode, Timestamp, VersioningState};
 use std::sync::Arc;
@@ -413,6 +414,8 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     let publication = Mutation::PublishStorageWrite {
         plan: Box::new(plan.clone()),
         operation: Box::new(put(row.clone())),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
+        activity: None,
     };
     assert_eq!(
         meta.submit(publication.clone()).await.unwrap(),
@@ -428,7 +431,9 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(plan.clone()),
-            operation: Box::new(put(wrong))
+            operation: Box::new(put(wrong)),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .is_err()
@@ -436,7 +441,9 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(plan.clone()),
-            operation: Box::new(publication.clone())
+            operation: Box::new(publication.clone()),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .is_err()
@@ -478,7 +485,9 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(next.clone()),
-            operation: Box::new(conditional)
+            operation: Box::new(conditional),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .is_err()
@@ -487,7 +496,9 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
     assert!(matches!(
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(next.clone()),
-            operation: Box::new(put(row))
+            operation: Box::new(put(row)),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .unwrap(),
@@ -646,6 +657,8 @@ pub(super) fn publish_part(plan: &crate::storage::StorageWritePlan) -> Mutation 
                 part_dek: None,
             },
         }),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
+        activity: None,
     }
 }
 
@@ -673,6 +686,8 @@ pub async fn assert_prepare_storage_restore(meta: &dyn MetadataStore) {
         meta.submit(Mutation::PublishStorageWrite {
             plan: Box::new(object.plan().clone()),
             operation: Box::new(put(row.clone())),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .unwrap(),
@@ -1052,6 +1067,8 @@ fn publish_completion(plan: &crate::storage::StorageWritePlan, owner: UserId) ->
             precondition: Default::default(),
             replication: Vec::new(),
         }),
+        index_spool: crate::blob::IndexSpoolState::Materialized,
+        activity: None,
     }
 }
 
@@ -1188,11 +1205,250 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
     assert!(claim(meta, &generation, 100, 4).await.is_empty());
 }
 
+/// A plan authorized against one bucket instance must not be admitted after that bucket was
+/// deleted and recreated under another owner: name equality alone is not identity.
+pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-recreate-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let owner_a = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let planned = plan(&bucket, &generation).with_bucket_owner(owner_a.clone());
+    let write_plan = planned.plan().clone();
+    meta.submit(Mutation::DeleteBucket(bucket.clone()))
+        .await
+        .unwrap();
+    let owner_b = UserId::generate();
+    meta.submit(Mutation::CreateBucket(Box::new(crate::bucket::Bucket {
+        name: bucket.clone(),
+        owner_id: owner_b,
+        created_at: Timestamp(0),
+        versioning: crate::bucket::VersioningState::Unversioned,
+        ownership_mode: crate::authz::OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+    let outcome = meta
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: crate::storage::StorageMutation::Reserve {
+                plan: Box::new(write_plan),
+                now: Timestamp(0),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            MutationOutcome::StorageAdmission(crate::storage::StorageAdmission::NotApplied)
+        ),
+        "a plan bound to the old owner must not be admitted to a recreated bucket: {outcome:?}"
+    );
+}
+
+/// A successful publication commits its activity row in the same savepoint. A rejected
+/// precondition records nothing, and a duplicate activity id never fails the object.
+pub async fn assert_publication_co_commits_activity(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-activity-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let owner = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+
+    let planned = plan(&bucket, &generation);
+    let write_plan = planned.plan();
+    admit_object(meta, write_plan).await;
+    let row = object_row(write_plan, owner.clone());
+    let activity = crate::meta::ActivityEntry {
+        id: "activity-co-commit".to_owned(),
+        action: "PutObject".to_owned(),
+        bucket: Some(bucket.as_str().to_owned()),
+        key: Some(row.key.as_str().to_owned()),
+        size: Some(row.size_logical),
+        etag: Some("etag".to_owned()),
+        actor: None,
+        at: Timestamp(0),
+    };
+    let outcome = meta
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(write_plan.clone()),
+            operation: Box::new(put(row.clone())),
+            index_spool: IndexSpoolState::Materialized,
+            activity: Some(Box::new(activity.clone())),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Put { .. }));
+    assert_eq!(
+        meta.get_version(&bucket, &row.key, &row.version_id)
+            .await
+            .unwrap(),
+        Some(row.clone())
+    );
+    assert!(
+        meta.list_activity(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == activity.id),
+        "a successful publication records its activity in the same commit"
+    );
+
+    // A rejected precondition must record no activity at all.
+    let rejected = crate::meta::ActivityEntry {
+        id: "activity-co-commit-rejected".to_owned(),
+        ..activity.clone()
+    };
+    let planned_rejected = plan(&bucket, &generation);
+    let plan_rejected = planned_rejected.plan();
+    admit_object(meta, plan_rejected).await;
+    let row_rejected = object_row(plan_rejected, owner.clone());
+    let mut conditional = put(row_rejected);
+    if let Mutation::PutObjectVersion { precondition, .. } = &mut conditional {
+        precondition.if_none_match = Some(crate::meta::IfNoneMatch::Any);
+    }
+    assert!(
+        meta.submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan_rejected.clone()),
+            operation: Box::new(conditional),
+            index_spool: IndexSpoolState::Materialized,
+            activity: Some(Box::new(rejected.clone())),
+        })
+        .await
+        .is_err(),
+        "an existing current version must reject If-None-Match: *"
+    );
+    assert!(
+        !meta
+            .list_activity(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == rejected.id),
+        "a rejected publication records no activity"
+    );
+
+    // A duplicate activity id is best-effort: the object still publishes.
+    let planned_duplicate = PlannedStorageWrite::new(
+        bucket.clone(),
+        generation.clone(),
+        StorageWriteTarget::Object {
+            key: ObjectKey::parse("journal/duplicate").unwrap(),
+            version_id: VersionId::null(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        },
+    )
+    .unwrap();
+    let plan_duplicate = planned_duplicate.plan();
+    admit_object(meta, plan_duplicate).await;
+    let row_duplicate = object_row(plan_duplicate, owner);
+    let outcome = meta
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan_duplicate.clone()),
+            operation: Box::new(put(row_duplicate.clone())),
+            index_spool: IndexSpoolState::Materialized,
+            activity: Some(Box::new(activity.clone())),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, MutationOutcome::Put { .. }),
+        "a duplicate activity id must not fail the publication"
+    );
+    assert_eq!(
+        meta.get_version(&bucket, &row_duplicate.key, &row_duplicate.version_id)
+            .await
+            .unwrap(),
+        Some(row_duplicate)
+    );
+}
+
+/// A live write reports whether it opened the planned index-spool alias. A write that never
+/// opened it created no name, so only the renamed temporary alias is retired; recovery keeps the
+/// conservative behaviour exercised by `assert_storage_journal`.
+pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-spool-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let owner = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let planned = plan(&bucket, &generation);
+    let plan = planned.plan();
+    admit_object(meta, plan).await;
+    let row = object_row(plan, owner);
+    let outcome = meta
+        .submit(Mutation::PublishStorageWrite {
+            plan: Box::new(plan.clone()),
+            operation: Box::new(put(row)),
+            index_spool: IndexSpoolState::NeverCreated,
+            activity: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Put { .. }));
+
+    let temporary = plan
+        .paths
+        .iter()
+        .find(|path| path.role == StoragePathRole::Temporary)
+        .expect("temporary alias");
+    let spool = plan
+        .paths
+        .iter()
+        .find(|path| path.role == StoragePathRole::IndexSpool)
+        .expect("index-spool alias");
+    let claimed = claim(meta, &generation, 100, 0).await;
+    assert_eq!(
+        claimed.len(),
+        1,
+        "a write that never opened the index spool owes no barrier for it"
+    );
+    assert_eq!(claimed[0].path, temporary.path);
+    assert_ne!(claimed[0].path, spool.path);
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn in_memory_prepare_storage_restore_contract() {
         super::assert_prepare_storage_restore(&crate::testing::InMemoryMetadataStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_admission_rejects_a_recreated_bucket() {
+        super::assert_admission_rejects_recreated_bucket(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_publication_co_commits_activity() {
+        super::assert_publication_co_commits_activity(&crate::testing::InMemoryMetadataStore::new())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_unused_index_spool_is_not_retired() {
+        super::assert_unused_index_spool_is_not_retired(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -175,6 +175,8 @@ async fn meta_operation(
                 initial_state: InitialObjectState::default(),
                 replication: Vec::new(),
             }),
+            index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await?;
     if !matches!(outcome, MutationOutcome::Put { .. }) {

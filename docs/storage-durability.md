@@ -19,7 +19,7 @@ typed `StorageCreationPermit` and `StorageIoLease` are mandatory at `stage`, `st
 
 After admission, object publication follows one ordered sequence, and the order is the durability design.
 
-First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. After buffered writes complete, any unused preallocation beyond the staged descriptor's actual EOF is released under the same retained I/O ownership; errors prevent publication. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch publication fails and the admitted paths enter exact recovery, with no visible object metadata written. Sixth, the metadata transaction is submitted to the writer with the exact admitted plan and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, exact cleanup debt recorded with publication reclaims superseded blobs and remaining provisional aliases, and the activity and metrics are recorded. Physical cleanup is retried independently; its failure cannot revoke an already committed object.
+First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. After buffered writes complete, any unused preallocation beyond the staged descriptor's actual EOF is released under the same retained I/O ownership; errors prevent publication. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch publication fails and the admitted paths enter exact recovery, with no visible object metadata written. Sixth, the metadata transaction is submitted to the writer with the exact admitted plan and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, exact cleanup debt recorded with publication reclaims superseded blobs and remaining provisional aliases, and the activity and metrics are recorded. A successful `PutObject` may carry its activity row in the publication transaction itself: it then commits atomically with the object, and a multi-shard store submits that row to the global shard after publication. A duplicate activity id is ignored because the audit intent is already satisfied; any other activity error fails the publication rather than acknowledging an object from a transaction whose state is no longer trustworthy. Physical cleanup is retried independently; its failure cannot revoke an already committed object.
 
 The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob without a visible object row, whose admitted intent is resolved into exact cleanup during recovery; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
 
@@ -59,10 +59,15 @@ startup recovery. A timeout or a lost acknowledgement is never evidence that byt
 Cleanup uses exact Writer claims bound to a generation, claim token and expiry. Claims recheck
 that no authoritative reference or active intent owns the path. The blob layer rejects a still
 locked file, unlinks only the claimed filename, synchronizes its directory, and prunes only empty
-supported parents with parent synchronization. Already-absent names still require a namespace
-barrier. The Writer retires debt and associated quota only after durable absence and a matching,
-unexpired acknowledgement. Unknown siblings survive; filesystem errors and stale acknowledgements
-retain debt. Request abort and multipart termination do not authorize recursive session deletion.
+supported parents with parent synchronization. Concurrent claims whose paths share a directory
+complete one coalesced absence barrier, so each claim still waits for a full directory sync
+without issuing its own. Already-absent names still require a namespace barrier. The one
+exception is the optional index-spool alias: live publication states whether the write ever
+opened it, and a write that never did created no name to retire. Recovery always treats that
+alias as materialized because it cannot know. The Writer retires debt and associated quota only
+after durable absence and a matching, unexpired acknowledgement. Unknown siblings survive;
+filesystem errors and stale acknowledgements retain debt. Request abort and multipart termination
+do not authorize recursive session deletion.
 
 When multipart termination or replacement attaches quota debt to an already-claimed scratch alias,
 the Writer invalidates that obsolete claim and its lease in the same savepoint. A fresh claim may
@@ -226,8 +231,10 @@ indexes spill to a buffered temporary file on the data filesystem at the exact i
 already included in admission. Creation uses the anchored namespace and locks the file; the create
 job unlinks only that newly created inode before returning its leased file owner. Queued writes,
 reads and returned buffers retain that owner after request cancellation. A crash before unlink or
-before its namespace barrier can leave or restore the alias, so publication/recovery records exact
-cleanup even when the spool name appears absent. Full scans protect that debt until its claimed
+before its namespace barrier can leave or restore the alias, so publication or recovery records
+exact cleanup even when the spool name appears absent. The one exception is a live write that
+reports it never opened the alias: no name was ever created, so there is nothing to retire and
+recovery still assumes the conservative state. Full scans protect both cases until a claimed
 cleanup proves durable absence. The spool is flushed and copied in 64-KiB batches into the final blob, followed by its unchanged MAC and trailer, **before** that
 blob's existing file-sync/rename/directory-sync sequence. Scratch data has no separate fsync or
 committed sidecar. Errors, including ENOSPC during spool flush/copy, abort publication.

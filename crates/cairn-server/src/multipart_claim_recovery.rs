@@ -548,6 +548,8 @@ mod tests {
                     part_dek: None,
                 },
             }),
+            index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .unwrap();
@@ -642,6 +644,8 @@ mod tests {
                 .submit(Mutation::PublishStorageWrite {
                     plan: Box::new(record.plan.clone()),
                     operation: Box::new(put(row)),
+                    index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+                    activity: None,
                 })
                 .await;
             assert_eq!(outcome.is_err(), lose_ack);
@@ -930,6 +934,8 @@ mod tests {
                     precondition: Default::default(),
                     replication: Vec::new(),
                 }),
+                index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+                activity: None,
             })
             .await
             .is_err()

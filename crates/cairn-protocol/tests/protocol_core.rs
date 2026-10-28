@@ -273,6 +273,8 @@ async fn seed_plaintext_part(
                 part_dek: None,
             },
         }),
+        index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+        activity: None,
     })
     .await
     .unwrap();
@@ -308,7 +310,9 @@ fn member(user: &str) -> Principal {
 
 fn member_with_policy(user: &str, policy: &str) -> Principal {
     let mut principal = member(user);
-    principal.user_policy = Some(Box::new(cairn_authz::parse_user_policy(policy).unwrap()));
+    principal.user_policy = Some(std::sync::Arc::new(
+        cairn_authz::parse_user_policy(policy).unwrap(),
+    ));
     principal
 }
 
@@ -1869,7 +1873,7 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
     let h = harness().await;
     put_simple(&h, "timed", "obj").await;
     let samples = h.svc.drain_put_timings();
-    assert_eq!(samples.len(), 8);
+    assert_eq!(samples.len(), 7);
     assert!(samples.iter().all(|sample| sample.completed));
     for stage in [
         PutStage::Total,
@@ -1879,7 +1883,6 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
         PutStage::PublicationPrep,
         PutStage::Publication,
         PutStage::Notification,
-        PutStage::Audit,
     ] {
         assert_eq!(
             samples
@@ -6257,6 +6260,130 @@ async fn copy_source_read_is_authorized_cross_tenant_denied() {
     );
 }
 
+/// Regression for the write-side selector bypass: a tag-conditioned explicit Deny must not be
+/// escaped by naming an absent version on a write that acts on the current object. The request is
+/// rejected before authorization, and the tagged object is unchanged.
+#[tokio::test]
+async fn object_write_cannot_escape_tag_deny_with_version_selector() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let owner = member("owner-w");
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                None,
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let policy = br#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Principal":"*","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::vwrite/*"},
+        {"Effect":"Deny","Principal":"*","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::vwrite/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/protected":"true"}}}]}"#.to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                None,
+                &[("policy", "")],
+                &[],
+                policy,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // The current object carries the protected tag.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[("x-amz-tagging", "protected=true")],
+                b"protected".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Without the selector the tag-conditioned Deny applies.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[],
+                b"denied".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Naming an absent version must not change what the write is authorized against.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[("versionId", "absent-version")],
+                &[],
+                b"bypass".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+                owner,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body, b"protected",
+        "the rejected selector write must not change the object"
+    );
+}
+
 /// Version-scoped authorization (audit #33): a policy condition on `s3:ExistingObjectTag` must be
 /// evaluated against the version named by `?versionId`, not the current version. An attacker must
 /// not read a restricted OLD version merely because the CURRENT version carries the tag the policy
@@ -6645,6 +6772,51 @@ async fn versioning_and_object_tagging() {
     assert!(
         xml.contains("env") && xml.contains("prod"),
         "tags returned: {xml}"
+    );
+}
+
+/// A write that ignores `?versionId` must reject the selector instead of authorizing against a
+/// different version's tags/ACL. Otherwise a tag-conditioned Deny is evaluated against an absent or
+/// untagged version while the write still replaces the current object.
+#[tokio::test]
+async fn object_write_rejects_version_id_selector() {
+    let h = harness().await;
+    put_simple(&h, "vguard", "k").await;
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vguard"),
+                Some("k"),
+                &[("versionId", "does-not-exist")],
+                &[],
+                b"overwrite".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "write must reject versionId"
+    );
+    assert!(String::from_utf8_lossy(&body).contains("InvalidArgument"));
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("vguard"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"conditional",
+        "the rejected write must not change the object"
     );
 }
 
@@ -9771,6 +9943,8 @@ async fn sse_kms_tampered_descriptor_fails_closed() {
                 initial_state: cairn_types::InitialObjectState::default(),
                 replication: Vec::new(),
             }),
+            index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
         .await
         .unwrap();
@@ -10859,7 +11033,7 @@ async fn bulk_delete_replica_marker_cannot_bypass_replication_action_policy() {
     );
 
     let mut denied_admin = admin();
-    denied_admin.user_policy = Some(Box::new(
+    denied_admin.user_policy = Some(std::sync::Arc::new(
         cairn_authz::parse_user_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ReplicateDelete","Resource":"arn:aws:s3:::replbulk/*"}]}"#,
         )
@@ -13935,7 +14109,7 @@ async fn no_webhook_config_emits_nothing() {
 
 /// A session principal for `user` carrying an optional scoped policy (always least-privilege:
 /// Member role, `is_session = true`).
-fn session_of(user: &str, policy: Option<Box<cairn_types::authz::Policy>>) -> Principal {
+fn session_of(user: &str, policy: Option<std::sync::Arc<cairn_types::authz::Policy>>) -> Principal {
     Principal {
         user_id: UserId(user.to_owned()),
         display_name: user.to_owned(),
@@ -14032,7 +14206,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped.clone()))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped.clone()))),
                     ),
                 )
                 .await,
@@ -14054,7 +14228,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped.clone()))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped.clone()))),
                     ),
                 )
                 .await,
@@ -14076,7 +14250,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
                         &[],
                         &[],
                         vec![],
-                        session_of("parent", Some(Box::new(scoped))),
+                        session_of("parent", Some(std::sync::Arc::new(scoped))),
                     ),
                 )
                 .await,
@@ -14160,7 +14334,7 @@ async fn service_actions_honor_session_scope_and_identity_denies() {
     );
 
     let mut admin_deny = admin();
-    admin_deny.user_policy = Some(Box::new(
+    admin_deny.user_policy = Some(std::sync::Arc::new(
         cairn_authz::parse_user_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::admin-denied-create"}]}"#,
         )
@@ -14311,7 +14485,7 @@ async fn session_does_not_inherit_owner_bypass() {
                 &[],
                 &[],
                 vec![],
-                session_of("owner", Some(Box::new(policy))),
+                session_of("owner", Some(std::sync::Arc::new(policy))),
             ),
         )
         .await,

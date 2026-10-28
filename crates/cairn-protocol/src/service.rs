@@ -177,26 +177,33 @@ impl S3Service {
 
     async fn prepare_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
     ) -> Result<PreparedStorageWrite> {
         let runtime = self
             .storage_runtime
             .as_ref()
             .ok_or_else(|| Error::Internal("storage write runtime is unavailable".into()))?;
-        runtime.prepare(&*self.blob, bucket.clone(), target).await
+        runtime
+            .prepare(
+                &*self.blob,
+                bucket.name.clone(),
+                bucket.owner_id.clone(),
+                target,
+            )
+            .await
     }
 
     async fn admit_object_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
     ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
         let prepared = self.prepare_storage(bucket, target).await?;
         let outcome = self
             .meta
             .submit(Mutation::Storage {
-                bucket: bucket.clone(),
+                bucket: bucket.name.clone(),
                 operation: StorageMutation::Reserve {
                     plan: Box::new(prepared.plan().clone()),
                     now: self.clock.now(),
@@ -217,7 +224,7 @@ impl S3Service {
 
     async fn admit_part_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
         operation: Mutation,
     ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
@@ -557,6 +564,15 @@ impl S3Service {
         // handler. A dedicated Member credential may hold only ReplicateObject/ReplicateDelete;
         // conversely an ordinary PutObject/DeleteObject grant must not make a forged marker work.
         let is_replica = matches!(action, Action::ReplicateObject | Action::ReplicateDelete);
+        // A `versionId` selector names the version that tag/ACL conditions must evaluate against.
+        // Only operations that actually target a version may carry one. A write or multipart
+        // operation that ignores the selector must never authorize against a *different* (absent or
+        // untagged) version, or a tag-conditioned Deny could be bypassed by naming such a version.
+        if req.query("versionId").is_some() && !action_uses_version_selector(action) {
+            return Err(Error::InvalidArgument(
+                "versionId is not supported for this operation".to_owned(),
+            ));
+        }
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().ok_or(Error::NoSuchKey)?;
         // When the request names a `?versionId`, gate version-scoped policy conditions
@@ -586,13 +602,13 @@ impl S3Service {
                     && req.query("partNumber").is_some()
                     && req.header("x-amz-copy-source").is_some() =>
             {
-                self.upload_part_copy(&req).await
+                self.upload_part_copy(&req, &bucket).await
             }
             Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
-                self.upload_part(req, body).await
+                self.upload_part(req, body, &bucket).await
             }
             Method::PUT if req.header("x-amz-copy-source").is_some() => {
-                self.copy_object(&req).await
+                self.copy_object(&req, &bucket).await
             }
             Method::PUT if req.has_query("tagging") => self.put_object_tagging(req, body).await,
             Method::GET if req.has_query("tagging") => self.get_object_tagging(&req).await,
@@ -613,7 +629,9 @@ impl S3Service {
             Method::POST if req.has_query("uploads") => {
                 self.create_multipart(&req, is_replica).await
             }
-            Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
+            Method::POST if req.has_query("uploadId") => {
+                self.complete_multipart(req, body, &bucket).await
+            }
             Method::GET if req.has_query("uploadId") => self.list_parts(&req).await,
             Method::DELETE if req.has_query("uploadId") => self.abort_multipart(&req).await,
             // HEAD is exempt from the guard below for the same reason as in `bucket_op`: it writes
@@ -623,9 +641,9 @@ impl S3Service {
             // not serve — must never fall through to a data-plane handler (a `PUT object?acl` or
             // `PUT object?attributes` must not overwrite the object body). Answer NotImplemented.
             _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
-            Method::PUT => self.put_object(req, body, is_replica).await,
+            Method::PUT => self.put_object(req, body, is_replica, &bucket).await,
             Method::GET => self.get_object(&req).await,
-            Method::DELETE => self.delete_object(&req, is_replica).await,
+            Method::DELETE => self.delete_object(&req, is_replica, &bucket).await,
             _ => Err(Error::NotImplemented),
         }
     }
@@ -814,11 +832,11 @@ impl S3Service {
         req: S3Request,
         raw_body: cairn_types::BodyStream,
         is_replica: bool,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
         let sampled = self.put_timings.sample();
         let total_timer = sampled.then(|| self.put_timings.start(PutStage::Total));
         let preflight_timer = sampled.then(|| self.put_timings.start(PutStage::Preflight));
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
         // The opt-in TTL header is parsed before staging so a malformed value cannot leave an
@@ -965,7 +983,7 @@ impl S3Service {
         let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
         let admitted = self
             .admit_object_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Object {
                     key: key.clone(),
                     version_id: version_id.clone(),
@@ -1116,7 +1134,7 @@ impl S3Service {
             Ok(Vec::new())
         } else {
             self.replication_outbox(
-                &bucket,
+                bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
@@ -1139,15 +1157,27 @@ impl S3Service {
         let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
         let publication = self
             .meta
-            .submit(write_guard.publication(Mutation::PutObjectVersion {
-                row: Box::new(row),
-                precondition: precond,
-                initial_state: InitialObjectState {
-                    tags: initial_tags,
-                    lock_intent,
+            .submit(write_guard.publication(
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: precond,
+                    initial_state: InitialObjectState {
+                        tags: initial_tags,
+                        lock_intent,
+                    },
+                    replication,
                 },
-                replication,
-            }))
+                staged.index_spool,
+                Some(Box::new(self.activity_entry(
+                    "PutObject",
+                    bucket.name.as_str(),
+                    Some(key.as_str()),
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    req.principal.as_ref(),
+                    now,
+                ))),
+            ))
             .await;
         if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
             if let Some(timer) = publication_timer {
@@ -1177,20 +1207,6 @@ impl S3Service {
                 )
                 .await;
                 if let Some(timer) = notification_timer {
-                    timer.complete();
-                }
-                // Audit the mutation (ARCH 26.3, best-effort).
-                let audit_timer = sampled.then(|| self.put_timings.start(PutStage::Audit));
-                self.audit(
-                    "PutObject",
-                    bucket.name.as_str(),
-                    Some(key.as_str()),
-                    Some(staged.size_logical),
-                    Some(staged.etag.as_str()),
-                    req.principal.as_ref(),
-                )
-                .await;
-                if let Some(timer) = audit_timer {
                     timer.complete();
                 }
                 let mut resp = S3Response::status(StatusCode::OK)
@@ -1397,8 +1413,12 @@ impl S3Service {
         Ok(resp)
     }
 
-    async fn delete_object(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(req).await?;
+    async fn delete_object(
+        &self,
+        req: &S3Request,
+        is_replica: bool,
+        bucket: &Bucket,
+    ) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
         let event_key = key.clone();
@@ -1417,7 +1437,7 @@ impl S3Service {
         if let Some(vid) = req.query("versionId") {
             let version_id = VersionId::from_string(vid.to_owned());
             let bypass = self
-                .governance_bypass_capability(req, &bucket, &key, &version_id)
+                .governance_bypass_capability(req, bucket, &key, &version_id)
                 .await?;
             // S3 reports on a version-scoped DELETE whether the version it permanently removed was
             // itself a delete marker (`x-amz-delete-marker`). Read that BEFORE the mutation — the
@@ -1492,7 +1512,7 @@ impl S3Service {
                     // newer version), enqueueing nothing (loop prevention).
                     self.meta
                         .submit(Mutation::PutObjectVersion {
-                            row: Box::new(replica_marker_row(&bucket, &key, &marker_id, now)),
+                            row: Box::new(replica_marker_row(bucket, &key, &marker_id, now)),
                             precondition: Precondition::default(),
                             initial_state: InitialObjectState::default(),
                             replication: Vec::new(),
@@ -1501,7 +1521,7 @@ impl S3Service {
                 } else {
                     let replication = self
                         .replication_outbox(
-                            &bucket,
+                            bucket,
                             &key,
                             &marker_id,
                             ReplicationOp::DeleteMarker,
@@ -1552,13 +1572,13 @@ impl S3Service {
             }
             VersioningState::Suspended => {
                 let bypass = self
-                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .governance_bypass_capability(req, bucket, &key, &VersionId::null())
                     .await?;
                 // A Suspended bucket inserts a NULL-version marker; replication requires
                 // Enabled versioning, so `replication_outbox` returns an empty list here by construction.
                 let replication = self
                     .replication_outbox(
-                        &bucket,
+                        bucket,
                         &key,
                         &VersionId::null(),
                         ReplicationOp::DeleteMarker,
@@ -1613,7 +1633,7 @@ impl S3Service {
             }
             VersioningState::Unversioned => {
                 let bypass = self
-                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .governance_bypass_capability(req, bucket, &key, &VersionId::null())
                     .await?;
                 let outcome = self
                     .meta
@@ -1864,8 +1884,8 @@ impl S3Service {
         &self,
         req: S3Request,
         raw_body: cairn_types::BodyStream,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
@@ -1930,7 +1950,7 @@ impl S3Service {
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut part_guard) = self
             .admit_part_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Part {
                     upload_id: upload_id.clone(),
                     part_number,
@@ -2007,11 +2027,15 @@ impl S3Service {
         };
         let outcome = match self
             .meta
-            .submit(part_guard.publication(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: attempt_id.clone(),
-                part,
-            }))
+            .submit(part_guard.publication(
+                Mutation::RecordPart {
+                    upload_id: upload_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    part,
+                },
+                staged.index_spool,
+                None,
+            ))
             .await
         {
             Ok(outcome) => outcome,
@@ -2050,8 +2074,7 @@ impl S3Service {
     /// optional `x-amz-copy-source-range` are parsed; the source range is opened from the blob
     /// store (logical coordinates), restaged as a part, recorded, and a `CopyPartResult` carrying
     /// the part ETag and last-modified time is returned.
-    async fn upload_part_copy(&self, req: &S3Request) -> Result<S3Response> {
-        let dest_bucket = self.fetch_bucket(req).await?;
+    async fn upload_part_copy(&self, req: &S3Request, dest_bucket: &Bucket) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
@@ -2181,7 +2204,7 @@ impl S3Service {
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut part_guard) = self
             .admit_part_storage(
-                &dest_bucket.name,
+                dest_bucket,
                 StorageWriteTarget::Part {
                     upload_id: upload_id.clone(),
                     part_number,
@@ -2226,11 +2249,15 @@ impl S3Service {
         };
         let outcome = match self
             .meta
-            .submit(part_guard.publication(Mutation::RecordPart {
-                upload_id: upload_id.clone(),
-                attempt_id: attempt_id.clone(),
-                part,
-            }))
+            .submit(part_guard.publication(
+                Mutation::RecordPart {
+                    upload_id: upload_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    part,
+                },
+                staged.index_spool,
+                None,
+            ))
             .await
         {
             Ok(outcome) => outcome,
@@ -2269,8 +2296,8 @@ impl S3Service {
         &self,
         req: S3Request,
         body: cairn_types::BodyStream,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
@@ -2391,7 +2418,7 @@ impl S3Service {
         let claim_token = MultipartClaimToken::generate();
         let prepared = self
             .prepare_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Completion {
                     upload_id: upload_id.clone(),
                     claim_token: claim_token.as_str().to_owned(),
@@ -2681,7 +2708,7 @@ impl S3Service {
             Ok(Vec::new())
         } else {
             self.replication_outbox(
-                &bucket,
+                bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
@@ -2705,13 +2732,17 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(claim_guard.publication(Mutation::CompleteMultipart {
-                upload_id: upload_id.clone(),
-                claim_token: claim_token.clone(),
-                row: Box::new(row),
-                precondition: Precondition::default(),
-                replication,
-            }))
+            .submit(claim_guard.publication(
+                Mutation::CompleteMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: claim_token.clone(),
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    replication,
+                },
+                staged.index_spool,
+                None,
+            ))
             .await
         {
             Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed {
@@ -2931,8 +2962,7 @@ impl S3Service {
 
     // --- copy & bulk delete ---
 
-    async fn copy_object(&self, req: &S3Request) -> Result<S3Response> {
-        let dest_bucket = self.fetch_bucket(req).await?;
+    async fn copy_object(&self, req: &S3Request, dest_bucket: &Bucket) -> Result<S3Response> {
         let dest_key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
         let lock_intent = self
@@ -3124,7 +3154,7 @@ impl S3Service {
         let row_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut write_guard) = self
             .admit_object_storage(
-                &dest_bucket.name,
+                dest_bucket,
                 StorageWriteTarget::Object {
                     key: dest_key.clone(),
                     version_id: version_id.clone(),
@@ -3217,7 +3247,7 @@ impl S3Service {
         // inline `x-amz-tagging` under REPLACE; prefix rules match regardless.
         let replication = self
             .replication_outbox(
-                &dest_bucket,
+                dest_bucket,
                 &dest_key_for_event,
                 &version_id,
                 ReplicationOp::ObjectCreate,
@@ -3235,15 +3265,19 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(write_guard.publication(Mutation::PutObjectVersion {
-                row: Box::new(row),
-                precondition: Precondition::default(),
-                initial_state: InitialObjectState {
-                    tags: dest_tags,
-                    lock_intent,
+            .submit(write_guard.publication(
+                Mutation::PutObjectVersion {
+                    row: Box::new(row),
+                    precondition: Precondition::default(),
+                    initial_state: InitialObjectState {
+                        tags: dest_tags,
+                        lock_intent,
+                    },
+                    replication,
                 },
-                replication,
-            }))
+                staged.index_spool,
+                None,
+            ))
             .await
         {
             Ok(MutationOutcome::Put { .. }) => {
@@ -4911,6 +4945,32 @@ impl S3Service {
     /// actor", which may legitimately be anonymous). Never bind the principal via a fallible
     /// `require_principal(..)?` around this: an anonymous-permitted mutation carries no principal,
     /// and failing the request for a missing actor would break the very write policy just allowed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the audit identity fields it shares with audit()"
+    )]
+    fn activity_entry(
+        &self,
+        action: &str,
+        bucket: &str,
+        key: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+        principal: Option<&Principal>,
+        at: cairn_types::time::Timestamp,
+    ) -> cairn_types::meta::ActivityEntry {
+        cairn_types::meta::ActivityEntry {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            action: action.to_owned(),
+            bucket: Some(bucket.to_owned()),
+            key: key.map(str::to_owned),
+            size,
+            etag: etag.map(|e| e.trim_matches('"').to_owned()),
+            actor: principal.map(|p| p.access_key_id.clone()),
+            at,
+        }
+    }
+
     async fn audit(
         &self,
         action: &str,
@@ -4920,16 +4980,8 @@ impl S3Service {
         etag: Option<&str>,
         principal: Option<&Principal>,
     ) {
-        let entry = cairn_types::meta::ActivityEntry {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            action: action.to_owned(),
-            bucket: Some(bucket.to_owned()),
-            key: key.map(str::to_owned),
-            size,
-            etag: etag.map(|e| e.trim_matches('"').to_owned()),
-            actor: principal.map(|p| p.access_key_id.clone()),
-            at: self.clock.now(),
-        };
+        let entry =
+            self.activity_entry(action, bucket, key, size, etag, principal, self.clock.now());
         let _ = self
             .meta
             .submit(cairn_types::meta::Mutation::RecordActivity(Box::new(entry)))
@@ -5059,7 +5111,7 @@ impl S3Service {
             account_bpa: PublicAccessBlock::default(),
             bucket_bpa: PublicAccessBlock::default(),
             policy: None,
-            user_policy: principal.user_policy.as_deref().cloned(),
+            user_policy: principal.user_policy.clone(),
             bucket_acl: None,
             object_acl: None,
             ownership_mode: OwnershipMode::BucketOwnerEnforced,
@@ -5141,8 +5193,7 @@ impl S3Service {
             || req
                 .principal
                 .as_ref()
-                .and_then(|p| p.user_policy.as_deref())
-                .is_some()
+                .is_some_and(|p| p.user_policy.is_some())
             || bucket.ownership_mode != cairn_types::authz::OwnershipMode::BucketOwnerEnforced;
         let acl_row = if needs_object_meta {
             match &resource {
@@ -5192,10 +5243,7 @@ impl S3Service {
         context.request_tags = request_tags;
         // The requester's attached identity policy (loaded at auth time), evaluated in union with
         // the bucket policy. `None` for anonymous requesters and users without one.
-        let user_policy = req
-            .principal
-            .as_ref()
-            .and_then(|p| p.user_policy.as_deref().cloned());
+        let user_policy = req.principal.as_ref().and_then(|p| p.user_policy.clone());
         let input = AuthzInput {
             requester,
             // A session credential is governed solely by its own scoped policy (ARCH 14): the authz
@@ -5694,6 +5742,27 @@ fn build_event_payload(
 /// — only `AbortMultipartUpload` and `ListMultipartUploadParts` exist — so those stay mapped to
 /// the closest existing action (`PutObject`). NOTE: add `CreateMultipartUpload`/`UploadPart` etc.
 /// to the action catalogue if finer-grained multipart policy is required.
+/// Whether `action` resolves the `versionId` query selector. A `false` action must reject the
+/// selector: authorizing it against a named version while the handler acts on the current
+/// object/key is a policy-condition bypass (tag-conditioned Deny evaluated against another row).
+fn action_uses_version_selector(action: Action) -> bool {
+    matches!(
+        action,
+        Action::GetObjectVersion
+            | Action::DeleteObjectVersion
+            | Action::GetObjectAcl
+            | Action::PutObjectAcl
+            | Action::GetObjectTagging
+            | Action::PutObjectTagging
+            | Action::DeleteObjectTagging
+            | Action::GetObjectRetention
+            | Action::PutObjectRetention
+            | Action::GetObjectLegalHold
+            | Action::PutObjectLegalHold
+            | Action::GetObjectAttributes
+    )
+}
+
 fn object_action(req: &S3Request) -> Result<Action> {
     use Action::*;
     let q = |s: &str| req.has_query(s);

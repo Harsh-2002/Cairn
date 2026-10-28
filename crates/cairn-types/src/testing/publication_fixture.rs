@@ -128,6 +128,7 @@ impl PublicationFixture {
             attempt,
             generation: self.generation.clone(),
             bucket: row.bucket.clone(),
+            bucket_owner: None,
             target,
             paths: vec![
                 StorageIntentPath {
@@ -251,6 +252,8 @@ impl PublicationFixture {
         Ok(Mutation::PublishStorageWrite {
             plan: Box::new(plan),
             operation: Box::new(operation),
+            index_spool: crate::blob::IndexSpoolState::Materialized,
+            activity: None,
         })
     }
 }

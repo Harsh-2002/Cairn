@@ -1,7 +1,7 @@
 //! Durable physical-write ownership (storage protocol 2, ARCH 8). Plans contain names, never
 //! file handles. Only an acknowledged admission can turn a fresh plan into a creation permit.
 
-use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, VersionId};
+use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::time::Timestamp;
 use crate::{BlobError, MetaError};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,11 @@ pub struct StorageWritePlan {
     pub attempt: StorageToken,
     pub generation: StorageToken,
     pub bucket: BucketName,
+    /// Owner recorded from the bucket snapshot the request was authorized against. Admission
+    /// refuses a plan whose name now resolves to a different owner (a delete/recreate race across
+    /// tenants). `None` for recovery plans, where the admission already exists.
+    #[serde(default)]
+    pub bucket_owner: Option<UserId>,
     pub target: StorageWriteTarget,
     pub paths: Vec<StorageIntentPath>,
 }
@@ -358,6 +363,15 @@ impl StorageWritePlan {
 #[derive(Debug)]
 pub struct PlannedStorageWrite(StorageWritePlan);
 
+impl PlannedStorageWrite {
+    /// Bind admission to the owner of the bucket snapshot authorization evaluated.
+    #[must_use]
+    pub fn with_bucket_owner(mut self, owner: UserId) -> Self {
+        self.0.bucket_owner = Some(owner);
+        self
+    }
+}
+
 /// Typed Writer acknowledgement. An engine constructs this only for a committed admission.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StorageAdmission {
@@ -418,6 +432,7 @@ impl PlannedStorageWrite {
             attempt: StorageToken::generate(),
             generation,
             bucket,
+            bucket_owner: None,
             target,
             paths: Vec::new(),
         };

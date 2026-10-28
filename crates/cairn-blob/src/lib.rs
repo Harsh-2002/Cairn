@@ -47,8 +47,8 @@ use cairn_types::SecretKey32;
 pub use cairn_types::blob::BlobCipher;
 use cairn_types::blob::ReadBufferLease;
 use cairn_types::blob::{
-    BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport,
-    StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
+    BlobProbe, BlobReadHandle, ByteRange, ContentRange, IndexSpoolState, PartRef, ReconcileOpts,
+    ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
 };
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
@@ -63,6 +63,12 @@ use std::sync::Arc;
 
 const STAGING: &str = ".staging";
 const READ_CHUNK: usize = 64 * 1024;
+
+/// Plaintext multipart assembly reads one part per blocking job. A 256-KiB job amortises the
+/// blocking-pool hand-off over four times the bytes of a single [`READ_CHUNK`] while keeping the
+/// retained buffer small and the yield granularity sub-millisecond. Encrypted parts keep their
+/// block-sized decoder frames.
+const ASSEMBLY_READ_CHUNK: usize = 4 * READ_CHUNK;
 /// The logical block size for an encrypted-but-uncompressed object (no bucket policy supplies a
 /// block size in that case). 64 KiB keeps the per-block GCM-tag overhead negligible (16 bytes per
 /// 65536) while bounding the amount decrypted for a small ranged read.
@@ -416,6 +422,17 @@ fn validate_stage_len(opts: &StageOptions, logical_len: Option<u64>) -> Result<(
     Ok(())
 }
 
+/// One completed streaming pass. The caller turns it into a [`StagedBlob`] or [`StagedPart`].
+struct StagedWrite {
+    logical: u64,
+    physical: u64,
+    md5: String,
+    checksums: Vec<cairn_types::object::ChecksumValue>,
+    compression: CompressionDescriptor,
+    internal_sha256: String,
+    index_spool: IndexSpoolState,
+}
+
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
@@ -425,17 +442,7 @@ async fn write_staged(
     opts: &StageOptions,
     paths: &AdmittedPaths,
     mut raw_body_breakdown: Option<&mut timing::RawBodyBreakdown<'_>>,
-) -> Result<
-    (
-        u64,
-        u64,
-        String,
-        Vec<cairn_types::object::ChecksumValue>,
-        CompressionDescriptor,
-        String,
-    ),
-    BlobError,
-> {
+) -> Result<StagedWrite, BlobError> {
     let (compress, block_pol) = encoding_policies(opts);
     validate_stage_len(opts, opts.content_length)?;
     let mut hashers = Hashers::new(&opts.extra_checksums);
@@ -465,7 +472,8 @@ async fn write_staged(
             hashers.update(&chunk);
             physical += enc.feed(&chunk, file).await?;
         }
-        physical += enc.finish(file).await?;
+        let (tail_bytes, index_spool) = enc.finish(file).await?;
+        physical += tail_bytes;
         let (md5, checks, internal_sha256) = hashers.finalize();
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
@@ -477,7 +485,15 @@ async fn write_staged(
             },
             None => CompressionDescriptor::Uncompressed,
         };
-        Ok((logical, physical, md5, checks, descriptor, internal_sha256))
+        Ok(StagedWrite {
+            logical,
+            physical,
+            md5,
+            checksums: checks,
+            compression: descriptor,
+            internal_sha256,
+            index_spool,
+        })
     } else {
         loop {
             if let Some(detail) = raw_body_breakdown.as_mut() {
@@ -517,14 +533,15 @@ async fn write_staged(
         if let Some(detail) = raw_body_breakdown.as_mut() {
             detail.end(true);
         }
-        Ok((
+        Ok(StagedWrite {
             logical,
             physical,
             md5,
-            checks,
-            CompressionDescriptor::Uncompressed,
+            checksums: checks,
+            compression: CompressionDescriptor::Uncompressed,
             internal_sha256,
-        ))
+            index_spool: IndexSpoolState::NeverCreated,
+        })
     }
 }
 
@@ -533,15 +550,19 @@ async fn write_staged(
 enum StreamInput {
     Raw(PathBuf),
     Container(Box<CompressedReader<std::fs::File>>),
+    /// A descriptor the probe already opened and validated. Using it avoids a second path
+    /// resolution/open and the window in which the name could be replaced after validation.
+    File(Arc<std::fs::File>),
 }
 
 /// Probe output owns its memory reservation too: a completed blocking task can retain this
 /// result after its awaiting request is cancelled. Drop buffers before releasing that lease.
 struct ReadProbe {
     logical_len: u64,
-    reuse_file: Option<std::fs::File>,
+    reuse_file: Option<Arc<std::fs::File>>,
     whole: Option<Bytes>,
     prepared: Option<Box<CompressedReader<std::fs::File>>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
     _lease: Option<ReadBufferLease>,
 }
 
@@ -571,6 +592,26 @@ fn stream_input(
                 if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
                     return Ok(());
                 }
+            }
+        }
+        StreamInput::File(file) => {
+            let mut position = offset;
+            let mut remaining = len;
+            let mut buf = vec![0u8; READ_CHUNK];
+            while remaining > 0 {
+                let want = remaining.min(READ_CHUNK as u64) as usize;
+                let n = read_at(&file, &mut buf[..want], position).map_err(io_err)?;
+                if n == 0 {
+                    break;
+                }
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                position = position.saturating_add(n as u64);
+                remaining -= n as u64;
             }
         }
         StreamInput::Raw(path) => {
@@ -745,8 +786,8 @@ impl LocalBlobStore {
                     while remaining != 0 {
                         let mut buf = plaintext_buf
                             .take()
-                            .unwrap_or_else(|| vec![0u8; READ_CHUNK]);
-                        let want = remaining.min(READ_CHUNK as u64) as usize;
+                            .unwrap_or_else(|| vec![0u8; ASSEMBLY_READ_CHUNK]);
+                        let want = remaining.min(ASSEMBLY_READ_CHUNK as u64) as usize;
                         let (buf, n) = file
                             .run(move |mut file| {
                                 use std::io::Read;
@@ -812,6 +853,42 @@ impl LocalBlobStore {
     }
 }
 
+/// Read at an absolute position without mutating a shared file cursor. The descriptor is shared
+/// with the optional zero-copy hint, so a cursor-based read could race the kernel transfer.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// Portable fallback: the anchored descriptor is not shared with a concurrent transfer off Unix,
+/// so a cursor read is safe there.
+#[cfg(not(unix))]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 /// Bound a coalesced read by the length already checked against metadata, even if a local writer
 /// grows the file after fstat. A fixed slice also avoids read_to_end's speculative capacity growth.
 fn read_small(reader: &mut impl std::io::Read, len: u64) -> Result<Bytes, BlobError> {
@@ -862,6 +939,11 @@ impl LocalBlobStore {
         // channel that otherwise dominate a tiny GET (such an object is below the kernel sendfile floor
         // anyway, so it would never take the zero-copy path). This is the small-object GET fast path.
         let small_read_max = self.small_read_max;
+        // Admit the read before opening the blob. The probe itself opens a descriptor, reads a
+        // small object whole, and validates framing; doing that outside the pool let a flood of
+        // slow readers start unbounded probe work before admission. The same permit travels with
+        // the resulting body, so admission still covers the transfer.
+        let permit = self.acquire_io_owned().await?;
         let probe_path = file_path.clone();
         let plaintext_length_mismatch = self.plaintext_length_mismatch.clone();
         let probe_cipher = cipher.clone();
@@ -872,9 +954,11 @@ impl LocalBlobStore {
             reuse_file,
             whole,
             prepared,
+            permit,
             _lease: _probe_result_lease,
         } = tokio::task::spawn_blocking(move || -> Result<ReadProbe, BlobError> {
             let _lease = probe_lease;
+            let _probe_permit = permit;
             let mut f = match std::fs::File::open(&probe_path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -912,13 +996,14 @@ impl LocalBlobStore {
             } else if file_len <= small_read_max {
                 (file_len, None, Some(read_small(&mut f, file_len)?), None)
             } else {
-                (file_len, Some(f), None, None)
+                (file_len, Some(Arc::new(f)), None, None)
             };
             Ok(ReadProbe {
                 logical_len,
                 reuse_file,
                 whole,
                 prepared,
+                permit: _probe_permit,
                 _lease,
             })
         })
@@ -960,7 +1045,6 @@ impl LocalBlobStore {
             // this, a small-object GET fast path is unbounded — a flood of slow readers of
             // below-floor objects could hold far more transient memory than `read_permits` was
             // sized to allow (a read-side slow-loris, the exact class this pool exists to bound).
-            let permit = self.acquire_io_owned().await?;
             enum SmallState {
                 Item(Bytes, tokio::sync::OwnedSemaphorePermit),
                 Held(tokio::sync::OwnedSemaphorePermit),
@@ -976,19 +1060,23 @@ impl LocalBlobStore {
             ));
             (body, None)
         } else {
-            // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
-            // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
-            let permit = self.acquire_io_owned().await?;
+            // The probe's admission permit stays with the streamed transfer (ARCH 7.4) and is
+            // released when the read task finishes. (The kernel sendfile fast path below is
+            // bounded separately by the server.)
             let input = match prepared {
                 Some(reader) => StreamInput::Container(reader),
-                None => StreamInput::Raw(file_path.clone()),
+                None => match reuse_file.as_ref() {
+                    // Serve the descriptor the probe validated instead of reopening the path.
+                    Some(file) => StreamInput::File(Arc::clone(file)),
+                    None => StreamInput::Raw(file_path.clone()),
+                },
             };
             let body = read_stream(input, offset, len, (permit, lease.clone()));
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
             // fd the probe opened. Encrypted blobs are always block-formatted (`is_container`), so
             // `reuse_file` is `None` for them and the kernel never sees ciphertext.
             let zero_copy = reuse_file.map(|f| ZeroCopyRead {
-                file: Arc::new(f),
+                file: f,
                 offset,
                 len,
             });
@@ -1091,7 +1179,7 @@ impl BlobStore for LocalBlobStore {
             }
         }
         drop(raw_body_breakdown);
-        let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
+        let write = match outcome {
             Ok(v) => v,
             Err(e) => {
                 sink.abort().await;
@@ -1124,13 +1212,14 @@ impl BlobStore for LocalBlobStore {
 
         let staged = StagedBlob {
             storage_path,
-            size_logical: logical,
-            size_physical: physical,
-            etag: ETag::from_md5_hex(md5.clone()),
-            md5_hex: md5,
-            checksums,
-            internal_sha256,
-            compression: descriptor,
+            size_logical: write.logical,
+            size_physical: write.physical,
+            etag: ETag::from_md5_hex(write.md5.clone()),
+            md5_hex: write.md5,
+            checksums: write.checksums,
+            internal_sha256: write.internal_sha256,
+            compression: write.compression,
+            index_spool: write.index_spool,
         };
         Ok(staged)
     }
@@ -1229,13 +1318,26 @@ impl BlobStore for LocalBlobStore {
         let operation = lease.try_child()?;
         let root = self.data_root.clone();
         let path = cleanup.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let _lease = lease;
+        let namespace = tokio::task::spawn_blocking(move || {
             let _operation = operation;
-            namespace::cleanup(&root, &path).map_err(io_err)
+            namespace::cleanup_unlink(&root, &path).map_err(io_err)
         })
         .await
-        .map_err(|error| BlobError::Io(error.to_string()))?
+        .map_err(|error| BlobError::Io(error.to_string()))??;
+        fail::fail_point!("blob_before_coalesced_dirsync", |_| Err(BlobError::Io(
+            "injected storage directory sync failure".into()
+        )));
+        // Concurrent cleanups into the same directory share one absence barrier. Every row still
+        // carries its own exact claim and identity checks.
+        self.dir_sync.sync_file(namespace.parent(), &lease).await?;
+        let prune_operation = lease.try_child()?;
+        tokio::task::spawn_blocking(move || {
+            let _operation = prune_operation;
+            namespace::cleanup_prune(namespace).map_err(io_err)
+        })
+        .await
+        .map_err(|error| BlobError::Io(error.to_string()))??;
+        Ok(())
     }
 
     async fn stage_part(
@@ -1275,14 +1377,13 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        let (logical, _phys, md5, checks, _desc, _internal_sha256) =
-            match write_staged(&mut sink, body, &opts, &paths, None).await {
-                Ok(v) => v,
-                Err(e) => {
-                    sink.abort().await;
-                    return Err(e);
-                }
-            };
+        let write = match write_staged(&mut sink, body, &opts, &paths, None).await {
+            Ok(v) => v,
+            Err(e) => {
+                sink.abort().await;
+                return Err(e);
+            }
+        };
         sink.fsync_in_place().await?;
         // fsync the session directory so the new part's directory entry is durable. Without this, a
         // part that was acknowledged 200 OK could lose its dirent on power loss even though its bytes
@@ -1295,9 +1396,10 @@ impl BlobStore for LocalBlobStore {
             .await?;
         Ok(StagedPart {
             storage_path: paths.storage_path.clone(),
-            size: logical,
-            md5_hex: md5,
-            checksums: checks,
+            size: write.logical,
+            md5_hex: write.md5,
+            checksums: write.checksums,
+            index_spool: write.index_spool,
         })
     }
 
@@ -1385,9 +1487,13 @@ impl BlobStore for LocalBlobStore {
             sink.abort().await;
             return Err(e);
         }
+        let mut index_spool = IndexSpoolState::NeverCreated;
         let descriptor = if let Some(e) = enc {
             match e.finish(&mut sink).await {
-                Ok(bytes) => physical += bytes,
+                Ok((bytes, spool)) => {
+                    physical += bytes;
+                    index_spool = spool;
+                }
                 Err(err) => {
                     sink.abort().await;
                     return Err(err);
@@ -1427,6 +1533,7 @@ impl BlobStore for LocalBlobStore {
             checksums,
             internal_sha256,
             compression: descriptor,
+            index_spool,
         };
         Ok(staged)
     }
@@ -1839,6 +1946,36 @@ mod tests {
                 .any(|sample| sample.stage == ObjectWriteStage::BodySink)
         );
         assert!(samples.iter().all(|sample| sample.completed));
+    }
+
+    #[tokio::test]
+    async fn raw_and_small_encoded_writes_never_open_the_index_spool() {
+        for compression in [None, Some(CompressionPolicy::default())] {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap()
+                    .with_io_uring(false);
+            let staged = store
+                .stage_fixture(
+                    &BucketName::parse("bkt").unwrap(),
+                    Box::pin(futures_util::stream::once(async {
+                        Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"payload"))
+                    })),
+                    StageOptions {
+                        compression,
+                        ..StageOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                staged.index_spool,
+                IndexSpoolState::NeverCreated,
+                "a buffered index must not be reported as a created alias"
+            );
+        }
     }
 
     #[tokio::test]

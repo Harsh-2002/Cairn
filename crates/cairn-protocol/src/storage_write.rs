@@ -1,7 +1,8 @@
 //! Runtime-neutral ownership of one admitted physical write (ARCH 8).
 
+use cairn_types::blob::IndexSpoolState;
 use cairn_types::error::Error;
-use cairn_types::meta::Mutation;
+use cairn_types::meta::{ActivityEntry, Mutation};
 use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
 use cairn_types::storage::{
     PlannedStorageWrite, StorageAdmission, StorageCreationPermit, StorageToken, StorageWritePlan,
@@ -88,12 +89,15 @@ impl StorageWriteRuntime {
         &self,
         blob: &dyn BlobStore,
         bucket: BucketName,
+        bucket_owner: cairn_types::id::UserId,
         target: StorageWriteTarget,
     ) -> Result<PreparedStorageWrite, Error> {
         let slot = (self.admission)().await.ok_or_else(|| {
             Error::Internal("storage recovery admission is unavailable".to_owned())
         })?;
-        let planned = blob.plan_write(bucket, self.generation.clone(), target)?;
+        let planned = blob
+            .plan_write(bucket, self.generation.clone(), target)?
+            .with_bucket_owner(bucket_owner);
         let plan = planned.plan().clone();
         let lifetime = StorageRecoveryPermit::new((self.node_lifetime.clone(), slot));
         let (io, lease) = StorageIoWatch::new(
@@ -144,7 +148,12 @@ pub(crate) struct StorageWriteGuard {
 }
 
 impl StorageWriteGuard {
-    pub(crate) fn publication(&self, operation: Mutation) -> Mutation {
+    pub(crate) fn publication(
+        &self,
+        operation: Mutation,
+        index_spool: IndexSpoolState,
+        activity: Option<Box<ActivityEntry>>,
+    ) -> Mutation {
         Mutation::PublishStorageWrite {
             plan: Box::new(
                 self.recovery
@@ -154,6 +163,8 @@ impl StorageWriteGuard {
                     .clone(),
             ),
             operation: Box::new(operation),
+            index_spool,
+            activity,
         }
     }
 

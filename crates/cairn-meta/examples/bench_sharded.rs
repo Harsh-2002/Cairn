@@ -161,6 +161,8 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
                             initial_state: InitialObjectState::default(),
                             replication: Vec::new(),
                         }),
+                        index_spool: cairn_types::blob::IndexSpoolState::Materialized,
+                        activity: None,
                     })
                     .await
                     .expect("protocol-2 metadata publication failed");

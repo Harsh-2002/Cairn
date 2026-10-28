@@ -717,6 +717,15 @@ fn seek_after(prefix: &str, delimiter: Option<&str>, marker: &str) -> Option<Str
     Some(successor(marker))
 }
 
+/// Usable rows per SQL batch when the page still needs `remaining` output entries.
+///
+/// Demand-sized so a one- or ten-key page does not decode and discard a full `LIST_BATCH` of rows.
+/// Clamped to at least one row because a delimiter collapse can fill the page exactly and the next
+/// batch still has to probe for the truncation lookahead. `LIST_BATCH` stays the hard ceiling.
+fn list_batch_size(remaining: usize) -> usize {
+    remaining.clamp(1, LIST_BATCH)
+}
+
 /// The efficient listing implementation: half-open range seek with delimiter skip-scan.
 ///
 /// Two resume channels, with deliberately different semantics:
@@ -771,6 +780,16 @@ fn list_impl(
     let mut seen_cp = std::collections::HashSet::new();
 
     'outer: loop {
+        // Demand-sized batch: fetch only what this page still needs, plus one lookahead row. The
+        // `+ 1` is what distinguishes "exactly filled" from "more rows exist" — a page filled by
+        // exactly `batch` rows is truncated only if that extra row came back. The lookahead is
+        // therefore *processed* too (and only ever seen by the fullness check, which runs before
+        // every push, so it can never over-fill the page). A delimiter collapse can fill the page
+        // (or consume fewer entries than rows) without filling `batch`, so the outer loop keeps
+        // re-seeking from the advanced `seek` until the page is full or the range is exhausted.
+        // `batch + 1` never exceeds `LIST_BATCH + 1`.
+        let remaining = limit.saturating_sub(page.items.len() + page.common_prefixes.len());
+        let batch = list_batch_size(remaining);
         let rows = fetch_rows(
             conn,
             bucket,
@@ -781,13 +800,13 @@ fn list_impl(
                 .as_ref()
                 .map(|(key, version)| (key.as_str(), version.as_str())),
             query.visible_at,
-            LIST_BATCH + 1,
+            batch + 1,
         )?;
         if rows.is_empty() {
             break;
         }
-        let exhausted = rows.len() <= LIST_BATCH;
-        for summary in rows.into_iter().take(LIST_BATCH) {
+        let exhausted = rows.len() <= batch;
+        for summary in rows.into_iter().take(batch + 1) {
             if page.items.len() + page.common_prefixes.len() >= limit {
                 page.truncated = true;
                 if latest_only {
@@ -2415,5 +2434,228 @@ mod key_hash_binding_tests {
             "the rejected same-prefix replacement must preserve the upgraded full identity"
         );
         assert_eq!(states[0].created_at, 10);
+    }
+}
+
+#[cfg(test)]
+mod listing_batch_tests {
+    use super::*;
+    use cairn_types::authz::OwnershipMode;
+    use cairn_types::bucket::VersioningState;
+    use cairn_types::meta::{InitialObjectState, Precondition};
+    use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+    use cairn_types::testing::FixtureMetadataStore;
+
+    fn row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
+        ObjectVersionRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            bucket: bucket.clone(),
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: VersionId::null(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: 1,
+            size_physical: 1,
+            etag: ETag::from_string("e".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_path: Some(StoragePath::generate(bucket)),
+            compression: CompressionDescriptor::Uncompressed,
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: UserId::generate(),
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            sse_descriptor: None,
+            replication_status: None,
+            internal_sha256: None,
+            replicated_at: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        }
+    }
+
+    /// One bucket seeded with one current version per key.
+    async fn seeded_store(keys: &[String]) -> (SqliteMetadataStore, BucketName) {
+        let store = crate::open_in_memory().unwrap();
+        let fixture = store.begin_fixture().await.unwrap();
+        let bucket = BucketName::parse("batch-bkt").unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(Bucket {
+                name: bucket.clone(),
+                owner_id: UserId::generate(),
+                created_at: Timestamp(1),
+                versioning: VersioningState::Enabled,
+                ownership_mode: OwnershipMode::BucketOwnerEnforced,
+                region: "us-east-1".to_owned(),
+                compression: None,
+            })))
+            .await
+            .unwrap();
+        for key in keys {
+            store
+                .submit_fixture(
+                    &fixture,
+                    Mutation::PutObjectVersion {
+                        row: Box::new(row(&bucket, key)),
+                        precondition: Precondition::default(),
+                        initial_state: InitialObjectState::default(),
+                        replication: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        (store, bucket)
+    }
+
+    /// Page `list_current` to exhaustion at `limit`, returning the flattened item keys, the
+    /// common prefixes in listing order, and the number of pages served.
+    async fn drain(
+        store: &SqliteMetadataStore,
+        bucket: &BucketName,
+        delimiter: Option<&str>,
+        limit: u32,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let mut items = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let page = store
+                .list_current(
+                    bucket,
+                    &ListQuery {
+                        delimiter: delimiter.map(str::to_owned),
+                        cursor: cursor.clone(),
+                        limit,
+                        ..ListQuery::default()
+                    },
+                )
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(
+                page.items.len() + page.common_prefixes.len() <= limit as usize,
+                "page exceeded the requested limit"
+            );
+            items.extend(page.items.iter().map(|i| i.key.as_str().to_owned()));
+            common_prefixes.extend(page.common_prefixes.iter().cloned());
+            if !page.truncated {
+                break;
+            }
+            cursor = page.next_cursor.clone();
+            assert!(cursor.is_some(), "a truncated page must carry a cursor");
+        }
+        (items, common_prefixes, pages)
+    }
+
+    #[test]
+    fn batch_size_is_demand_sized_with_one_lookahead_row() {
+        // The old fixed batch decoded 1,025 rows for a 5-key page; the demand-sized batch asks
+        // for the 5 entries still needed plus exactly one lookahead row.
+        assert_eq!(list_batch_size(1) + 1, 2);
+        assert_eq!(list_batch_size(5) + 1, 6);
+        assert_eq!(list_batch_size(10) + 1, 11);
+        // A full page still caps at LIST_BATCH usable rows (+ the lookahead).
+        assert_eq!(list_batch_size(LIST_BATCH), LIST_BATCH);
+        assert_eq!(list_batch_size(usize::MAX), LIST_BATCH);
+        // A page already filled by a delimiter collapse still probes one row for truncation.
+        assert_eq!(list_batch_size(0), 1);
+    }
+
+    #[tokio::test]
+    async fn small_page_is_demand_sized_and_drains_without_gaps() {
+        let keys: Vec<String> = (0..40).map(|i| format!("key-{i:02}")).collect();
+        let (store, bucket) = seeded_store(&keys).await;
+
+        let first = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    limit: 5,
+                    ..ListQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.items.len(),
+            5,
+            "a 5-key page must return exactly 5 objects, not a collapsed prefix"
+        );
+        assert!(first.truncated, "40 keys cannot fit in a 5-key page");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            keys[..5].iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        let (drained, prefixes, pages) = drain(&store, &bucket, None, 5).await;
+        assert!(prefixes.is_empty());
+        assert_eq!(
+            drained, keys,
+            "cursor paging must return every key exactly once, in order, with no gaps or duplicates"
+        );
+        assert_eq!(pages, 8, "40 keys at 5 per page is 8 pages");
+    }
+
+    #[tokio::test]
+    async fn delimiter_collapse_still_fills_the_page_across_batches() {
+        // The first 20 keys all collapse into one common prefix; the remaining 20 are direct items.
+        let mut keys: Vec<String> = (0..20).map(|i| format!("group/{i:02}")).collect();
+        keys.extend((0..20).map(|i| format!("z{i:02}")));
+        let (store, bucket) = seeded_store(&keys).await;
+
+        let first = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    delimiter: Some("/".to_owned()),
+                    limit: 5,
+                    ..ListQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.common_prefixes, vec!["group/".to_owned()]);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z00", "z01", "z02", "z03"],
+            "the collapsed prefix consumes one entry, so the rest of the page fills with items"
+        );
+        assert!(
+            first.truncated,
+            "a page filled while more keys remain must be truncated"
+        );
+
+        let expected_items: Vec<String> = (0..20).map(|i| format!("z{i:02}")).collect();
+        let (drained, prefixes, pages) = drain(&store, &bucket, Some("/"), 5).await;
+        assert_eq!(
+            prefixes,
+            vec!["group/".to_owned()],
+            "the collapsed group must be returned exactly once"
+        );
+        assert_eq!(
+            drained, expected_items,
+            "no key under the collapsed prefix may leak into the item stream"
+        );
+        assert!(
+            pages > 1,
+            "the delimiter case must page through every batch"
+        );
     }
 }

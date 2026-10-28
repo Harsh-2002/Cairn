@@ -1,0 +1,597 @@
+{
+ "schema": 1,
+ "case": "put_1m",
+ "pairs": 5,
+ "duration": 12,
+ "host_capacity": {
+  "memtotal_kib": 8854120,
+  "swaptotal_kib": 4194300,
+  "logical_cpus": 4
+ },
+ "metrics_drain_seconds": 17,
+ "linger_us": {
+  "control": 0,
+  "candidate": 0
+ },
+ "binaries": {
+  "candidate": {
+   "path": "/tmp/opencode/bench/cairn-branch",
+   "sha256": "be4dc103667df37b6682d52b3a3ee0b26dff9932665425b76575574bc8514ca7"
+  },
+  "warp": {
+   "path": "/tmp/opencode/bench/warp-1.8.0",
+   "sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+  },
+  "control": {
+   "path": "/tmp/opencode/bench/cairn-main",
+   "sha256": "a2603381e8c4152f793a0a51f12cd3630ac8c0967eaf8729a3fe629bcf71a60a"
+  }
+ },
+ "host": "4 vCPU KVM, one 100-GB virtual disk, shared node, MemTotal ~8.0 GiB ballooning",
+ "warp": {
+  "version": "v1.8.0",
+  "sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+ },
+ "arms": [
+  {
+   "engine": "cairn",
+   "variant": "control",
+   "order": 1,
+   "status": "PASS",
+   "mib_per_second": 62.64,
+   "objects_per_second": 62.64,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110582.0,
+    "end_unix_seconds": 1793110591.0,
+    "raw_end_unix_seconds": 1793110595.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 62.63612015122734,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.091398239135742,
+     "unrelated_cpu_seconds": 0.35,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2086181,
+      "full": 1441527
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 370515032,
+      "syscr": 0,
+      "syscw": 15715,
+      "read_bytes": 0,
+      "write_bytes": 371290112
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 912408576,
+   "server_peak_rss": 39559168,
+   "host_capacity_before": {
+    "memtotal_kib": 8854120,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 8833784,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "candidate",
+   "order": 2,
+   "status": "PASS",
+   "mib_per_second": 92.05,
+   "objects_per_second": 92.05,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110615.0,
+    "end_unix_seconds": 1793110624.0,
+    "raw_end_unix_seconds": 1793110628.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 92.04813522782045,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.148306369781494,
+     "unrelated_cpu_seconds": 1.11,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2289979,
+      "full": 940213
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 1159168,
+      "wchar": 650232656,
+      "syscr": 283,
+      "syscw": 25674,
+      "read_bytes": 0,
+      "write_bytes": 651616256
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 1201766400,
+   "server_peak_rss": 42176512,
+   "host_capacity_before": {
+    "memtotal_kib": 8936184,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 8946244,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "candidate",
+   "order": 3,
+   "status": "PASS",
+   "mib_per_second": 80.01,
+   "objects_per_second": 80.01,
+   "analyzed_seconds": 10.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110650.0,
+    "end_unix_seconds": 1793110660.0,
+    "raw_end_unix_seconds": 1793110664.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 10.0,
+    "aggregate_mib_per_second": 80.01283066128263,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.096902847290039,
+     "unrelated_cpu_seconds": 0.5800000000000001,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2073401,
+      "full": 1201165
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 486117954,
+      "syscr": 0,
+      "syscw": 16740,
+      "read_bytes": 0,
+      "write_bytes": 486969344
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 1113726976,
+   "server_peak_rss": 42287104,
+   "host_capacity_before": {
+    "memtotal_kib": 9029436,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 8875352,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "control",
+   "order": 4,
+   "status": "PASS",
+   "mib_per_second": 45.6,
+   "objects_per_second": 45.6,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110684.0,
+    "end_unix_seconds": 1793110693.0,
+    "raw_end_unix_seconds": 1793110697.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 45.60193420023759,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.069538354873657,
+     "unrelated_cpu_seconds": 0.36,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2017302,
+      "full": 1503043
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 310082570,
+      "syscr": 0,
+      "syscw": 13816,
+      "read_bytes": 0,
+      "write_bytes": 310718464
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 752140288,
+   "server_peak_rss": 38744064,
+   "host_capacity_before": {
+    "memtotal_kib": 8977752,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9112332,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "control",
+   "order": 5,
+   "status": "PASS",
+   "mib_per_second": 99.95,
+   "objects_per_second": 99.95,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110718.0,
+    "end_unix_seconds": 1793110727.0,
+    "raw_end_unix_seconds": 1793110731.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 99.94985750405988,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.134700298309326,
+     "unrelated_cpu_seconds": 0.81,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 1801301,
+      "full": 503606
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 1126400,
+      "wchar": 804468333,
+      "syscr": 275,
+      "syscw": 38542,
+      "read_bytes": 0,
+      "write_bytes": 806723584
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 1300393984,
+   "server_peak_rss": 41717760,
+   "host_capacity_before": {
+    "memtotal_kib": 9309880,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9231576,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "candidate",
+   "order": 6,
+   "status": "PASS",
+   "mib_per_second": 58.79,
+   "objects_per_second": 58.79,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110752.0,
+    "end_unix_seconds": 1793110761.0,
+    "raw_end_unix_seconds": 1793110765.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 58.78568519795492,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.075704336166382,
+     "unrelated_cpu_seconds": 0.26,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2070063,
+      "full": 1389735
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 395603434,
+      "syscr": 0,
+      "syscw": 14088,
+      "read_bytes": 0,
+      "write_bytes": 396218368
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 909893632,
+   "server_peak_rss": 38105088,
+   "host_capacity_before": {
+    "memtotal_kib": 9407160,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9363380,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "candidate",
+   "order": 7,
+   "status": "PASS",
+   "mib_per_second": 57.74,
+   "objects_per_second": 57.74,
+   "analyzed_seconds": 9.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110787.0,
+    "end_unix_seconds": 1793110796.0,
+    "raw_end_unix_seconds": 1793110800.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 9.0,
+    "aggregate_mib_per_second": 57.738028833224284,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.071909666061401,
+     "unrelated_cpu_seconds": 0.73,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 2022295,
+      "full": 1291760
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 395511384,
+      "syscr": 0,
+      "syscw": 13551,
+      "read_bytes": 0,
+      "write_bytes": 396111872
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 792330240,
+   "server_peak_rss": 39567360,
+   "host_capacity_before": {
+    "memtotal_kib": 9197048,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9094648,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "control",
+   "order": 8,
+   "status": "PASS",
+   "mib_per_second": 87.68,
+   "objects_per_second": 87.68,
+   "analyzed_seconds": 10.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110820.0,
+    "end_unix_seconds": 1793110830.0,
+    "raw_end_unix_seconds": 1793110834.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 10.0,
+    "aggregate_mib_per_second": 87.67982376945113,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.152970790863037,
+     "unrelated_cpu_seconds": 0.8400000000000001,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 1709063,
+      "full": 511565
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 1220608,
+      "wchar": 697921108,
+      "syscr": 298,
+      "syscw": 33791,
+      "read_bytes": 0,
+      "write_bytes": 699752448
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 1116278784,
+   "server_peak_rss": 40271872,
+   "host_capacity_before": {
+    "memtotal_kib": 9043008,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 8917472,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "control",
+   "order": 9,
+   "status": "PASS",
+   "mib_per_second": 51.63,
+   "objects_per_second": 51.63,
+   "analyzed_seconds": 10.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110855.0,
+    "end_unix_seconds": 1793110865.0,
+    "raw_end_unix_seconds": 1793110869.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 10.0,
+    "aggregate_mib_per_second": 51.63198758810906,
+    "host_window": {
+     "complete_intervals": 3,
+     "coverage_seconds": 6.079981565475464,
+     "unrelated_cpu_seconds": 0.44,
+     "unrelated_cpu_valid_intervals": 3,
+     "host_io_pressure_delta_us": {
+      "some": 1780201,
+      "full": 1156985
+     },
+     "host_io_pressure_valid_intervals": 3,
+     "server_process_io_delta": {
+      "rchar": 0,
+      "wchar": 381631095,
+      "syscr": 0,
+      "syscw": 16942,
+      "read_bytes": 0,
+      "write_bytes": 382435328
+     },
+     "server_process_io_valid_intervals": 3
+    }
+   },
+   "peak_bytes": 713768960,
+   "server_peak_rss": 39981056,
+   "host_capacity_before": {
+    "memtotal_kib": 9019872,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9177084,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  },
+  {
+   "engine": "cairn",
+   "variant": "candidate",
+   "order": 10,
+   "status": "PASS",
+   "mib_per_second": 82.14,
+   "objects_per_second": 82.14,
+   "analyzed_seconds": 10.0,
+   "reported_errors": 0,
+   "strict_settings": {
+    "CAIRN_META_SYNCHRONOUS": "full",
+    "CAIRN_META_SHARDS": "1",
+    "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+   },
+   "warp_operation_timeline": {
+    "status": "captured source-derived Warp scored interval with report-score parity",
+    "start_unix_seconds": 1793110889.0,
+    "end_unix_seconds": 1793110899.0,
+    "raw_end_unix_seconds": 1793110903.0,
+    "interval_source": "Warp v1.8 throughput start plus measured duration; raw end is +4s",
+    "analyzed_seconds_exact": 10.0,
+    "aggregate_mib_per_second": 82.14444471293497,
+    "host_window": {
+     "complete_intervals": 4,
+     "coverage_seconds": 8.133464574813843,
+     "unrelated_cpu_seconds": 0.9000000000000001,
+     "unrelated_cpu_valid_intervals": 4,
+     "host_io_pressure_delta_us": {
+      "some": 2655697,
+      "full": 1516028
+     },
+     "host_io_pressure_valid_intervals": 4,
+     "server_process_io_delta": {
+      "rchar": 1093632,
+      "wchar": 682232594,
+      "syscr": 267,
+      "syscw": 27288,
+      "read_bytes": 0,
+      "write_bytes": 683503616
+     },
+     "server_process_io_valid_intervals": 4
+    }
+   },
+   "peak_bytes": 1114075136,
+   "server_peak_rss": 39227392,
+   "host_capacity_before": {
+    "memtotal_kib": 9381884,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   },
+   "host_capacity_after": {
+    "memtotal_kib": 9340840,
+    "swaptotal_kib": 4194300,
+    "logical_cpus": 4
+   }
+  }
+ ]
+}

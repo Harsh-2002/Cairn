@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cairn_put_ab import main as ab_main
+from cairn_put_ab import main as ab_main, pair_summary
 from rustfs_compare import (CASES, analyze_warp_put_timeline, arm_usage, cairn_metrics,
                             capacity_compatible,
                             diskstats_delta, io_pressure_totals, parse_diskstats,
@@ -22,6 +22,39 @@ from rustfs_compare import (CASES, analyze_warp_put_timeline, arm_usage, cairn_m
                             scored_host_window,
                             server_environment, run_arm, tree_usage, unrelated_cpu_delta,
                             verify_rustfs_durability, warp_benchdata_paths)
+
+
+class PairSummaryTests(unittest.TestCase):
+    def test_pairs_join_by_variant_not_array_position(self):
+        arms = [
+            {"order": 1, "variant": "candidate", "status": "PASS", "mib_per_second": 50.0},
+            {"order": 2, "variant": "control", "status": "PASS", "mib_per_second": 100.0},
+            {"order": 3, "variant": "control", "status": "PASS", "mib_per_second": 80.0},
+            {"order": 4, "variant": "candidate", "status": "PASS", "mib_per_second": 120.0},
+        ]
+        pairs = pair_summary(arms)
+        self.assertEqual([p["pair"] for p in pairs], [1, 2])
+        # Chronological second arm is the control in pair 1: the ratio must stay 0.5, not 2.0.
+        self.assertEqual(pairs[0]["candidate_over_control"], 0.5)
+        self.assertEqual(pairs[0]["control_order"], 2)
+        self.assertEqual(pairs[1]["candidate_over_control"], 1.5)
+
+    def test_incomplete_or_ambiguous_pairs_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "exactly one control"):
+            pair_summary([{"order": 1, "variant": "candidate", "status": "PASS",
+                           "mib_per_second": 1.0}])
+        with self.assertRaisesRegex(ValueError, "duplicate variant"):
+            pair_summary([
+                {"order": 1, "variant": "control", "status": "PASS", "mib_per_second": 1.0},
+                {"order": 2, "variant": "control", "status": "PASS", "mib_per_second": 2.0},
+            ])
+
+    def test_non_pass_arms_are_not_scored(self):
+        arms = [
+            {"order": 1, "variant": "control", "status": "INCONCLUSIVE", "mib_per_second": 10.0},
+            {"order": 2, "variant": "candidate", "status": "PASS", "mib_per_second": 20.0},
+        ]
+        self.assertEqual(pair_summary(arms), [])
 
 
 class WarpParserTests(unittest.TestCase):

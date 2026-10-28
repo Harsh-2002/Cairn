@@ -269,7 +269,7 @@ impl AuthChain {
         // can never widen beyond what its own policy grants.
         let user_policy = match creds.inline_policy.as_deref() {
             Some(raw) => match cairn_authz::parse_user_policy(raw) {
-                Ok(policy) => Some(Box::new(policy)),
+                Ok(policy) => Some(Arc::new(policy)),
                 Err(e) => {
                     tracing::warn!(
                         access_key_id,
@@ -448,11 +448,11 @@ impl AuthChain {
         if principal.is_session {
             return Ok(principal);
         }
-        // Cache hit: attach a clone of the shared parsed policy. The downstream `AuthzInput`
-        // deep-clones the policy anyway (`.as_deref().cloned()`), so a `Box` clone here costs no
-        // more than today while skipping both the metadata read and the JSON parse.
+        // Cache hit: share the parsed policy with the request instead of deep-copying it. Both the
+        // principal and the authorization input hold the same immutable `Arc`, so a large identity
+        // policy is parsed once and never cloned per request.
         if let Some(cached) = self.cache.get_policy(&principal.user_id) {
-            principal.user_policy = cached.as_ref().map(|p| Box::new((**p).clone()));
+            principal.user_policy = cached;
             return Ok(principal);
         }
         let observed = self.cache.observe_epoch();
@@ -462,7 +462,7 @@ impl AuthChain {
                     let arc = Arc::new(policy);
                     self.cache
                         .put_policy(&principal.user_id, Some(arc.clone()), observed);
-                    principal.user_policy = Some(Box::new((*arc).clone()));
+                    principal.user_policy = Some(arc.clone());
                 }
                 Err(e) => {
                     // Never cache malformed as "absent": absence is authorization-significant for

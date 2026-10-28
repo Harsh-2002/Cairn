@@ -165,7 +165,7 @@ fn session_policy_decision(
         account_bpa: cairn_types::PublicAccessBlock::default(),
         bucket_bpa: cairn_types::PublicAccessBlock::default(),
         policy: None,
-        user_policy: Some(policy),
+        user_policy: Some(std::sync::Arc::new(policy)),
         bucket_acl: None,
         object_acl: None,
         ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,

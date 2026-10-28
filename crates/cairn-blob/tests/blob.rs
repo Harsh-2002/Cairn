@@ -99,6 +99,58 @@ async fn encoded_stream_reuses_the_probed_descriptor_after_path_replacement() {
 }
 
 #[tokio::test]
+async fn raw_stream_reuses_the_probed_descriptor_after_path_replacement() {
+    use futures_util::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("raw-anchored-read").unwrap();
+    // Larger than the small-object cutoff, so the probe hands the descriptor to the streamed path.
+    let original = vec![b'a'; 512 * 1024 + 7];
+    let staged = store
+        .stage_fixture(&bucket, body(original.clone()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let mut handle = store
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await
+        .unwrap();
+    assert!(
+        handle.zero_copy.is_some(),
+        "an uncompressed large object carries the descriptor hint"
+    );
+    let replacement = store
+        .stage_fixture(
+            &bucket,
+            body(vec![b'b'; original.len()]),
+            opts(None, "text/plain"),
+        )
+        .await
+        .unwrap();
+    tokio::fs::rename(
+        dir.path().join(replacement.storage_path.as_str()),
+        dir.path().join(staged.storage_path.as_str()),
+    )
+    .await
+    .unwrap();
+    let mut received = Vec::new();
+    while let Some(chunk) = handle.body.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(
+        received, original,
+        "the stream must serve the descriptor the probe validated, not reopen the replaced path"
+    );
+}
+
+#[tokio::test]
 async fn raw_read_memory_bound_includes_an_enlarged_small_object_cutoff() {
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
@@ -1238,6 +1290,56 @@ async fn multipart_assembly_roundtrip() {
         !dir.path()
             .join(format!(".staging/multipart/{upload}"))
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn assembly_reads_plaintext_parts_across_multiple_read_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let b = BucketName::parse("assembly-chunks").unwrap();
+    let upload = UploadId::generate();
+    // Larger than one assembly read job and not a multiple of it, so the final short read and the
+    // boundary between jobs are both exercised.
+    let payload: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    let part = store
+        .stage_part_fixture(
+            &upload,
+            1,
+            "large-plaintext",
+            body(payload.clone()),
+            ChecksumSet::none(),
+            2 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+    let assembled = store
+        .assemble_fixture(
+            &b,
+            &[PartRef {
+                part_number: 1,
+                storage_path: part.storage_path.clone(),
+                size: part.size,
+                cipher: BlobCipher::KnownPlaintext,
+            }],
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.size_logical, payload.len() as u64);
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression,
+            assembled.size_logical,
+        )
+        .await,
+        payload
     );
 }
 
