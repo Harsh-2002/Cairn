@@ -63,6 +63,12 @@ use std::sync::Arc;
 
 const STAGING: &str = ".staging";
 const READ_CHUNK: usize = 64 * 1024;
+
+/// Plaintext multipart assembly reads one part per blocking job. A 256-KiB job amortises the
+/// blocking-pool hand-off over four times the bytes of a single [`READ_CHUNK`] while keeping the
+/// retained buffer small and the yield granularity sub-millisecond. Encrypted parts keep their
+/// block-sized decoder frames.
+const ASSEMBLY_READ_CHUNK: usize = 4 * READ_CHUNK;
 /// The logical block size for an encrypted-but-uncompressed object (no bucket policy supplies a
 /// block size in that case). 64 KiB keeps the per-block GCM-tag overhead negligible (16 bytes per
 /// 65536) while bounding the amount decrypted for a small ranged read.
@@ -769,8 +775,8 @@ impl LocalBlobStore {
                     while remaining != 0 {
                         let mut buf = plaintext_buf
                             .take()
-                            .unwrap_or_else(|| vec![0u8; READ_CHUNK]);
-                        let want = remaining.min(READ_CHUNK as u64) as usize;
+                            .unwrap_or_else(|| vec![0u8; ASSEMBLY_READ_CHUNK]);
+                        let want = remaining.min(ASSEMBLY_READ_CHUNK as u64) as usize;
                         let (buf, n) = file
                             .run(move |mut file| {
                                 use std::io::Read;
