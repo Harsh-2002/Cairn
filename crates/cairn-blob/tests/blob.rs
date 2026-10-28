@@ -1294,6 +1294,56 @@ async fn multipart_assembly_roundtrip() {
 }
 
 #[tokio::test]
+async fn assembly_reads_plaintext_parts_across_multiple_read_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let b = BucketName::parse("assembly-chunks").unwrap();
+    let upload = UploadId::generate();
+    // Larger than one assembly read job and not a multiple of it, so the final short read and the
+    // boundary between jobs are both exercised.
+    let payload: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    let part = store
+        .stage_part_fixture(
+            &upload,
+            1,
+            "large-plaintext",
+            body(payload.clone()),
+            ChecksumSet::none(),
+            2 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+    let assembled = store
+        .assemble_fixture(
+            &b,
+            &[PartRef {
+                part_number: 1,
+                storage_path: part.storage_path.clone(),
+                size: part.size,
+                cipher: BlobCipher::KnownPlaintext,
+            }],
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.size_logical, payload.len() as u64);
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression,
+            assembled.size_logical,
+        )
+        .await,
+        payload
+    );
+}
+
+#[tokio::test]
 async fn assemble_enforces_size_ceiling() {
     // Audit 2026-07: the multipart total must be bounded by size_ceiling, exactly as a single PUT is.
     let dir = tempfile::tempdir().unwrap();
