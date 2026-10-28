@@ -249,3 +249,18 @@ The scored cells are descriptive medians of three arms per engine, **not** the f
 Execution amendment: the first scored invocation completed the 36 arms through LIST, then Warp 1.8 rejected the initial DELETE configuration **before measurement** because its default batch/concurrency requires at least 6,400 prepared objects. The failed attempt and full elapsed time are retained. The DELETE pool is raised from 2,000 to 12,000 solely to satisfy that client-side minimum and avoid finishing the finite workload during the 12-second interval. DELETE, mixed and multipart run as separate continuations; their pair order and all other parameters stay fixed. This operational correction is not a selected performance result.
 
 Warp then completed the larger DELETE preparation but emitted `Skipping DELETE too few samples`, so standalone Warp DELETE is **inconclusive**. Its `multipart` command with `--parts 100 --part.size 5MiB` created a 500-MiB object but rejected GET because it expected 5 MiB; the observed client-side size expectation makes that arm unusable as server performance evidence. Both failed arms and their costs stay in the campaign record. A separate, standard-library Python SigV4 client in [`conformance/rustfs_s3_compare.py`](../conformance/rustfs_s3_compare.py) supplies the missing cells with the same three-pair alternating order: 12,000 prepared 4-KiB objects, concurrency 16, then a 12-second standalone DELETE interval; and full initiate→two 5-MiB parts→Complete→byte-verified GET→DELETE cycles, concurrency 4 for 12 seconds. The latter reports completed 10-MiB objects/s and verified MiB/s, not Warp's failed part operation. These cells are labeled by their different client, never pooled with Warp throughput. Exact success responses and complete-object SHA-256 are mandatory. A client-saturated or prematurely exhausted arm is inconclusive.
+
+## 2026-10-28 — second in-contract tranche
+
+The second tranche adds request-fact reuse, larger multipart assembly reads and variant-safe pairing:
+
+| Draft PR | Change |
+| --- | --- |
+| [#132](https://github.com/Harsh-2002/Cairn/pull/132) | one authorized bucket snapshot per object request; shared `Arc<Policy>` instead of two deep clones |
+| [#133](https://github.com/Harsh-2002/Cairn/pull/133) | plaintext multipart assembly reads 256 KiB per blocking job instead of 64 KiB |
+| [#134](https://github.com/Harsh-2002/Cairn/pull/134) | `pairs_detail` joins arms by variant, never by array position |
+
+[#135](https://github.com/Harsh-2002/Cairn/pull/135) integrates all first- and second-tranche changes. The combined tree passed fmt, all-features Clippy, **1,542 workspace tests** (5 skipped), doctests and `docs_check.py`.
+
+Correctness smoke, one 8-second arm per workload on the combined binary, zero errors: PUT 1 MiB 56.84 MiB/s, GET 1 MiB 2048.54 MiB/s, LIST 103,576.77 objects/s, mixed 1 MiB 341.49 MiB/s. Three alternating PUT pairs gave 0.732, 1.511 and 0.615 (geomean 0.88, 1/3 wins) — inside this host's noise and **not** a regression or a win claim. The runner emitted the corrected pairing block, including pair 2 where the candidate ran first (`candidate_order` 3, `control_order` 4). Compact evidence:
+[`performance-plan-integration-v2-smoke-2026-10-28.json`](performance-evidence/2026-10/performance-plan-integration-v2-smoke-2026-10-28.json).

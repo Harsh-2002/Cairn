@@ -1,0 +1,384 @@
+{
+ "schema": 1,
+ "date": "2026-10-28",
+ "host": "4 vCPU KVM, one 100-GB virtual disk, shared node, MemTotal ~8.0 GiB ballooning",
+ "binaries": {
+  "control_main_sha256": "a2603381e8c4152f793a0a51f12cd3630ac8c0967eaf8729a3fe629bcf71a60a",
+  "candidate_v2_sha256": "69debe961612c4fd37804e8b77a783d96037b21ca4709e9968f7373246bd72cf",
+  "warp_sha256": "d41abf5ff9bd61796def9d6ee9856fa25d325617476cd0c34b482cb42c716c8b"
+ },
+ "runs": {
+  "get_1m_single": {
+   "case": "get_1m",
+   "duration": 8,
+   "arms": [
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 1,
+     "status": "PASS",
+     "mib_per_second": 2048.54,
+     "objects_per_second": 2048.54,
+     "analyzed_seconds": 5.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "peak_bytes": 71516160,
+     "server_peak_rss": 56045568
+    }
+   ]
+  },
+  "list_4k_single": {
+   "case": "list_4k",
+   "duration": 8,
+   "arms": [
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 1,
+     "status": "PASS",
+     "mib_per_second": null,
+     "objects_per_second": 103576.77,
+     "analyzed_seconds": 5.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "peak_bytes": 45985792,
+     "server_peak_rss": 37937152
+    }
+   ]
+  },
+  "mixed_1m_single": {
+   "case": "mixed_1m",
+   "duration": 8,
+   "arms": [
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 1,
+     "status": "PASS",
+     "mib_per_second": 341.49,
+     "objects_per_second": 568.64,
+     "analyzed_seconds": 5.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "peak_bytes": 543035392,
+     "server_peak_rss": 63606784
+    }
+   ]
+  },
+  "put_1m_single": {
+   "case": "put_1m",
+   "duration": 8,
+   "arms": [
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 1,
+     "status": "PASS",
+     "mib_per_second": 56.84,
+     "objects_per_second": 56.84,
+     "analyzed_seconds": 5.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "peak_bytes": 555266048,
+     "server_peak_rss": 43466752
+    }
+   ]
+  },
+  "put_1m_ab": {
+   "case": "put_1m",
+   "duration": 12,
+   "pairs": 3,
+   "pairing_basis": "adjacent order windows, each joined by the recorded variant label and binary SHA; array position is never used to infer control or candidate",
+   "pairs_detail": [
+    {
+     "pair": 1,
+     "control_order": 1,
+     "candidate_order": 2,
+     "control_variant": "control",
+     "candidate_variant": "candidate",
+     "control_mib_per_second": 71.2,
+     "candidate_mib_per_second": 52.13,
+     "candidate_over_control": 0.7321629213483146
+    },
+    {
+     "pair": 2,
+     "control_order": 4,
+     "candidate_order": 3,
+     "control_variant": "control",
+     "candidate_variant": "candidate",
+     "control_mib_per_second": 53.61,
+     "candidate_mib_per_second": 81.03,
+     "candidate_over_control": 1.5114717403469502
+    },
+    {
+     "pair": 3,
+     "control_order": 5,
+     "candidate_order": 6,
+     "control_variant": "control",
+     "candidate_variant": "candidate",
+     "control_mib_per_second": 81.98,
+     "candidate_mib_per_second": 50.4,
+     "candidate_over_control": 0.6147840936813856
+    }
+   ],
+   "arms": [
+    {
+     "engine": "cairn",
+     "variant": "control",
+     "order": 1,
+     "status": "PASS",
+     "mib_per_second": 71.2,
+     "objects_per_second": 71.2,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 841,
+       "total_ms": 13850.024647
+      },
+      "fsync_staging": {
+       "calls": 1337,
+       "total_ms": 23095.705996
+      },
+      "fsync_other_dir": {
+       "calls": 437,
+       "total_ms": 7715.424951
+      },
+      "fsync_other": {
+       "calls": 632,
+       "total_ms": 12616.28508
+      },
+      "fdatasync": {
+       "calls": 841,
+       "total_ms": 21205.371855
+      }
+     },
+     "peak_bytes": 899403776,
+     "server_peak_rss": 38916096
+    },
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 2,
+     "status": "PASS",
+     "mib_per_second": 52.13,
+     "objects_per_second": 52.13,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 709,
+       "total_ms": 15234.582324
+      },
+      "fsync_staging": {
+       "calls": 1056,
+       "total_ms": 18645.075832000002
+      },
+      "fsync_other_dir": {
+       "calls": 359,
+       "total_ms": 7556.076583
+      },
+      "fsync_other": {
+       "calls": 542,
+       "total_ms": 11249.18234
+      },
+      "fdatasync": {
+       "calls": 709,
+       "total_ms": 19394.806409
+      }
+     },
+     "peak_bytes": 819113984,
+     "server_peak_rss": 41594880
+    },
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 3,
+     "status": "PASS",
+     "mib_per_second": 81.03,
+     "objects_per_second": 81.03,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 971,
+       "total_ms": 15275.356678
+      },
+      "fsync_staging": {
+       "calls": 1616,
+       "total_ms": 18190.22118
+      },
+      "fsync_other_dir": {
+       "calls": 506,
+       "total_ms": 6796.905121
+      },
+      "fsync_other": {
+       "calls": 785,
+       "total_ms": 12059.074956999999
+      },
+      "fdatasync": {
+       "calls": 971,
+       "total_ms": 18932.301883
+      }
+     },
+     "peak_bytes": 1059127296,
+     "server_peak_rss": 40906752
+    },
+    {
+     "engine": "cairn",
+     "variant": "control",
+     "order": 4,
+     "status": "PASS",
+     "mib_per_second": 53.61,
+     "objects_per_second": 53.61,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 626,
+       "total_ms": 15215.873349
+      },
+      "fsync_staging": {
+       "calls": 992,
+       "total_ms": 20118.194136000002
+      },
+      "fsync_other_dir": {
+       "calls": 313,
+       "total_ms": 7511.11118
+      },
+      "fsync_other": {
+       "calls": 419,
+       "total_ms": 12460.322357
+      },
+      "fdatasync": {
+       "calls": 626,
+       "total_ms": 19828.285973
+      }
+     },
+     "peak_bytes": 716091392,
+     "server_peak_rss": 36982784
+    },
+    {
+     "engine": "cairn",
+     "variant": "control",
+     "order": 5,
+     "status": "PASS",
+     "mib_per_second": 81.98,
+     "objects_per_second": 81.98,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 984,
+       "total_ms": 11631.907011000001
+      },
+      "fsync_staging": {
+       "calls": 1796,
+       "total_ms": 15901.815794
+      },
+      "fsync_other_dir": {
+       "calls": 498,
+       "total_ms": 6427.489305
+      },
+      "fsync_other": {
+       "calls": 847,
+       "total_ms": 10925.006397
+      },
+      "fdatasync": {
+       "calls": 984,
+       "total_ms": 18054.347853
+      }
+     },
+     "peak_bytes": 1066790912,
+     "server_peak_rss": 40284160
+    },
+    {
+     "engine": "cairn",
+     "variant": "candidate",
+     "order": 6,
+     "status": "PASS",
+     "mib_per_second": 50.4,
+     "objects_per_second": 50.4,
+     "analyzed_seconds": 9.0,
+     "reported_errors": 0,
+     "strict_settings": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+     },
+     "sync_probe_status": "captured",
+     "sync_probe_load_delta": {
+      "fsync_root": {
+       "calls": 686,
+       "total_ms": 14588.112986
+      },
+      "fsync_staging": {
+       "calls": 1138,
+       "total_ms": 23118.385692
+      },
+      "fsync_other_dir": {
+       "calls": 367,
+       "total_ms": 8212.659554
+      },
+      "fsync_other": {
+       "calls": 504,
+       "total_ms": 12518.616862
+      },
+      "fdatasync": {
+       "calls": 686,
+       "total_ms": 21335.133309
+      }
+     },
+     "peak_bytes": 788672512,
+     "server_peak_rss": 37625856
+    }
+   ]
+  }
+ }
+}
