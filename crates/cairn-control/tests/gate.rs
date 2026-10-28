@@ -158,7 +158,7 @@ fn object_data_cleanup<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a 
     for path in &data {
         let sidecar = object_metadata_path(path).expect("object data path");
         assert!(
-            metadata.iter().any(|meta| *meta == &sidecar),
+            metadata.contains(&&sidecar),
             "sidecar cleanup debt missing for {}",
             path.as_str()
         );
@@ -166,7 +166,7 @@ fn object_data_cleanup<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a 
     for sidecar in &metadata {
         let data_path = object_data_path_for_metadata(sidecar).expect("sidecar path");
         assert!(
-            data.iter().any(|path| *path == &data_path),
+            data.contains(&&data_path),
             "sidecar cleanup debt lacks its data path: {}",
             sidecar.as_str()
         );
