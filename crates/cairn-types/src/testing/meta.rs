@@ -896,7 +896,8 @@ impl MetadataStore for InMemoryMetadataStore {
             Mutation::Storage {
                 operation: crate::storage::StorageMutation::Reserve { .. },
                 ..
-            }
+            } | Mutation::AdmitStorageWrite { .. }
+                | Mutation::PublishObjectWrite { .. }
         ) && self
             .reject_next_storage_admission_out_of_space
             .swap(false, Ordering::AcqRel)
@@ -2245,6 +2246,30 @@ impl State {
                 }
                 Ok(outcome)
             }
+            Mutation::PublishObjectWrite {
+                plan,
+                operation,
+                index_spool,
+                activity,
+            } => {
+                plan.validate_object_publication(&operation)?;
+                if !storage::object_publication_allowed(st, &plan)? {
+                    return Ok(MutationOutcome::StoragePublicationNotApplied);
+                }
+                let outcome = Self::apply_inner(st, *operation)?;
+                if matches!(&outcome, MutationOutcome::Put { .. }) {
+                    storage::resolve_paths(st, &plan, index_spool)?;
+                    if let Some(entry) = activity
+                        && !st.activity.iter().any(|existing| existing.id == entry.id)
+                    {
+                        st.activity.push(*entry);
+                    }
+                }
+                Ok(outcome)
+            }
+            Mutation::AbandonObjectWrite { plan, quiescence } => {
+                storage::abandon_object(st, &plan, &quiescence)
+            }
             other => {
                 crate::storage::validate_unadmitted_mutation(&other)?;
                 Self::apply_inner(st, other)
@@ -2289,6 +2314,9 @@ impl State {
             } => storage::baseline_complete(st, token, completed_at),
 
             Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+                Err(MetaError::Engine("nested storage operation".into()))
+            }
+            Mutation::PublishObjectWrite { .. } | Mutation::AbandonObjectWrite { .. } => {
                 Err(MetaError::Engine("nested storage operation".into()))
             }
             Mutation::BeginStorageGeneration { generation } => Ok(storage::begin(st, generation)),

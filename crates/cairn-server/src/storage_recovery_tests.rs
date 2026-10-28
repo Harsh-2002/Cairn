@@ -62,7 +62,7 @@ async fn stage_unpublished(
     let permit = planned.admit(receipt, lease).unwrap();
     let staged = blob
         .stage(
-            permit,
+            permit.into(),
             Box::pin(futures_util::stream::once(async {
                 Ok(Bytes::from_static(b"unpublished but durably staged"))
             })),

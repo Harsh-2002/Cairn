@@ -107,8 +107,9 @@ sampling decision, independently of the blob sampler. The fixed stages are `tota
 `preflight`, `storage_admission`, `blob_stage`, `publication_prep`, `publication`,
 `notification` and `audit`; `result=interrupted` includes an error or cancellation
 before that stage completed. `preflight` includes bucket/config reads and request
-preparation; `storage_admission` includes plan preparation and the Writer admission
-await; `blob_stage` is the inclusive blob-store await; `publication_prep` includes
+preparation; `storage_admission` includes plan preparation, bucket-snapshot binding and the
+bounded recovery-slot acquisition (it no longer awaits the Writer for an ordinary PUT);
+`blob_stage` is the inclusive blob-store await; `publication_prep` includes
 post-stage validations, row construction and replication intent; `publication` is
 the authoritative Writer await; `notification` is the remaining best-effort post-commit
 await. A successful PUT's `audit` row is co-committed with publication, so the `audit`

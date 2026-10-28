@@ -119,33 +119,51 @@ changing rows, counters or outboxes. A lost predicate returns `DeleteNotApplied`
 parsing, replacement/deletion protection, retention rules, versioning transitions and exact initial
 tag/lock installation remain Writer-authoritative.
 
-Protocol 2 requires a file-free plan before physical creation. Ordinary PUT/Copy admission reserves
-the exact attempt, generation, target and canonical temporary/final/index paths. Multipart
-`AdmitStorageWrite` combines that reservation with the original quota reservation or exact-token
-completion claim in one savepoint. A losing reserve/claim grants no creation authority. Only an
-acknowledged matching admission and a live I/O lease can produce the move-only creation permit
-consumed by the blob layer (Section 12.1).
+Protocol 2 requires a file-free plan before physical creation for multipart. A multipart
+`AdmitStorageWrite` combines the exact attempt, generation, target and canonical
+temporary/final/index paths with the original quota reservation or exact-token completion claim in
+one savepoint. A losing reserve/claim grants no creation authority; only an acknowledged matching
+admission and a live I/O lease can produce the move-only creation permit consumed by the blob
+layer (Section 12.1).
 
-`PublishStorageWrite` validates the original mutation against that plan, then checks the current
-generation, exact persisted intent and normalized ownership index, and the cancellation flag.
-An absent, stale or cancelled owner returns `StoragePublicationNotApplied`. Direct physical
-`PutObjectVersion`, `RecordPart` and `CompleteMultipart` mutations are rejected. The accepted
-publication preserves the original preconditions, tags, Object Lock and outbox behavior; its
-savepoint commits those effects, consumes the intent and records cleanup for unreferenced planned
-paths, except an index-spool alias the caller reports it never opened. A successful publication may
-also carry the operator activity row: it commits in the same savepoint, a duplicate activity id is
-ignored because the audit intent is already satisfied, and any other activity error fails the
-publication instead of acknowledging a transaction whose state is no longer trustworthy. A
-multi-shard router submits the row to the global shard after publication. Replacement and deletion record cleanup debt in the same savepoint as
-removing a live reference. Returned superseded paths are descriptive outcomes, not authority for
+An ordinary object PUT, Copy or import plan is never journaled. It carries the authorized bucket
+owner and creation time and is fenced once, by `PublishObjectWrite`, after the blob is durable.
+Inside that single savepoint the Writer validates the plan against the inner `PutObjectVersion`,
+requires the current generation, compares the bucket row's `owner_id` **and** `created_at` with the
+plan's snapshot, and refuses an attempt that already owns an intent. Every planned path must also
+be free of authoritative object/part references, intent-path rows and cleanup debt; otherwise the
+outcome is `StoragePublicationNotApplied`. A same-name bucket deleted and recreated by the same or
+a different principal therefore cannot receive the write. On success the original preconditions,
+quota, Object Lock, tags, outbox and deletion effects apply unchanged, cleanup debt is recorded
+only for planned paths that remain unreferenced, and the activity row is best-effort. Because
+there is no pre-body Writer barrier, a metadata filesystem that is out of space surfaces at this
+publication: the client receives `507 InsufficientStorage` after the body has been read, no row is
+created, and abandonment or the startup scan reclaims the staged file.
+
+Parts and completions keep `PublishStorageWrite`: it validates the original mutation against the
+plan, then checks the current generation, exact persisted intent and normalized ownership index,
+and the cancellation flag. An absent, stale or cancelled owner returns
+`StoragePublicationNotApplied`. Direct physical `PutObjectVersion`, `RecordPart` and
+`CompleteMultipart` mutations are rejected. The accepted publication preserves the original
+preconditions, tags, Object Lock and outbox behavior; its savepoint commits those effects, consumes
+the intent and records cleanup for unreferenced planned paths, except an index-spool alias the
+caller reports it never opened. A successful publication may also carry the operator activity row:
+it commits in the same savepoint, a duplicate activity id is ignored because the audit intent is
+already satisfied, and any other activity error fails the publication instead of acknowledging a
+transaction whose state is no longer trustworthy. A multi-shard router submits the row to the
+global shard after publication. Replacement and deletion record cleanup debt in the same savepoint
+as removing a live reference. Returned superseded paths are descriptive outcomes, not authority for
 direct unlink. A late failure rolls back publication, intent consumption and cleanup changes
 together.
 
-Cancellation closes further I/O lease admission and marks the intent, but cannot prove that a
-blocking task, queued backend operation or prepared result has stopped. After the actual ownership
-set drains, `Resolve` carries its unforgeable quiescence proof through the Writer FIFO. Resolution
-checks exact live object/part references, retains referenced paths and converts unreferenced paths
-to durable cleanup before retiring the intent. The legacy exact `ResolveObjectWrite` and
+Cancellation closes further I/O lease admission and, for multipart, marks the intent, but cannot
+prove that a blocking task, queued backend operation or prepared result has stopped. After the
+actual ownership set drains, `Resolve` carries its unforgeable quiescence proof through the Writer
+FIFO. Resolution checks exact live object/part references, retains referenced paths and converts
+unreferenced paths to durable cleanup before retiring the intent. An ordinary object has no intent
+to mark: after the same quiescence proof, `AbandonObjectWrite` keeps every referenced path and
+records cleanup only for planned aliases no row owns; a still-present intent for the same attempt
+is resolved exactly as `Resolve` would resolve it. The legacy exact `ResolveObjectWrite` and
 `ResolveMultipartPartWrite` probes remain ordering/identity checks; their misses alone do not
 authorize physical deletion or quota release. Immutable row identity and attempt-derived part
 paths prevent delayed recovery from confusing a replacement with its predecessor.
@@ -208,11 +226,14 @@ Cairn's protocol and control layers are written against a small set of internal 
 
 The blob store owns object bytes on some medium and knows nothing of S3, identity, or metadata. It exposes the ability to stage a single object by consuming a byte stream, during which it computes the plaintext MD5 that becomes the ETag and any additional checksum algorithms the caller requests, applies the bucket's compression policy producing the self-describing blob format when compression is selected, enforces a hard size ceiling by aborting if exceeded, and performs the durable commit prefix of fsyncing the file and its directory before returning; on return it guarantees the blob is durable and reports the storage path, the logical and physical sizes, and the computed hashes, but it writes no metadata and does not itself verify against client-supplied checksums, which the caller does with the returned hashes. It exposes opening a committed blob through `open_raw(path, range, cipher, compression, expected_logical_len)`, whose `cipher` selector is `BlobCipher::KnownPlaintext`, `BlobCipher::LegacyV2(DEK)`, or `BlobCipher::AuthenticatedV3(DEK)`; it returns a handle that serves the whole object or a byte range, transparently decompressing each block and — for an encrypted declaration — decrypting each AES-256-GCM block. Cipher, compression, container generation, and full logical length come from authoritative metadata. A declared raw plaintext file must equal that trusted length; compressed layout is bound to its trusted block geometry; and the reader requires an encrypted on-disk version to match its declaration exactly, so body bytes cannot select their own parser. A DEK-free `probe(path)` inspects a blob's physical form without decrypting it. There is no DEK-less open. It exposes idempotent deletion of an exact path, including the durable absence barrier when the path is already missing; callers must hold the Writer cleanup claim described in Section 11.6. It exposes staging a multipart part, reporting the part's plaintext size and MD5 and storage path, and assembling ordered parts into a single committed blob through the same durable sequence with compression applied during assembly, and legacy session cleanup for exclusive full-scan recovery. Online protocol-2 reclamation uses exact claimed paths. Finally it exposes reconciliation, which must be bounded in memory and which is given batched membership oracles for live blobs and live upload sessions so it can stream the filesystem and reclaim orphans without materialising the keyspace. The default implementation is the local filesystem engine of Sections 7 through 10; an in-memory implementation backs unit tests; future implementations behind the same interface include an io_uring engine and a remote-S3-backed cold tier used by lifecycle transition.
 
-`stage`, `stage_part` and `assemble` consume a move-only `StorageCreationPermit` produced from a
-matching Writer admission. File-free plans and cloned plan DTOs cannot create files. Each actual
-backend operation, including blocking work and prepared results, retains the storage I/O lease
-and node-lock lifetime until completion. Errors and cancellation leave physical cleanup to exact
-Writer claims; they do not make the request future's lifetime a reclamation barrier.
+`stage` consumes a move-only `ObjectCreationPermit` whose plan carries the authorized bucket
+snapshot; `stage_part` and `assemble` consume a move-only `StorageCreationPermit` produced from a
+matching Writer admission. File-free plans and cloned plan DTOs cannot create files. An admitted
+multipart permit can strengthen into an object permit because admission implies everything an
+object permit promises, but the reverse is impossible. Each actual backend operation, including
+blocking work and prepared results, retains the storage I/O lease and node-lock lifetime until
+completion. Errors and cancellation leave physical cleanup to exact Writer claims or the object
+abandonment path; they do not make the request future's lifetime a reclamation barrier.
 
 `BlobStore::read_memory_bound(compression, encrypted, logical_len)` reports the backend's
 conservative allocation and maximum-frame bounds without opening a file or resolving a key.

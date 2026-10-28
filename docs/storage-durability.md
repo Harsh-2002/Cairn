@@ -12,16 +12,31 @@ Cairn guarantees that after a crash during normal operation, on restart it conve
 
 Every physical object or part write starts with a bounded, immutable storage plan: attempt and
 server-generation tokens, the exact target identity, and every possible temporary, final and index
-spool filename. Before any file can be created, the single metadata Writer durably admits that
-plan; multipart reservation or completion-claim admission occurs in the same savepoint. A matching
-typed `StorageCreationPermit` and `StorageIoLease` are mandatory at `stage`, `stage_part` and
-`assemble`. A missing, rejected or unacknowledged admission cannot authorize file creation.
+spool filename. A multipart part or assembly must be durably admitted by the single metadata Writer
+before any file can be created; multipart reservation or completion-claim admission occurs in the
+same savepoint. An ordinary object plan is file-free and in memory: it also carries the authorized
+bucket owner and creation time, and its single `PublishObjectWrite` savepoint re-establishes the
+current generation, that exact bucket incarnation, exact path availability and the original write
+preconditions before any row becomes visible. A matching typed `StorageCreationPermit` (multipart)
+or `ObjectCreationPermit` (ordinary object) and a live `StorageIoLease` are mandatory at `stage`,
+`stage_part` and `assemble`. A missing, rejected or unacknowledged admission cannot authorize
+multipart file creation; an ordinary object permit is authorized by publication instead.
 
-After admission, object publication follows one ordered sequence, and the order is the durability design.
+Once the plan is bounded and its recovery slot is held, object publication follows one ordered sequence, and the order is the durability design.
 
-First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. After buffered writes complete, any unused preallocation beyond the staged descriptor's actual EOF is released under the same retained I/O ownership; errors prevent publication. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch publication fails and the admitted paths enter exact recovery, with no visible object metadata written. Sixth, the metadata transaction is submitted to the writer with the exact admitted plan and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, exact cleanup debt recorded with publication reclaims superseded blobs and remaining provisional aliases, and the activity and metrics are recorded. A successful `PutObject` may carry its activity row in the publication transaction itself: it then commits atomically with the object, and a multi-shard store submits that row to the global shard after publication. A duplicate activity id is ignored because the audit intent is already satisfied; any other activity error fails the publication rather than acknowledging an object from a transaction whose state is no longer trustworthy. Physical cleanup is retried independently; its failure cannot revoke an already committed object.
+First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. After buffered writes complete, any unused preallocation beyond the staged descriptor's actual EOF is released under the same retained I/O ownership; errors prevent publication. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch publication fails and the planned paths enter exact recovery, with no visible object metadata written. Sixth, the metadata transaction is submitted to the writer with the exact plan and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, exact cleanup debt recorded with publication reclaims superseded blobs and remaining provisional aliases, and the activity and metrics are recorded. A successful `PutObject` may carry its activity row in the publication transaction itself: it then commits atomically with the object, and a multi-shard store submits that row to the global shard after publication. A duplicate activity id is ignored because the audit intent is already satisfied; any other activity error fails the publication rather than acknowledging an object from a transaction whose state is no longer trustworthy. Physical cleanup is retried independently; its failure cannot revoke an already committed object.
 
-The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob without a visible object row, whose admitted intent is resolved into exact cleanup during recovery; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
+The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob without a visible object row. For a multipart plan its admitted intent is resolved into exact cleanup during recovery; for an ordinary object the retained abandonment resolves it in-process, and if the process itself died the mandatory startup scan reclaims the unreferenced file after its exclusive-lock quiescence probe. A crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
+
+An ordinary object PUT therefore has exactly two crash shapes: a file without a row, which is
+reclaimed, or a row with a file, which is served. It can never produce a row without a file. The
+only interleaving that could do so is cancellation racing an in-flight publication. The Writer is
+FIFO: a publication is either never enqueued or applied before any later mutation, and the
+abandonment is always submitted later by the retained worker, after the request future (and its
+publication) is dropped. When abandonment runs, the final path is either referenced by the
+committed row and preserved, or provably unreferenced forever. No online reconciler exists; the
+full scan runs only under exclusive node ownership at startup and offline maintenance, so an
+in-flight final file is never ambiguous while serving.
 
 Prepared creation paths hold shared locks on their actual directory descriptors. These locks
 follow cloned descriptors into queued namespace work, so cleanup cannot remove an empty target
@@ -39,8 +54,8 @@ data root cost one root fsync, not one each. The recorded barriers still complet
 non-cancellable preparation job, after every sibling entry exists and before any dependent file is
 opened.
 
-Cancellation does not synchronously unlink admitted paths. A bounded recovery slot and an exact
-plan guard are acquired before admission can reach the Writer, covering a lost admission
+Cancellation does not synchronously unlink planned paths. A bounded recovery slot and an exact
+plan guard are acquired before any file is created, covering a lost multipart admission
 acknowledgement as well as cancellation during staging, checksum validation and publication.
 Dropping the request cancels further lease acquisition and enqueues its record to a retained
 worker. Existing file owners, queued or executing blocking jobs, io_uring operations, returned
@@ -48,13 +63,22 @@ results and directory-sync waiters retain child leases through their actual comp
 lease retains the exclusive node lifetime and recovery slot; dropping an async future does not
 prove that its I/O has stopped.
 
-The worker submits exact cancellation through the serialized Writer, waits for all existing I/O
-leases to drain, and probes exclusive locks on the plan's existing files. Only then
-may typed quiescence resolve the intent. Resolution preserves an exact authoritative object or
-part reference and converts unreferenced aliases into durable cleanup debt. Successful publication
-atomically consumes the matching intent and records provisional/superseded cleanup; its guard is
-disarmed before any post-commit await. An ambiguous Writer result preserves ownership for exclusive
-startup recovery. A timeout or a lost acknowledgement is never evidence that bytes are unreferenced.
+For a multipart plan the worker submits exact cancellation through the serialized Writer, waits
+for all existing I/O leases to drain, and probes exclusive locks on the plan's existing files.
+Only then may typed quiescence resolve the intent. For an ordinary object plan there is no intent
+to cancel: the worker proves the same backend quiescence and submits `AbandonObjectWrite`, which
+records reference-checked cleanup for every planned path no row owns. A plan in a mixed/rollback
+state that still carries an intent is resolved exactly as the multipart path would resolve it.
+Resolution preserves an exact authoritative object or part reference and converts unreferenced
+aliases into durable cleanup debt. Successful publication atomically consumes a matching intent
+and records provisional/superseded cleanup; its guard is disarmed before any post-commit await. An
+ambiguous Writer result preserves ownership for exclusive startup recovery. A timeout or a lost
+acknowledgement is never evidence that bytes are unreferenced.
+
+An ordinary object, copy or import PUT no longer performs a pre-body Writer round-trip. A metadata
+filesystem that is out of space is therefore discovered at publication, after the body is staged;
+the client still receives `507 InsufficientStorage`, no row is created, and the staged file is
+reclaimed by abandonment or the startup scan.
 
 Cleanup uses exact Writer claims bound to a generation, claim token and expiry. Claims recheck
 that no authoritative reference or active intent owns the path. The blob layer rejects a still
@@ -185,7 +209,7 @@ Because Cairn does not implement drive redundancy, its single-node durability is
 
 ### 9.1 Principles
 
-Object bytes live as files named by an opaque identifier, never by key; metadata is the source of truth; a blob is visible only when referenced, while admitted writes and cleanup debt also protect their exact physical paths during recovery. Versioning, tagging, ACLs, and the rest are metadata concerns and do not change the fundamental on-disk shape: a version of an object is simply another row referencing another blob, and a delete marker is a row with no blob at all. This is why the storage model scales to the full feature set without a redesign: features accrete in metadata, not on disk.
+Object bytes live as files named by an opaque identifier, never by key; metadata is the source of truth; a blob is visible only when referenced, while outstanding multipart intents and cleanup debt also protect their exact physical paths during recovery. Versioning, tagging, ACLs, and the rest are metadata concerns and do not change the fundamental on-disk shape: a version of an object is simply another row referencing another blob, and a delete marker is a row with no blob at all. This is why the storage model scales to the full feature set without a redesign: features accrete in metadata, not on disk.
 
 ### 9.2 Directory layout
 

@@ -180,6 +180,100 @@ pub(super) fn owns_publication(st: &State, plan: &StorageWritePlan) -> R<bool> {
     )
 }
 
+/// An ordinary object plan is never journaled, so publication re-establishes everything the old
+/// admission carried: the live generation, the authorized bucket incarnation and path availability.
+pub(super) fn object_publication_allowed(st: &State, plan: &StorageWritePlan) -> R<bool> {
+    plan.validate()?;
+    if st.storage.baseline.legacy_accounting_hold {
+        return Err(invalid("storage baseline accounting is held"));
+    }
+    if st.storage.baseline.generation.as_ref() != Some(&plan.generation) {
+        return Ok(false);
+    }
+    if st.storage.intents.contains_key(&plan.attempt) {
+        return Ok(false);
+    }
+    let Some(bucket) = st.buckets.get(plan.bucket.as_str()) else {
+        return Ok(false);
+    };
+    if let Some(expected) = &plan.bucket_owner
+        && &bucket.owner_id != expected
+    {
+        return Ok(false);
+    }
+    if let Some(expected) = plan.bucket_created_at
+        && bucket.created_at != expected
+    {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if referenced(st, &path.path)
+            || st
+                .storage
+                .intents
+                .values()
+                .any(|(intent, _)| intent.paths.iter().any(|p| p.path == path.path))
+            || st
+                .storage
+                .cleanups
+                .values()
+                .any(|row| row.path == path.path)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Record reference-checked cleanup for every planned alias, without touching any intent. This is
+/// the ordinary-object publication/abandonment path; multipart still resolves through `resolve`.
+pub(super) fn resolve_paths(
+    st: &mut State,
+    plan: &StorageWritePlan,
+    index_spool: crate::blob::IndexSpoolState,
+) -> R<()> {
+    let mut journal = st.storage.clone();
+    resolve_paths_inner(st, &mut journal, plan, index_spool)?;
+    st.storage = journal;
+    Ok(())
+}
+
+pub(super) fn abandon_object(
+    st: &mut State,
+    plan: &StorageWritePlan,
+    quiescence: &crate::storage::io::StorageQuiescence,
+) -> R<MutationOutcome> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(invalid("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(invalid("storage quiescence identity mismatch"));
+    }
+    if st.storage.baseline.generation.as_ref() != Some(quiescence.generation()) {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    if let Some((stored, _)) = st
+        .storage
+        .intents
+        .get(&plan.attempt)
+        .filter(|(stored, _)| stored.bucket == plan.bucket && stored.generation == plan.generation)
+        .cloned()
+    {
+        let mut journal = st.storage.clone();
+        resolve(
+            st,
+            &mut journal,
+            &stored,
+            crate::blob::IndexSpoolState::Materialized,
+        )?;
+        st.storage = journal;
+        return Ok(MutationOutcome::StorageUpdated { applied: true });
+    }
+    resolve_paths(st, plan, crate::blob::IndexSpoolState::Materialized)?;
+    Ok(MutationOutcome::StorageUpdated { applied: true })
+}
+
 pub(super) fn discard_unacknowledged(st: &mut State, plan: &StorageWritePlan) {
     st.storage.intents.remove(&plan.attempt);
 }
@@ -347,6 +441,17 @@ fn resolve(
     plan: &StorageWritePlan,
     index_spool: crate::blob::IndexSpoolState,
 ) -> R<()> {
+    resolve_paths_inner(st, journal, plan, index_spool)?;
+    journal.intents.remove(&plan.attempt);
+    Ok(())
+}
+
+fn resolve_paths_inner(
+    st: &mut State,
+    journal: &mut Journal,
+    plan: &StorageWritePlan,
+    index_spool: crate::blob::IndexSpoolState,
+) -> R<()> {
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().cloned())
         .transpose()?;
@@ -417,7 +522,6 @@ fn resolve(
             )?;
         }
     }
-    journal.intents.remove(&plan.attempt);
     Ok(())
 }
 

@@ -3,7 +3,10 @@
 
 use crate::io_err;
 use crate::timing::{ObjectWriteStage, ObjectWriteTimings};
-use cairn_types::storage::{StorageCreationPermit, StoragePathRole, io::StorageIoLease};
+use cairn_types::storage::{
+    ObjectCreationPermit, StorageCreationPermit, StoragePathRole, StorageWritePlan,
+    io::StorageIoLease,
+};
 use cairn_types::{BlobError, StoragePath};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, mkdirat, open, unlinkat};
 use std::collections::HashMap;
@@ -288,6 +291,30 @@ impl AdmittedPaths {
             .validate()
             .map_err(|error| BlobError::Io(error.to_string()))?;
         let (plan, lease) = permit.into_parts();
+        Self::open_parts(root, plan, lease, timing).await
+    }
+
+    /// Open the paths of an unadmitted ordinary object plan. Ownership is publication-time, so the
+    /// caller's live lease and the bounded plan are the only creation authority here.
+    pub(crate) async fn open_object_sampled(
+        root: &Path,
+        permit: ObjectCreationPermit,
+        timing: Option<Arc<ObjectWriteTimings>>,
+    ) -> Result<Self, BlobError> {
+        permit
+            .plan()
+            .validate()
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        let (plan, lease) = permit.into_parts();
+        Self::open_parts(root, plan, lease, timing).await
+    }
+
+    async fn open_parts(
+        root: &Path,
+        plan: StorageWritePlan,
+        lease: StorageIoLease,
+        timing: Option<Arc<ObjectWriteTimings>>,
+    ) -> Result<Self, BlobError> {
         let operation = lease.try_child()?;
         let root = root.to_owned();
         let queued_at = timing.as_ref().map(|_| Instant::now());

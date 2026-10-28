@@ -40,7 +40,9 @@ use zeroize::Zeroizing;
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     /// Select every possible physical name without performing I/O. The returned plan is consumed
-    /// only after the canonical Writer acknowledges its exact durable admission.
+    /// by a move-only creation permit: an ordinary object binds the authorized bucket snapshot and
+    /// is fenced again by its single publication savepoint, while a multipart part or assembly is
+    /// consumed only after the canonical Writer acknowledges its exact durable admission.
     fn plan_write(
         &self,
         bucket: BucketName,
@@ -67,7 +69,7 @@ pub trait BlobStore: Send + Sync {
     /// blob is durable. Writes no metadata; does not verify client checksums.
     async fn stage(
         &self,
-        permit: crate::storage::StorageCreationPermit,
+        permit: crate::storage::ObjectCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError>;

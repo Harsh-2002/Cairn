@@ -1,5 +1,6 @@
 //! Durable physical-write ownership (storage protocol 2, ARCH 8). Plans contain names, never
-//! file handles. Only an acknowledged admission can turn a fresh plan into a creation permit.
+//! file handles. A multipart plan becomes a creation permit only after its durable admission; an
+//! ordinary object plan becomes an [`ObjectCreationPermit`] that is fenced by publication.
 
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::time::Timestamp;
@@ -157,11 +158,17 @@ pub struct StorageWritePlan {
     pub attempt: StorageToken,
     pub generation: StorageToken,
     pub bucket: BucketName,
-    /// Owner recorded from the bucket snapshot the request was authorized against. Admission
-    /// refuses a plan whose name now resolves to a different owner (a delete/recreate race across
-    /// tenants). `None` for recovery plans, where the admission already exists.
+    /// Owner recorded from the bucket snapshot the request was authorized against. Admission or
+    /// publication refuses a plan whose name now resolves to a different owner (a delete/recreate
+    /// race across tenants). `None` for recovery plans, where the admission already exists.
     #[serde(default)]
     pub bucket_owner: Option<UserId>,
+    /// Bucket incarnation the request was authorized against. A same-name delete/recreate by the
+    /// same owner is still a different bucket, so an ordinary object publication compares this
+    /// value as well as the owner. `None` for plans recovered from an older journal, where the
+    /// comparison is skipped.
+    #[serde(default)]
+    pub bucket_created_at: Option<Timestamp>,
     pub target: StorageWriteTarget,
     pub paths: Vec<StorageIntentPath>,
 }
@@ -291,6 +298,26 @@ impl StorageWritePlan {
         }
     }
 
+    /// Publication of an ordinary object write that was never journaled: only an exact object
+    /// target and its [`crate::meta::Mutation::PutObjectVersion`] are accepted, and the plan must
+    /// carry the authorized bucket snapshot the publication savepoint re-verifies.
+    pub fn validate_object_publication(
+        &self,
+        operation: &crate::meta::Mutation,
+    ) -> Result<(), MetaError> {
+        if !matches!(self.target, StorageWriteTarget::Object { .. }) {
+            return Err(invalid(
+                "unadmitted storage publication requires an object target",
+            ));
+        }
+        if self.bucket_owner.is_none() || self.bucket_created_at.is_none() {
+            return Err(invalid(
+                "unadmitted storage publication requires a bucket snapshot",
+            ));
+        }
+        self.validate_publication(operation)
+    }
+
     fn expected_paths(&self) -> Result<Vec<StorageIntentPath>, MetaError> {
         let mut paths = Vec::with_capacity(3);
         let id = self.attempt.as_str();
@@ -364,10 +391,12 @@ impl StorageWritePlan {
 pub struct PlannedStorageWrite(StorageWritePlan);
 
 impl PlannedStorageWrite {
-    /// Bind admission to the owner of the bucket snapshot authorization evaluated.
+    /// Bind the authorized bucket snapshot (owner and incarnation) to this plan. Ordinary object
+    /// publication re-establishes both inside its own savepoint.
     #[must_use]
-    pub fn with_bucket_owner(mut self, owner: UserId) -> Self {
+    pub fn with_bucket_snapshot(mut self, owner: UserId, created_at: Timestamp) -> Self {
         self.0.bucket_owner = Some(owner);
+        self.0.bucket_created_at = Some(created_at);
         self
     }
 }
@@ -382,7 +411,9 @@ pub enum StorageAdmission {
 /// Per-bucket journal transactions, routed using the bucket retained by the outer mutation.
 #[derive(Clone, Debug)]
 pub enum StorageMutation {
-    /// Ordinary object admission. Multipart admission shares the existing reserve/claim savepoint.
+    /// Multipart part/completion admission, or the generic journal primitive used by the storage
+    /// contract fixtures. No production ordinary-object PUT uses this after protocol 2 moved to
+    /// publication-time fencing (`PublishObjectWrite`).
     Reserve {
         plan: Box<StorageWritePlan>,
         now: Timestamp,
@@ -433,6 +464,7 @@ impl PlannedStorageWrite {
             generation,
             bucket,
             bucket_owner: None,
+            bucket_created_at: None,
             target,
             paths: Vec::new(),
         };
@@ -463,6 +495,59 @@ impl PlannedStorageWrite {
             plan: self.0,
             lease,
         })
+    }
+
+    /// Consume an object plan as a file-free creation permit. This is deliberately **not** a
+    /// Writer acknowledgement: the publication savepoint re-establishes the current generation,
+    /// the authorized bucket incarnation and exact path availability before any row becomes
+    /// visible (ARCH 8.2). Multipart writes still require [`Self::admit`].
+    pub fn into_object_permit(
+        self,
+        lease: io::StorageIoLease,
+    ) -> Result<ObjectCreationPermit, BlobError> {
+        if !matches!(self.0.target, StorageWriteTarget::Object { .. })
+            || !lease.owns(&self.0.attempt, &self.0.generation)
+            || lease.is_cancelled()
+        {
+            return Err(BlobError::Io("object creation ownership lost".to_owned()));
+        }
+        Ok(ObjectCreationPermit {
+            plan: self.0,
+            lease,
+        })
+    }
+}
+
+/// Move-only permission consumed by one ordinary object staging operation. It carries a bounded,
+/// canonical plan and live I/O ownership, but no Writer intent; publication is the durable
+/// authority. A stronger, Writer-admitted permit converts into this one because admission implies
+/// everything it promises.
+#[derive(Debug)]
+pub struct ObjectCreationPermit {
+    plan: StorageWritePlan,
+    lease: io::StorageIoLease,
+}
+
+impl ObjectCreationPermit {
+    /// The bounded plan this request may create.
+    #[must_use]
+    pub fn plan(&self) -> &StorageWritePlan {
+        &self.plan
+    }
+
+    /// Transfer ownership to backend handles; each detached operation must obtain its own lease.
+    #[must_use]
+    pub fn into_parts(self) -> (StorageWritePlan, io::StorageIoLease) {
+        (self.plan, self.lease)
+    }
+}
+
+impl From<StorageCreationPermit> for ObjectCreationPermit {
+    fn from(permit: StorageCreationPermit) -> Self {
+        Self {
+            plan: permit.plan,
+            lease: permit.lease,
+        }
     }
 }
 

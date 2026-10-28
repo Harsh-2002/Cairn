@@ -179,8 +179,11 @@ full-scan recovery). Startup validates schema/protocol support before PRAGMAs, m
 sanitation or Writer startup; direct migration calls repeat the guard. Older released binaries
 without this check remain unsafe downgrade targets. Restore from a verified pre-upgrade snapshot.
 
-Storage protocol 2 requires durable Writer admission before any new physical write. Use the
-move-only BlobStore creation permit and retain its I/O/node lifetime through actual jobs. Publish
-with the exact plan; all authoritative removals atomically record cleanup debt. Reclaim only under
-exact Writer claims after I/O quiescence and retire only after namespace sync. Full scans remain
-mandatory. The data namespace requires Linux 5.6+ `openat2` and refuses descendant mounts/symlinks.
+Storage protocol 2 requires a file-free, bounded plan before any new physical write. Multipart
+parts and assemblies use the durable Writer admission path and its move-only
+`StorageCreationPermit`; an ordinary object plan uses an `ObjectCreationPermit` and is fenced once
+by the `PublishObjectWrite` savepoint, which re-checks the bucket incarnation and exact path
+availability. Retain the I/O/node lifetime through actual jobs. Publish with the exact plan; all
+authoritative removals atomically record cleanup debt. Reclaim only under exact Writer claims after
+I/O quiescence and retire only after namespace sync. Full scans remain mandatory. The data
+namespace requires Linux 5.6+ `openat2` and refuses descendant mounts/symlinks.

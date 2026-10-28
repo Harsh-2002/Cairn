@@ -1211,13 +1211,14 @@ pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore)
     let bucket = BucketName::parse("storage-recreate-contract").unwrap();
     create_bucket(meta, &bucket).await;
     let owner_a = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let incarnation = meta.get_bucket(&bucket).await.unwrap().unwrap().created_at;
     let generation = StorageToken::generate();
     meta.submit(Mutation::BeginStorageGeneration {
         generation: generation.clone(),
     })
     .await
     .unwrap();
-    let planned = plan(&bucket, &generation).with_bucket_owner(owner_a.clone());
+    let planned = plan(&bucket, &generation).with_bucket_snapshot(owner_a.clone(), incarnation);
     let write_plan = planned.plan().clone();
     meta.submit(Mutation::DeleteBucket(bucket.clone()))
         .await
@@ -1251,6 +1252,204 @@ pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore)
         ),
         "a plan bound to the old owner must not be admitted to a recreated bucket: {outcome:?}"
     );
+}
+
+/// An ordinary object plan is never journaled. Publication must still refuse a same-named bucket
+/// that was deleted and recreated, whether the new owner differs (cross-tenant) or the same owner
+/// merely recreated the bucket (a new incarnation).
+pub async fn assert_object_publication_rejects_recreated_bucket(meta: &dyn MetadataStore) {
+    for different_owner in [true, false] {
+        let name = if different_owner {
+            "storage-object-recreate-owner"
+        } else {
+            "storage-object-recreate-incarnation"
+        };
+        let bucket = BucketName::parse(name).unwrap();
+        create_bucket(meta, &bucket).await;
+        let original = meta.get_bucket(&bucket).await.unwrap().unwrap();
+        let generation = StorageToken::generate();
+        meta.submit(Mutation::BeginStorageGeneration {
+            generation: generation.clone(),
+        })
+        .await
+        .unwrap();
+        let planned = plan(&bucket, &generation)
+            .with_bucket_snapshot(original.owner_id.clone(), original.created_at);
+        let write_plan = planned.plan().clone();
+        let row = object_row(&write_plan, original.owner_id.clone());
+        meta.submit(Mutation::DeleteBucket(bucket.clone()))
+            .await
+            .unwrap();
+        let owner = if different_owner {
+            UserId::generate()
+        } else {
+            original.owner_id.clone()
+        };
+        meta.submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: bucket.clone(),
+            owner_id: owner,
+            created_at: Timestamp(original.created_at.0 + 1),
+            versioning: VersioningState::Unversioned,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
+        let outcome = meta
+            .submit(Mutation::PublishObjectWrite {
+                plan: Box::new(write_plan),
+                operation: Box::new(put(row.clone())),
+                index_spool: IndexSpoolState::Materialized,
+                activity: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MutationOutcome::StoragePublicationNotApplied),
+            "an unadmitted plan bound to the old bucket incarnation must not publish: {outcome:?}"
+        );
+        assert!(
+            meta.get_version(&bucket, &row.key, &row.version_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused publication must create no row"
+        );
+    }
+}
+
+/// An ordinary object publication creates no intent, records cleanup only for unreferenced
+/// aliases, and a later abandonment (the crash-after-publish shape) keeps the live row's file.
+pub async fn assert_unadmitted_object_publication(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-object-publication").unwrap();
+    create_bucket(meta, &bucket).await;
+    let bucket_row = meta.get_bucket(&bucket).await.unwrap().unwrap();
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let planned = plan(&bucket, &generation)
+        .with_bucket_snapshot(bucket_row.owner_id.clone(), bucket_row.created_at);
+    let write_plan = planned.plan().clone();
+    let row = object_row(&write_plan, bucket_row.owner_id);
+    let outcome = meta
+        .submit(Mutation::PublishObjectWrite {
+            plan: Box::new(write_plan.clone()),
+            operation: Box::new(put(row.clone())),
+            index_spool: IndexSpoolState::Materialized,
+            activity: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Put { .. }));
+    assert_eq!(
+        meta.get_version(&bucket, &row.key, &row.version_id)
+            .await
+            .unwrap(),
+        Some(row.clone())
+    );
+
+    // A request that crashed after the commit but before disarming recovers this same plan. The
+    // live final path must not become cleanup debt.
+    let (mut watch, lease) =
+        StorageIoWatch::new(write_plan.attempt.clone(), generation.clone(), Arc::new(()));
+    drop(lease);
+    assert_eq!(
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(write_plan.clone()),
+            quiescence: watch.quiescent().await,
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::StorageUpdated { applied: true }
+    );
+    assert_eq!(
+        meta.get_version(&bucket, &row.key, &row.version_id)
+            .await
+            .unwrap(),
+        Some(row.clone()),
+        "abandonment after publication must preserve the visible row"
+    );
+    let final_path = write_plan.final_path().unwrap();
+    let debts = claim(meta, &generation, 100, 0).await;
+    assert_eq!(
+        debts.len(),
+        2,
+        "only the temp and spool aliases owe cleanup"
+    );
+    assert!(
+        debts.iter().all(|cleanup| &cleanup.path != final_path),
+        "the referenced final path must never become cleanup debt"
+    );
+
+    // Ordinary publication leaves no intent behind: a rotated generation enumerates none.
+    let next = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: next.clone(),
+    })
+    .await
+    .unwrap();
+    let MutationOutcome::StorageIntentBatch(plans) = meta
+        .submit(Mutation::ListStorageIntents {
+            generation: next,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("storage intent batch expected")
+    };
+    assert!(
+        plans.is_empty(),
+        "an ordinary object publication must not create an intent"
+    );
+}
+
+/// Abandoning an uncommitted ordinary object plan makes every planned alias exact cleanup debt.
+/// This is the metadata half of the crash-before-publication shape the startup scan also reclaims.
+pub async fn assert_unadmitted_abandonment_reclaims_aliases(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-object-abandon").unwrap();
+    create_bucket(meta, &bucket).await;
+    let bucket_row = meta.get_bucket(&bucket).await.unwrap().unwrap();
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let planned = plan(&bucket, &generation)
+        .with_bucket_snapshot(bucket_row.owner_id.clone(), bucket_row.created_at);
+    let write_plan = planned.plan().clone();
+    let row = object_row(&write_plan, bucket_row.owner_id);
+    let (mut watch, lease) =
+        StorageIoWatch::new(write_plan.attempt.clone(), generation.clone(), Arc::new(()));
+    drop(lease);
+    assert_eq!(
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(write_plan.clone()),
+            quiescence: watch.quiescent().await,
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::StorageUpdated { applied: true }
+    );
+    assert!(
+        meta.get_version(&bucket, &row.key, &row.version_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let debts = claim(meta, &generation, 100, 0).await;
+    assert_eq!(debts.len(), write_plan.paths.len());
+    for path in &write_plan.paths {
+        assert!(
+            debts.iter().any(|cleanup| cleanup.path == path.path),
+            "every planned alias must become exact cleanup debt"
+        );
+    }
 }
 
 /// A successful publication commits its activity row in the same savepoint. A rejected
@@ -1446,6 +1645,20 @@ mod tests {
     #[tokio::test]
     async fn in_memory_unused_index_spool_is_not_retired() {
         super::assert_unused_index_spool_is_not_retired(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_object_publication_contract() {
+        super::assert_object_publication_rejects_recreated_bucket(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
+        super::assert_unadmitted_object_publication(&crate::testing::InMemoryMetadataStore::new())
+            .await;
+        super::assert_unadmitted_abandonment_reclaims_aliases(
             &crate::testing::InMemoryMetadataStore::new(),
         )
         .await;

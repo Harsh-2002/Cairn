@@ -73,6 +73,28 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 )),
             }
         }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            activity,
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !crate::storage::object_publication_allowed(driver, &plan).await? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = apply_inner(driver, *operation).await?;
+            if matches!(&outcome, MutationOutcome::Put { .. }) {
+                crate::storage::resolve_paths(driver, &plan, index_spool).await?;
+                if let Some(entry) = activity {
+                    insert_activity_best_effort(driver, &entry).await?;
+                }
+            }
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            crate::storage::abandon_object(driver, &plan, &quiescence).await
+        }
         Mutation::PublishStorageWrite {
             plan,
             operation,
@@ -99,13 +121,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 // failure, so it must fail the publication instead of acknowledging an object from
                 // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
                 if let Some(entry) = activity {
-                    match insert_activity(driver, &entry).await {
-                        Ok(()) => {}
-                        Err(cairn_types::MetaError::Conflict) => {
-                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    insert_activity_best_effort(driver, &entry).await?;
                 }
             }
             Ok(outcome)
@@ -114,6 +130,20 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             cairn_types::storage::validate_unadmitted_mutation(&other)?;
             apply_inner(driver, other).await
         }
+    }
+}
+
+async fn insert_activity_best_effort(
+    driver: &dyn AsyncSqlDriver,
+    entry: &cairn_types::meta::ActivityEntry,
+) -> R<()> {
+    match insert_activity(driver, entry).await {
+        Ok(()) => Ok(()),
+        Err(cairn_types::MetaError::Conflict) => {
+            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -170,7 +200,10 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
             completed_at,
         } => crate::baseline::complete(driver, &token, completed_at).await,
 
-        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+        Mutation::AdmitStorageWrite { .. }
+        | Mutation::PublishStorageWrite { .. }
+        | Mutation::PublishObjectWrite { .. }
+        | Mutation::AbandonObjectWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => {

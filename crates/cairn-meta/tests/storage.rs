@@ -162,11 +162,13 @@ async fn storage_admission_rejects_a_recreated_bucket_from_an_old_plan() {
     let bucket = BucketName::parse("recreate-race").unwrap();
     let owner_a = UserId::generate();
     let owner_b = UserId::generate();
-    let new_bucket = |owner: &UserId| {
+    let created_at_a = Timestamp(1);
+    let created_at_b = Timestamp(2);
+    let new_bucket = |owner: &UserId, created_at: Timestamp| {
         Box::new(Bucket {
             name: bucket.clone(),
             owner_id: owner.clone(),
-            created_at: Timestamp(1),
+            created_at,
             versioning: VersioningState::Unversioned,
             ownership_mode: OwnershipMode::BucketOwnerEnforced,
             region: "us-east-1".to_owned(),
@@ -174,7 +176,7 @@ async fn storage_admission_rejects_a_recreated_bucket_from_an_old_plan() {
         })
     };
     store
-        .submit(Mutation::CreateBucket(new_bucket(&owner_a)))
+        .submit(Mutation::CreateBucket(new_bucket(&owner_a, created_at_a)))
         .await
         .unwrap();
     let generation = StorageToken::generate();
@@ -194,14 +196,14 @@ async fn storage_admission_rejects_a_recreated_bucket_from_an_old_plan() {
         },
     )
     .unwrap()
-    .with_bucket_owner(owner_a.clone());
+    .with_bucket_snapshot(owner_a.clone(), created_at_a);
     let plan = planned.plan().clone();
     store
         .submit(Mutation::DeleteBucket(bucket.clone()))
         .await
         .unwrap();
     store
-        .submit(Mutation::CreateBucket(new_bucket(&owner_b)))
+        .submit(Mutation::CreateBucket(new_bucket(&owner_b, created_at_b)))
         .await
         .unwrap();
     let outcome = store
@@ -232,4 +234,35 @@ async fn sharded_admission_rejects_a_recreated_bucket() {
         .collect();
     let store = cairn_meta::ShardedMetadataStore::new(shards);
     cairn_types::testing::assert_admission_rejects_recreated_bucket(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_object_publication_contract() {
+    cairn_types::testing::assert_object_publication_rejects_recreated_bucket(
+        &cairn_meta::open_in_memory().unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_object_publication(
+        &cairn_meta::open_in_memory().unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_abandonment_reclaims_aliases(
+        &cairn_meta::open_in_memory().unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sharded_object_publication_contract() {
+    use cairn_types::MetadataStore;
+    use std::sync::Arc;
+    let new_store = || {
+        let shards: Vec<Arc<dyn MetadataStore>> = (0..4)
+            .map(|_| Arc::new(cairn_meta::open_in_memory().unwrap()) as Arc<dyn MetadataStore>)
+            .collect();
+        cairn_meta::ShardedMetadataStore::new(shards)
+    };
+    cairn_types::testing::assert_object_publication_rejects_recreated_bucket(&new_store()).await;
+    cairn_types::testing::assert_unadmitted_object_publication(&new_store()).await;
+    cairn_types::testing::assert_unadmitted_abandonment_reclaims_aliases(&new_store()).await;
 }

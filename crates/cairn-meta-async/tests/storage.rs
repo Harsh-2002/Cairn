@@ -93,3 +93,35 @@ async fn turso_admission_rejects_a_recreated_bucket() {
     let store = cairn_meta_async::open_turso_in_memory().await.unwrap();
     cairn_types::testing::assert_admission_rejects_recreated_bucket(&store).await;
 }
+
+#[tokio::test]
+async fn libsql_object_publication_contract() {
+    cairn_types::testing::assert_object_publication_rejects_recreated_bucket(
+        &cairn_meta_async::open_libsql_in_memory().await.unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_object_publication(
+        &cairn_meta_async::open_libsql_in_memory().await.unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_abandonment_reclaims_aliases(
+        &cairn_meta_async::open_libsql_in_memory().await.unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turso_object_publication_contract() {
+    cairn_types::testing::assert_object_publication_rejects_recreated_bucket(
+        &cairn_meta_async::open_turso_in_memory().await.unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_object_publication(
+        &cairn_meta_async::open_turso_in_memory().await.unwrap(),
+    )
+    .await;
+    cairn_types::testing::assert_unadmitted_abandonment_reclaims_aliases(
+        &cairn_meta_async::open_turso_in_memory().await.unwrap(),
+    )
+    .await;
+}

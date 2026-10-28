@@ -227,7 +227,42 @@ pub fn publication_allowed(view: &dyn View, plan: &StorageWritePlan) -> Result<b
     }
     Ok(true)
 }
-pub fn resolve(
+pub fn object_publication_allowed(
+    view: &dyn View,
+    plan: &StorageWritePlan,
+) -> Result<bool, MetaError> {
+    if generation(view)?.as_ref() != Some(&plan.generation) {
+        return Ok(false);
+    }
+    let Some(bucket) = get::<Bucket>(view, &key(BUCKET, &[plan.bucket.as_str()]))? else {
+        return Ok(false);
+    };
+    let Some(expected_owner) = &plan.bucket_owner else {
+        return Err(kv::error("object publication requires a bucket owner"));
+    };
+    let Some(created_at) = plan.bucket_created_at else {
+        return Err(kv::error(
+            "object publication requires a bucket incarnation",
+        ));
+    };
+    if &bucket.owner_id != expected_owner || bucket.created_at != created_at {
+        return Ok(false);
+    }
+    if get::<Intent>(view, &key(INTENT, &[plan.attempt.as_str()]))?.is_some() {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if referenced(view, &path.path)?
+            || intent_path(view, &path.path)?
+            || debt_by_path(view, &path.path)?.is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub fn resolve_paths(
     view: &mut Overlay<'_>,
     plan: &StorageWritePlan,
     index_spool: cairn_types::blob::IndexSpoolState,
@@ -282,6 +317,15 @@ pub fn resolve(
             )?;
         }
     }
+    Ok(())
+}
+
+pub fn resolve(
+    view: &mut Overlay<'_>,
+    plan: &StorageWritePlan,
+    index_spool: cairn_types::blob::IndexSpoolState,
+) -> Result<(), MetaError> {
+    resolve_paths(view, plan, index_spool)?;
     view.remove(key(INTENT, &[plan.attempt.as_str()]))?;
     for path in &plan.paths {
         view.remove(key(INTENT_PATH, &[path.path.as_str()]))?;
@@ -291,6 +335,37 @@ pub fn resolve(
     }
     Ok(())
 }
+
+pub fn abandon_object(
+    view: &mut Overlay<'_>,
+    plan: &StorageWritePlan,
+    quiescence: &cairn_types::storage::io::StorageQuiescence,
+) -> Result<MutationOutcome, MetaError> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(kv::error("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(kv::error("storage quiescence identity mismatch"));
+    }
+    if generation(view)?.as_ref() != Some(quiescence.generation()) {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    if let Some(intent) = get::<Intent>(view, &key(INTENT, &[plan.attempt.as_str()]))?
+        && intent.plan.bucket == plan.bucket
+        && intent.plan.generation == plan.generation
+    {
+        resolve(
+            view,
+            &intent.plan,
+            cairn_types::blob::IndexSpoolState::Materialized,
+        )?;
+        return Ok(MutationOutcome::StorageUpdated { applied: true });
+    }
+    resolve_paths(view, plan, cairn_types::blob::IndexSpoolState::Materialized)?;
+    Ok(MutationOutcome::StorageUpdated { applied: true })
+}
+
 pub fn claim(
     view: &mut Overlay<'_>,
     token: StorageToken,

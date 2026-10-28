@@ -5,8 +5,8 @@ use cairn_types::error::Error;
 use cairn_types::meta::{ActivityEntry, Mutation};
 use cairn_types::storage::io::{StorageIoLease, StorageIoWatch};
 use cairn_types::storage::{
-    PlannedStorageWrite, StorageAdmission, StorageCreationPermit, StorageToken, StorageWritePlan,
-    StorageWriteTarget,
+    ObjectCreationPermit, PlannedStorageWrite, StorageAdmission, StorageCreationPermit,
+    StorageToken, StorageWritePlan, StorageWriteTarget,
 };
 use cairn_types::{BlobStore, BucketName};
 use std::future::Future;
@@ -90,6 +90,7 @@ impl StorageWriteRuntime {
         blob: &dyn BlobStore,
         bucket: BucketName,
         bucket_owner: cairn_types::id::UserId,
+        bucket_created_at: cairn_types::Timestamp,
         target: StorageWriteTarget,
     ) -> Result<PreparedStorageWrite, Error> {
         let slot = (self.admission)().await.ok_or_else(|| {
@@ -97,7 +98,7 @@ impl StorageWriteRuntime {
         })?;
         let planned = blob
             .plan_write(bucket, self.generation.clone(), target)?
-            .with_bucket_owner(bucket_owner);
+            .with_bucket_snapshot(bucket_owner, bucket_created_at);
         let plan = planned.plan().clone();
         let lifetime = StorageRecoveryPermit::new((self.node_lifetime.clone(), slot));
         let (io, lease) = StorageIoWatch::new(
@@ -135,6 +136,13 @@ impl PreparedStorageWrite {
         Ok((permit, self.guard))
     }
 
+    /// Consume an ordinary object plan without a Writer receipt. The guard stays armed until the
+    /// publication savepoint, which is the only durable authority for this plan.
+    pub(crate) fn into_object(self) -> Result<(ObjectCreationPermit, StorageWriteGuard), Error> {
+        let permit = self.planned.into_object_permit(self.lease)?;
+        Ok((permit, self.guard))
+    }
+
     /// A typed admission miss owns no claim or files. An error or missing acknowledgement must
     /// instead leave the guard armed, because the Writer may already have committed admission.
     pub(crate) fn reject(mut self) {
@@ -159,6 +167,28 @@ impl StorageWriteGuard {
                 self.recovery
                     .as_ref()
                     .expect("armed storage publication")
+                    .plan
+                    .clone(),
+            ),
+            operation: Box::new(operation),
+            index_spool,
+            activity,
+        }
+    }
+
+    /// Publication of a plan that was never journaled. The Writer re-establishes generation,
+    /// bucket incarnation and exact path availability inside the same savepoint.
+    pub(crate) fn planned_publication(
+        &self,
+        operation: Mutation,
+        index_spool: IndexSpoolState,
+        activity: Option<Box<ActivityEntry>>,
+    ) -> Mutation {
+        Mutation::PublishObjectWrite {
+            plan: Box::new(
+                self.recovery
+                    .as_ref()
+                    .expect("armed object publication")
                     .plan
                     .clone(),
             ),

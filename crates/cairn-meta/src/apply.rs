@@ -71,6 +71,28 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 )),
             }
         }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            activity,
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !crate::storage::object_publication_allowed(conn, &plan)? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = apply_inner(conn, *operation)?;
+            if matches!(&outcome, MutationOutcome::Put { .. }) {
+                crate::storage::resolve_paths(conn, &plan, index_spool)?;
+                if let Some(entry) = activity {
+                    insert_activity_best_effort(conn, &entry)?;
+                }
+            }
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            crate::storage::abandon_object(conn, &plan, &quiescence)
+        }
         Mutation::PublishStorageWrite {
             plan,
             operation,
@@ -97,13 +119,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 // failure, so it must fail the publication instead of acknowledging an object from
                 // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
                 if let Some(entry) = activity {
-                    match insert_activity(conn, &entry) {
-                        Ok(()) => {}
-                        Err(cairn_types::MetaError::Conflict) => {
-                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    insert_activity_best_effort(conn, &entry)?;
                 }
             }
             Ok(outcome)
@@ -145,7 +161,10 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             completed_at,
         } => crate::baseline::complete(conn, &token, completed_at),
 
-        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+        Mutation::AdmitStorageWrite { .. }
+        | Mutation::PublishStorageWrite { .. }
+        | Mutation::PublishObjectWrite { .. }
+        | Mutation::AbandonObjectWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => crate::storage::begin(conn, &generation),
@@ -3251,6 +3270,20 @@ fn owns_replication_claim(
         "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
         params![id, token.as_str(), now.0], |row| row.get(0),
     ).map_err(engine_err)
+}
+
+fn insert_activity_best_effort(
+    conn: &Connection,
+    entry: &cairn_types::meta::ActivityEntry,
+) -> R<()> {
+    match insert_activity(conn, entry) {
+        Ok(()) => Ok(()),
+        Err(cairn_types::MetaError::Conflict) => {
+            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn insert_activity(conn: &Connection, entry: &cairn_types::meta::ActivityEntry) -> R<()> {

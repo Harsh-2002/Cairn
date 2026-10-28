@@ -10,7 +10,7 @@ use crate::error::BlobError;
 use crate::id::{BucketName, StoragePath, UploadId};
 use crate::object::{CompressionDescriptor, ETag};
 use crate::secret::SecretKey32;
-use crate::storage::{StorageCreationPermit, StorageWriteTarget};
+use crate::storage::{ObjectCreationPermit, StorageCreationPermit, StorageWriteTarget};
 use crate::traits::{BlobStore, ReconcileOracle};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -142,7 +142,7 @@ impl BlobStore for InMemoryBlobStore {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -464,7 +464,7 @@ pub trait FixtureBlobStore: BlobStore {
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
         self.stage(
-            fixture_permit(
+            fixture_object_permit(
                 bucket.clone(),
                 StorageWriteTarget::Object {
                     key: crate::ObjectKey::parse("fixture").expect("valid fixture key"),
@@ -536,6 +536,19 @@ pub trait FixtureBlobStore: BlobStore {
 }
 
 impl<T: BlobStore + ?Sized> FixtureBlobStore for T {}
+
+fn fixture_object_permit(
+    bucket: BucketName,
+    target: StorageWriteTarget,
+) -> Result<ObjectCreationPermit, BlobError> {
+    use crate::storage::{PlannedStorageWrite, StorageToken, io::StorageIoWatch};
+    let planned = PlannedStorageWrite::new(bucket, StorageToken::generate(), target)
+        .map_err(|error| BlobError::Io(error.to_string()))?;
+    let plan = planned.plan().clone();
+    let (_watch, lease) =
+        StorageIoWatch::new(plan.attempt.clone(), plan.generation.clone(), Arc::new(()));
+    planned.into_object_permit(lease)
+}
 
 fn fixture_permit(
     bucket: BucketName,

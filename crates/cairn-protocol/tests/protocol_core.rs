@@ -10,7 +10,7 @@ use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::storage::io::StorageIoWatch;
 use cairn_types::storage::{
-    StorageCreationPermit, StorageMutation, StorageToken, StorageWriteTarget,
+    ObjectCreationPermit, StorageCreationPermit, StorageMutation, StorageToken, StorageWriteTarget,
 };
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 use http::{Method, StatusCode};
@@ -101,15 +101,18 @@ async fn resolve_storage(
     record: &StorageWriteRecovery,
 ) -> cairn_types::MutationOutcome {
     use cairn_types::{Mutation, MutationOutcome};
-    meta.submit(Mutation::Storage {
-        bucket: record.plan.bucket.clone(),
-        operation: StorageMutation::Cancel {
-            attempt: record.plan.attempt.clone(),
-            generation: record.plan.generation.clone(),
-        },
-    })
-    .await
-    .unwrap();
+    let is_object = matches!(record.plan.target, StorageWriteTarget::Object { .. });
+    if !is_object {
+        meta.submit(Mutation::Storage {
+            bucket: record.plan.bucket.clone(),
+            operation: StorageMutation::Cancel {
+                attempt: record.plan.attempt.clone(),
+                generation: record.plan.generation.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    }
     let mut io = record.io.clone();
     let proof = io.quiescent().await;
     let (_, lease) = StorageIoWatch::new(
@@ -133,13 +136,21 @@ async fn resolve_storage(
         .await
         .unwrap();
     }
-    let outcome = meta
-        .submit(Mutation::Storage {
+    let outcome = if is_object {
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(record.plan.clone()),
+            quiescence: proof,
+        })
+        .await
+        .unwrap()
+    } else {
+        meta.submit(Mutation::Storage {
             bucket: record.plan.bucket.clone(),
             operation: StorageMutation::Resolve { quiescence: proof },
         })
         .await
-        .unwrap();
+        .unwrap()
+    };
     loop {
         let MutationOutcome::StorageCleanupBatch(batch) = meta
             .submit(Mutation::ClaimStorageCleanup {
@@ -379,12 +390,13 @@ async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMeta
     (harness, meta)
 }
 
-/// Admission can hit a full metadata filesystem before staging ever observes blob ENOSPC.
-/// Preserve the storage-capacity response and leave the body/files untouched until a later retry.
+/// An ordinary object PUT has no pre-body admission, so a metadata filesystem that is out of space
+/// is discovered at publication after the body is staged. The response stays 507, no row appears,
+/// and the unacknowledged file remains recoverable cleanup—never a visible object.
 #[tokio::test]
-async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
+async fn storage_publication_out_of_space_is_507_after_body_and_leaves_no_row() {
     let (h, meta) = in_memory_harness().await;
-    let bucket = "full-admission";
+    let bucket = "full-publication";
     assert_eq!(
         send(
             &h.svc,
@@ -409,7 +421,7 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
     let observed = polled.clone();
     let body = Box::pin(futures_util::stream::once(async move {
         observed.store(true, Ordering::Release);
-        Ok(Bytes::from_static(b"must not stage"))
+        Ok(Bytes::from_static(b"staged but never published"))
     }));
     let (status, _, response) = drain(h.svc.handle(request, body).await).await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
@@ -418,9 +430,11 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
             .unwrap()
             .contains("InsufficientStorage")
     );
-    assert!(!polled.load(Ordering::Acquire));
+    assert!(
+        polled.load(Ordering::Acquire),
+        "an ordinary PUT now reads its body before the single publication barrier"
+    );
     h.settle_recovery().await;
-    assert!(!h._dir.path().join(bucket).exists());
     assert_eq!(staging_entries(), before);
     assert!(
         meta.current_version(
@@ -430,6 +444,15 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
         .await
         .unwrap()
         .is_none()
+    );
+    // The staged final file may remain until cleanup or the startup scan reclaims it; it must
+    // never be referenced by a row.
+    let leftovers = std::fs::read_dir(h._dir.path().join(bucket))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert!(
+        leftovers <= 1,
+        "at most the one unacknowledged final file may remain, found {leftovers}"
     );
 
     let expected = b"capacity restored".to_vec();
@@ -544,7 +567,7 @@ impl BlobStore for AbortAfterStagePartBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -751,7 +774,7 @@ impl BlobStore for AssembleGateBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -1896,7 +1919,7 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
 }
 
 #[tokio::test]
-async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
+async fn sampled_put_timing_marks_a_publication_failure_after_the_blob_stage() {
     let (h, meta) = in_memory_harness().await;
     let (status, _, _) = drain(
         send(
@@ -1925,26 +1948,101 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     .await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     let samples = h.svc.drain_put_timings();
-    assert_eq!(samples.len(), 3);
+    assert_eq!(samples.len(), 6);
+    for stage in [
+        PutStage::Preflight,
+        PutStage::StorageAdmission,
+        PutStage::BlobStage,
+        PutStage::PublicationPrep,
+    ] {
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.stage == stage && sample.completed),
+            "{stage:?} must complete before the failing publication"
+        );
+    }
     assert!(
         samples
             .iter()
-            .any(|sample| sample.stage == PutStage::Preflight && sample.completed)
-    );
-    assert!(
-        samples
-            .iter()
-            .any(|sample| sample.stage == PutStage::StorageAdmission && !sample.completed)
+            .any(|sample| sample.stage == PutStage::Publication && !sample.completed)
     );
     assert!(
         samples
             .iter()
             .any(|sample| sample.stage == PutStage::Total && !sample.completed)
     );
+}
+
+#[tokio::test]
+async fn ordinary_put_creates_no_intent_while_multipart_parts_stay_admitted() {
+    // An ordinary object PUT never journals a storage intent: publication is the one barrier.
+    let h = harness().await;
+    put_simple(&h, "intent-object", "obj").await;
+    let next = StorageToken::generate();
+    h.meta
+        .submit(cairn_types::Mutation::BeginStorageGeneration {
+            generation: next.clone(),
+        })
+        .await
+        .unwrap();
+    let cairn_types::MutationOutcome::StorageIntentBatch(plans) = h
+        .meta
+        .submit(cairn_types::Mutation::ListStorageIntents {
+            generation: next,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("storage intent batch expected")
+    };
     assert!(
-        !samples
-            .iter()
-            .any(|sample| sample.stage == PutStage::BlobStage)
+        plans.is_empty(),
+        "ordinary PUT must not leave a storage intent: {plans:?}"
+    );
+
+    // Multipart remains Writer-admitted: its joint reserve/claim still runs before staging, so a
+    // rejected admission fails the part upload with the storage-capacity response.
+    let (h, meta) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("intent-part"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = start_upload(&h, "intent-part", "obj").await;
+    meta.reject_next_storage_admission_out_of_space();
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("intent-part"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"hello".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "a part upload still requires a successful Writer admission"
+    );
+    assert!(
+        h.meta
+            .list_parts(&UploadId::from_string(upload_id.clone()), 0, 100)
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+        "a refused part admission must record no part"
     );
 }
 
@@ -8160,10 +8258,10 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     );
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
 
-    // A later null-version overwrite replaces the row. Delayed recovery now proves only the old
+    // A later null-version overwrite replaces the row. Delayed abandonment now proves only the old
     // unique path unreferenced; it cannot delete the current object's different path.
     let (status, _, _) = drain(
         send(
@@ -8193,7 +8291,7 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     );
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
     let (status, _, body) = drain(
         send(

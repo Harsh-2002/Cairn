@@ -129,6 +129,7 @@ impl PublicationFixture {
             generation: self.generation.clone(),
             bucket: row.bucket.clone(),
             bucket_owner: None,
+            bucket_created_at: None,
             target,
             paths: vec![
                 StorageIntentPath {
@@ -156,7 +157,7 @@ impl PublicationFixture {
         meta: &M,
         planned: PlannedStorageWrite,
         now: Timestamp,
-    ) -> Result<(StorageWritePlan, crate::storage::StorageCreationPermit), MetaError> {
+    ) -> Result<(StorageWritePlan, crate::storage::ObjectCreationPermit), MetaError> {
         let plan = planned.plan().clone();
         if plan.generation != self.generation
             || !matches!(plan.target, StorageWriteTarget::Object { .. })
@@ -185,7 +186,8 @@ impl PublicationFixture {
         );
         let permit = planned
             .admit(receipt, lease)
-            .map_err(|error| MetaError::Engine(error.to_string()))?;
+            .map_err(|error| MetaError::Engine(error.to_string()))?
+            .into();
         Ok((plan, permit))
     }
 

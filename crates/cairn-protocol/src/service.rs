@@ -37,7 +37,7 @@ use cairn_types::object::{
 };
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::storage::{
-    StorageAdmission, StorageCreationPermit, StorageMutation, StorageWriteTarget,
+    ObjectCreationPermit, StorageAdmission, StorageCreationPermit, StorageWriteTarget,
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
@@ -189,37 +189,22 @@ impl S3Service {
                 &*self.blob,
                 bucket.name.clone(),
                 bucket.owner_id.clone(),
+                bucket.created_at,
                 target,
             )
             .await
     }
 
-    async fn admit_object_storage(
+    /// Plan an ordinary object write without a Writer round-trip. The retained guard abandons the
+    /// plan through the recovery worker if the request fails or is cancelled; the single
+    /// publication savepoint re-establishes bucket identity and path ownership.
+    async fn plan_object_storage(
         &self,
         bucket: &Bucket,
         target: StorageWriteTarget,
-    ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
+    ) -> Result<(ObjectCreationPermit, StorageWriteGuard)> {
         let prepared = self.prepare_storage(bucket, target).await?;
-        let outcome = self
-            .meta
-            .submit(Mutation::Storage {
-                bucket: bucket.name.clone(),
-                operation: StorageMutation::Reserve {
-                    plan: Box::new(prepared.plan().clone()),
-                    now: self.clock.now(),
-                },
-            })
-            .await?;
-        match outcome {
-            MutationOutcome::StorageAdmission(StorageAdmission::NotApplied) => {
-                prepared.reject();
-                Err(Error::Internal("storage admission lost ownership".into()))
-            }
-            MutationOutcome::StorageAdmission(receipt) => prepared.admit(receipt),
-            _ => Err(Error::Internal(
-                "unexpected storage admission outcome".into(),
-            )),
-        }
+        prepared.into_object()
     }
 
     async fn admit_part_storage(
@@ -982,7 +967,7 @@ impl S3Service {
         }
         let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
         let admitted = self
-            .admit_object_storage(
+            .plan_object_storage(
                 bucket,
                 StorageWriteTarget::Object {
                     key: key.clone(),
@@ -1157,7 +1142,7 @@ impl S3Service {
         let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
         let publication = self
             .meta
-            .submit(write_guard.publication(
+            .submit(write_guard.planned_publication(
                 Mutation::PutObjectVersion {
                     row: Box::new(row),
                     precondition: precond,
@@ -3153,7 +3138,7 @@ impl S3Service {
         };
         let row_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut write_guard) = self
-            .admit_object_storage(
+            .plan_object_storage(
                 dest_bucket,
                 StorageWriteTarget::Object {
                     key: dest_key.clone(),
@@ -3265,7 +3250,7 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(write_guard.publication(
+            .submit(write_guard.planned_publication(
                 Mutation::PutObjectVersion {
                     row: Box::new(row),
                     precondition: Precondition::default(),

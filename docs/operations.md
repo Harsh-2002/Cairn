@@ -234,10 +234,13 @@ commit sequence is: stream to staging → fsync the file → rename into place �
 directory** → validate hashes → commit the metadata transaction (the single linearization
 point) → reclaim superseded blobs. A write is acknowledged only after its metadata commit is
 durable. Drive-failure survival is delegated to the storage layer; host-failure survival comes
-from bucket replication. Every write first commits its exact intended filenames through the Writer; admission is not an
-S3 success. If PUT/Copy, part upload or completion is cancelled or loses an acknowledgement,
+from bucket replication. Multipart writes first commit their exact intended filenames through the
+Writer; an ordinary PUT/Copy/import plan stays in memory and is fenced once by its publication
+transaction, so it crosses one durable Writer barrier instead of two. Admission is not an
+S3 success. If a PUT/Copy, part upload or completion is cancelled or loses an acknowledgement,
 the retained recovery worker waits for backend I/O and kernel file ownership to quiesce, then
-resolves the intent through the Writer. Deletes and replacements persist exact cleanup debt;
+resolves a multipart intent, or abandons an ordinary object plan, through the Writer. Deletes and
+replacements persist exact cleanup debt;
 quota remains charged until unlink and namespace sync succeed. Errors preserve accounting for
 exclusive restart recovery. Shutdown drains this queue after HTTP and background producers,
 including imports, stop and before the final WAL checkpoint. Full startup scans remain mandatory;

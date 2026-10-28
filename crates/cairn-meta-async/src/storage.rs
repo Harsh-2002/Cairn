@@ -405,10 +405,89 @@ async fn referenced(db: &DB<'_>, path: &StoragePath) -> R<bool> {
         vec![text(path.as_str())]).await?.is_empty())
 }
 
+/// Whether an ordinary object plan may publish in this savepoint. It replaces the admission fence
+/// the request used to carry: the generation is current, the bucket is the exact authorized
+/// incarnation (owner and creation time), no intent exists for the attempt, and every planned
+/// alias is free of authoritative references, intent ownership and cleanup debt.
+pub async fn object_publication_allowed(db: &DB<'_>, plan: &StorageWritePlan) -> R<bool> {
+    crate::baseline::ensure_unheld(db).await?;
+    if !current(db, &plan.generation).await? {
+        return Ok(false);
+    }
+    let bucket_row = q(
+        db,
+        "SELECT owner_id,created_at FROM buckets WHERE name=?1",
+        vec![text(plan.bucket.as_str())],
+    )
+    .await?;
+    let Some(bucket_row) = bucket_row.first() else {
+        return Ok(false);
+    };
+    let owner = plan
+        .bucket_owner
+        .as_ref()
+        .ok_or_else(|| invalid("object publication requires a bucket owner"))?;
+    let created_at = plan
+        .bucket_created_at
+        .ok_or_else(|| invalid("object publication requires a bucket incarnation"))?;
+    if string(bucket_row, 0)? != owner.0 || integer(bucket_row, 1)? != created_at.0 {
+        return Ok(false);
+    }
+    if !q(
+        db,
+        "SELECT 1 FROM storage_write_intents WHERE attempt_id=?1",
+        vec![text(plan.attempt.as_str())],
+    )
+    .await?
+    .is_empty()
+    {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if referenced(db, &path.path).await? || !q(db,
+            "SELECT 1 FROM storage_intent_paths WHERE storage_path=?1 UNION ALL SELECT 1 FROM storage_cleanups WHERE storage_path=?1 LIMIT 1",
+            vec![text(path.path.as_str())]).await?.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Abandon a planned ordinary object write after the caller proved backend quiescence. There is
+/// usually no intent, so cleanup is reference-checked directly. A mixed/rollback state that does
+/// still carry an intent for this attempt is resolved exactly like `StorageMutation::Resolve`.
+pub async fn abandon_object(
+    db: &DB<'_>,
+    plan: &StorageWritePlan,
+    quiescence: &cairn_types::storage::io::StorageQuiescence,
+) -> R<MutationOutcome> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(invalid("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(invalid("storage quiescence identity mismatch"));
+    }
+    if !current(db, quiescence.generation()).await? {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    if let Some(stored) = load(db, &plan.bucket, &plan.attempt, &plan.generation).await? {
+        resolve(db, &stored, IndexSpoolState::Materialized).await?;
+        return Ok(MutationOutcome::StorageUpdated { applied: true });
+    }
+    resolve_paths(db, plan, IndexSpoolState::Materialized).await?;
+    Ok(MutationOutcome::StorageUpdated { applied: true })
+}
+
 /// Enqueue aliases even when rename/unlink probably removed them: retirement still needs the
 /// containing namespace barrier. Reference checks are Writer-serialized, never stale WAL reads.
-async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
-    validate_index(db, plan).await?;
+/// Ordinary object plans have no intent, so this never validates or removes one.
+pub(crate) async fn resolve_paths(
+    db: &DB<'_>,
+    plan: &StorageWritePlan,
+    index_spool: IndexSpoolState,
+) -> R<()> {
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
         .transpose()?;
@@ -467,6 +546,14 @@ async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolSt
             enqueue_owned(db, &plan.bucket, &path.path, quota.as_deref(), owner).await?;
         }
     }
+    Ok(())
+}
+
+/// Resolve an admitted plan: validate its normalized index, enqueue reference-checked cleanup and
+/// then discard its exact intent. Parts and completions keep this path.
+async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
+    validate_index(db, plan).await?;
+    resolve_paths(db, plan, index_spool).await?;
     discard_unacknowledged(db, plan).await
 }
 

@@ -54,7 +54,7 @@ use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
 use cairn_types::id::StoragePath;
 use cairn_types::object::{ChecksumSet, CompressionDescriptor, ETag};
-use cairn_types::storage::{StorageCreationPermit, StorageWriteTarget};
+use cairn_types::storage::{ObjectCreationPermit, StorageCreationPermit, StorageWriteTarget};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
@@ -1122,7 +1122,7 @@ impl BlobStore for LocalBlobStore {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -1148,7 +1148,7 @@ impl BlobStore for LocalBlobStore {
             ));
         }
         let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Namespace));
-        let paths = AdmittedPaths::open_sampled(
+        let paths = AdmittedPaths::open_object_sampled(
             &self.data_root,
             permit,
             sampled.then(|| self.object_write_timings.clone()),

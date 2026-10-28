@@ -1492,6 +1492,75 @@ async fn reconcile_reclaims_orphans_only() {
     ));
 }
 
+/// A crash after the final rename and directory barrier (the `blob_after_durable` seam) leaves a
+/// durable file with no row and no cleanup debt. The next startup scan must reclaim it.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failpoint_after_durable_leaves_an_orphan_the_next_scan_reclaims() {
+    let _scenario = fail::FailScenario::setup();
+    fail::cfg("blob_after_durable", "panic").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("crash-after-durable").unwrap();
+    let task_store = store.clone();
+    let task_bucket = bucket.clone();
+    let task = tokio::spawn(async move {
+        task_store
+            .stage_fixture(
+                &task_bucket,
+                body(b"durable but unpublished".to_vec()),
+                opts(None, "text/plain"),
+            )
+            .await
+    });
+    let panic = task.await.expect_err("the armed failpoint must panic");
+    assert!(panic.is_panic());
+    fail::remove("blob_after_durable");
+
+    let bucket_dir = dir.path().join(bucket.as_str());
+    let finals = std::fs::read_dir(&bucket_dir).unwrap().count();
+    assert_eq!(finals, 1, "the durable final file survives the crash");
+    let staging = std::fs::read_dir(dir.path().join(".staging")).unwrap();
+    assert_eq!(
+        staging
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count(),
+        0,
+        "the rename already moved the temporary alias"
+    );
+
+    let oracle = SetReconcileOracle {
+        live_paths: Default::default(),
+        live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
+    };
+    let report = store
+        .reconcile_fixture(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        report.orphans_reclaimed >= 1,
+        "the unreferenced final file must be reclaimed: {report:?}"
+    );
+    assert!(
+        std::fs::read_dir(&bucket_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+            == 0,
+        "no unreferenced final file may remain after the scan"
+    );
+}
+
 #[tokio::test]
 async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_is_path_exact() {
     let dir = tempfile::tempdir().unwrap();
