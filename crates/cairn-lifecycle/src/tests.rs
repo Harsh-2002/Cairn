@@ -78,7 +78,10 @@ async fn drain_cleanup(
 fn object_data_paths<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a StoragePath> {
     let mut data = Vec::new();
     let mut metadata = Vec::new();
-    for path in removed.iter().filter(|path| path.as_str().starts_with(prefix)) {
+    for path in removed
+        .iter()
+        .filter(|path| path.as_str().starts_with(prefix))
+    {
         if object_data_path_for_metadata(path).is_some() {
             metadata.push(path);
         } else {

@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use cairn_control::{ControlResponse, ControlService, SystemInfo};
+use cairn_types::StoragePath;
 use cairn_types::auth::{AuthMethod, Principal, Role};
 use cairn_types::blob::StageOptions;
 use cairn_types::bucket::VersioningState;
@@ -18,7 +19,6 @@ use cairn_types::object::{
 use cairn_types::storage::{
     StorageToken, StorageWriteTarget, object_data_path_for_metadata, object_metadata_path,
 };
-use cairn_types::StoragePath;
 use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -145,7 +145,10 @@ async fn drain_cleanup(
 fn object_data_cleanup<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a StoragePath> {
     let mut data = Vec::new();
     let mut metadata = Vec::new();
-    for path in removed.iter().filter(|path| path.as_str().starts_with(prefix)) {
+    for path in removed
+        .iter()
+        .filter(|path| path.as_str().starts_with(prefix))
+    {
         if object_data_path_for_metadata(path).is_some() {
             metadata.push(path);
         } else {
