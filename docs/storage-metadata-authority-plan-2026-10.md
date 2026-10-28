@@ -57,6 +57,47 @@ Acceptance: full gate green, no data-path regression beyond one small file sync,
 unchanged.
 
 ### P2 — index off the ACK path
+
+The hard requirement is that moving the index off the ACK path must not weaken conditional PUT,
+quota, versioning, Object Lock, or bucket delete/recreate. File metadata alone cannot serialize two
+concurrent `If-None-Match: *` writes, so P2 adds a single-process **object coordinator**:
+
+- **Per-key striped locks.** Every object mutation (PUT, Copy, DELETE, tag/ACL/lock, multipart
+  completion) acquires the key's stripe, then evaluates conditions, versioning and Object Lock
+  against the SQLite index **plus the in-memory overlay**. The durable metadata file is written and
+  the directory barrier completes while the stripe is held, then the overlay entry is inserted
+  atomically with the ACK. A concurrent conditional writer waits, sees the overlay entry, and fails
+  with 412 correctly.
+- **Bucket generation fence.** Bucket delete/recreate takes the bucket's fence in the same
+  coordinator; an object ACK re-checks the bucket generation after acquiring its stripe. Delete
+  therefore waits for in-flight object commits or refuses, instead of allowing a same-name
+  injection.
+- **Quota and counters.** Quota is checked under the stripe against the durable roll-up plus overlay
+  deltas; the winning write records its delta in the overlay before ACK. After a crash, rebuild
+  restores the roll-up from metadata files before readiness, so a post-crash node is exact.
+- **Version ordering.** Version ids are generated locally; the current-version decision is
+  serialized by the stripe and represented in the overlay, so the index fold order cannot change
+  which version a client saw as current at ACK.
+- **Overlay and fold.** The overlay is bounded (entries and bytes), in-memory only, and holds the
+  exact row plus superseded generation for LIST/GET merging. A background Writer fold submits rows
+  in order; fold failure keeps the entry and retries, never loses an ACKed object. Shutdown drains
+  the overlay before exit.
+- **Rebuild.** Startup scans metadata files, validates data/meta identity, and inserts missing rows
+  and counters before serving. A lagging index is repaired; a corrupted or missing sidecar is an
+  incident, never an invented object.
+- **LIST/GET.** LIST merges the overlay with the index, preserving read-after-write. GET may resolve
+  the row from the metadata file when the index misses it.
+
+Strictness limits to state explicitly: the coordinator is process-local, which is valid for the
+single-node ceiling. A hard crash loses only the overlay; rebuild reconstructs it from durable
+metadata files. Quota may be briefly stale only for writes that were ACKed after the crash boundary
+and are already represented in their metadata files; readiness waits for rebuild, so no client sees
+the stale state.
+
+P2 acceptance requires a two-writer conditional race test, quota under concurrent PUTs, bucket
+delete vs in-flight PUT, version ordering, overlay bound/shutdown drain, and crash-with-lagging-index
+rebuild. No feature flag; protocol 3 gates it.
+
 Overlay + async fold + startup rebuild. ACK after the file barrier; SQLite submission follows.
 LIST/GET merge the overlay. Crash/restart rebuilds missing rows from sidecars before readiness.
 Feature is protocol-gated, no runtime flag. Acceptance: fr38 PUT ≥ 0.95x RustFS; LIST stays ≥ 3x;
