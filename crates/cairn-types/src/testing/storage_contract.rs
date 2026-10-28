@@ -1205,6 +1205,54 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
     assert!(claim(meta, &generation, 100, 4).await.is_empty());
 }
 
+/// A plan authorized against one bucket instance must not be admitted after that bucket was
+/// deleted and recreated under another owner: name equality alone is not identity.
+pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-recreate-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let owner_a = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let planned = plan(&bucket, &generation).with_bucket_owner(owner_a.clone());
+    let write_plan = planned.plan().clone();
+    meta.submit(Mutation::DeleteBucket(bucket.clone()))
+        .await
+        .unwrap();
+    let owner_b = UserId::generate();
+    meta.submit(Mutation::CreateBucket(Box::new(crate::bucket::Bucket {
+        name: bucket.clone(),
+        owner_id: owner_b,
+        created_at: Timestamp(0),
+        versioning: crate::bucket::VersioningState::Unversioned,
+        ownership_mode: crate::authz::OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+    let outcome = meta
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: crate::storage::StorageMutation::Reserve {
+                plan: Box::new(write_plan),
+                now: Timestamp(0),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            MutationOutcome::StorageAdmission(crate::storage::StorageAdmission::NotApplied)
+        ),
+        "a plan bound to the old owner must not be admitted to a recreated bucket: {outcome:?}"
+    );
+}
+
 /// A successful publication commits its activity row in the same savepoint. A rejected
 /// precondition records nothing, and a duplicate activity id never fails the object.
 pub async fn assert_publication_co_commits_activity(meta: &dyn MetadataStore) {
@@ -1379,6 +1427,14 @@ mod tests {
     #[tokio::test]
     async fn in_memory_prepare_storage_restore_contract() {
         super::assert_prepare_storage_restore(&crate::testing::InMemoryMetadataStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_admission_rejects_a_recreated_bucket() {
+        super::assert_admission_rejects_recreated_bucket(
+            &crate::testing::InMemoryMetadataStore::new(),
+        )
+        .await;
     }
 
     #[tokio::test]

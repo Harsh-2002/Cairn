@@ -144,3 +144,92 @@ async fn sharded_publication_co_commits_activity() {
     let store = cairn_meta::ShardedMetadataStore::new(shards);
     cairn_types::testing::assert_publication_co_commits_activity(&store).await;
 }
+
+/// A plan authorized against one bucket instance must not be admitted after that bucket was
+/// deleted and recreated under another owner: name equality alone is not identity.
+#[tokio::test]
+async fn storage_admission_rejects_a_recreated_bucket_from_an_old_plan() {
+    use cairn_types::authz::OwnershipMode;
+    use cairn_types::bucket::VersioningState;
+    use cairn_types::storage::{
+        PlannedStorageWrite, StorageAdmission, StorageMutation, StorageToken, StorageWriteTarget,
+    };
+    use cairn_types::{
+        Bucket, BucketName, MetadataStore, Mutation, MutationOutcome, ObjectKey, Timestamp, UserId,
+        VersionId,
+    };
+    let store = cairn_meta::open_in_memory().unwrap();
+    let bucket = BucketName::parse("recreate-race").unwrap();
+    let owner_a = UserId::generate();
+    let owner_b = UserId::generate();
+    let new_bucket = |owner: &UserId| {
+        Box::new(Bucket {
+            name: bucket.clone(),
+            owner_id: owner.clone(),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Unversioned,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        })
+    };
+    store
+        .submit(Mutation::CreateBucket(new_bucket(&owner_a)))
+        .await
+        .unwrap();
+    let generation = StorageToken::generate();
+    store
+        .submit(Mutation::BeginStorageGeneration {
+            generation: generation.clone(),
+        })
+        .await
+        .unwrap();
+    let planned = PlannedStorageWrite::new(
+        bucket.clone(),
+        generation,
+        StorageWriteTarget::Object {
+            key: ObjectKey::parse("obj").unwrap(),
+            version_id: VersionId::null(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        },
+    )
+    .unwrap()
+    .with_bucket_owner(owner_a.clone());
+    let plan = planned.plan().clone();
+    store
+        .submit(Mutation::DeleteBucket(bucket.clone()))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::CreateBucket(new_bucket(&owner_b)))
+        .await
+        .unwrap();
+    let outcome = store
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: StorageMutation::Reserve {
+                plan: Box::new(plan),
+                now: Timestamp(2),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            MutationOutcome::StorageAdmission(StorageAdmission::NotApplied)
+        ),
+        "a plan authorized for the old bucket must not be admitted to a recreated one: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn sharded_admission_rejects_a_recreated_bucket() {
+    use cairn_types::MetadataStore;
+    use std::sync::Arc;
+    let shards: Vec<Arc<dyn MetadataStore>> = (0..4)
+        .map(|_| Arc::new(cairn_meta::open_in_memory().unwrap()) as Arc<dyn MetadataStore>)
+        .collect();
+    let store = cairn_meta::ShardedMetadataStore::new(shards);
+    cairn_types::testing::assert_admission_rejects_recreated_bucket(&store).await;
+}

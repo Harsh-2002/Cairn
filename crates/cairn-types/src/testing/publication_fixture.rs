@@ -128,6 +128,7 @@ impl PublicationFixture {
             attempt,
             generation: self.generation.clone(),
             bucket: row.bucket.clone(),
+            bucket_owner: None,
             target,
             paths: vec![
                 StorageIntentPath {

@@ -215,6 +215,14 @@ fn reserve(
     {
         return Ok(StorageAdmission::NotApplied);
     }
+    if let Some(expected) = &plan.bucket_owner
+        && st
+            .buckets
+            .get(bucket.as_str())
+            .is_none_or(|bucket| &bucket.owner_id != expected)
+    {
+        return Ok(StorageAdmission::NotApplied);
+    }
     if let StorageWriteTarget::Part { upload_id, .. }
     | StorageWriteTarget::Completion { upload_id, .. } = &plan.target
         && let Some(session) = st.multipart.get(upload_id.as_str())

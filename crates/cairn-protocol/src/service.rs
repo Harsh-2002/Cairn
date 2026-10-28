@@ -177,26 +177,33 @@ impl S3Service {
 
     async fn prepare_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
     ) -> Result<PreparedStorageWrite> {
         let runtime = self
             .storage_runtime
             .as_ref()
             .ok_or_else(|| Error::Internal("storage write runtime is unavailable".into()))?;
-        runtime.prepare(&*self.blob, bucket.clone(), target).await
+        runtime
+            .prepare(
+                &*self.blob,
+                bucket.name.clone(),
+                bucket.owner_id.clone(),
+                target,
+            )
+            .await
     }
 
     async fn admit_object_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
     ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
         let prepared = self.prepare_storage(bucket, target).await?;
         let outcome = self
             .meta
             .submit(Mutation::Storage {
-                bucket: bucket.clone(),
+                bucket: bucket.name.clone(),
                 operation: StorageMutation::Reserve {
                     plan: Box::new(prepared.plan().clone()),
                     now: self.clock.now(),
@@ -217,7 +224,7 @@ impl S3Service {
 
     async fn admit_part_storage(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         target: StorageWriteTarget,
         operation: Mutation,
     ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
@@ -976,7 +983,7 @@ impl S3Service {
         let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
         let admitted = self
             .admit_object_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Object {
                     key: key.clone(),
                     version_id: version_id.clone(),
@@ -1943,7 +1950,7 @@ impl S3Service {
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut part_guard) = self
             .admit_part_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Part {
                     upload_id: upload_id.clone(),
                     part_number,
@@ -2197,7 +2204,7 @@ impl S3Service {
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut part_guard) = self
             .admit_part_storage(
-                &dest_bucket.name,
+                dest_bucket,
                 StorageWriteTarget::Part {
                     upload_id: upload_id.clone(),
                     part_number,
@@ -2411,7 +2418,7 @@ impl S3Service {
         let claim_token = MultipartClaimToken::generate();
         let prepared = self
             .prepare_storage(
-                &bucket.name,
+                bucket,
                 StorageWriteTarget::Completion {
                     upload_id: upload_id.clone(),
                     claim_token: claim_token.as_str().to_owned(),
@@ -3147,7 +3154,7 @@ impl S3Service {
         let row_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut write_guard) = self
             .admit_object_storage(
-                &dest_bucket.name,
+                dest_bucket,
                 StorageWriteTarget::Object {
                     key: dest_key.clone(),
                     version_id: version_id.clone(),

@@ -298,6 +298,7 @@ fn plan_from_ready(path: &Path) -> StorageWritePlan {
         attempt: StorageToken::try_from(fields[0].to_owned()).unwrap(),
         generation: StorageToken::try_from(fields[1].to_owned()).unwrap(),
         bucket: BucketName::parse("bucket").unwrap(),
+        bucket_owner: None,
         target: StorageWriteTarget::Object {
             key: ObjectKey::parse("key").unwrap(),
             version_id: VersionId::null(),

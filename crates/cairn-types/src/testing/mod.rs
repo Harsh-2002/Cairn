@@ -62,7 +62,8 @@ pub use replication_upload_contract::assert_replication_upload_journal;
 
 mod storage_contract;
 pub use storage_contract::{
-    assert_prepare_storage_restore, assert_publication_co_commits_activity, assert_storage_journal,
+    assert_admission_rejects_recreated_bucket, assert_prepare_storage_restore,
+    assert_publication_co_commits_activity, assert_storage_journal,
     assert_unused_index_spool_is_not_retired,
 };
 

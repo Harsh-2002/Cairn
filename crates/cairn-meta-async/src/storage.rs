@@ -295,13 +295,6 @@ pub async fn reserve(
         return Err(invalid("storage admission routing mismatch"));
     }
     if !current(db, &plan.generation).await?
-        || q(
-            db,
-            "SELECT 1 FROM buckets WHERE name=?1",
-            vec![text(bucket.as_str())],
-        )
-        .await?
-        .is_empty()
         || !q(
             db,
             "SELECT 1 FROM storage_write_intents WHERE attempt_id=?1",
@@ -309,6 +302,20 @@ pub async fn reserve(
         )
         .await?
         .is_empty()
+    {
+        return Ok(StorageAdmission::NotApplied);
+    }
+    let bucket_owner = q(
+        db,
+        "SELECT owner_id FROM buckets WHERE name=?1",
+        vec![text(bucket.as_str())],
+    )
+    .await?;
+    let Some(bucket_owner) = bucket_owner.first() else {
+        return Ok(StorageAdmission::NotApplied);
+    };
+    if let Some(expected) = &plan.bucket_owner
+        && string(bucket_owner, 0)? != expected.0
     {
         return Ok(StorageAdmission::NotApplied);
     }

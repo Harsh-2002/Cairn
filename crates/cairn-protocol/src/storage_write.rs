@@ -89,12 +89,15 @@ impl StorageWriteRuntime {
         &self,
         blob: &dyn BlobStore,
         bucket: BucketName,
+        bucket_owner: cairn_types::id::UserId,
         target: StorageWriteTarget,
     ) -> Result<PreparedStorageWrite, Error> {
         let slot = (self.admission)().await.ok_or_else(|| {
             Error::Internal("storage recovery admission is unavailable".to_owned())
         })?;
-        let planned = blob.plan_write(bucket, self.generation.clone(), target)?;
+        let planned = blob
+            .plan_write(bucket, self.generation.clone(), target)?
+            .with_bucket_owner(bucket_owner);
         let plan = planned.plan().clone();
         let lifetime = StorageRecoveryPermit::new((self.node_lifetime.clone(), slot));
         let (io, lease) = StorageIoWatch::new(
