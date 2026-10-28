@@ -34,6 +34,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (AES256/aws:kms), multipart+SSE incl. UploadPartCopy, cross-policy copy (upgrade/downgrade), and the
   on-disk proofs — committed/staged blobs are VERSION_ENCRYPTED CRNB with the plaintext marker absent,
   a tampered ciphertext byte makes GET fail closed, transparent at-rest (leg 2) advertises nothing.
+  Protocol-3 `<uuid>.meta` sidecars are JSON authority records, not CRNB containers: the helpers
+  sample data files only and assert every data blob has its sidecar and no sidecar leaks object bytes.
 - `share.sh` — object sharing (one-time data-origin bearer URL, capability-free list/get, stable-id
   revoke + durable-session-backed interoperable SigV4 presigned URLs), pure curl. **Control listener
   ON for minting.**
@@ -50,6 +52,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (`cairn_scrub_corruption_total`) for a **plaintext**, a **transparently at-rest encrypted**
   (`CAIRN_ENCRYPT_AT_REST=true` — the boolean `true`, Figment rejects `1`), a **client SSE-S3**, and a
   **compressed** object, plus an isolated **multipart** object with optional SDK checksums disabled.
+  Corruption targets a data blob only: a compressed container can be smaller than its JSON `.meta`
+  sidecar, so selecting "largest file" would corrupt a sidecar the scrub never reads.
   The multipart arm proves healthy verification before corruption, then detection through the
   internal SHA-256 with zero composite-ETag skips. The middle two are THE REGRESSION GUARD for the encrypted scrub: the pass
   used to skip any version carrying an `sse_descriptor`, so on an at-rest node it verified 0% of the

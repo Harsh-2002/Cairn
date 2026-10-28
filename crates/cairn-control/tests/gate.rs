@@ -15,7 +15,10 @@ use cairn_types::object::{
     CompressionDescriptor, ETag, ExplicitObjectLockIntent, ObjectLockMode, ObjectRetention,
     ObjectVersionRow, StorageClass,
 };
-use cairn_types::storage::{StorageToken, StorageWriteTarget};
+use cairn_types::storage::{
+    StorageToken, StorageWriteTarget, object_data_path_for_metadata, object_metadata_path,
+};
+use cairn_types::StoragePath;
 use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -134,6 +137,38 @@ async fn drain_cleanup(
             ));
         }
     }
+}
+
+/// Return the exact object *data* cleanup debt under `prefix`, and prove each data path owns
+/// exactly one protocol-3 metadata sidecar in the same batch. A physical-file count must never
+/// silently accept a half-retired object (data reclaimed, sidecar left behind or vice versa).
+fn object_data_cleanup<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a StoragePath> {
+    let mut data = Vec::new();
+    let mut metadata = Vec::new();
+    for path in removed.iter().filter(|path| path.as_str().starts_with(prefix)) {
+        if object_data_path_for_metadata(path).is_some() {
+            metadata.push(path);
+        } else {
+            data.push(path);
+        }
+    }
+    for path in &data {
+        let sidecar = object_metadata_path(path).expect("object data path");
+        assert!(
+            metadata.iter().any(|meta| *meta == &sidecar),
+            "sidecar cleanup debt missing for {}",
+            path.as_str()
+        );
+    }
+    for sidecar in &metadata {
+        let data_path = object_data_path_for_metadata(sidecar).expect("sidecar path");
+        assert!(
+            data.iter().any(|path| *path == &data_path),
+            "sidecar cleanup debt lacks its data path: {}",
+            sidecar.as_str()
+        );
+    }
+    data
 }
 
 fn body_stream(data: &'static [u8]) -> cairn_types::BodyStream {
@@ -469,11 +504,9 @@ async fn force_delete_removes_unprotected_bucket_and_blobs() {
     );
     let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("data/"))
-            .count(),
-        2
+        object_data_cleanup(&removed, "data/").len(),
+        2,
+        "both data files and their metadata sidecars were retired"
     );
     assert_eq!(h.blob.blob_count(), 0);
 }
@@ -528,11 +561,9 @@ async fn recursive_delete_removes_unprotected_versions_and_blobs() {
     );
     let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("data/"))
-            .count(),
-        2
+        object_data_cleanup(&removed, "data/").len(),
+        2,
+        "both data files and their metadata sidecars were retired"
     );
     assert_eq!(h.blob.blob_count(), 0);
 }
@@ -627,11 +658,9 @@ async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
     );
     let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("worm/"))
-            .count(),
-        1
+        object_data_cleanup(&removed, "worm/").len(),
+        1,
+        "the unlocked object's data file and its sidecar were retired"
     );
     assert_eq!(h.blob.blob_count(), 3);
     assert!(removed.contains(&unlocked_path));
@@ -778,11 +807,9 @@ async fn recursive_delete_reports_protected_and_deletes_later_unlocked_versions(
     );
     let removed = drain_cleanup(&h.fixture, &*h.meta, &*h.blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("worm-prefix/"))
-            .count(),
-        1
+        object_data_cleanup(&removed, "worm-prefix/").len(),
+        1,
+        "the unlocked object's data file and its sidecar were retired"
     );
     assert!(removed.contains(&unlocked_path));
     assert!(!removed.contains(&protected_path));
