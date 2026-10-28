@@ -28,6 +28,8 @@ crates/cairn-types/fuzz/artifacts/
 
 warp-*.csv.zst
 warp-*.csv
+warp-*.json.zst
+warp-*.json
 *.benchdata.csv.zst
 lcov.info
 
