@@ -6260,6 +6260,130 @@ async fn copy_source_read_is_authorized_cross_tenant_denied() {
     );
 }
 
+/// Regression for the write-side selector bypass: a tag-conditioned explicit Deny must not be
+/// escaped by naming an absent version on a write that acts on the current object. The request is
+/// rejected before authorization, and the tagged object is unchanged.
+#[tokio::test]
+async fn object_write_cannot_escape_tag_deny_with_version_selector() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let owner = member("owner-w");
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                None,
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let policy = br#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Principal":"*","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::vwrite/*"},
+        {"Effect":"Deny","Principal":"*","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::vwrite/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/protected":"true"}}}]}"#.to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                None,
+                &[("policy", "")],
+                &[],
+                policy,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // The current object carries the protected tag.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[("x-amz-tagging", "protected=true")],
+                b"protected".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Without the selector the tag-conditioned Deny applies.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[],
+                b"denied".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Naming an absent version must not change what the write is authorized against.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vwrite"),
+                Some("obj"),
+                &[("versionId", "absent-version")],
+                &[],
+                b"bypass".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("vwrite"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+                owner,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body, b"protected",
+        "the rejected selector write must not change the object"
+    );
+}
+
 /// Version-scoped authorization (audit #33): a policy condition on `s3:ExistingObjectTag` must be
 /// evaluated against the version named by `?versionId`, not the current version. An attacker must
 /// not read a restricted OLD version merely because the CURRENT version carries the tag the policy
