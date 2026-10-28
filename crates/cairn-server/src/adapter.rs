@@ -1911,7 +1911,7 @@ async fn serve_share(stack: &AppStack, token: &str, read: ShareRead<'_>) -> Resp
         role: Role::Member,
         method: AuthMethod::Bearer,
         chunk_signing: None,
-        user_policy: Some(Box::new(policy)),
+        user_policy: Some(std::sync::Arc::new(policy)),
         is_session: false,
     };
 
