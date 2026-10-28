@@ -586,13 +586,13 @@ impl S3Service {
                     && req.query("partNumber").is_some()
                     && req.header("x-amz-copy-source").is_some() =>
             {
-                self.upload_part_copy(&req).await
+                self.upload_part_copy(&req, &bucket).await
             }
             Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
-                self.upload_part(req, body).await
+                self.upload_part(req, body, &bucket).await
             }
             Method::PUT if req.header("x-amz-copy-source").is_some() => {
-                self.copy_object(&req).await
+                self.copy_object(&req, &bucket).await
             }
             Method::PUT if req.has_query("tagging") => self.put_object_tagging(req, body).await,
             Method::GET if req.has_query("tagging") => self.get_object_tagging(&req).await,
@@ -613,7 +613,9 @@ impl S3Service {
             Method::POST if req.has_query("uploads") => {
                 self.create_multipart(&req, is_replica).await
             }
-            Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
+            Method::POST if req.has_query("uploadId") => {
+                self.complete_multipart(req, body, &bucket).await
+            }
             Method::GET if req.has_query("uploadId") => self.list_parts(&req).await,
             Method::DELETE if req.has_query("uploadId") => self.abort_multipart(&req).await,
             // HEAD is exempt from the guard below for the same reason as in `bucket_op`: it writes
@@ -623,9 +625,9 @@ impl S3Service {
             // not serve — must never fall through to a data-plane handler (a `PUT object?acl` or
             // `PUT object?attributes` must not overwrite the object body). Answer NotImplemented.
             _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
-            Method::PUT => self.put_object(req, body, is_replica).await,
+            Method::PUT => self.put_object(req, body, is_replica, &bucket).await,
             Method::GET => self.get_object(&req).await,
-            Method::DELETE => self.delete_object(&req, is_replica).await,
+            Method::DELETE => self.delete_object(&req, is_replica, &bucket).await,
             _ => Err(Error::NotImplemented),
         }
     }
@@ -814,11 +816,11 @@ impl S3Service {
         req: S3Request,
         raw_body: cairn_types::BodyStream,
         is_replica: bool,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
         let sampled = self.put_timings.sample();
         let total_timer = sampled.then(|| self.put_timings.start(PutStage::Total));
         let preflight_timer = sampled.then(|| self.put_timings.start(PutStage::Preflight));
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
         // The opt-in TTL header is parsed before staging so a malformed value cannot leave an
@@ -1116,7 +1118,7 @@ impl S3Service {
             Ok(Vec::new())
         } else {
             self.replication_outbox(
-                &bucket,
+                bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
@@ -1397,8 +1399,12 @@ impl S3Service {
         Ok(resp)
     }
 
-    async fn delete_object(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(req).await?;
+    async fn delete_object(
+        &self,
+        req: &S3Request,
+        is_replica: bool,
+        bucket: &Bucket,
+    ) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
         let event_key = key.clone();
@@ -1417,7 +1423,7 @@ impl S3Service {
         if let Some(vid) = req.query("versionId") {
             let version_id = VersionId::from_string(vid.to_owned());
             let bypass = self
-                .governance_bypass_capability(req, &bucket, &key, &version_id)
+                .governance_bypass_capability(req, bucket, &key, &version_id)
                 .await?;
             // S3 reports on a version-scoped DELETE whether the version it permanently removed was
             // itself a delete marker (`x-amz-delete-marker`). Read that BEFORE the mutation — the
@@ -1492,7 +1498,7 @@ impl S3Service {
                     // newer version), enqueueing nothing (loop prevention).
                     self.meta
                         .submit(Mutation::PutObjectVersion {
-                            row: Box::new(replica_marker_row(&bucket, &key, &marker_id, now)),
+                            row: Box::new(replica_marker_row(bucket, &key, &marker_id, now)),
                             precondition: Precondition::default(),
                             initial_state: InitialObjectState::default(),
                             replication: Vec::new(),
@@ -1501,7 +1507,7 @@ impl S3Service {
                 } else {
                     let replication = self
                         .replication_outbox(
-                            &bucket,
+                            bucket,
                             &key,
                             &marker_id,
                             ReplicationOp::DeleteMarker,
@@ -1552,13 +1558,13 @@ impl S3Service {
             }
             VersioningState::Suspended => {
                 let bypass = self
-                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .governance_bypass_capability(req, bucket, &key, &VersionId::null())
                     .await?;
                 // A Suspended bucket inserts a NULL-version marker; replication requires
                 // Enabled versioning, so `replication_outbox` returns an empty list here by construction.
                 let replication = self
                     .replication_outbox(
-                        &bucket,
+                        bucket,
                         &key,
                         &VersionId::null(),
                         ReplicationOp::DeleteMarker,
@@ -1613,7 +1619,7 @@ impl S3Service {
             }
             VersioningState::Unversioned => {
                 let bypass = self
-                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .governance_bypass_capability(req, bucket, &key, &VersionId::null())
                     .await?;
                 let outcome = self
                     .meta
@@ -1864,8 +1870,8 @@ impl S3Service {
         &self,
         req: S3Request,
         raw_body: cairn_types::BodyStream,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
@@ -2050,8 +2056,7 @@ impl S3Service {
     /// optional `x-amz-copy-source-range` are parsed; the source range is opened from the blob
     /// store (logical coordinates), restaged as a part, recorded, and a `CopyPartResult` carrying
     /// the part ETag and last-modified time is returned.
-    async fn upload_part_copy(&self, req: &S3Request) -> Result<S3Response> {
-        let dest_bucket = self.fetch_bucket(req).await?;
+    async fn upload_part_copy(&self, req: &S3Request, dest_bucket: &Bucket) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
@@ -2269,8 +2274,8 @@ impl S3Service {
         &self,
         req: S3Request,
         body: cairn_types::BodyStream,
+        bucket: &Bucket,
     ) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
@@ -2681,7 +2686,7 @@ impl S3Service {
             Ok(Vec::new())
         } else {
             self.replication_outbox(
-                &bucket,
+                bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
@@ -2931,8 +2936,7 @@ impl S3Service {
 
     // --- copy & bulk delete ---
 
-    async fn copy_object(&self, req: &S3Request) -> Result<S3Response> {
-        let dest_bucket = self.fetch_bucket(req).await?;
+    async fn copy_object(&self, req: &S3Request, dest_bucket: &Bucket) -> Result<S3Response> {
         let dest_key = req.key.clone().expect("key present");
         let intent_validation_now = self.clock.now();
         let lock_intent = self
@@ -3217,7 +3221,7 @@ impl S3Service {
         // inline `x-amz-tagging` under REPLACE; prefix rules match regardless.
         let replication = self
             .replication_outbox(
-                &dest_bucket,
+                dest_bucket,
                 &dest_key_for_event,
                 &version_id,
                 ReplicationOp::ObjectCreate,
