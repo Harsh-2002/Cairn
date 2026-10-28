@@ -6648,6 +6648,51 @@ async fn versioning_and_object_tagging() {
     );
 }
 
+/// A write that ignores `?versionId` must reject the selector instead of authorizing against a
+/// different version's tags/ACL. Otherwise a tag-conditioned Deny is evaluated against an absent or
+/// untagged version while the write still replaces the current object.
+#[tokio::test]
+async fn object_write_rejects_version_id_selector() {
+    let h = harness().await;
+    put_simple(&h, "vguard", "k").await;
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vguard"),
+                Some("k"),
+                &[("versionId", "does-not-exist")],
+                &[],
+                b"overwrite".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "write must reject versionId"
+    );
+    assert!(String::from_utf8_lossy(&body).contains("InvalidArgument"));
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("vguard"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"conditional",
+        "the rejected write must not change the object"
+    );
+}
+
 /// Tag GET/PUT operate on the version named by `?versionId`, not always the current one (audit
 /// #15): tagging an older version must not tag — nor be read from — the current version.
 #[tokio::test]

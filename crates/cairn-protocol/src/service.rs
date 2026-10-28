@@ -557,6 +557,15 @@ impl S3Service {
         // handler. A dedicated Member credential may hold only ReplicateObject/ReplicateDelete;
         // conversely an ordinary PutObject/DeleteObject grant must not make a forged marker work.
         let is_replica = matches!(action, Action::ReplicateObject | Action::ReplicateDelete);
+        // A `versionId` selector names the version that tag/ACL conditions must evaluate against.
+        // Only operations that actually target a version may carry one. A write or multipart
+        // operation that ignores the selector must never authorize against a *different* (absent or
+        // untagged) version, or a tag-conditioned Deny could be bypassed by naming such a version.
+        if req.query("versionId").is_some() && !action_uses_version_selector(action) {
+            return Err(Error::InvalidArgument(
+                "versionId is not supported for this operation".to_owned(),
+            ));
+        }
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().ok_or(Error::NoSuchKey)?;
         // When the request names a `?versionId`, gate version-scoped policy conditions
@@ -5694,6 +5703,27 @@ fn build_event_payload(
 /// — only `AbortMultipartUpload` and `ListMultipartUploadParts` exist — so those stay mapped to
 /// the closest existing action (`PutObject`). NOTE: add `CreateMultipartUpload`/`UploadPart` etc.
 /// to the action catalogue if finer-grained multipart policy is required.
+/// Whether `action` resolves the `versionId` query selector. A `false` action must reject the
+/// selector: authorizing it against a named version while the handler acts on the current
+/// object/key is a policy-condition bypass (tag-conditioned Deny evaluated against another row).
+fn action_uses_version_selector(action: Action) -> bool {
+    matches!(
+        action,
+        Action::GetObjectVersion
+            | Action::DeleteObjectVersion
+            | Action::GetObjectAcl
+            | Action::PutObjectAcl
+            | Action::GetObjectTagging
+            | Action::PutObjectTagging
+            | Action::DeleteObjectTagging
+            | Action::GetObjectRetention
+            | Action::PutObjectRetention
+            | Action::GetObjectLegalHold
+            | Action::PutObjectLegalHold
+            | Action::GetObjectAttributes
+    )
+}
+
 fn object_action(req: &S3Request) -> Result<Action> {
     use Action::*;
     let q = |s: &str| req.has_query(s);
