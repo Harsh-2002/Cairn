@@ -615,7 +615,7 @@ async fn serve_tls(
                 Ok(ktls_stream) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "ok").increment(1);
                     tracing::debug!(%peer, "kTLS offload engaged");
-                    serve_io(ktls_stream, state, peer, true, role, conn_shutdown).await;
+                    serve_io(ktls_stream, state, peer, true, role, conn_shutdown, false).await;
                 }
                 Err(e) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "error").increment(1);
@@ -630,7 +630,7 @@ async fn serve_tls(
     // Userspace path (feature off, non-Linux, or kTLS unavailable): the original behaviour.
     let _ = ktls_ready;
     match acceptor.accept(stream).await {
-        Ok(tls) => serve_io(tls, state, peer, true, role, conn_shutdown).await,
+        Ok(tls) => serve_io(tls, state, peer, true, role, conn_shutdown, false).await,
         Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
     }
 }
@@ -788,13 +788,16 @@ async fn serve_plaintext(
         .await
         {
             crate::fast_get::Fast::Handled => {}
-            crate::fast_get::Fast::Fallback { stream } => {
-                serve_io(stream, state, peer, false, role, conn_shutdown).await;
+            crate::fast_get::Fast::Fallback {
+                stream,
+                close_after,
+            } => {
+                serve_io(stream, state, peer, false, role, conn_shutdown, close_after).await;
             }
         }
         return;
     }
-    serve_io(stream, state, peer, false, role, conn_shutdown).await;
+    serve_io(stream, state, peer, false, role, conn_shutdown, false).await;
 }
 
 async fn serve_io<S>(
@@ -804,6 +807,7 @@ async fn serve_io<S>(
     secure: bool,
     role: ListenerRole,
     mut conn_shutdown: watch::Receiver<bool>,
+    close_after_response: bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -821,6 +825,7 @@ async fn serve_io<S>(
     builder
         .http1()
         .timer(TokioTimer::new())
+        .keep_alive(!close_after_response)
         .header_read_timeout(header_read_timeout);
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
