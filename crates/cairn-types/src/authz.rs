@@ -420,7 +420,7 @@ pub struct AuthzInput {
     /// Evaluated in union with the bucket policy; its statements have no principal (the requester is
     /// implicitly the principal), and its grants are never public, so they survive Block Public
     /// Access. `None` for anonymous requesters and users without an attached policy.
-    pub user_policy: Option<Policy>,
+    pub user_policy: Option<std::sync::Arc<Policy>>,
     /// The bucket ACL.
     pub bucket_acl: Option<Acl>,
     /// The object ACL (for object actions).

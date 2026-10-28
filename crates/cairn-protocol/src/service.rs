@@ -5059,7 +5059,7 @@ impl S3Service {
             account_bpa: PublicAccessBlock::default(),
             bucket_bpa: PublicAccessBlock::default(),
             policy: None,
-            user_policy: principal.user_policy.as_deref().cloned(),
+            user_policy: principal.user_policy.clone(),
             bucket_acl: None,
             object_acl: None,
             ownership_mode: OwnershipMode::BucketOwnerEnforced,
@@ -5141,8 +5141,7 @@ impl S3Service {
             || req
                 .principal
                 .as_ref()
-                .and_then(|p| p.user_policy.as_deref())
-                .is_some()
+                .is_some_and(|p| p.user_policy.is_some())
             || bucket.ownership_mode != cairn_types::authz::OwnershipMode::BucketOwnerEnforced;
         let acl_row = if needs_object_meta {
             match &resource {
@@ -5192,10 +5191,7 @@ impl S3Service {
         context.request_tags = request_tags;
         // The requester's attached identity policy (loaded at auth time), evaluated in union with
         // the bucket policy. `None` for anonymous requesters and users without one.
-        let user_policy = req
-            .principal
-            .as_ref()
-            .and_then(|p| p.user_policy.as_deref().cloned());
+        let user_policy = req.principal.as_ref().and_then(|p| p.user_policy.clone());
         let input = AuthzInput {
             requester,
             // A session credential is governed solely by its own scoped policy (ARCH 14): the authz

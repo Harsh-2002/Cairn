@@ -117,7 +117,9 @@ pub struct Principal {
     /// (ARCH 15 / user-centric authz). `None` if the user has no attached policy. Carried into
     /// authorization, where it is evaluated in union with the bucket policy. Boxed so the common
     /// `None` case keeps [`Principal`] (and thus `AuthOutcome`) small.
-    pub user_policy: Option<Box<crate::authz::Policy>>,
+    /// Shared with the authentication policy cache; cloning a principal must not deep-copy a
+    /// potentially large identity policy on every request.
+    pub user_policy: Option<std::sync::Arc<crate::authz::Policy>>,
     /// Whether this principal authenticated with an STS-style **temporary session credential**
     /// (ARCH 14). A session is least-privilege by construction: it NEVER receives the owner or
     /// administrator short-circuit in authorization (even though `user_id`/`role` carry the parent's
