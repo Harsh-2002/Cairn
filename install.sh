@@ -241,6 +241,7 @@ wait_healthy() {
 }
 
 print_access() {
+  pa_env="$1"
   pa_scheme="http"; [ -n "$OPT_TLS_CERT" ] && pa_scheme="https"
   pa_s3_host="127.0.0.1"
   pa_web_host="127.0.0.1"
@@ -251,8 +252,11 @@ print_access() {
   info "API        ${C_B}$pa_scheme://$pa_s3_host:$API_PORT${C_RESET}"
   info "Console    ${C_B}$pa_scheme://$pa_web_host:$CONSOLE_PORT${C_RESET}"
   info "Access key ${C_B}$ROOT_AK${C_RESET}"
-  info "Secret key ${C_B}$ROOT_SK${C_RESET}"
-  info "${C_DIM}Keep these and the master key safe. Update later by re-running this script.${C_RESET}"
+  # Never print the generated secret to stdout: installer output is routinely captured in terminal
+  # scrollback, shell history and CI logs. The 0600 environment file is the delivery channel.
+  info "Secret key ${C_DIM}stored in $pa_env (mode 0600)${C_RESET}"
+  info "${C_DIM}Read it with: sudo grep '^CAIRN_ROOT_SECRET_KEY=' $pa_env${C_RESET}"
+  info "${C_DIM}Keep the environment file and master key safe. Update later by re-running this script.${C_RESET}"
 }
 
 # ---- host install / update ----------------------------------------------------------------------
@@ -502,7 +506,7 @@ install_host() {
     *) warn "no systemd or OpenRC detected. Start it manually:"; info "set -a; . $HOST_ENV; set +a; $BIN_PATH serve" ;;
   esac
   if wait_healthy; then ok "health check passed"; else warn "did not pass health check in time; check the service logs"; fi
-  print_access
+  print_access "$HOST_ENV"
 }
 
 # ---- docker install / update ---------------------------------------------------------------------
@@ -608,7 +612,7 @@ install_docker() {
   compose up -d
   ok "started the cairn container (data in the 'cairn_data' volume)"
   if wait_healthy; then ok "health check passed"; else warn "did not pass health check in time; check 'docker logs cairn'"; fi
-  print_access
+  print_access "$DOCKER_DIR/.env"
 }
 
 # ---- uninstall ----------------------------------------------------------------------------------
