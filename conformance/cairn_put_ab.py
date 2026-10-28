@@ -10,6 +10,51 @@ from pathlib import Path
 from rustfs_compare import CASES, host_capacity, run_arm, sha256, tree_usage
 
 
+def pair_summary(arms):
+    """Pair arms by their recorded pair number and label them by variant.
+
+    The runner alternates control/candidate order between pairs, so the second arm of a pair is
+    not always the candidate. Downstream analysis must never infer identity from array position:
+    join on ``variant`` (and the binary SHA recorded in ``binaries``) and keep the chronological
+    order in the result so a reversed invocation stays visible.
+    """
+    pairs = []
+    by_pair = {}
+    for arm in arms:
+        order = arm.get("order")
+        if not isinstance(order, int) or order < 1:
+            raise ValueError("arm is missing a positive order")
+        by_pair.setdefault((order - 1) // 2, []).append(arm)
+    for index in sorted(by_pair):
+        window = by_pair[index]
+        labelled = {}
+        for arm in window:
+            variant = arm.get("variant")
+            if variant in labelled:
+                raise ValueError(f"duplicate variant {variant!r} in one pair")
+            labelled[variant] = arm
+        if set(labelled) != {"control", "candidate"}:
+            raise ValueError("a pair must contain exactly one control and one candidate")
+        control, candidate = labelled["control"], labelled["candidate"]
+        if control.get("status") != "PASS" or candidate.get("status") != "PASS":
+            continue
+        control_rate = control.get("mib_per_second")
+        candidate_rate = candidate.get("mib_per_second")
+        if not control_rate or not candidate_rate:
+            continue
+        pairs.append({
+            "pair": index + 1,
+            "control_order": control["order"],
+            "candidate_order": candidate["order"],
+            "control_variant": "control",
+            "candidate_variant": "candidate",
+            "control_mib_per_second": control_rate,
+            "candidate_mib_per_second": candidate_rate,
+            "candidate_over_control": candidate_rate / control_rate,
+        })
+    return pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
@@ -102,6 +147,12 @@ def main():
         report["elapsed_seconds"] = time.monotonic() - start
         output.write_text(json.dumps(report, indent=2) + "\n")
         raise SystemExit(str(error))
+    report["pairing_basis"] = (
+        "adjacent order windows, each joined by the recorded variant label and binary SHA; "
+        "array position is never used to infer control or candidate")
+    if not args.single_candidate:
+        report["pairs_detail"] = pair_summary(report["arms"])
+        output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Completed {len(report['arms'])} arms in {report['elapsed_seconds']:.1f}s; {output}")
 
 
