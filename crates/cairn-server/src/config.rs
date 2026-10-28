@@ -433,8 +433,24 @@ pub struct Config {
     pub fastio_min_bytes: u64,
 }
 
+/// Per-connection metadata page cache for the default configuration.
+///
+/// The pool scales with the host, but the total cache budget is fixed. A flat 64 MiB per
+/// connection therefore made the default configuration invalid on hosts with enough CPUs
+/// (roughly 32+): `64 MiB × (read_pool + 1) > 2 GiB`, and startup refused. Scale the default down
+/// so the hard total budget always holds, while small hosts keep the full 64 MiB.
+fn default_meta_cache_bytes_per_conn(read_pool_size: u32) -> u64 {
+    const PER_CONN: u64 = 64 * 1024 * 1024;
+    const TOTAL: u64 = 2 * 1024 * 1024 * 1024;
+    const MINIMUM: u64 = 1024 * 1024;
+    (TOTAL / (u64::from(read_pool_size) + 1)).clamp(MINIMUM, PER_CONN)
+}
+
 impl Default for Config {
     fn default() -> Self {
+        let meta_read_pool_size = std::thread::available_parallelism()
+            .map(|n| (n.get() as u32).clamp(8, 64))
+            .unwrap_or(8);
         Self {
             api_addr: "0.0.0.0:7373".parse().expect("valid default addr"),
             console_addr: "0.0.0.0:7374".to_owned(),
@@ -477,10 +493,8 @@ impl Default for Config {
             meta_group_commit_linger_micros: 0,
             // Scale read concurrency with the host; floor 8 so a small box still parallelizes
             // reads, cap 64 so the cache budget stays bounded.
-            meta_read_pool_size: std::thread::available_parallelism()
-                .map(|n| (n.get() as u32).clamp(8, 64))
-                .unwrap_or(8),
-            meta_cache_bytes_per_conn: 64 * 1024 * 1024,
+            meta_read_pool_size,
+            meta_cache_bytes_per_conn: default_meta_cache_bytes_per_conn(meta_read_pool_size),
             meta_cache_total_budget_bytes: 2 * 1024 * 1024 * 1024,
             meta_mmap_bytes: 256 * 1024 * 1024,
             meta_shards: 1,
@@ -1374,6 +1388,23 @@ mod tests {
     #[test]
     fn default_is_valid() {
         assert!(base().validate().is_ok());
+    }
+
+    #[test]
+    fn default_cache_scales_to_the_read_pool_on_large_hosts() {
+        for pool in [8u32, 31, 32, 64] {
+            let per_connection = default_meta_cache_bytes_per_conn(pool);
+            assert!(per_connection >= 1024 * 1024);
+            assert!(
+                per_connection * (u64::from(pool) + 1) <= 2 * 1024 * 1024 * 1024,
+                "pool {pool} with {per_connection} bytes/conn exceeds the default budget"
+            );
+        }
+        // The shape that made startup refuse on a 32+ vCPU host: pool 64 with the old flat 64 MiB.
+        let mut config = base();
+        config.meta_read_pool_size = 64;
+        config.meta_cache_bytes_per_conn = default_meta_cache_bytes_per_conn(64);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
