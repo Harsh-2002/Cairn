@@ -18,7 +18,7 @@
 //! bytes of an already-authorized response are written. It never serves anything the normal path
 //! would not.
 
-use crate::adapter::{ListenerRole, route_path, service_worker_scope_for_path};
+use crate::adapter::{ListenerRole, service_worker_scope_for_path};
 use crate::proxy::TrustedProxies;
 use crate::stack::AppStack;
 use cairn_protocol::{S3Body, S3Request};
@@ -55,8 +55,10 @@ pub enum Fast {
     /// The connection was fully served (one or more `sendfile` GETs) and is now closed.
     Handled,
     /// A request the fast path cannot serve was encountered; hand the connection to hyper with the
-    /// already-consumed bytes replayed first (see [`Rewind`]).
-    Fallback { stream: Rewind },
+    /// already-consumed bytes replayed first (see [`Rewind`]). `close_after` asks hyper to close the
+    /// socket after that response so a client that reconnects starts its next request (often a GET)
+    /// on a fresh connection the fast path can serve.
+    Fallback { stream: Rewind, close_after: bool },
 }
 
 /// A connection handed back to hyper after the fast-path loop consumed (read) some bytes from it. It
@@ -120,6 +122,18 @@ fn fallback(stream: TcpStream, consumed: Vec<u8>, reason: &'static str) -> Fast 
     metrics::counter!("cairn_sendfile_fallback_total", "reason" => reason).increment(1);
     Fast::Fallback {
         stream: Rewind::new(consumed, stream),
+        close_after: false,
+    }
+}
+
+/// Cede a non-GET connection to hyper but close it after the response. The client reconnects for
+/// its next request; a GET then starts on a fresh socket and can be served with sendfile.
+fn fallback_close(stream: TcpStream, consumed: Vec<u8>, reason: &'static str) -> Fast {
+    metrics::counter!("cairn_sendfile_fallback_total", "reason" => reason).increment(1);
+    metrics::counter!("cairn_sendfile_ceded_close_total").increment(1);
+    Fast::Fallback {
+        stream: Rewind::new(consumed, stream),
+        close_after: true,
     }
 }
 
@@ -376,7 +390,15 @@ pub async fn try_sendfile_get(
         };
         // See [`head_eligible`] for the single source of truth on header-level eligibility.
         if !head_eligible(&head) {
-            return fallback(stream, buf, "ineligible");
+            // A non-GET first request (Warp/Go sends HEAD or PUT before pooled GETs) would otherwise
+            // cede this socket to hyper for its entire life. Closing it lets the client reconnect;
+            // the next GET starts on a fresh connection that the sendfile loop can serve. GETs that
+            // are ineligible for other reasons (conditionals, Origin, upgrade) stay on hyper.
+            return if head.is_get {
+                fallback(stream, buf, "ineligible")
+            } else {
+                fallback_close(stream, buf, "method")
+            };
         }
 
         let (path, query) = match head.target.split_once('?') {
@@ -389,9 +411,18 @@ pub async fn try_sendfile_get(
         {
             return fallback(stream, buf, "not_object");
         }
-        // An unparseable bucket/key is not a fast-path GET; hand the buffered head to hyper, which
-        // renders the proper 400 through the normal adapter path.
-        let Ok((bucket, key)) = route_path(&path) else {
+        let host = head
+            .headers
+            .iter()
+            .find(|(k, _)| k == "host")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        // Resolve the same way the adapter does: vhost (`<bucket>.<s3_domain>`) or path-style.
+        // Path-only routing here would authorize and serve a vhost GET from the wrong bucket when
+        // `CAIRN_S3_DOMAIN` is configured.
+        let Ok((bucket, key)) =
+            crate::adapter::route_request(stack.s3_domain.as_deref(), &host, &path)
+        else {
             return fallback(stream, buf, "not_object");
         };
         if bucket.is_none() || key.is_none() {
@@ -400,12 +431,6 @@ pub async fn try_sendfile_get(
         if shutdown_visible(shutdown) {
             return Fast::Handled;
         }
-        let host = head
-            .headers
-            .iter()
-            .find(|(k, _)| k == "host")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
         let Some(source) = fast_path_client_source(peer, &head.headers, trusted_proxies) else {
             return fallback(stream, buf, "source_provenance");
         };

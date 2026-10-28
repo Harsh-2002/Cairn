@@ -65,9 +65,12 @@ fi
 
 # A 512 KiB incompressible object: eligible for the zero-copy path (uncompressed + unencrypted).
 head -c 524288 /dev/urandom > "$DATA/big.bin"
-curl -fsS -X PUT -H "$H" "$E/keepalive" >/dev/null || fail "create bucket failed"
+# A non-GET first request must be ceded to hyper with `connection: close`, so a pooled client
+# reconnects and its next GET starts on a fresh socket the sendfile loop can own.
+curl -fsS -D "$DATA/create.headers" -o /dev/null -X PUT -H "$H" "$E/keepalive" || fail "create bucket failed"
+grep -qi '^connection: close' "$DATA/create.headers" || fail "a non-GET fast-path fallback must close the connection"
 curl -fsS -X PUT -H "$H" --data-binary @"$DATA/big.bin" "$E/keepalive/big.bin" >/dev/null || fail "put failed"
-ok "populated a 512 KiB object"
+ok "populated a 512 KiB object; the ceded PUT closed the connection"
 
 scrape() { curl -s "$E/metrics" | awk '/^cairn_sendfile_get_total\{.*result="ok"/ {s+=$NF} END{print s+0}'; }
 before="$(scrape)"
@@ -82,6 +85,8 @@ ok "$N GETs over one keep-alive connection all returned byte-identical bodies"
 
 after="$(scrape)"
 delta=$((after - before))
+ceded="$(curl -s "$E/metrics" | awk '/^cairn_sendfile_ceded_close_total/ {s+=$NF} END{print s+0}')"
+[ "$ceded" -ge 2 ] || fail "expected the two ceded PUTs to increment cairn_sendfile_ceded_close_total, got $ceded"
 [ "$delta" -eq "$N" ] || fail "expected $N sendfile engagements on one connection, got $delta (a regression: the connection is not being kept alive across GETs)"
 ok "every one of the $N GETs engaged the sendfile path on the single connection (delta=$delta)"
 
