@@ -286,6 +286,10 @@ def run_comparison(args, campaign, cases=CASES):
         status, reasons = "CANCELLED", ["operator interruption"]
     except Unavailable as error:
         status, reasons = "INCONCLUSIVE", [str(error)]
+    except (KeyError, TypeError, ValueError) as error:
+        # A malformed or partially reported measurement is missing evidence, not a driver failure.
+        # The tiny pipeline test asserts this exact classification.
+        status, reasons = "INCONCLUSIVE", [f"invalid evidence: {type(error).__name__}: {error}"]
     except Exception as error:
         status, reasons = "FAIL", [f"{type(error).__name__}: {error}"]
     finally:
