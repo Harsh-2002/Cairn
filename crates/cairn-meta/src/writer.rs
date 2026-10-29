@@ -489,7 +489,10 @@ fn commit_batch(
     // publications therefore does not need a per-commit WAL fsync; control-plane and every mixed
     // batch keep the full barrier. (Prototype: measure before making this permanent.)
     let relaxed = batch.iter().all(|(mutation, _, _)| {
-        matches!(mutation, crate::meta::Mutation::PublishObjectWrite { .. })
+        matches!(
+            mutation,
+            cairn_types::meta::Mutation::PublishObjectWrite { .. }
+        )
     });
     let _ = conn.execute_batch(if relaxed {
         "PRAGMA synchronous=NORMAL"
