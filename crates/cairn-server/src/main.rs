@@ -33,6 +33,7 @@ mod observability;
 mod proxy;
 mod replication_audit;
 mod server;
+mod sidecar_rebuild;
 mod sse;
 mod sts;
 // Linux-only zero-copy syscall helpers for the `fast-io` perf path (kTLS probe + sendfile(2)).
