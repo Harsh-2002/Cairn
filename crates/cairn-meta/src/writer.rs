@@ -484,6 +484,18 @@ fn commit_batch(
     for (_, _, enqueued) in &batch {
         record_stage(stage_samples, "queue", *enqueued, true);
     }
+    // Object publications are backed by the durable object metadata file: a power loss may drop the
+    // index tail, and startup rebuild restores it from those files. A batch made only of such
+    // publications therefore does not need a per-commit WAL fsync; control-plane and every mixed
+    // batch keep the full barrier. (Prototype: measure before making this permanent.)
+    let relaxed = batch.iter().all(|(mutation, _, _)| {
+        matches!(mutation, crate::meta::Mutation::PublishObjectWrite { .. })
+    });
+    let _ = conn.execute_batch(if relaxed {
+        "PRAGMA synchronous=NORMAL"
+    } else {
+        "PRAGMA synchronous=FULL"
+    });
     let begin_start = Instant::now();
     let begin = conn.execute_batch("BEGIN IMMEDIATE");
     record_stage(stage_samples, "begin", begin_start, begin.is_ok());
