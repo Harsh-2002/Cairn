@@ -398,7 +398,9 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
                 replication,
             } = *operation
             else {
-                return Err(kv::error("candidate object publication shape is unsupported"));
+                return Err(kv::error(
+                    "candidate object publication shape is unsupported",
+                ));
             };
             let outcome = put(view, *row, precondition, initial_state, replication)?;
             journal::resolve_paths(view, &plan, index_spool)?;

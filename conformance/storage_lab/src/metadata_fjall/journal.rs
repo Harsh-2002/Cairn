@@ -301,11 +301,7 @@ pub fn abandon_object(
             cairn_types::blob::IndexSpoolState::Materialized,
         )?;
     } else {
-        resolve_paths(
-            view,
-            plan,
-            cairn_types::blob::IndexSpoolState::Materialized,
-        )?;
+        resolve_paths(view, plan, cairn_types::blob::IndexSpoolState::Materialized)?;
     }
     Ok(MutationOutcome::StorageUpdated { applied: true })
 }
