@@ -146,6 +146,10 @@ pub enum Mutation {
         operation: Box<Mutation>,
         index_spool: crate::blob::IndexSpoolState,
         activity: Option<Box<ActivityEntry>>,
+        /// The acknowledged write already proved no byte quota, no Object Lock configuration and
+        /// no precondition, so the fold may skip those checks (a quota or lock configured after
+        /// acknowledgement must never reject or mutate an acknowledged object).
+        relaxed: bool,
     },
     /// Abandon a planned ordinary object write after the recovery worker proved actual backend
     /// quiescence. Object targets only. A still-present intent for the same attempt (an older

@@ -76,12 +76,28 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             operation,
             index_spool,
             activity,
+            relaxed,
         } => {
             plan.validate_object_publication(&operation)?;
             if !crate::storage::object_publication_allowed(conn, &plan)? {
                 return Ok(MutationOutcome::StoragePublicationNotApplied);
             }
-            let outcome = apply_inner(conn, *operation)?;
+            let outcome = match *operation {
+                Mutation::PutObjectVersion {
+                    row,
+                    precondition,
+                    initial_state,
+                    replication,
+                } => put_version(
+                    conn,
+                    *row,
+                    &precondition,
+                    initial_state,
+                    replication,
+                    !relaxed,
+                )?,
+                other => apply_inner(conn, other)?,
+            };
             if matches!(&outcome, MutationOutcome::Put { .. }) {
                 crate::storage::resolve_paths(conn, &plan, index_spool)?;
                 if let Some(entry) = activity {
@@ -194,7 +210,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             precondition,
             initial_state,
             replication,
-        } => put_version(conn, *row, &precondition, initial_state, replication),
+        } => put_version(conn, *row, &precondition, initial_state, replication, true),
         Mutation::ResolveObjectWrite {
             bucket,
             key,
@@ -2069,23 +2085,26 @@ fn put_version(
     precondition: &Precondition,
     initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
+    strict: bool,
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
-    enforce_bucket_quota(conn, &row)?;
-    enforce_user_quota(conn, &row)?;
-    if replacement_is_protected(
-        conn,
-        &row.bucket,
-        &row.key,
-        &row.version_id,
-        row.created_at,
-        GovernanceBypass::Denied,
-    )? {
-        return Err(MetaError::ObjectProtected);
+    if strict {
+        enforce_bucket_quota(conn, &row)?;
+        enforce_user_quota(conn, &row)?;
+        if replacement_is_protected(
+            conn,
+            &row.bucket,
+            &row.key,
+            &row.version_id,
+            row.created_at,
+            GovernanceBypass::Denied,
+        )? {
+            return Err(MetaError::ObjectProtected);
+        }
     }
     let (tags, lock_state) = if row.is_delete_marker {
         (Vec::new(), ObjectLockState::default())
-    } else {
+    } else if strict {
         (
             initial_state.tags,
             resolve_initial_object_lock(
@@ -2095,6 +2114,8 @@ fn put_version(
                 row.created_at,
             )?,
         )
+    } else {
+        (initial_state.tags, ObjectLockState::default())
     };
     if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
         return Err(MetaError::ObjectTtlConflict);

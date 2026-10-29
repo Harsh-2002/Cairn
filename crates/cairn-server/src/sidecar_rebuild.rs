@@ -306,6 +306,9 @@ async fn publish_rebuilt(
             operation: Box::new(operation),
             index_spool: IndexSpoolState::NeverCreated,
             activity: None,
+            // A rebuild must restore an acknowledged row; full checks could reject it if a quota
+            // was configured after the acknowledgement.
+            relaxed: true,
         })
         .await?
     {

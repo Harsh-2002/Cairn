@@ -1297,6 +1297,7 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
             operation: Box::new(put(row)),
             index_spool: IndexSpoolState::Materialized,
             activity: None,
+            relaxed: false,
         })
         .await
         .unwrap();
@@ -1365,6 +1366,7 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
             ))),
             index_spool: IndexSpoolState::Materialized,
             activity: None,
+            relaxed: false,
         })
         .await
         .unwrap();
@@ -1391,6 +1393,7 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
             operation: Box::new(put(object_row(&stale.plan().clone(), owner_a.clone()))),
             index_spool: IndexSpoolState::Materialized,
             activity: None,
+            relaxed: false,
         })
         .await
         .unwrap();
@@ -1580,6 +1583,7 @@ pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) 
             operation: Box::new(put(row)),
             index_spool: IndexSpoolState::NeverCreated,
             activity: None,
+            relaxed: false,
         })
         .await
         .unwrap();

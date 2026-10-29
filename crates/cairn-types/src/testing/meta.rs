@@ -2222,6 +2222,8 @@ impl State {
                 operation,
                 index_spool,
                 activity,
+                // The double keeps full checks: its tests do not exercise the relaxed fold.
+                relaxed: _,
             } => {
                 plan.validate_object_publication(&operation)?;
                 if !storage::object_publication_allowed(st, &plan)? {

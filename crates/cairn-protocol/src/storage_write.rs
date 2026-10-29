@@ -183,6 +183,7 @@ impl StorageWriteGuard {
         operation: Mutation,
         index_spool: IndexSpoolState,
         activity: Option<Box<ActivityEntry>>,
+        relaxed: bool,
     ) -> Mutation {
         Mutation::PublishObjectWrite {
             plan: Box::new(
@@ -195,6 +196,7 @@ impl StorageWriteGuard {
             operation: Box::new(operation),
             index_spool,
             activity,
+            relaxed,
         }
     }
 

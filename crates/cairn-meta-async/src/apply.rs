@@ -78,12 +78,31 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             operation,
             index_spool,
             activity,
+            relaxed,
         } => {
             plan.validate_object_publication(&operation)?;
             if !crate::storage::object_publication_allowed(driver, &plan).await? {
                 return Ok(MutationOutcome::StoragePublicationNotApplied);
             }
-            let outcome = apply_inner(driver, *operation).await?;
+            let outcome = match *operation {
+                Mutation::PutObjectVersion {
+                    row,
+                    precondition,
+                    initial_state,
+                    replication,
+                } => {
+                    put_version(
+                        driver,
+                        *row,
+                        &precondition,
+                        initial_state,
+                        replication,
+                        !relaxed,
+                    )
+                    .await?
+                }
+                other => apply_inner(driver, other).await?,
+            };
             if matches!(&outcome, MutationOutcome::Put { .. }) {
                 crate::storage::resolve_paths(driver, &plan, index_spool).await?;
                 if let Some(entry) = activity {
@@ -237,7 +256,17 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
             precondition,
             initial_state,
             replication,
-        } => put_version(driver, *row, &precondition, initial_state, replication).await,
+        } => {
+            put_version(
+                driver,
+                *row,
+                &precondition,
+                initial_state,
+                replication,
+                true,
+            )
+            .await
+        }
         Mutation::ResolveObjectWrite {
             bucket,
             key,
@@ -2200,24 +2229,29 @@ async fn put_version(
     precondition: &Precondition,
     initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
+    strict: bool,
 ) -> R<MutationOutcome> {
     check_precondition(driver, &row.bucket, &row.key, precondition).await?;
-    enforce_bucket_quota(driver, &row).await?;
-    enforce_user_quota(driver, &row).await?;
-    if replacement_is_protected(
-        driver,
-        &row.bucket,
-        &row.key,
-        &row.version_id,
-        row.created_at,
-        GovernanceBypass::Denied,
-    )
-    .await?
-    {
-        return Err(MetaError::ObjectProtected);
+    if strict {
+        enforce_bucket_quota(driver, &row).await?;
+        enforce_user_quota(driver, &row).await?;
+        if replacement_is_protected(
+            driver,
+            &row.bucket,
+            &row.key,
+            &row.version_id,
+            row.created_at,
+            GovernanceBypass::Denied,
+        )
+        .await?
+        {
+            return Err(MetaError::ObjectProtected);
+        }
     }
     let (initial_tags, lock_state) = if row.is_delete_marker {
         (Vec::new(), ObjectLockState::default())
+    } else if !strict {
+        (initial_state.tags, ObjectLockState::default())
     } else {
         let lock_state = resolve_initial_object_lock(
             driver,

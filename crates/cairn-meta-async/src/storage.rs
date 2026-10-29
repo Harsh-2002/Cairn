@@ -443,6 +443,12 @@ pub async fn object_publication_allowed(db: &DB<'_>, plan: &StorageWritePlan) ->
         return Ok(false);
     }
     for path in &plan.paths {
+        if !matches!(
+            path.role,
+            StoragePathRole::Final | StoragePathRole::ObjectMetadata
+        ) {
+            continue;
+        }
         if referenced(db, &path.path).await? || !q(db,
             "SELECT 1 FROM storage_intent_paths WHERE storage_path=?1 UNION ALL SELECT 1 FROM storage_cleanups WHERE storage_path=?1 LIMIT 1",
             vec![text(path.path.as_str())]).await?.is_empty()

@@ -479,6 +479,12 @@ pub(super) fn object_publication_allowed(st: &State, plan: &StorageWritePlan) ->
         return Ok(false);
     }
     for path in &plan.paths {
+        if !matches!(
+            path.role,
+            StoragePathRole::Final | StoragePathRole::ObjectMetadata
+        ) {
+            continue;
+        }
         if referenced(st, &path.path)
             || st
                 .storage

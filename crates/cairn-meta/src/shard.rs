@@ -570,6 +570,7 @@ impl MetadataStore for ShardedMetadataStore {
                 operation,
                 index_spool,
                 activity,
+                relaxed,
             } if activity.is_some() && self.shards.len() > 1 => {
                 let bucket = plan.bucket.clone();
                 let activity = activity.expect("guarded by is_some");
@@ -580,6 +581,7 @@ impl MetadataStore for ShardedMetadataStore {
                         operation,
                         index_spool,
                         activity: None,
+                        relaxed,
                     })
                     .await?;
                 if matches!(&outcome, MutationOutcome::Put { .. }) {

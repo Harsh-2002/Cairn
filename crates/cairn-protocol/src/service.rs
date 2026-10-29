@@ -1238,6 +1238,7 @@ impl S3Service {
                 req.principal.as_ref(),
                 now,
             ))),
+            overlay_fast,
         );
         let publication = if overlay_fast {
             let overlay = self.overlay.as_ref().expect("checked above");
@@ -3403,6 +3404,7 @@ impl S3Service {
                 },
                 staged.index_spool,
                 None,
+                false,
             ))
             .await
         {

@@ -447,6 +447,15 @@ pub fn object_publication_allowed(db: &DB, plan: &StorageWritePlan) -> R<bool> {
         return Ok(false);
     }
     for path in &plan.paths {
+        // Only the final data and metadata names can be referenced by another row or a journal
+        // entry. The staging aliases and index spool belong to this unique attempt, and the intent
+        // check above already excludes a prior resolution of it.
+        if !matches!(
+            path.role,
+            StoragePathRole::Final | StoragePathRole::ObjectMetadata
+        ) {
+            continue;
+        }
         if referenced(db, &path.path)? || !q(db,
             "SELECT 1 FROM storage_intent_paths WHERE storage_path=?1 UNION ALL SELECT 1 FROM storage_cleanups WHERE storage_path=?1 LIMIT 1",
             vec![text(path.path.as_str())])?.is_empty()
