@@ -5,8 +5,8 @@ use crate::id::{BucketName, ObjectKey, UserId, VersionId};
 use crate::meta::{Mutation, MutationOutcome};
 use crate::storage::io::StorageIoWatch;
 use crate::storage::{
-    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StoragePathRole,
-    StorageToken, StorageWriteTarget,
+    PlannedStorageWrite, StorageAdmission, StorageCleanup, StorageMutation, StorageToken,
+    StorageWriteTarget,
 };
 use crate::{Bucket, MetadataStore, OwnershipMode, Timestamp, VersioningState};
 use std::sync::Arc;
@@ -1415,6 +1415,7 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
                 operation: Box::new(put(object_row(&plan, owner))),
                 index_spool: IndexSpoolState::Materialized,
                 activity: None,
+                relaxed: false,
             })
             .await
             .unwrap();
@@ -1583,7 +1584,6 @@ pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) 
             operation: Box::new(put(row)),
             index_spool: IndexSpoolState::NeverCreated,
             activity: None,
-            relaxed: false,
         })
         .await
         .unwrap();
