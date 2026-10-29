@@ -541,6 +541,13 @@ pub(crate) async fn resolve_paths(
         if path.role == StoragePathRole::ObjectMetadata && published_object {
             continue;
         }
+        // A successful publication renamed the staging data and metadata aliases into their
+        // final names. The old names no longer exist, so enqueueing them as cleanup debt would
+        // only feed the cleanup worker a storm of no-op unlinks (and stall the Writer behind its
+        // reference checks) at high small-object rates. A failed/abandoned write keeps them.
+        if path.role == StoragePathRole::Temporary && published_object {
+            continue;
+        }
         // A write that never opened the index spool created no name, so its absence owes no
         // namespace barrier. Recovery keeps the conservative `Materialized` state.
         if path.role == StoragePathRole::IndexSpool && index_spool == IndexSpoolState::NeverCreated
