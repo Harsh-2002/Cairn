@@ -65,6 +65,7 @@ toml = "0.8"
 
 # --- crypto & hashing ---
 sha2 = "0.10"
+aws-lc-rs = "1.18"
 sha1 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
