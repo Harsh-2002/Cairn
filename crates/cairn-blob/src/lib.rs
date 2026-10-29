@@ -1009,6 +1009,8 @@ impl LocalBlobStore {
                 if let Some(payload_len) = inline_payload_len(&mut f, file_len).map_err(io_err)?
                     && payload_len == expected_logical_len
                 {
+                    // The trailer probe moved the cursor; every read below starts at the payload.
+                    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0)).map_err(io_err)?;
                     file_len = payload_len;
                     inline = true;
                 }
