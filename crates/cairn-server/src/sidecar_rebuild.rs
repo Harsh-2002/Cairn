@@ -57,16 +57,39 @@ pub(crate) async fn rebuild_missing_object_rows(
             continue;
         };
         for entry in entries.flatten() {
-            let sidecar = entry.path();
-            if sidecar.extension().and_then(|e| e.to_str()) != Some("meta") {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("meta") {
+                report.scanned += 1;
+                match read_sidecar(&path) {
+                    Ok(record) => records.push(record),
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(path = %path.display(), %error, "unreadable object metadata sidecar");
+                    }
+                }
+                continue;
+            }
+            // Small plaintext objects carry their record as a trailer in the data file and have no
+            // `.meta` companion. A legacy two-file object always has one, so absence plus the magic
+            // is the discriminator.
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let mut companion = path.clone().into_os_string();
+            companion.push(".meta");
+            if std::path::Path::new(&companion).exists() {
                 continue;
             }
             report.scanned += 1;
-            match read_sidecar(&sidecar) {
-                Ok(record) => records.push(record),
+            match read_inline_record(&path) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => report.skipped += 1,
                 Err(error) => {
                     report.failed += 1;
-                    tracing::warn!(path = %sidecar.display(), %error, "unreadable object metadata sidecar");
+                    tracing::warn!(path = %path.display(), %error, "unreadable inline metadata trailer");
                 }
             }
         }
@@ -178,6 +201,49 @@ fn sidecar_rebuild_paths(
             path: StoragePath::from_string(format!(".staging/{id}.index.tmp")),
         },
     ]
+}
+
+/// Read an inline object's metadata from the trailer of its data file, if present.
+fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).map_err(|error| MetaError::Engine(error.to_string()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| MetaError::Engine(error.to_string()))?
+        .len();
+    const FIXED: u64 = 16;
+    if len < FIXED {
+        return Ok(None);
+    }
+    let mut fixed = [0u8; 16];
+    file.seek(SeekFrom::Start(len - FIXED))
+        .and_then(|_| file.read_exact(&mut fixed))
+        .map_err(|error| MetaError::Engine(error.to_string()))?;
+    if fixed[12..16] != cairn_types::storage::INLINE_TRAILER_MAGIC {
+        return Ok(None);
+    }
+    let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
+    let payload_len = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
+    let suffix_len = meta_len
+        .checked_add(FIXED)
+        .filter(|total| *total <= len)
+        .ok_or_else(|| MetaError::Engine("inline trailer length exceeds its file".into()))?;
+    let mut suffix = vec![0u8; suffix_len as usize];
+    file.seek(SeekFrom::Start(len - suffix_len))
+        .and_then(|_| file.read_exact(&mut suffix))
+        .map_err(|error| MetaError::Engine(error.to_string()))?;
+    let Some((record, trailer_payload)) = ObjectMetadataRecord::decode_inline_suffix(&suffix)
+        .map_err(|error| MetaError::Engine(format!("inline metadata trailer: {error}")))?
+    else {
+        return Ok(None);
+    };
+    if trailer_payload != record.size_physical {
+        return Err(MetaError::Engine(
+            "inline trailer payload length disagrees with its record".into(),
+        ));
+    }
+    Ok(Some(record))
 }
 
 fn read_sidecar(path: &Path) -> Result<ObjectMetadataRecord, MetaError> {
