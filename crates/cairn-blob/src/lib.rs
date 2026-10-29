@@ -438,6 +438,31 @@ struct StagedWrite {
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
+/// If `file` ends with the inline metadata trailer, return the declared payload length. The
+/// payload itself is an ordinary byte range at offset 0; the trailer only carries the record.
+fn inline_payload_len(file: &mut std::fs::File, file_len: u64) -> std::io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FIXED: u64 = 16;
+    if file_len < FIXED {
+        return Ok(None);
+    }
+    if file.metadata()?.len() != file_len {
+        return Ok(None);
+    }
+    let mut fixed = [0u8; 16];
+    file.seek(SeekFrom::Start(file_len - FIXED))?;
+    file.read_exact(&mut fixed)?;
+    if fixed[12..16] != cairn_types::storage::INLINE_TRAILER_MAGIC {
+        return Ok(None);
+    }
+    let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
+    let payload_len = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
+    if file_len != payload_len.saturating_add(meta_len).saturating_add(FIXED) {
+        return Ok(None);
+    }
+    Ok(Some(payload_len))
+}
+
 async fn write_staged(
     file: &mut Staging,
     mut body: cairn_types::BodyStream,
@@ -970,14 +995,25 @@ impl LocalBlobStore {
                 }
                 Err(e) => return Err(io_err(e)),
             };
-            let file_len = f.metadata().map_err(io_err)?.len();
+            let mut file_len = f.metadata().map_err(io_err)?.len();
             // Plaintext framing is an authoritative metadata declaration. Validate its one
             // independent physical invariant instead of sniffing the body: plaintext and
             // logical lengths must match exactly. This catches the ordinary missing-DEK case
             // (an encrypted/uncompressed CRNB file has framing overhead), yet preserves S3's
             // arbitrary-byte contract when a legitimate plaintext object's bytes themselves
             // happen to form a complete CRNB file.
+            let mut inline = false;
             if !is_container && file_len != expected_logical_len {
+                // A small object may carry its metadata as a trailer after the payload. The row's
+                // physical length is the payload length; the trailer is not client data.
+                if let Some(payload_len) = inline_payload_len(&mut f, file_len).map_err(io_err)?
+                    && payload_len == expected_logical_len
+                {
+                    file_len = payload_len;
+                    inline = true;
+                }
+            }
+            if !is_container && !inline && file_len != expected_logical_len {
                 plaintext_length_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     path = %probe_path.display(),
@@ -1230,11 +1266,31 @@ impl BlobStore for LocalBlobStore {
         let sidecar = match &opts.metadata_seed {
             Some(seed) => {
                 let record = ObjectMetadataRecord::from_staged(seed, &staged);
-                match stage_metadata_sidecar(&paths, &record).await {
-                    Ok(sidecar) => Some(sidecar),
-                    Err(error) => {
+                // Small plaintext objects carry the record as a trailer in the data file: one
+                // create, one fsync, one rename, one directory entry. Compressed/encrypted
+                // objects keep the separate sidecar (their container trailer must stay last).
+                let plaintext = matches!(staged.compression, CompressionDescriptor::Uncompressed)
+                    && opts.encryption.is_none();
+                if plaintext && staged.size_logical <= cairn_types::storage::INLINE_MAX_BYTES {
+                    let trailer = match record.encode_inline_trailer(staged.size_physical) {
+                        Ok(trailer) => trailer,
+                        Err(error) => {
+                            sink.abort().await;
+                            return Err(BlobError::Io(error.to_string()));
+                        }
+                    };
+                    if let Err(error) = sink.write_all(&trailer).await {
                         sink.abort().await;
                         return Err(error);
+                    }
+                    None
+                } else {
+                    match stage_metadata_sidecar(&paths, &record).await {
+                        Ok(sidecar) => Some(sidecar),
+                        Err(error) => {
+                            sink.abort().await;
+                            return Err(error);
+                        }
                     }
                 }
             }

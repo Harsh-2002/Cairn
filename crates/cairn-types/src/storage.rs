@@ -619,6 +619,50 @@ pub struct ObjectMetadataSeed {
     pub lock_intent: ExplicitObjectLockIntent,
 }
 
+/// Largest logical object stored as one inline file (payload + metadata trailer).
+pub const INLINE_MAX_BYTES: u64 = 128 * 1024;
+
+/// Trailer magic: `payload || metadata JSON || u32 meta_len || u64 payload_len || magic`.
+pub const INLINE_TRAILER_MAGIC: [u8; 4] = *b"CRNI";
+
+/// Fixed trailer size after the metadata JSON (`meta_len`, `payload_len`, magic).
+pub const INLINE_TRAILER_FIXED: usize = 4 + 8 + 4;
+
+impl ObjectMetadataRecord {
+    /// Encode the metadata JSON and its trailer for a file that already holds `payload_len` bytes.
+    pub fn encode_inline_trailer(&self, payload_len: u64) -> Result<Vec<u8>, MetaError> {
+        let json =
+            serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))?;
+        let meta_len = u32::try_from(json.len())
+            .map_err(|_| MetaError::Engine("inline metadata exceeds 4 GiB".into()))?;
+        let mut out = Vec::with_capacity(json.len() + INLINE_TRAILER_FIXED);
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&meta_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&INLINE_TRAILER_MAGIC);
+        Ok(out)
+    }
+
+    /// Decode the metadata from the exact trailer suffix (`metadata JSON || fixed trailer`).
+    pub fn decode_inline_suffix(suffix: &[u8]) -> Result<Option<(Self, u64)>, MetaError> {
+        if suffix.len() < INLINE_TRAILER_FIXED {
+            return Ok(None);
+        }
+        let fixed = &suffix[suffix.len() - INLINE_TRAILER_FIXED..];
+        if fixed[12..16] != INLINE_TRAILER_MAGIC {
+            return Ok(None);
+        }
+        let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as usize;
+        let payload_len = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
+        if suffix.len() != meta_len + INLINE_TRAILER_FIXED {
+            return Err(MetaError::Engine("inline metadata length mismatch".into()));
+        }
+        let record: Self = serde_json::from_slice(&suffix[..meta_len])
+            .map_err(|error| MetaError::Engine(error.to_string()))?;
+        Ok(Some((record, payload_len)))
+    }
+}
+
 impl ObjectMetadataRecord {
     /// Bind the pre-stage fields to the exact staged blob.
     #[must_use]
