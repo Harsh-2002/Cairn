@@ -492,6 +492,11 @@ fn commit_batch(
         matches!(
             mutation,
             cairn_types::meta::Mutation::PublishObjectWrite { .. }
+                | cairn_types::meta::Mutation::AbandonObjectWrite { .. }
+                // The storage journal and its cleanup debt are recovered by the mandatory full
+                // scan; losing their WAL tail never loses an acknowledged object.
+                | cairn_types::meta::Mutation::Storage { .. }
+                | cairn_types::meta::Mutation::ClaimStorageCleanup { .. }
         )
     });
     let _ = conn.execute_batch(if relaxed {
