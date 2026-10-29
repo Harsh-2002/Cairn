@@ -194,7 +194,7 @@ async fn storage_admission_rejects_a_recreated_bucket_from_an_old_plan() {
         },
     )
     .unwrap()
-    .with_bucket_owner(owner_a.clone());
+    .with_bucket_snapshot(owner_a.clone(), Timestamp(1));
     let plan = planned.plan().clone();
     store
         .submit(Mutation::DeleteBucket(bucket.clone()))

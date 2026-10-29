@@ -563,6 +563,34 @@ impl MetadataStore for ShardedMetadataStore {
                 Ok(outcome)
             }
 
+            // Same split for an unadmitted ordinary object publication: the plan and write are
+            // per-bucket, while the best-effort activity row belongs to the global shard.
+            Mutation::PublishObjectWrite {
+                plan,
+                operation,
+                index_spool,
+                activity,
+            } if activity.is_some() && self.shards.len() > 1 => {
+                let bucket = plan.bucket.clone();
+                let activity = activity.expect("guarded by is_some");
+                let outcome = self
+                    .for_bucket(bucket.as_str())
+                    .submit(Mutation::PublishObjectWrite {
+                        plan,
+                        operation,
+                        index_spool,
+                        activity: None,
+                    })
+                    .await?;
+                if matches!(&outcome, MutationOutcome::Put { .. }) {
+                    let _ = self
+                        .global()
+                        .submit(Mutation::RecordActivity(activity))
+                        .await;
+                }
+                Ok(outcome)
+            }
+
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
             | Mutation::ResolveObjectWrite { .. }
@@ -585,6 +613,8 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::Storage { .. }
             | Mutation::AdmitStorageWrite { .. }
             | Mutation::PublishStorageWrite { .. }
+            | Mutation::PublishObjectWrite { .. }
+            | Mutation::AbandonObjectWrite { .. }
             | Mutation::ReplicationUpload { .. }
             // Both of its statements are keyed on `bucket_name`, and every outbox row and version
             // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
@@ -1363,9 +1393,10 @@ impl MetadataStore for ShardedMetadataStore {
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
         Mutation::ClassifyStorageBaseline { bucket, .. } => bucket.as_str(),
-        Mutation::AdmitStorageWrite { plan, .. } | Mutation::PublishStorageWrite { plan, .. } => {
-            plan.bucket.as_str()
-        }
+        Mutation::AdmitStorageWrite { plan, .. }
+        | Mutation::PublishStorageWrite { plan, .. }
+        | Mutation::PublishObjectWrite { plan, .. }
+        | Mutation::AbandonObjectWrite { plan, .. } => plan.bucket.as_str(),
         Mutation::Storage { bucket, .. } | Mutation::ReplicationUpload { bucket, .. } => {
             bucket.as_str()
         }

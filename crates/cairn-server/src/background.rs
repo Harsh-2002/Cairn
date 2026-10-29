@@ -2690,7 +2690,7 @@ mod tests {
             let staged = stack
                 .blob
                 .stage(
-                    planned.admit(receipt, lease).unwrap(),
+                    planned.admit(receipt, lease).unwrap().into(),
                     Box::pin(futures_util::stream::once(async {
                         Ok(bytes::Bytes::from_static(b"durable"))
                     })),

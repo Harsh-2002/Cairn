@@ -544,7 +544,7 @@ impl BlobStore for AbortAfterStagePartBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: cairn_types::storage::ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -751,7 +751,7 @@ impl BlobStore for AssembleGateBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: cairn_types::storage::ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {

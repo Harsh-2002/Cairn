@@ -127,15 +127,24 @@ async fn recover_one(
     blob: &dyn BlobStore,
     mut record: StorageWriteRecovery,
 ) -> Result<(), String> {
-    let cancellation = meta
-        .submit(Mutation::Storage {
-            bucket: record.plan.bucket.clone(),
-            operation: StorageMutation::Cancel {
-                attempt: record.plan.attempt.clone(),
-                generation: record.plan.generation.clone(),
-            },
-        })
-        .await;
+    // Ordinary object plans are never journaled, so there is no intent to cancel. Their FIFO
+    // ordering against publication is the proof: the publication either already committed (the
+    // final path is referenced and stays authoritative) or was never enqueued and never will be.
+    let is_object = matches!(record.plan.target, StorageWriteTarget::Object { .. });
+    let cancellation = if is_object {
+        None
+    } else {
+        Some(
+            meta.submit(Mutation::Storage {
+                bucket: record.plan.bucket.clone(),
+                operation: StorageMutation::Cancel {
+                    attempt: record.plan.attempt.clone(),
+                    generation: record.plan.generation.clone(),
+                },
+            })
+            .await,
+        )
+    };
     // Even a failed metadata cancellation must wait for old actual I/O before its queue slot can
     // disappear or shutdown can report this record drained.
     let proof = record.io.quiescent().await;
@@ -147,9 +156,11 @@ async fn recover_one(
     blob.confirm_storage_quiescence(&record.plan, lease)
         .await
         .map_err(|error| error.to_string())?;
-    match cancellation.map_err(|error| error.to_string())? {
-        MutationOutcome::StorageUpdated { .. } => {}
-        _ => return Err("unexpected storage cancellation outcome".into()),
+    if let Some(cancellation) = cancellation {
+        match cancellation.map_err(|error| error.to_string())? {
+            MutationOutcome::StorageUpdated { .. } => {}
+            _ => return Err("unexpected storage cancellation outcome".into()),
+        }
     }
     if let StorageWriteTarget::Completion {
         upload_id,
@@ -171,14 +182,20 @@ async fn recover_one(
             _ => return Err("unexpected storage completion release outcome".into()),
         }
     }
-    match meta
-        .submit(Mutation::Storage {
+    let resolution = if is_object {
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(record.plan),
+            quiescence: proof,
+        })
+        .await
+    } else {
+        meta.submit(Mutation::Storage {
             bucket: record.plan.bucket,
             operation: StorageMutation::Resolve { quiescence: proof },
         })
         .await
-        .map_err(|error| error.to_string())?
-    {
+    };
+    match resolution.map_err(|error| error.to_string())? {
         MutationOutcome::StorageUpdated { .. } => Ok(()),
         _ => Err("unexpected storage resolution outcome".into()),
     }
@@ -588,7 +605,7 @@ mod tests {
             object_target("put"),
         )
         .await;
-        blob.stage(permit, body(), StageOptions::default())
+        blob.stage(permit.into(), body(), StageOptions::default())
             .await
             .unwrap();
         enqueue(&queue, record);
@@ -629,7 +646,7 @@ mod tests {
             )
             .await;
             let staged = blob
-                .stage(permit, body(), StageOptions::default())
+                .stage(permit.into(), body(), StageOptions::default())
                 .await
                 .unwrap();
             let mut row = object_row(&record.plan, UserId("owner".into()));
@@ -1110,7 +1127,7 @@ mod tests {
         }
         async fn stage(
             &self,
-            permit: StorageCreationPermit,
+            permit: cairn_types::storage::ObjectCreationPermit,
             body: BodyStream,
             opts: StageOptions,
         ) -> Result<StagedBlob, BlobError> {
@@ -1204,7 +1221,7 @@ mod tests {
         )
         .await;
         let staged = blob
-            .stage(permit, body(), StageOptions::default())
+            .stage(permit.into(), body(), StageOptions::default())
             .await
             .unwrap();
         enqueue(&queue, record);

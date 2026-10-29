@@ -3,7 +3,10 @@
 
 use crate::io_err;
 use crate::timing::{ObjectWriteStage, ObjectWriteTimings};
-use cairn_types::storage::{StorageCreationPermit, StoragePathRole, io::StorageIoLease};
+use cairn_types::storage::{
+    ObjectCreationPermit, StorageCreationPermit, StoragePathRole, StorageWritePlan,
+    io::StorageIoLease,
+};
 use cairn_types::{BlobError, StoragePath};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, mkdirat, open, unlinkat};
 use std::collections::HashMap;
@@ -274,19 +277,56 @@ pub(crate) struct AdmittedPaths {
     pub(crate) lease: StorageIoLease,
 }
 
+/// Either a Writer-admitted multipart permit or a file-free ordinary object permit. Both name a
+/// bounded plan and own live I/O; only the admission strength differs, and the backend treats the
+/// names identically.
+pub(crate) enum AdmittedPermit {
+    Object(ObjectCreationPermit),
+    Admitted(StorageCreationPermit),
+}
+
+impl AdmittedPermit {
+    fn plan(&self) -> &StorageWritePlan {
+        match self {
+            Self::Object(permit) => permit.plan(),
+            Self::Admitted(permit) => permit.plan(),
+        }
+    }
+
+    fn into_parts(self) -> (StorageWritePlan, StorageIoLease) {
+        match self {
+            Self::Object(permit) => permit.into_parts(),
+            Self::Admitted(permit) => permit.into_parts(),
+        }
+    }
+}
+
+impl From<ObjectCreationPermit> for AdmittedPermit {
+    fn from(permit: ObjectCreationPermit) -> Self {
+        Self::Object(permit)
+    }
+}
+
+impl From<StorageCreationPermit> for AdmittedPermit {
+    fn from(permit: StorageCreationPermit) -> Self {
+        Self::Admitted(permit)
+    }
+}
+
 impl AdmittedPaths {
     pub(crate) async fn open(
         root: &Path,
-        permit: StorageCreationPermit,
+        permit: impl Into<AdmittedPermit>,
     ) -> Result<Self, BlobError> {
         Self::open_sampled(root, permit, None).await
     }
 
     pub(crate) async fn open_sampled(
         root: &Path,
-        permit: StorageCreationPermit,
+        permit: impl Into<AdmittedPermit>,
         timing: Option<Arc<ObjectWriteTimings>>,
     ) -> Result<Self, BlobError> {
+        let permit = permit.into();
         permit
             .plan()
             .validate()

@@ -67,7 +67,7 @@ pub trait BlobStore: Send + Sync {
     /// blob is durable. Writes no metadata; does not verify client checksums.
     async fn stage(
         &self,
-        permit: crate::storage::StorageCreationPermit,
+        permit: crate::storage::ObjectCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError>;

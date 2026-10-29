@@ -317,6 +317,7 @@ pub async fn assert_storage_journal(meta: &dyn MetadataStore) {
     assert_storage_publication(meta).await;
     assert_storage_multipart_quota(meta).await;
     assert_storage_completion(meta).await;
+    assert_object_publication_without_admission(meta).await;
 }
 
 pub(super) fn object_row(
@@ -1227,14 +1228,15 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
 pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore) {
     let bucket = BucketName::parse("storage-recreate-contract").unwrap();
     create_bucket(meta, &bucket).await;
-    let owner_a = meta.get_bucket(&bucket).await.unwrap().unwrap().owner_id;
+    let snapshot = meta.get_bucket(&bucket).await.unwrap().unwrap();
+    let owner_a = snapshot.owner_id;
     let generation = StorageToken::generate();
     meta.submit(Mutation::BeginStorageGeneration {
         generation: generation.clone(),
     })
     .await
     .unwrap();
-    let planned = plan(&bucket, &generation).with_bucket_owner(owner_a.clone());
+    let planned = plan(&bucket, &generation).with_bucket_snapshot(owner_a.clone(), snapshot.created_at);
     let write_plan = planned.plan().clone();
     meta.submit(Mutation::DeleteBucket(bucket.clone()))
         .await
@@ -1268,6 +1270,160 @@ pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore)
         ),
         "a plan bound to the old owner must not be admitted to a recreated bucket: {outcome:?}"
     );
+}
+
+/// Ordinary object publication must not require a journaled intent, and abandoning a plan before
+/// its publication is enqueued must make that publication permanently impossible. The bucket
+/// fence refuses a deleted bucket, a different owner, and a same-owner new incarnation.
+pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-unadmitted-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let snapshot = meta.get_bucket(&bucket).await.unwrap().unwrap();
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+
+    let planned = plan(&bucket, &generation)
+        .with_bucket_snapshot(snapshot.owner_id.clone(), snapshot.created_at);
+    let write_plan = planned.plan().clone();
+    let row = object_row(&write_plan, snapshot.owner_id.clone());
+    let outcome = meta
+        .submit(Mutation::PublishObjectWrite {
+            plan: Box::new(write_plan.clone()),
+            operation: Box::new(put(row)),
+            index_spool: IndexSpoolState::Materialized,
+            activity: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, MutationOutcome::Put { .. }),
+        "publication without a journaled intent must apply: {outcome:?}"
+    );
+    // A published object keeps its final path; only the provisional aliases become debt.
+    for cleanup in claim(meta, &generation, 100, 0).await {
+        assert_ne!(
+            Some(&cleanup.path),
+            write_plan.final_path().ok(),
+            "a referenced final path must never be queued for cleanup"
+        );
+    }
+    let (mut watch, lease) = StorageIoWatch::new(
+        write_plan.attempt.clone(),
+        write_plan.generation.clone(),
+        Arc::new(()),
+    );
+    drop(lease);
+    let proof = watch.quiescent().await;
+    assert_eq!(
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(write_plan.clone()),
+            quiescence: proof,
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::StorageUpdated { applied: true }
+    );
+    for cleanup in claim(meta, &generation, 100, 1).await {
+        assert_ne!(
+            Some(&cleanup.path),
+            write_plan.final_path().ok(),
+            "abandonment after publication must keep the final path"
+        );
+    }
+
+    // Abandon before publication is enqueued: the cleanup debt fences the same plan forever.
+    let abandoned = plan(&bucket, &generation)
+        .with_bucket_snapshot(snapshot.owner_id.clone(), snapshot.created_at);
+    let abandoned_plan = abandoned.plan().clone();
+    let (mut watch, lease) = StorageIoWatch::new(
+        abandoned_plan.attempt.clone(),
+        abandoned_plan.generation.clone(),
+        Arc::new(()),
+    );
+    drop(lease);
+    let proof = watch.quiescent().await;
+    assert_eq!(
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(abandoned_plan.clone()),
+            quiescence: proof,
+        })
+        .await
+        .unwrap(),
+        MutationOutcome::StorageUpdated { applied: true }
+    );
+    let late = meta
+        .submit(Mutation::PublishObjectWrite {
+            plan: Box::new(abandoned_plan),
+            operation: Box::new(put(object_row(
+                &abandoned.plan().clone(),
+                snapshot.owner_id.clone(),
+            ))),
+            index_spool: IndexSpoolState::Materialized,
+            activity: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        late,
+        MutationOutcome::StoragePublicationNotApplied,
+        "an abandoned plan's names are owned by cleanup debt"
+    );
+
+    // Bucket incarnation fence: same owner with a new created_at is a different bucket.
+    let recreated = BucketName::parse("storage-unadmitted-recreate-contract").unwrap();
+    let owner_a = UserId::generate();
+    let mut first = new_bucket(&recreated, &owner_a, Timestamp(0));
+    meta.submit(Mutation::CreateBucket(Box::new(first.clone())))
+        .await
+        .unwrap();
+    let stale = plan(&recreated, &generation)
+        .with_bucket_snapshot(owner_a.clone(), Timestamp(0));
+    meta.submit(Mutation::DeleteBucket(recreated.clone()))
+        .await
+        .unwrap();
+    first.created_at = Timestamp(5);
+    meta.submit(Mutation::CreateBucket(Box::new(first)))
+        .await
+        .unwrap();
+    for owner in [owner_a.clone(), UserId::generate()] {
+        let mut plan = stale.plan().clone();
+        plan.bucket_owner = Some(owner.clone());
+        let refused = meta
+            .submit(Mutation::PublishObjectWrite {
+                plan: Box::new(plan.clone()),
+                operation: Box::new(put(object_row(&plan, owner))),
+                index_spool: IndexSpoolState::Materialized,
+                activity: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            refused,
+            MutationOutcome::StoragePublicationNotApplied,
+            "a publication bound to another bucket incarnation must be refused"
+        );
+    }
+}
+
+/// Build one bucket with an explicit identity and incarnation.
+pub(super) fn new_bucket(
+    name: &BucketName,
+    owner: &UserId,
+    created_at: Timestamp,
+) -> Bucket {
+    Bucket {
+        name: name.clone(),
+        owner_id: owner.clone(),
+        created_at,
+        versioning: VersioningState::Unversioned,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    }
 }
 
 /// A successful publication commits its activity row in the same savepoint. A rejected

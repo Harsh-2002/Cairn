@@ -156,6 +156,7 @@ impl PublicationFixture {
             generation: self.generation.clone(),
             bucket: row.bucket.clone(),
             bucket_owner: None,
+            bucket_created_at: None,
             target,
             paths,
         };

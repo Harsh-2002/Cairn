@@ -279,7 +279,7 @@ fn writer() {
         }));
         store
             .stage(
-                permit,
+                permit.into(),
                 body,
                 StageOptions {
                     size_ceiling: 1024 * 1024,

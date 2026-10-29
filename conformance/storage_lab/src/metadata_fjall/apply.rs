@@ -381,6 +381,32 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             journal::resolve(view, &plan, index_spool)?;
             Ok(outcome)
         }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            ..
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !journal::object_publication_allowed(view, &plan)? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let Mutation::PutObjectVersion {
+                row,
+                precondition,
+                initial_state,
+                replication,
+            } = *operation
+            else {
+                return Err(kv::error("candidate object publication shape is unsupported"));
+            };
+            let outcome = put(view, *row, precondition, initial_state, replication)?;
+            journal::resolve_paths(view, &plan, index_spool)?;
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            journal::abandon_object(view, &plan, &quiescence)
+        }
         Mutation::ResolveObjectWrite {
             bucket,
             key: object,

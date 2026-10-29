@@ -356,6 +356,18 @@ fn resolve(
     plan: &StorageWritePlan,
     index_spool: crate::blob::IndexSpoolState,
 ) -> R<()> {
+    resolve_paths(st, journal, plan, index_spool)?;
+    journal.intents.remove(&plan.attempt);
+    Ok(())
+}
+
+/// Enqueue reference-checked cleanup without requiring or discarding an intent.
+pub(super) fn resolve_paths(
+    st: &mut State,
+    journal: &mut Journal,
+    plan: &StorageWritePlan,
+    index_spool: crate::blob::IndexSpoolState,
+) -> R<()> {
     let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
         && referenced(st, plan.final_path()?);
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
@@ -432,8 +444,87 @@ fn resolve(
             )?;
         }
     }
-    journal.intents.remove(&plan.attempt);
     Ok(())
+}
+
+/// The double's publication fence: current generation, exact bucket incarnation, no intent for
+/// the attempt, and every planned alias free of references, intent ownership and cleanup debt.
+pub(super) fn object_publication_allowed(st: &State, plan: &StorageWritePlan) -> R<bool> {
+    plan.validate()?;
+    if st.storage.baseline.generation.as_ref() != Some(&plan.generation) {
+        return Ok(false);
+    }
+    let bucket_row = st.buckets.get(plan.bucket.as_str());
+    let Some(bucket_row) = bucket_row else {
+        return Ok(false);
+    };
+    let owner = plan
+        .bucket_owner
+        .as_ref()
+        .ok_or_else(|| invalid("object publication requires a bucket owner"))?;
+    let created_at = plan
+        .bucket_created_at
+        .ok_or_else(|| invalid("object publication requires a bucket incarnation"))?;
+    if bucket_row.owner_id != *owner || bucket_row.created_at != created_at {
+        return Ok(false);
+    }
+    if st.storage.intents.contains_key(&plan.attempt) {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if referenced(st, &path.path)
+            || st
+                .storage
+                .cleanups
+                .values()
+                .any(|row| row.path == path.path)
+            || st
+                .storage
+                .intents
+                .values()
+                .any(|(intent, _)| intent.paths.iter().any(|owned| owned.path == path.path))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Abandon an object plan after proven quiescence. A stale intent for the same attempt is resolved
+/// exactly like [`StorageMutation::Resolve`]; otherwise cleanup is reference-checked directly.
+pub(super) fn abandon_object(
+    st: &mut State,
+    plan: &StorageWritePlan,
+    quiescence: &crate::storage::io::StorageQuiescence,
+) -> R<MutationOutcome> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(invalid("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(invalid("storage quiescence identity mismatch"));
+    }
+    if st.storage.baseline.generation.as_ref() != Some(quiescence.generation()) {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    let mut journal = st.storage.clone();
+    if let Some((stored, _)) = journal.intents.get(quiescence.attempt()).cloned() {
+        resolve(
+            st,
+            &mut journal,
+            &stored,
+            crate::blob::IndexSpoolState::Materialized,
+        )?;
+    } else {
+        resolve_paths(
+            st,
+            &mut journal,
+            plan,
+            crate::blob::IndexSpoolState::Materialized,
+        )?;
+    }
+    st.storage = journal;
+    Ok(MutationOutcome::StorageUpdated { applied: true })
 }
 
 fn retire_quota(st: &mut State, journal: &mut Journal, debt: &str) {

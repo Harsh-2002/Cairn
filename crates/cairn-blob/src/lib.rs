@@ -54,7 +54,9 @@ use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
 use cairn_types::id::StoragePath;
 use cairn_types::object::{ChecksumSet, CompressionDescriptor, ETag};
-use cairn_types::storage::{ObjectMetadataRecord, StorageCreationPermit, StorageWriteTarget};
+use cairn_types::storage::{
+    ObjectCreationPermit, ObjectMetadataRecord, StorageCreationPermit, StorageWriteTarget,
+};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
@@ -1098,12 +1100,13 @@ impl LocalBlobStore {
     }
 }
 
-/// Write, fsync and retain the protocol-3 sidecar's temporary alias. It is renamed only after the
-/// data file's own rename, under the same admitted intent.
+/// Write the protocol-3 sidecar's temporary alias without syncing it. The caller runs the
+/// sidecar's fsync concurrently with the data commit, then renames data first and metadata last
+/// under one directory barrier.
 async fn stage_metadata_sidecar(
     paths: &AdmittedPaths,
     record: &ObjectMetadataRecord,
-) -> Result<(), BlobError> {
+) -> Result<Staging, BlobError> {
     let staging = paths
         .metadata_staging
         .as_ref()
@@ -1113,27 +1116,7 @@ async fn stage_metadata_sidecar(
         .map_err(|error| BlobError::Io(error.to_string()))?;
     let mut sink = Staging::create(staging.clone(), false, None, paths.lease.try_child()?).await?;
     sink.write_all(&bytes).await?;
-    sink.fsync_in_place().await
-}
-
-/// Rename the fsynced sidecar alias into its final `<data>.meta` name. A failure aborts before any
-/// acknowledgement; the admitted intent still owns both physical names for recovery.
-async fn commit_metadata_sidecar(paths: &AdmittedPaths) -> Result<(), BlobError> {
-    let staging = paths
-        .metadata_staging
-        .clone()
-        .ok_or_else(|| BlobError::Io("storage plan lacks an object metadata alias".into()))?;
-    let destination = paths
-        .metadata_file
-        .clone()
-        .ok_or_else(|| BlobError::Io("storage plan lacks an object metadata path".into()))?;
-    let operation = paths.lease.try_child()?;
-    tokio::task::spawn_blocking(move || {
-        let _operation = operation;
-        staging.rename_to(&destination).map_err(io_err)
-    })
-    .await
-    .map_err(|error| BlobError::Io(error.to_string()))?
+    Ok(sink)
 }
 
 #[async_trait]
@@ -1160,7 +1143,7 @@ impl BlobStore for LocalBlobStore {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -1240,29 +1223,49 @@ impl BlobStore for LocalBlobStore {
             compression: write.compression,
             index_spool: write.index_spool,
         };
-        // Protocol 3 P1: serialize the sidecar before the data rename, fsync it, then rename data
-        // followed by metadata. One destination-directory barrier covers both entries. SQLite
-        // publication still follows this function and remains the ACK authority.
-        if let Some(seed) = &opts.metadata_seed {
-            let record = ObjectMetadataRecord::from_staged(seed, &staged);
-            if let Err(error) = stage_metadata_sidecar(&paths, &record).await {
-                sink.abort().await;
-                return Err(error);
+        // Protocol 3: write the sidecar alias, then overlap the data commit (flush, fsync,
+        // rename) with the sidecar fsync. Data is renamed first and metadata second, under one
+        // destination-directory barrier. A sidecar failure aborts before any acknowledgement;
+        // a SQLite publication (P1) still follows this function and remains the ACK authority.
+        let sidecar = match &opts.metadata_seed {
+            Some(seed) => {
+                let record = ObjectMetadataRecord::from_staged(seed, &staged);
+                match stage_metadata_sidecar(&paths, &record).await {
+                    Ok(sidecar) => Some(sidecar),
+                    Err(error) => {
+                        sink.abort().await;
+                        return Err(error);
+                    }
+                }
             }
-        }
-        sink.commit_sampled(
+            None => None,
+        };
+        let data_commit = sink.commit_sampled(
             &paths.final_file,
             sampled.then(|| self.object_write_timings.clone()),
-        )
-        .await?;
+        );
+        let sidecar = match sidecar {
+            Some(sidecar) => {
+                let ((), sidecar) = tokio::try_join!(data_commit, sidecar.fsync_retained())?;
+                Some(sidecar)
+            }
+            None => {
+                data_commit.await?;
+                None
+            }
+        };
         if let Some(timer) = timer {
             timer.complete();
         }
-        if opts.metadata_seed.is_some() {
+        if let Some(sidecar) = sidecar {
             fail::fail_point!("blob_after_data_rename", |_| Err(BlobError::Io(
                 "injected failure after data rename, before metadata rename".into()
             )));
-            commit_metadata_sidecar(&paths).await?;
+            let destination = paths
+                .metadata_file
+                .clone()
+                .ok_or_else(|| BlobError::Io("storage plan lacks an object metadata path".into()))?;
+            sidecar.rename_retained(&destination).await?;
         }
         drop(copy_permit);
         let timer = sampled.then(|| {

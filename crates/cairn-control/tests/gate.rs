@@ -265,7 +265,7 @@ async fn put_object_with_lock(
     let staged = h
         .blob
         .stage(
-            permit,
+            permit.into(),
             body_stream(data),
             StageOptions {
                 compression: None,

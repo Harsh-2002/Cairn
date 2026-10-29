@@ -197,7 +197,7 @@ async fn put_object_with_ttl(
     let stream = once_body(body.to_vec());
     let staged = blob
         .stage(
-            permit,
+            permit.into(),
             stream,
             cairn_types::StageOptions {
                 compression: None,
