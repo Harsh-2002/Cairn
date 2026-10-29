@@ -7,9 +7,10 @@
 //! serves traffic. A corrupt or mismatched sidecar is reported and skipped: this pass never invents
 //! an object, and it never deletes anything.
 
+use cairn_types::blob::IndexSpoolState;
 use cairn_types::error::MetaError;
 use cairn_types::id::StoragePath;
-use cairn_types::meta::{IndexSpoolState, Mutation, MutationOutcome};
+use cairn_types::meta::{Mutation, MutationOutcome};
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::storage::{
     ObjectMetadataRecord, StorageIntentPath, StoragePathRole, StorageToken, StorageWritePlan,
