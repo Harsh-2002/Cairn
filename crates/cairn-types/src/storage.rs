@@ -643,6 +643,23 @@ impl ObjectMetadataRecord {
         Ok(out)
     }
 
+    /// Decode the metadata from a whole inline file (`payload || metadata || trailer`).
+    pub fn decode_inline_file(bytes: &[u8]) -> Result<Option<(Self, u64)>, MetaError> {
+        if bytes.len() < INLINE_TRAILER_FIXED {
+            return Ok(None);
+        }
+        let fixed = &bytes[bytes.len() - INLINE_TRAILER_FIXED..];
+        if fixed[12..16] != INLINE_TRAILER_MAGIC {
+            return Ok(None);
+        }
+        let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as usize;
+        let total = meta_len
+            .checked_add(INLINE_TRAILER_FIXED)
+            .filter(|total| *total <= bytes.len())
+            .ok_or_else(|| MetaError::Engine("inline metadata length exceeds its file".into()))?;
+        Self::decode_inline_suffix(&bytes[bytes.len() - total..])
+    }
+
     /// Decode the metadata from the exact trailer suffix (`metadata JSON || fixed trailer`).
     pub fn decode_inline_suffix(suffix: &[u8]) -> Result<Option<(Self, u64)>, MetaError> {
         if suffix.len() < INLINE_TRAILER_FIXED {

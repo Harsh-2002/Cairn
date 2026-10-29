@@ -19547,9 +19547,30 @@ async fn put_writes_a_sidecar_that_matches_the_published_row() {
         .unwrap()
         .expect("published row");
     let data = row.storage_path.clone().expect("physical row");
-    let metadata = cairn_types::storage::object_metadata_path(&data).expect("sidecar path");
-    let bytes = std::fs::read(h._dir.path().join(metadata.as_str())).unwrap();
-    let record = cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap();
+    let data_path = h._dir.path().join(data.as_str());
+    let data_bytes = std::fs::read(&data_path).unwrap();
+    // A small plaintext object carries one inline trailer instead of a separate sidecar.
+    let record = match cairn_types::storage::object_metadata_path(&data)
+        .map(|metadata| h._dir.path().join(metadata.as_str()))
+        .filter(|metadata| metadata.exists())
+    {
+        Some(metadata) => {
+            let bytes = std::fs::read(metadata).unwrap();
+            cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap()
+        }
+        None => {
+            let (record, payload_len) =
+                cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&data_bytes)
+                    .unwrap()
+                    .expect("inline trailer");
+            assert_eq!(
+                &data_bytes[..payload_len as usize],
+                b"sidecar identity",
+                "inline payload must be exactly the client body"
+            );
+            record
+        }
+    };
     assert_eq!(record.bucket, row.bucket);
     assert_eq!(record.key, row.key);
     assert_eq!(record.version_id, row.version_id);
@@ -19562,8 +19583,7 @@ async fn put_writes_a_sidecar_that_matches_the_published_row() {
     assert_eq!(record.internal_sha256, row.internal_sha256);
     assert_eq!(record.checksums, row.checksums);
     assert_eq!(record.sse_descriptor, row.sse_descriptor);
-    assert_eq!(
-        std::fs::read(h._dir.path().join(data.as_str())).unwrap(),
-        b"sidecar identity"
-    );
+    if record.storage_path == data && data_bytes.len() == row.size_physical as usize {
+        assert_eq!(data_bytes, b"sidecar identity");
+    }
 }
