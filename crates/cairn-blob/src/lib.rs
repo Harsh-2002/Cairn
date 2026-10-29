@@ -1332,8 +1332,16 @@ impl BlobStore for LocalBlobStore {
             self.object_write_timings
                 .start(ObjectWriteStage::DirectorySync)
         });
+        // Both renames removed their `.staging` source entries. Retiring those names used to be
+        // delegated to cleanup debt; synchronize the staging directory here instead, so a
+        // successful publication never depends on the asynchronous cleaner for that barrier.
+        // The coalescer shares one barrier across concurrent writers in the same directory.
+        let staging_parent = paths.staging.parent.clone();
         self.dir_sync
             .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
+        self.dir_sync
+            .sync_file(staging_parent, &paths.lease)
             .await?;
         if let Some(timer) = timer {
             timer.complete();

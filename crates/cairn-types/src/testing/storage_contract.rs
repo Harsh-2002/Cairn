@@ -459,7 +459,7 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
         MutationOutcome::StoragePublicationNotApplied
     );
     let aliases = claim(meta, &generation, 100, 0).await;
-    assert_eq!(aliases.len(), 3);
+    assert_eq!(aliases.len(), 1);
     let metadata_path = crate::storage::object_metadata_path(plan.final_path().unwrap())
         .expect("object sidecar path");
     for cleanup in aliases {
@@ -741,7 +741,7 @@ pub async fn assert_prepare_storage_restore(meta: &dyn MetadataStore) {
     assert!(reservations.is_empty());
     assert!(debts.is_empty());
     let old_claims = claim(meta, &generation, 100, 0).await;
-    assert_eq!(old_claims.len(), 6);
+    assert_eq!(old_claims.len(), 4);
     assert!(
         old_claims
             .iter()
@@ -1585,36 +1585,12 @@ pub async fn assert_unused_index_spool_is_not_retired(meta: &dyn MetadataStore) 
         .unwrap();
     assert!(matches!(outcome, MutationOutcome::Put { .. }));
 
-    let temporary = plan
-        .paths
-        .iter()
-        .find(|path| path.role == StoragePathRole::Temporary)
-        .expect("temporary alias");
-    let metadata_alias = plan
-        .paths
-        .iter()
-        .find(|path| {
-            path.role == StoragePathRole::Temporary && path.path.as_str().ends_with(".meta.tmp")
-        })
-        .expect("temporary metadata alias");
-    let spool = plan
-        .paths
-        .iter()
-        .find(|path| path.role == StoragePathRole::IndexSpool)
-        .expect("index-spool alias");
     let claimed = claim(meta, &generation, 100, 0).await;
-    assert_eq!(
-        claimed.len(),
-        2,
-        "a write that never opened the index spool owes no barrier for it, but both staging aliases do"
-    );
-    assert!(claimed.iter().any(|cleanup| cleanup.path == temporary.path));
     assert!(
-        claimed
-            .iter()
-            .any(|cleanup| cleanup.path == metadata_alias.path)
+        claimed.is_empty(),
+        "a successful publication renamed its staging aliases and the commit path synchronizes the \
+         staging directory, so no alias and no unused index spool leaves cleanup debt"
     );
-    assert!(!claimed.iter().any(|cleanup| cleanup.path == spool.path));
 }
 
 #[cfg(test)]

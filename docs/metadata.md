@@ -137,7 +137,7 @@ abandonment or can never be enqueued afterwards, so cleanup cannot race a visibl
 
 Protocol 3 P1 rewrites object writes as a dual-write: the plan also names the exact
 `<final>.meta` sidecar and its staging alias, the blob layer overlaps the sidecar fsync with the data commit,
-then renames data and sidecar under the same directory barrier, and the existing Writer publication still commits the row before
+then renames data and sidecar under the same directory barrier (including the staging directory, so a successful publication's consumed aliases owe no cleanup debt), and the existing Writer publication still commits the row before
 the client is acknowledged. SQLite therefore remains the read and ACK authority throughout P1; the
 sidecar is durable evidence, not a read source. The deterministic sidecar names are derived from
 the attempt instead of adding `storage_intent_paths` roles, so schema v39 and all four metadata
