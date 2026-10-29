@@ -224,7 +224,6 @@ fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaE
         return Ok(None);
     }
     let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
-    let payload_len = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
     let suffix_len = meta_len
         .checked_add(FIXED)
         .filter(|total| *total <= len)
