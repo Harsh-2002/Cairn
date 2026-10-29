@@ -657,7 +657,10 @@ pub async fn build(
         storage_lifetime.clone(),
         multipart_claim_recovery.admission_callback(),
         multipart_claim_recovery.callback(),
-    ));
+    ))
+    // Ordinary object acknowledgements fold their index row asynchronously; reads and every key
+    // mutation drain this bounded overlay first.
+    .with_overlay(cairn_protocol::Overlay::start(meta.clone(), 8192usize));
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));

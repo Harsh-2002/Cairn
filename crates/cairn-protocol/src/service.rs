@@ -7,6 +7,7 @@ use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
 use crate::object_ttl::{self, TtlSpec};
+use crate::overlay::Overlay;
 use crate::put_timing::{PutStage, PutTiming, PutTimings};
 use crate::request::{S3Body, S3Request, S3Response};
 use crate::storage_write::{PreparedStorageWrite, StorageWriteGuard, StorageWriteRuntime};
@@ -81,6 +82,8 @@ pub struct S3Service {
     storage_runtime: Option<StorageWriteRuntime>,
     /// Bounded one-in-32 ordinary PUT response-path samples shared by service clones.
     put_timings: Arc<PutTimings>,
+    /// Acknowledged object writes whose index fold is still pending.
+    overlay: Option<Arc<Overlay>>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -120,6 +123,7 @@ impl S3Service {
             replication_wake: None,
             storage_runtime: None,
             put_timings: Arc::new(PutTimings::default()),
+            overlay: None,
         }
     }
 
@@ -164,6 +168,24 @@ impl S3Service {
     pub fn with_storage_runtime(mut self, runtime: StorageWriteRuntime) -> Self {
         self.storage_runtime = Some(runtime);
         self
+    }
+
+    /// Attach the acknowledged-write overlay that keeps the index fold off the PUT path.
+    #[must_use]
+    pub fn with_overlay(mut self, overlay: Arc<Overlay>) -> Self {
+        self.overlay = Some(overlay);
+        self
+    }
+
+    /// Wait until every acknowledged object write has reached the index.
+    async fn drain_overlay(&self) -> Result<()> {
+        if let Some(overlay) = &self.overlay {
+            overlay
+                .drain()
+                .await
+                .map_err(|error| Error::Internal(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Drain fixed-label sampled PUT response-path timings for the metrics task.
@@ -690,6 +712,9 @@ impl S3Service {
 
     async fn delete_bucket(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // Pending acknowledged writes are not in the index yet; fold them before the emptiness
+        // check so a bucket with a just-written object is never reported empty.
+        self.drain_overlay().await?;
         if !self.meta.is_bucket_empty(&bucket.name).await? {
             return Err(Error::BucketNotEmpty);
         }
@@ -716,6 +741,7 @@ impl S3Service {
 
     async fn list_objects(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        self.drain_overlay().await?;
         let v1 = req.query("list-type").map(|v| v != "2").unwrap_or(true);
         let prefix = req.query("prefix").map(str::to_owned);
         // An empty but PRESENT `delimiter=` means "no delimiter" (S3 semantics): normalize it to
@@ -1174,30 +1200,77 @@ impl S3Service {
             timer.complete();
         }
         let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
-        let publication = self
-            .meta
-            .submit(write_guard.planned_publication(
-                Mutation::PutObjectVersion {
-                    row: Box::new(row),
-                    precondition: precond,
-                    initial_state: InitialObjectState {
-                        tags: initial_tags,
-                        lock_intent,
-                    },
-                    replication,
+        // An unconditional write to a bucket with no byte quota and no Object Lock can acknowledge
+        // after the file barrier: the row goes into the bounded overlay and folds afterwards. Every
+        // key mutation and LIST drains the overlay first, so the index never acts on a stale view.
+        let overlay_fast = self.overlay.is_some()
+            && precond.is_unconditional()
+            && ttl_request.is_none()
+            && !is_replica
+            && replication.is_empty()
+            && lock_intent.retention.is_none()
+            && lock_intent.legal_hold.is_none()
+            && matches!(self.meta.get_bucket_quota(&bucket.name).await, Ok(None))
+            && matches!(
+                self.meta
+                    .get_bucket_config(&bucket.name, ConfigAspect::ObjectLock)
+                    .await,
+                Ok(None)
+            );
+        let row = std::sync::Arc::new(row);
+        let mutation = write_guard.planned_publication(
+            Mutation::PutObjectVersion {
+                row: Box::new((*row).clone()),
+                precondition: precond,
+                initial_state: InitialObjectState {
+                    tags: initial_tags,
+                    lock_intent,
                 },
-                staged.index_spool,
-                Some(Box::new(self.activity_entry(
-                    "PutObject",
-                    bucket.name.as_str(),
-                    Some(key.as_str()),
-                    Some(staged.size_logical),
-                    Some(staged.etag.as_str()),
-                    req.principal.as_ref(),
-                    now,
-                ))),
-            ))
-            .await;
+                replication,
+            },
+            staged.index_spool,
+            Some(Box::new(self.activity_entry(
+                "PutObject",
+                bucket.name.as_str(),
+                Some(key.as_str()),
+                Some(staged.size_logical),
+                Some(staged.etag.as_str()),
+                req.principal.as_ref(),
+                now,
+            ))),
+        );
+        let publication = if overlay_fast {
+            let overlay = self.overlay.as_ref().expect("checked above");
+            let _stripe = overlay.stripe(&bucket.name, &key).await;
+            let same_bucket = matches!(
+                self.meta.get_bucket(&bucket.name).await,
+                Ok(Some(current))
+                    if current.created_at == bucket.created_at
+                        && current.owner_id == bucket.owner_id
+            );
+            if same_bucket {
+                overlay
+                    .acknowledge(&bucket.name, &key, Arc::clone(&row), mutation)
+                    .await;
+                Ok(MutationOutcome::Put {
+                    version_id: version_id.clone(),
+                    superseded: None,
+                })
+            } else {
+                drop(_stripe);
+                self.meta.submit(mutation).await
+            }
+        } else if self.overlay.is_some() {
+            let overlay = self.overlay.as_ref().expect("checked above");
+            let _stripe = overlay.stripe(&bucket.name, &key).await;
+            if let Err(error) = overlay.wait_key(&bucket.name, &key).await {
+                self.recover_object_write(&mut write_guard).await;
+                return Err(Error::Internal(error.to_string()));
+            }
+            self.meta.submit(mutation).await
+        } else {
+            self.meta.submit(mutation).await
+        };
         if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
             if let Some(timer) = publication_timer {
                 timer.complete();
@@ -1439,6 +1512,7 @@ impl S3Service {
         bucket: &Bucket,
     ) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
+        self.drain_overlay().await?;
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
         let event_key = key.clone();
         let now = self.clock.now();
@@ -5393,16 +5467,25 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let row = match req.query("versionId") {
-            Some(vid) => self
-                .meta
-                .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
-                .await?
-                .ok_or(Error::NoSuchVersion)?,
-            None => self
-                .meta
-                .current_version(&bucket.name, &key)
-                .await?
-                .ok_or(Error::NoSuchKey)?,
+            Some(vid) => {
+                self.drain_overlay().await?;
+                self.meta
+                    .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                    .await?
+                    .ok_or(Error::NoSuchVersion)?
+            }
+            None => match self
+                .overlay
+                .as_ref()
+                .and_then(|overlay| overlay.latest(&bucket.name, &key))
+            {
+                Some(row) => (*row).clone(),
+                None => self
+                    .meta
+                    .current_version(&bucket.name, &key)
+                    .await?
+                    .ok_or(Error::NoSuchKey)?,
+            },
         };
         if row.is_delete_marker {
             return Err(Error::NoSuchKey);
@@ -5422,6 +5505,7 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         match req.query("versionId") {
             Some(vid) => {
+                self.drain_overlay().await?;
                 let row = self
                     .meta
                     .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
@@ -5436,6 +5520,16 @@ impl S3Service {
                 Ok(ReadTarget::Object(Box::new(row)))
             }
             None => {
+                if let Some(row) = self
+                    .overlay
+                    .as_ref()
+                    .and_then(|overlay| overlay.latest(&bucket.name, &key))
+                {
+                    if row.is_delete_marker {
+                        return Ok(ReadTarget::DeleteMarker(not_found_marker(req, &row)));
+                    }
+                    return Ok(ReadTarget::Object(Box::new((*row).clone())));
+                }
                 let row = self
                     .meta
                     .current_version(&bucket.name, &key)
