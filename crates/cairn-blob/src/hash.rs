@@ -2,11 +2,11 @@
 //! plus client-requested checksum algorithms, computed once over the plaintext.
 
 use crate::crc64nvme::Crc64Nvme;
+use aws_lc_rs::digest::{Context as Sha256Context, SHA256};
 use base64::Engine;
 use cairn_types::object::{ChecksumAlgorithm, ChecksumSet, ChecksumValue};
 use md5::{Digest, Md5};
 use sha1::Sha1;
-use sha2::Sha256;
 
 /// Accumulates MD5, internal SHA-256, and requested supplementary checksums over plaintext.
 pub struct Hashers {
@@ -15,7 +15,7 @@ pub struct Hashers {
     crc32c: Option<u32>,
     crc64nvme: Option<Crc64Nvme>,
     sha1: Option<Sha1>,
-    sha256: Sha256,
+    sha256: Sha256Context,
     expose_sha256: bool,
 }
 
@@ -36,7 +36,7 @@ impl Hashers {
             crc32c: has(ChecksumAlgorithm::Crc32c).then_some(0),
             crc64nvme: has(ChecksumAlgorithm::Crc64Nvme).then(Crc64Nvme::new),
             sha1: has(ChecksumAlgorithm::Sha1).then(Sha1::new),
-            sha256: Sha256::new(),
+            sha256: Sha256Context::new(&SHA256),
             expose_sha256: has(ChecksumAlgorithm::Sha256),
         }
     }
@@ -91,14 +91,14 @@ impl Hashers {
                 value: b64.encode(h.finalize()),
             });
         }
-        let sha256 = self.sha256.finalize();
+        let sha256 = self.sha256.finish();
         if self.expose_sha256 {
             checksums.push(ChecksumValue {
                 algorithm: ChecksumAlgorithm::Sha256,
-                value: b64.encode(sha256),
+                value: b64.encode(sha256.as_ref()),
             });
         }
-        (md5_hex, checksums, hex::encode(sha256))
+        (md5_hex, checksums, hex::encode(sha256.as_ref()))
     }
 }
 

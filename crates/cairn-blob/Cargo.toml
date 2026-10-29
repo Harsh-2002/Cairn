@@ -19,6 +19,10 @@ tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "macros"]
 md-5.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+# The always-on plaintext SHA-256 integrity baseline runs on aws-lc-rs, already a workspace
+# dependency (the rustls provider); its AVX2/AVX-512 assembly is several times faster than the
+# portable RustCrypto implementation. `sha2` remains for the block-index HMAC/fingerprints.
+aws-lc-rs.workspace = true
 hmac.workspace = true
 aes-gcm.workspace = true
 crc32fast.workspace = true
