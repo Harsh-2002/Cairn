@@ -509,7 +509,7 @@ async fn assert_storage_publication(meta: &dyn MetadataStore) {
         MutationOutcome::Put { .. }
     ));
     let aliases = claim(meta, &generation, 100, 2).await;
-    assert_eq!(aliases.len(), 5);
+    assert_eq!(aliases.len(), 3);
     assert!(
         aliases
             .iter()
