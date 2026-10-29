@@ -1240,6 +1240,9 @@ impl BlobStore for LocalBlobStore {
             }
             None => None,
         };
+        fail::fail_point!("blob_after_sidecar_stage", |_| Err(BlobError::Io(
+            "injected failure after sidecar staging, before the data commit".into()
+        )));
         let data_commit = sink.commit_sampled(
             &paths.final_file,
             sampled.then(|| self.object_write_timings.clone()),
@@ -1261,10 +1264,9 @@ impl BlobStore for LocalBlobStore {
             fail::fail_point!("blob_after_data_rename", |_| Err(BlobError::Io(
                 "injected failure after data rename, before metadata rename".into()
             )));
-            let destination = paths
-                .metadata_file
-                .clone()
-                .ok_or_else(|| BlobError::Io("storage plan lacks an object metadata path".into()))?;
+            let destination = paths.metadata_file.clone().ok_or_else(|| {
+                BlobError::Io("storage plan lacks an object metadata path".into())
+            })?;
             sidecar.rename_retained(&destination).await?;
         }
         drop(copy_permit);

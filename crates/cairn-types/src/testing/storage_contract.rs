@@ -1236,7 +1236,8 @@ pub async fn assert_admission_rejects_recreated_bucket(meta: &dyn MetadataStore)
     })
     .await
     .unwrap();
-    let planned = plan(&bucket, &generation).with_bucket_snapshot(owner_a.clone(), snapshot.created_at);
+    let planned =
+        plan(&bucket, &generation).with_bucket_snapshot(owner_a.clone(), snapshot.created_at);
     let write_plan = planned.plan().clone();
     meta.submit(Mutation::DeleteBucket(bucket.clone()))
         .await
@@ -1380,11 +1381,24 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
     meta.submit(Mutation::CreateBucket(Box::new(first.clone())))
         .await
         .unwrap();
-    let stale = plan(&recreated, &generation)
-        .with_bucket_snapshot(owner_a.clone(), Timestamp(0));
+    let stale = plan(&recreated, &generation).with_bucket_snapshot(owner_a.clone(), Timestamp(0));
     meta.submit(Mutation::DeleteBucket(recreated.clone()))
         .await
         .unwrap();
+    let deleted = meta
+        .submit(Mutation::PublishObjectWrite {
+            plan: Box::new(stale.plan().clone()),
+            operation: Box::new(put(object_row(&stale.plan().clone(), owner_a.clone()))),
+            index_spool: IndexSpoolState::Materialized,
+            activity: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted,
+        MutationOutcome::StoragePublicationNotApplied,
+        "a publication into a deleted bucket must be refused"
+    );
     first.created_at = Timestamp(5);
     meta.submit(Mutation::CreateBucket(Box::new(first)))
         .await
@@ -1410,11 +1424,7 @@ pub async fn assert_object_publication_without_admission(meta: &dyn MetadataStor
 }
 
 /// Build one bucket with an explicit identity and incarnation.
-pub(super) fn new_bucket(
-    name: &BucketName,
-    owner: &UserId,
-    created_at: Timestamp,
-) -> Bucket {
+pub(super) fn new_bucket(name: &BucketName, owner: &UserId, created_at: Timestamp) -> Bucket {
     Bucket {
         name: name.clone(),
         owner_id: owner.clone(),

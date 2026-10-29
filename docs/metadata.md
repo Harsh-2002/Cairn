@@ -119,16 +119,25 @@ changing rows, counters or outboxes. A lost predicate returns `DeleteNotApplied`
 parsing, replacement/deletion protection, retention rules, versioning transitions and exact initial
 tag/lock installation remain Writer-authoritative.
 
-Protocol 2 requires a file-free plan before physical creation. Ordinary PUT/Copy admission reserves
-the exact attempt, generation, target and canonical temporary/final/index paths. Multipart
-`AdmitStorageWrite` combines that reservation with the original quota reservation or exact-token
-completion claim in one savepoint. A losing reserve/claim grants no creation authority. Only an
+Protocol 2 requires a bounded, file-free plan before physical creation. Multipart
+`AdmitStorageWrite` combines its reservation with the original quota reservation or exact-token
+completion claim in one savepoint; a losing reserve/claim grants no creation authority, and only an
 acknowledged matching admission and a live I/O lease can produce the move-only creation permit
 consumed by the blob layer (Section 12.1).
 
+An ordinary PUT/Copy plan is not journaled. It is consumed as an `ObjectCreationPermit` and fenced
+by `PublishObjectWrite`, which in one savepoint checks the current generation, the authorized
+bucket owner and creation time, that no intent exists for the attempt, and that every planned path
+is free of object/part references, intent ownership and cleanup debt before applying the object
+upsert. The same savepoint records exact cleanup debt for every planned path that remains
+unreferenced. An abandoned plan is resolved only after proven I/O quiescence through
+`AbandonObjectWrite`; its cleanup debt makes a later publication of the same attempt impossible.
+The Writer's FIFO ordering is the proof: a publication is either already enqueued before the
+abandonment or can never be enqueued afterwards, so cleanup cannot race a visible row.
+
 Protocol 3 P1 rewrites object writes as a dual-write: the plan also names the exact
-`<final>.meta` sidecar and its staging alias, the blob layer fsyncs and renames data and sidecar
-under the same directory barrier, and the existing Writer publication still commits the row before
+`<final>.meta` sidecar and its staging alias, the blob layer overlaps the sidecar fsync with the data commit,
+then renames data and sidecar under the same directory barrier, and the existing Writer publication still commits the row before
 the client is acknowledged. SQLite therefore remains the read and ACK authority throughout P1; the
 sidecar is durable evidence, not a read source. The deterministic sidecar names are derived from
 the attempt instead of adding `storage_intent_paths` roles, so schema v39 and all four metadata

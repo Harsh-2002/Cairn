@@ -3671,6 +3671,53 @@ async fn legacy_object_without_a_sidecar_still_serves() {
 
 #[cfg(feature = "failpoints")]
 #[tokio::test]
+async fn sidecar_failure_before_the_data_commit_leaves_no_final_name() {
+    let _scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("sidecar-abort-bucket").unwrap();
+    let key = ObjectKey::parse("abort").unwrap();
+    let version = VersionId::null();
+    let seed = metadata_seed(&bucket, &key, &version, &"4".repeat(32));
+    fail::cfg("blob_after_sidecar_stage", "return").unwrap();
+    let result = store
+        .stage_fixture(
+            &bucket,
+            body(b"never committed".to_vec()),
+            StageOptions {
+                metadata_seed: Some(seed),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await;
+    fail::remove("blob_after_sidecar_stage");
+    assert!(result.is_err(), "the injected failure must prevent an ACK");
+    let bucket_dir = dir.path().join(bucket.as_str());
+    assert!(
+        !bucket_dir.exists() || std::fs::read_dir(&bucket_dir).unwrap().next().is_none(),
+        "neither the data nor the sidecar may reach a final name"
+    );
+    let staging: Vec<_> = std::fs::read_dir(dir.path().join(".staging"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        staging.iter().any(|name| name.ends_with(".meta.tmp")),
+        "the sidecar staging alias is durable evidence for recovery"
+    );
+    assert!(
+        staging
+            .iter()
+            .any(|name| name.ends_with(".tmp") && !name.ends_with(".meta.tmp")),
+        "the data staging alias is retained for recovery"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
 async fn crash_after_data_rename_before_metadata_rename_is_reclaimed_by_scan() {
     let _scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();

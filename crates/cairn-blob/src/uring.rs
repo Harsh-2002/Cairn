@@ -244,7 +244,10 @@ impl UringStaging {
     }
 
     /// Rename an already-fsynced staging file and wind the writer task down.
-    pub(crate) async fn rename_retained(mut self, destination: AnchoredPath) -> Result<(), BlobError> {
+    pub(crate) async fn rename_retained(
+        mut self,
+        destination: AnchoredPath,
+    ) -> Result<(), BlobError> {
         let _operation = self.owner.child().map_err(io_err)?;
         let (reply, result) = oneshot::channel();
         self.cmd_tx

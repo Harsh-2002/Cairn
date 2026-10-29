@@ -133,13 +133,22 @@ async fn resolve_storage(
         .await
         .unwrap();
     }
-    let outcome = meta
-        .submit(Mutation::Storage {
+    // Ordinary object plans have no intent: their abandonment is reference-checked directly.
+    let outcome = if matches!(record.plan.target, StorageWriteTarget::Object { .. }) {
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(record.plan.clone()),
+            quiescence: proof,
+        })
+        .await
+        .unwrap()
+    } else {
+        meta.submit(Mutation::Storage {
             bucket: record.plan.bucket.clone(),
             operation: StorageMutation::Resolve { quiescence: proof },
         })
         .await
-        .unwrap();
+        .unwrap()
+    };
     loop {
         let MutationOutcome::StorageCleanupBatch(batch) = meta
             .submit(Mutation::ClaimStorageCleanup {
@@ -382,9 +391,9 @@ async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMeta
 /// Admission can hit a full metadata filesystem before staging ever observes blob ENOSPC.
 /// Preserve the storage-capacity response and leave the body/files untouched until a later retry.
 #[tokio::test]
-async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
+async fn publication_out_of_space_is_507_after_durable_stage_and_leaks_no_object() {
     let (h, meta) = in_memory_harness().await;
-    let bucket = "full-admission";
+    let bucket = "full-publication";
     assert_eq!(
         send(
             &h.svc,
@@ -395,33 +404,27 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
         StatusCode::OK
     );
     meta.reject_next_storage_admission_out_of_space();
-    let staging_entries = || {
-        let mut names = std::fs::read_dir(h._dir.path().join(".staging"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
-    let before = staging_entries();
-    let (request, _) = req(Method::PUT, Some(bucket), Some("object"), &[], &[], vec![]);
-    let polled = Arc::new(AtomicBool::new(false));
-    let observed = polled.clone();
-    let body = Box::pin(futures_util::stream::once(async move {
-        observed.store(true, Ordering::Release);
-        Ok(Bytes::from_static(b"must not stage"))
-    }));
-    let (status, _, response) = drain(h.svc.handle(request, body).await).await;
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some("object"),
+                &[],
+                &[],
+                b"durable but unpublishable".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     assert!(
         String::from_utf8(response)
             .unwrap()
             .contains("InsufficientStorage")
     );
-    assert!(!polled.load(Ordering::Acquire));
-    h.settle_recovery().await;
-    assert!(!h._dir.path().join(bucket).exists());
-    assert_eq!(staging_entries(), before);
     assert!(
         meta.current_version(
             &BucketName::parse(bucket).unwrap(),
@@ -429,7 +432,14 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
         )
         .await
         .unwrap()
-        .is_none()
+        .is_none(),
+        "a refused publication must install no row"
+    );
+    h.settle_recovery().await;
+    assert_eq!(
+        blob_file_count(h._dir.path()),
+        0,
+        "the staged data and sidecar must be reclaimed"
     );
 
     let expected = b"capacity restored".to_vec();
@@ -1896,7 +1906,7 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
 }
 
 #[tokio::test]
-async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
+async fn sampled_put_timing_marks_failed_publication_after_stage() {
     let (h, meta) = in_memory_harness().await;
     let (status, _, _) = drain(
         send(
@@ -1907,6 +1917,7 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    h.svc.drain_put_timings();
     meta.reject_next_storage_admission_out_of_space();
     let (status, _, _) = drain(
         send(
@@ -1925,7 +1936,6 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     .await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     let samples = h.svc.drain_put_timings();
-    assert_eq!(samples.len(), 3);
     assert!(
         samples
             .iter()
@@ -1934,17 +1944,24 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     assert!(
         samples
             .iter()
-            .any(|sample| sample.stage == PutStage::StorageAdmission && !sample.completed)
+            .any(|sample| sample.stage == PutStage::StorageAdmission && sample.completed),
+        "planning is in-memory and completes before the body"
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::BlobStage && sample.completed),
+        "the body was durably staged before the publication failed"
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::Publication && !sample.completed)
     );
     assert!(
         samples
             .iter()
             .any(|sample| sample.stage == PutStage::Total && !sample.completed)
-    );
-    assert!(
-        !samples
-            .iter()
-            .any(|sample| sample.stage == PutStage::BlobStage)
     );
 }
 
@@ -8158,9 +8175,11 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
             .await
             .is_ok()
     );
+    // An ordinary object plan has no intent to be consumed twice: abandonment is
+    // reference-checked and applies, while the live row keeps the final path.
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
 
     // A later null-version overwrite replaces the row. Delayed recovery now proves only the old
@@ -8193,7 +8212,7 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     );
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
     let (status, _, body) = drain(
         send(

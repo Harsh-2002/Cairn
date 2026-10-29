@@ -503,8 +503,8 @@ impl InMemoryMetadataStore {
             .store(true, Ordering::Release);
     }
 
-    /// Reject the next ordinary physical-write admission before applying its transaction, as a
-    /// full metadata filesystem can do before the blob body is read.
+    /// Reject the next ordinary physical-write admission or publication before applying its
+    /// transaction, as a full metadata filesystem can do.
     pub fn reject_next_storage_admission_out_of_space(&self) {
         self.reject_next_storage_admission_out_of_space
             .store(true, Ordering::Release);
@@ -896,7 +896,7 @@ impl MetadataStore for InMemoryMetadataStore {
             Mutation::Storage {
                 operation: crate::storage::StorageMutation::Reserve { .. },
                 ..
-            }
+            } | Mutation::PublishObjectWrite { .. }
         ) && self
             .reject_next_storage_admission_out_of_space
             .swap(false, Ordering::AcqRel)
