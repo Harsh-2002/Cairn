@@ -92,6 +92,12 @@ async fn assert_full_scan_protects_journal(
         stage_unpublished(meta, &blob, &bucket, &generation, node.clone()).await;
     let proof = watch.quiescent().await;
     let paths: Vec<_> = plan.paths.iter().map(|path| path.path.clone()).collect();
+    // The oracle answers data ownership: a protocol-3 sidecar alias is live exactly when its data
+    // alias is, and the reconciler maps it back before querying.
+    let owned: Vec<_> = paths
+        .iter()
+        .map(cairn_types::storage::storage_alias_owner)
+        .collect();
     // Model a crash in scratch's create/unlink window. Its name was already admitted.
     let spool = plan.paths.last().unwrap().path.clone();
     std::fs::write(root.join(spool.as_str()), b"unfinished index").unwrap();
@@ -104,8 +110,8 @@ async fn assert_full_scan_protects_journal(
     std::fs::write(&legacy_tmp, b"legacy staging orphan").unwrap();
 
     assert_eq!(
-        oracle.live_blobs(&paths).await.unwrap(),
-        vec![true; paths.len()]
+        oracle.live_blobs(&owned).await.unwrap(),
+        vec![true; owned.len()]
     );
     let options = ReconcileOpts {
         batch_size: 1,
@@ -149,7 +155,9 @@ async fn assert_full_scan_protects_journal(
     else {
         panic!("expected exact cleanup claims");
     };
-    assert_eq!(cleanups.len(), 3);
+    // Every one of the five planned names is unreferenced: data staging alias, sidecar staging
+    // alias, final data, final sidecar and the index spool.
+    assert_eq!(cleanups.len(), 5);
     assert_eq!(
         oracle.live_blobs(&paths).await.unwrap(),
         vec![true; paths.len()]

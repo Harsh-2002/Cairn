@@ -120,10 +120,10 @@ fn metadata_name(name: &str) -> bool {
         .is_some_and(|id| lower_hex(id, 32))
 }
 
-/// The path the metadata oracle must answer for. A sidecar is live exactly when its data file is.
+/// The path the metadata oracle must answer for. A sidecar alias is live exactly when its data
+/// alias is, for both the final `.meta` name and the staged `.meta.tmp` name.
 fn ownership_path(prefix: &str, name: &str) -> StoragePath {
-    let path = StoragePath::from_string(format!("{prefix}/{name}"));
-    cairn_types::storage::object_data_path_for_metadata(&path).unwrap_or(path)
+    cairn_types::storage::storage_alias_owner(&StoragePath::from_string(format!("{prefix}/{name}")))
 }
 
 /// Exclusive full scan. Every directory iterator, namespace operation and abandoned job retains

@@ -92,6 +92,24 @@ pub fn object_data_path_for_metadata(metadata: &StoragePath) -> Option<StoragePa
     Some(StoragePath::from_string(format!("{directory}/{id}")))
 }
 
+/// The path whose liveness owns `path`. A protocol-3 sidecar alias — the final `<data>.meta` or a
+/// staging `<attempt>.meta.tmp` — is live exactly when its data alias is; every other name owns
+/// itself. Reconciliation and recovery ask the metadata oracle about this owner.
+#[must_use]
+pub fn storage_alias_owner(path: &StoragePath) -> StoragePath {
+    if let Some(data) = object_data_path_for_metadata(path) {
+        return data;
+    }
+    if let Some((directory, name)) = path.as_str().rsplit_once('/')
+        && directory == ".staging"
+        && let Some(attempt) = name.strip_suffix(".meta.tmp")
+        && uuid_name(attempt)
+    {
+        return StoragePath::from_string(format!(".staging/{attempt}.tmp"));
+    }
+    path.clone()
+}
+
 fn object_name(value: &str) -> bool {
     uuid_name(value) || value.strip_suffix(".meta").is_some_and(uuid_name)
 }
@@ -799,6 +817,25 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn alias_liveness_resolves_to_the_data_owner() {
+        let bucket = BucketName::parse("bucket").unwrap();
+        let data = StoragePath::generate(&bucket);
+        let final_sidecar = object_metadata_path(&data).unwrap();
+        assert_eq!(storage_alias_owner(&final_sidecar), data);
+
+        let attempt = StorageToken::generate();
+        let staged = StoragePath::from_string(format!(".staging/{}.meta.tmp", attempt.as_str()));
+        assert_eq!(
+            storage_alias_owner(&staged),
+            StoragePath::from_string(format!(".staging/{}.tmp", attempt.as_str()))
+        );
+        // A data path and unrelated names own themselves.
+        assert_eq!(storage_alias_owner(&data), data);
+        let other = StoragePath::from_string("bucket/unrelated".to_owned());
+        assert_eq!(storage_alias_owner(&other), other);
     }
 
     #[test]
