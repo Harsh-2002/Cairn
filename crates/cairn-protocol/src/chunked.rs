@@ -514,7 +514,7 @@ mod tests {
         let mut prev = seed.clone();
         let mut body = Vec::new();
         for p in payloads {
-            let hash = hex::encode(Sha256::digest(p));
+            let hash = hex::encode(aws_lc_rs::digest::digest(&SHA256, p).as_ref());
             let sts = cairn_auth::chunk_string_to_sign(&amzdate, &scope, &prev, &hash);
             let sig = cairn_auth::compute_signature(&key, &sts);
             body.extend_from_slice(format!("{:x};chunk-signature={}\r\n", p.len(), sig).as_bytes());

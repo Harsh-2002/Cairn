@@ -2834,9 +2834,11 @@ mod tests {
             )
             .await
             .unwrap();
-            // The object plan owns five exact physical names (staging tmp, sidecar tmp, final data,
-            // final sidecar, index spool); the locked data file is the one that cannot retire.
-            assert_eq!((batch.claimed, batch.retired), (5, 4));
+            // A plaintext object is one inline file, so its plan owns three exact journal names
+            // (staging alias, final data, index spool) rather than the five of the two-file layout
+            // (staging tmp, sidecar tmp, final data, final sidecar, index spool). The locked data
+            // file is the one that cannot retire.
+            assert_eq!((batch.claimed, batch.retired), (3, 2));
             assert_eq!(cleanup_counts(&cfg), (1, 1));
             assert!(path.exists());
             drop(file);
@@ -2864,7 +2866,8 @@ mod tests {
             let (_dir, cfg, stack) = fixture().await;
             let path = publish_and_delete(&stack, &cfg.data_dir).await;
             let before = cleanup_counts(&cfg);
-            assert_eq!(before, (5, 0));
+            // Three journal names for an inline plaintext object: staging alias, final data, spool.
+            assert_eq!(before, (3, 0));
             let (stop, rx) = watch::channel(false);
             stop.send(true).unwrap();
             sweeper_loop(stack, Duration::from_secs(3_600), 86_400, rx).await;

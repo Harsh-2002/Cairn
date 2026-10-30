@@ -296,7 +296,7 @@ async fn publish_rebuilt(
         precondition: Precondition::default(),
         initial_state: InitialObjectState {
             tags: record.tags.clone(),
-            lock_intent: record.lock_intent.clone(),
+            lock_intent: record.lock_intent,
         },
         replication: Vec::new(),
     };
@@ -328,7 +328,7 @@ fn rebuilt_operation(record: &ObjectMetadataRecord) -> Mutation {
         precondition: Precondition::default(),
         initial_state: InitialObjectState {
             tags: record.tags.clone(),
-            lock_intent: record.lock_intent.clone(),
+            lock_intent: record.lock_intent,
         },
         replication: Vec::new(),
     }

@@ -30,7 +30,9 @@ struct FoldItem {
 struct Barrier(tokio::sync::oneshot::Sender<Result<(), MetaError>>);
 
 enum QueueItem {
-    Write(FoldItem),
+    // Boxed: a FoldItem carries a full publication mutation (256+ bytes), and the queue is a
+    // single-producer channel whose entries are almost always this variant.
+    Write(Box<FoldItem>),
     Barrier(Barrier),
 }
 
@@ -125,12 +127,12 @@ impl Overlay {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert((bucket.clone(), key.clone()), Arc::clone(&row));
-        let item = QueueItem::Write(FoldItem {
+        let item = QueueItem::Write(Box::new(FoldItem {
             bucket: bucket.clone(),
             key: key.clone(),
             row_id: row.id.clone(),
             mutation,
-        });
+        }));
         if self.tx.send(item).await.is_err() {
             // The fold task is gone; the write stays in the overlay and the startup rebuild
             // repairs the index. Never fail an already-durable acknowledgement for this.
@@ -227,7 +229,7 @@ async fn fold_loop(
                 settle(&meta, &overlay, &mut inflight, item, attempts, result).await;
             }
             maybe = rx.recv() => match maybe {
-                Some(QueueItem::Write(item)) => inflight.push(submit(&meta, item, 0)),
+                Some(QueueItem::Write(item)) => inflight.push(submit(&meta, *item, 0)),
                 Some(QueueItem::Barrier(barrier)) => barriers.push_back(barrier),
                 None => closed = true,
             },
