@@ -185,9 +185,16 @@ impl Overlay {
 ///
 /// This loop keeps a bounded window of submissions in flight at all times. Completions are harvested
 /// as they arrive, so one slow row never delays the rows behind it, and the Writer always has queued
-/// work to coalesce into its next commit. Submission order is still FIFO — one task, one channel —
-/// so the index observes versions in acknowledgement order. A barrier stops admission, waits for the
-/// window to empty, and only then reports, so nothing queued after it can fold before it completes.
+/// work to coalesce into its next commit.
+///
+/// Submission order is still strict FIFO, which the index depends on for same-key overwrites:
+/// `FuturesUnordered`'s ready queue is a FIFO MPSC queue, so a freshly pushed future is polled (and
+/// therefore sends its mutation) before every later one, and the Writer's bounded channel hands out
+/// permits through a FIFO-fair semaphore, so even a send that parks under backpressure cannot be
+/// overtaken. One task plus one channel is what makes that hold.
+///
+/// A barrier stops admission, waits for the window to empty, and only then reports, so nothing
+/// queued after it can fold before it completes.
 async fn fold_loop(
     meta: Arc<dyn MetadataStore>,
     overlay: std::sync::Weak<Overlay>,
