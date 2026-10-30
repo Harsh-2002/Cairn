@@ -440,7 +440,10 @@ struct StagedWrite {
 /// transform is identical on both paths.
 /// If `file` ends with the inline metadata trailer, return the declared payload length. The
 /// payload itself is an ordinary byte range at offset 0; the trailer only carries the record.
-fn inline_payload_len(file: &mut std::fs::File, file_len: u64) -> std::io::Result<Option<u64>> {
+pub(crate) fn inline_payload_len(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> std::io::Result<Option<u64>> {
     use std::io::{Read, Seek, SeekFrom};
     const FIXED: u64 = 16;
     if file_len < FIXED {

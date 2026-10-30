@@ -602,12 +602,24 @@ fn verify_authority(root: &File, authority: StorageAuthority) -> Result<bool, Bl
         validate_directory_link(Some((parent, OsStr::new(name))), &directory)?;
         parents.push(directory);
     }
-    let (mut file, actual) = validate_file(
+    let (mut file, on_disk) = validate_file(
         parents.last().unwrap_or(root),
         OsStr::new(components.last().expect("validated storage path")),
         None,
         true,
     )?;
+    // A plaintext object is one inline file — payload followed by its metadata record — so the
+    // authoritative physical length is the payload, not the file length. The trailer probe
+    // validates the framing and returns the declared payload length; a file that merely ends in
+    // the magic without a consistent length is still a mismatch below.
+    let mut actual = on_disk;
+    if let Some(expected) = size
+        && expected != actual
+        && let Some(payload) = crate::inline_payload_len(&mut file, on_disk).map_err(io_err)?
+        && payload == expected
+    {
+        actual = payload;
+    }
     if size.is_some_and(|expected| expected != actual) {
         return Err(invalid(format!(
             "physical length mismatch for {}",
@@ -1152,6 +1164,91 @@ mod tests {
             );
             assert!(meta.storage_baseline_states().await.unwrap()[0].legacy_accounting_hold);
         }
+    }
+
+    #[tokio::test]
+    async fn inline_plaintext_object_verifies_by_its_declared_payload_length() {
+        let root = tempfile::tempdir().unwrap();
+        let blob = local(root.path()).await;
+        let meta = InMemoryMetadataStore::new();
+        let fixture = meta.begin_fixture().await.unwrap();
+        let bucket = bucket(&meta).await;
+        let id = StorageToken::generate().as_str().to_owned();
+        let path = StoragePath::from_string(format!("{bucket}/{id}"));
+        let payload = vec![b'p'; 4096];
+        let record = br#"{"format_version":1}"#;
+        let inline_bytes = |declared: u64| {
+            let mut bytes = payload.clone();
+            bytes.extend_from_slice(record);
+            bytes.extend_from_slice(&(record.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&declared.to_le_bytes());
+            bytes.extend_from_slice(&cairn_types::storage::INLINE_TRAILER_MAGIC);
+            bytes
+        };
+        let file = root.path().join(path.as_str());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, inline_bytes(payload.len() as u64)).unwrap();
+        let row = ObjectVersionRow {
+            id,
+            bucket: bucket.clone(),
+            key: ObjectKey::parse("inline").unwrap(),
+            version_id: VersionId::generate(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: payload.len() as u64,
+            size_physical: payload.len() as u64,
+            etag: ETag::from_string("etag".into()),
+            content_type: "application/octet-stream".into(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_path: Some(path.clone()),
+            compression: CompressionDescriptor::Uncompressed,
+            storage_class: cairn_types::StorageClass::Standard,
+            cold_locator: None,
+            owner_id: UserId("owner".into()),
+            user_metadata: vec![],
+            acl: None,
+            checksums: vec![],
+            sse_descriptor: None,
+            replication_status: None,
+            internal_sha256: None,
+            replicated_at: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        };
+        meta.submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Default::default(),
+                initial_state: Default::default(),
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let opts = begin(&meta, 1).await;
+        let report = blob
+            .classify_storage_baseline(&meta, &opts, fixture_storage_io())
+            .await
+            .unwrap();
+        drain(&meta, &blob, &opts).await;
+        let proof = blob
+            .verify_storage_baseline(&meta, &opts, &report, fixture_storage_io())
+            .await
+            .unwrap();
+        assert_eq!(proof.authoritative_files(), 1);
+        // A trailer whose declared length disagrees with the row is still a mismatch.
+        std::fs::write(&file, inline_bytes(payload.len() as u64 + 1)).unwrap();
+        assert!(
+            blob.verify_storage_baseline(&meta, &opts, &report, fixture_storage_io())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
