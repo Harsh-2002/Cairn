@@ -196,3 +196,45 @@ Consequences for P2:
 P2 is therefore **suspended**, not rejected: it stays the right design only if a non-performance
 requirement (file-level metadata authority, restore without SQLite) justifies it. Protocol 3 remains
 unshipped.
+
+## Measured revision — 2026-10-30
+
+The file-level authority requirement did justify it after all, and P2 shipped as a four-step stack
+(file-free admission → relaxed index commits with startup rebuild → single-file plaintext objects →
+asynchronous fold). Three findings changed the picture the suspension note was based on.
+
+1. **The fold, not the publication, was the ceiling.** The fold submitted one 64-row batch and waited
+   for every ack before assembling the next, so the single Writer thread idled between batches. A
+   bounded in-flight window (1024) that submits continuously and harvests completions as they arrive
+   moved 4 KiB from 3.5k to 5.0k obj/s with no other change.
+2. **The inline trailer was never size-specific.** Limiting it to 128 KiB made larger plaintext
+   objects pay for a second file, fsync, rename and directory entry for no reason: the trailer is
+   appended after the streamed body and the payload stays a byte range at offset 0. Every plaintext
+   object is now one file.
+3. **Streaming uploads hashed every chunk twice.** warp and the AWS SDKs send `aws-chunked` framing,
+   so the decoder verified each chunk's signature with pure-Rust `sha2` while the blob layer hashed
+   the whole body again on `aws-lc`. On a 1 MiB PUT the `sha2` pass alone was **45% of all server
+   CPU**; both chunk hashers now use `aws-lc`, which selects SHA-NI/AVX at runtime.
+
+Scoreboard (fr38, strict durability, interleaved same-session pairs, 23 s arms, warp c32 for 4 KiB
+and c16 for 1 MiB):
+
+| Workload | `main` | branch | RustFS | vs RustFS |
+|---|---:|---:|---:|---:|
+| PUT 4 KiB, host defaults | 1,700 obj/s | **5,062–5,153** | 4,335–5,564 | **1.10x** |
+| PUT 4 KiB, 8 pinned cores | — | **4,202** | 1,764 | **2.38x** |
+| PUT 1 MiB, host defaults | 366–417 obj/s | 418–480 | 423–637 | ~0.95x (noisy) |
+| PUT 1 MiB, 8 pinned cores | — | **466** | 358 | **1.30x** |
+| GET 1 MiB | — | — | — | **2.13x** (merged) |
+| LIST 1,000 keys | — | — | — | **3.76x** (merged) |
+
+CPU per object at 1 MiB is now at parity with RustFS (≈40M cycles), where it was 1.7x before the
+chunk-hash fix. On an unpinned host the 1 MiB ratio is dominated by other tenants (the host swings
+±25%); on a fixed core budget, which is the realistic deployment shape, the branch leads both
+workloads.
+
+Durability is unchanged: the ACK still follows the data-file fsync, the rename and the destination
+directory barrier. What moved is only the SQLite index row, which the startup rebuild restores from
+the durable object files, and the metadata that used to live in a second file now rides in the same
+one.
+

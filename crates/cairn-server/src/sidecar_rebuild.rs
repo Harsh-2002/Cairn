@@ -69,9 +69,9 @@ pub(crate) async fn rebuild_missing_object_rows(
                 }
                 continue;
             }
-            // Small plaintext objects carry their record as a trailer in the data file and have no
-            // `.meta` companion. A legacy two-file object always has one, so absence plus the magic
-            // is the discriminator.
+            // A plaintext object carries its record as a trailer in the data file and has no
+            // `.meta` companion, whatever its size. Compressed/encrypted objects always have one,
+            // so absence plus the magic is the discriminator.
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
