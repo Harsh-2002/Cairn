@@ -3794,13 +3794,18 @@ async fn crash_after_data_rename_before_metadata_rename_is_reclaimed_by_scan() {
     let bucket = BucketName::parse("crash-bucket").unwrap();
     let key = ObjectKey::parse("crash").unwrap();
     let version = VersionId::null();
-    let seed = metadata_seed(&bucket, &key, &version, &"1".repeat(32));
+    let mut seed = metadata_seed(&bucket, &key, &version, &"1".repeat(32));
+    // A plaintext object is one inline file and has no metadata rename to interrupt; encryption
+    // keeps the separate sidecar so this window (data durable, metadata still staged) exists.
+    seed.sse_descriptor =
+        Some(r#"{"alg":"AES256","wrapped_dek_b64":"sealed","nonce_b64":"nonce"}"#.to_owned());
     fail::cfg("blob_after_data_rename", "return").unwrap();
     let result = store
         .stage_fixture(
             &bucket,
             body(b"durable data".to_vec()),
             StageOptions {
+                encryption: Some(SecretKey32::new([0x41; 32])),
                 metadata_seed: Some(seed),
                 ..opts(None, "text/plain")
             },

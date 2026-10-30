@@ -511,7 +511,11 @@ def main():
             assert manifest["complete"] is True
             source_db = snapshot / "metadata.sqlite3"
             same_database_rows(database, source_db)
-            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox", "storage_write_intents", "storage_intent_paths", "storage_cleanups"):
+            # `storage_cleanups` is intentionally absent: a successful publication no longer
+            # enqueues debt for its consumed staging aliases, so an idle store's journal is empty.
+            # Its backup/restore behaviour is still asserted below (the restored journal drains to
+            # empty) and its crash behaviour is covered by the durability harness.
+            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox", "storage_write_intents", "storage_intent_paths"):
                 assert rows(source_db, table), f"vacuous coverage: {table}"
             assert all(row["lock_mode"] == "COMPLIANCE" and row["legal_hold"] == 1
                        and row["retain_until"] > int(time.time() * 1000)

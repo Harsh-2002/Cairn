@@ -57,6 +57,26 @@ def data_blobs(bucket):
     """Committed object *data* files. Protocol-3 `<uuid>.meta` sidecars are the durability
     authority's companion record, and `.tmp` aliases are staging, so neither is an object blob."""
     return [p for p in bucket_files(bucket) if not os.path.basename(p).endswith((".meta", ".tmp"))]
+def inline_trailer(path):
+    """Decode a plaintext object's inline metadata trailer, or None if the file has none."""
+    try:
+        blob = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(blob) < 16 or blob[-4:] != b"CRNI":
+        return None
+    meta_len = int.from_bytes(blob[-16:-12], "little")
+    payload_len = int.from_bytes(blob[-12:-4], "little")
+    total = meta_len + 16
+    if total > len(blob) or payload_len + total != len(blob):
+        return None
+    try:
+        record = json.loads(blob[len(blob) - total:-16])
+    except ValueError:
+        return None
+    record["_suffix_len"] = total
+    return record
+
 def orphan_blob_bytes(bucket):
     """The durable orphan blob left under $DATA/data/<bucket>/ by a crash after the blob became
     durable but before the metadata commit (opaque id, never named by key). Fresh data dir per seam,
@@ -209,18 +229,30 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
         if surviving:
             data_path = max(surviving, key=os.path.getsize)
             sidecar = data_path + ".meta"
-            if check(f"[{tag}] the durable orphan data blob has its protocol-3 sidecar",
-                     os.path.isfile(sidecar)):
+            record = None
+            if os.path.isfile(sidecar):
                 record = json.loads(Path(sidecar).read_text())
+                check(f"[{tag}] the durable orphan data blob has its protocol-3 sidecar", True)
+                check(f"[{tag}] the sidecar carries no plaintext object bytes",
+                      marker not in Path(sidecar).read_bytes())
+            else:
+                # A plaintext object is one inline file: the record rides in a trailer after the
+                # payload, so the same pairing invariant is checked in the data file itself.
+                trailer = inline_trailer(data_path)
+                if check(f"[{tag}] the durable orphan data blob carries its inline metadata trailer",
+                         trailer is not None):
+                    record = trailer
+                    check(f"[{tag}] the trailer carries no plaintext object bytes",
+                          marker not in Path(data_path).read_bytes()
+                          [len(Path(data_path).read_bytes()) - trailer["_suffix_len"]:])
+            if record is not None:
                 relative = os.path.relpath(data_path, os.path.join(ROOT, "data"))
-                check(f"[{tag}] the sidecar names its exact data path and object identity",
+                check(f"[{tag}] the record names its exact data path and object identity",
                       record.get("format_version") == 1 and record.get("bucket") == BUCKET
                       and record.get("key") == key and record.get("storage_path") == relative,
                       f"record={record}")
-                check(f"[{tag}] the sidecar carries no plaintext object bytes",
-                      marker not in Path(sidecar).read_bytes())
         else:
-            note(f"[{tag}] exact-path recovery retired the data+sidecar pair before pairing inspection")
+            note(f"[{tag}] exact-path recovery retired the data+metadata pair before pairing inspection")
     database = Path(ROOT) / "data" / "cairn.db"
     before_recovery = database_rows(database)
     exit_code, reclaimed, report = integrity()
