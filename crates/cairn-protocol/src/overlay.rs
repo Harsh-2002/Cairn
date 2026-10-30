@@ -67,33 +67,7 @@ impl Overlay {
         });
         let fold = Arc::downgrade(&overlay);
         tokio::spawn(async move {
-            while let Some(first) = rx.recv().await {
-                let mut items: Vec<FoldItem> = Vec::with_capacity(64);
-                let mut barriers: Vec<Barrier> = Vec::new();
-                match first {
-                    QueueItem::Barrier(barrier) => {
-                        let _ = barrier.0.send(Ok(()));
-                        continue;
-                    }
-                    QueueItem::Write(item) => items.push(item),
-                }
-                // Fill one batch from the queue. A barrier ends the batch: it may only complete
-                // after every write enqueued before it has folded.
-                while items.len() < 64 {
-                    match rx.try_recv() {
-                        Ok(QueueItem::Write(item)) => items.push(item),
-                        Ok(QueueItem::Barrier(barrier)) => {
-                            barriers.push(barrier);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                fold_batch(&*meta, &fold, items).await;
-                for barrier in barriers {
-                    let _ = barrier.0.send(Ok(()));
-                }
-            }
+            fold_loop(meta, fold, rx).await;
         });
         overlay
     }
@@ -200,83 +174,125 @@ impl Overlay {
     }
 }
 
-/// Fold a batch of acknowledged writes. The futures are polled in queue order, so they enter the
-/// Writer's channel in that order and the Writer applies them in the same order while amortising
-/// one commit across the whole batch.
-async fn fold_batch(
-    meta: &dyn MetadataStore,
-    overlay: &std::sync::Weak<Overlay>,
-    items: Vec<FoldItem>,
+/// Drive the index fold as a continuous pipeline.
+///
+/// The previous shape assembled a batch of up to 64 items, submitted them together, and waited for
+/// every ack before reading the next batch. That left the Writer idle between batches: it applied a
+/// batch, the fold task woke, rebuilt the batch, and only then did new work arrive. Under a steady
+/// write load the Writer therefore never stayed saturated.
+///
+/// This loop keeps a bounded window of submissions in flight at all times. Completions are harvested
+/// as they arrive, so one slow row never delays the rows behind it, and the Writer always has queued
+/// work to coalesce into its next commit. Submission order is still FIFO — one task, one channel —
+/// so the index observes versions in acknowledgement order. A barrier stops admission, waits for the
+/// window to empty, and only then reports, so nothing queued after it can fold before it completes.
+async fn fold_loop(
+    meta: Arc<dyn MetadataStore>,
+    overlay: std::sync::Weak<Overlay>,
+    mut rx: tokio::sync::mpsc::Receiver<QueueItem>,
 ) {
-    use futures_util::future::join_all;
-    let mut retry: Vec<FoldItem> = Vec::new();
-    let futures = items.iter().map(|item| meta.submit(item.mutation.clone()));
-    let results = join_all(futures).await;
-    for (item, result) in items.into_iter().zip(results) {
-        match result {
-            Ok(MutationOutcome::Put { .. }) => {
-                if let Some(overlay) = overlay.upgrade() {
-                    overlay.forget(&item.bucket, &item.key, &item.row_id);
-                }
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesUnordered;
+
+    let mut inflight: FuturesUnordered<Fold> = FuturesUnordered::new();
+    let mut barriers: std::collections::VecDeque<Barrier> = std::collections::VecDeque::new();
+    let mut closed = false;
+    loop {
+        if let Some(barrier) = barriers.pop_front() {
+            while let Some((item, attempts, result)) = inflight.next().await {
+                settle(&meta, &overlay, &mut inflight, item, attempts, result).await;
             }
-            Ok(MutationOutcome::StoragePublicationNotApplied) => {
-                // A vanished bucket can never apply; a conflicting path is retried a few times.
-                match meta.get_bucket(&item.bucket).await {
-                    Ok(None) => {
-                        if let Some(overlay) = overlay.upgrade() {
-                            overlay.forget(&item.bucket, &item.key, &item.row_id);
-                        }
-                    }
-                    _ => retry.push(item),
-                }
-            }
-            Ok(_) => {
-                if let Some(overlay) = overlay.upgrade() {
-                    overlay.forget(&item.bucket, &item.key, &item.row_id);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    bucket = item.bucket.as_str(),
-                    key = item.key.as_str(),
-                    %error,
-                    "object index fold failed; retrying"
-                );
-                retry.push(item);
-            }
+            let _ = barrier.0.send(Ok(()));
+            continue;
         }
-    }
-    // Bounded retry of the failed tail; a persistent failure keeps its overlay entry for reads and
-    // is repaired by the startup rebuild.
-    for attempt in 1..=20u32 {
-        if retry.is_empty() {
+        if closed {
+            if let Some((item, attempts, result)) = inflight.next().await {
+                settle(&meta, &overlay, &mut inflight, item, attempts, result).await;
+                continue;
+            }
             return;
         }
-        tokio::time::sleep(Duration::from_millis(u64::from(attempt.min(10)) * 2)).await;
-        let mut next = Vec::new();
-        for item in retry.drain(..) {
-            match meta.submit(item.mutation.clone()).await {
-                Ok(MutationOutcome::Put { .. })
-                | Ok(MutationOutcome::StoragePublicationNotApplied) => {
-                    if let Some(overlay) = overlay.upgrade() {
-                        overlay.forget(&item.bucket, &item.key, &item.row_id);
-                    }
-                }
-                Ok(_) => {
-                    if let Some(overlay) = overlay.upgrade() {
-                        overlay.forget(&item.bucket, &item.key, &item.row_id);
-                    }
-                }
-                Err(_) => next.push(item),
-            }
+        if inflight.len() >= MAX_IN_FLIGHT {
+            let (item, attempts, result) = inflight
+                .next()
+                .await
+                .expect("in-flight window is not empty");
+            settle(&meta, &overlay, &mut inflight, item, attempts, result).await;
+            continue;
         }
-        retry = next;
+        tokio::select! {
+            biased;
+            // Harvest first: a completed fold frees a slot and keeps the window moving.
+            Some((item, attempts, result)) = inflight.next(), if !inflight.is_empty() => {
+                settle(&meta, &overlay, &mut inflight, item, attempts, result).await;
+            }
+            maybe = rx.recv() => match maybe {
+                Some(QueueItem::Write(item)) => inflight.push(submit(&meta, item, 0)),
+                Some(QueueItem::Barrier(barrier)) => barriers.push_back(barrier),
+                None => closed = true,
+            },
+        }
     }
-    for item in retry {
-        tracing::error!(
-            bucket = item.bucket.as_str(),
-            key = item.key.as_str(),
-            "object index fold failed after retries; retaining the overlay entry"
-        );
+}
+
+/// Rows submitted but not yet acknowledged. Large enough to keep the Writer's own 256-row batch
+/// full several times over, small enough to bound memory while the fold stalls.
+const MAX_IN_FLIGHT: usize = 1024;
+/// A row that keeps failing is retried a few times without blocking its neighbours, then left in
+/// the overlay for reads and repaired by the startup rebuild.
+const MAX_ATTEMPTS: u32 = 4;
+
+type Fold = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (FoldItem, u32, Result<MutationOutcome, MetaError>)>
+            + Send,
+    >,
+>;
+
+fn submit(meta: &Arc<dyn MetadataStore>, item: FoldItem, attempts: u32) -> Fold {
+    let meta = Arc::clone(meta);
+    let mutation = item.mutation.clone();
+    Box::pin(async move { (item, attempts, meta.submit(mutation).await) })
+}
+
+/// Apply one fold outcome: forget the overlay row on success, or requeue a bounded retry.
+async fn settle(
+    meta: &Arc<dyn MetadataStore>,
+    overlay: &std::sync::Weak<Overlay>,
+    inflight: &mut futures_util::stream::FuturesUnordered<Fold>,
+    item: FoldItem,
+    attempts: u32,
+    result: Result<MutationOutcome, MetaError>,
+) {
+    let forget = match result {
+        Ok(MutationOutcome::StoragePublicationNotApplied) => {
+            // A vanished bucket can never apply; a conflicting path is retried instead.
+            matches!(meta.get_bucket(&item.bucket).await, Ok(None))
+        }
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                bucket = item.bucket.as_str(),
+                key = item.key.as_str(),
+                %error,
+                "object index fold failed; retrying"
+            );
+            false
+        }
+    };
+    if forget {
+        if let Some(overlay) = overlay.upgrade() {
+            overlay.forget(&item.bucket, &item.key, &item.row_id);
+        }
+        return;
     }
+    if attempts + 1 < MAX_ATTEMPTS {
+        inflight.push(submit(meta, item, attempts + 1));
+        return;
+    }
+    tracing::error!(
+        bucket = item.bucket.as_str(),
+        key = item.key.as_str(),
+        "object index fold failed after retries; retaining the overlay entry"
+    );
 }
