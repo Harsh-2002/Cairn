@@ -3483,6 +3483,9 @@ impl S3Service {
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // A multi-object delete must see an acknowledged write that is still waiting to fold,
+        // otherwise it reports success for a key whose row has not reached the index yet.
+        self.drain_overlay().await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
         // S3 caps a multi-object delete at 1000 keys per request (ARCH 21.5); reject a larger
@@ -3938,6 +3941,9 @@ impl S3Service {
 
     async fn list_object_versions(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // Pending acknowledged writes live only in the overlay until the index fold lands; a
+        // version listing must reflect an acknowledged PUT before it consults the index.
+        self.drain_overlay().await?;
         let prefix = req.query("prefix").map(str::to_owned);
         // Empty delimiter == no grouping (S3 semantics); normalize to None. See `list_objects`.
         let delimiter = req
