@@ -3489,7 +3489,7 @@ fn metadata_seed(
 }
 
 #[tokio::test]
-async fn object_sidecar_is_written_beside_the_data_and_matches_its_identity() {
+async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
         .await
@@ -3509,9 +3509,19 @@ async fn object_sidecar_is_written_beside_the_data_and_matches_its_identity() {
         )
         .await
         .unwrap();
+    // A plaintext object is one file: the record rides in a trailer after the payload, so no
+    // separate metadata file exists.
     let metadata = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
-    let bytes = std::fs::read(dir.path().join(metadata.as_str())).unwrap();
-    let record = cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap();
+    assert!(
+        !dir.path().join(metadata.as_str()).exists(),
+        "plaintext objects must not write a sidecar"
+    );
+    let bytes = std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap();
+    let (record, payload_len) =
+        cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&bytes)
+            .unwrap()
+            .expect("plaintext object ends with the inline trailer");
+    assert_eq!(payload_len, staged.size_logical);
     assert_eq!(
         record.format_version,
         cairn_types::storage::OBJECT_METADATA_FORMAT_VERSION
@@ -3541,6 +3551,63 @@ async fn object_sidecar_is_written_beside_the_data_and_matches_its_identity() {
         .await,
         b"sidecar bytes"
     );
+}
+
+#[tokio::test]
+async fn large_plaintext_object_is_one_inline_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("large-inline").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let version = VersionId::null();
+    let payload: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    let staged = store
+        .stage_fixture(
+            &bucket,
+            body(payload.clone()),
+            StageOptions {
+                metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"d".repeat(32))),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    // Size does not select the representation: a plaintext object is always payload plus trailer,
+    // so it never pays for a second file, a second fsync, or a second directory entry.
+    let metadata = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    assert!(!dir.path().join(metadata.as_str()).exists());
+    let bytes = std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap();
+    let (record, payload_len) =
+        cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&bytes)
+            .unwrap()
+            .expect("large plaintext object ends with the inline trailer");
+    assert_eq!(payload_len, 256 * 1024);
+    assert_eq!(record.size_logical, 256 * 1024);
+    assert_eq!(
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical
+        )
+        .await,
+        payload
+    );
+    let ranged = read_all(
+        &store,
+        &staged.storage_path,
+        Some(ByteRange {
+            offset: 1000,
+            length: 4096,
+        }),
+        &staged.compression,
+        staged.size_logical,
+    )
+    .await;
+    assert_eq!(ranged, payload[1000..5096]);
 }
 
 #[tokio::test]
@@ -3785,11 +3852,14 @@ async fn reconcile_keeps_a_live_sidecar_with_its_data_and_reclaims_an_orphan_pai
     let bucket = BucketName::parse("paired-bucket").unwrap();
     let key = ObjectKey::parse("object").unwrap();
     let version = VersionId::null();
+    // Encryption keeps the separate sidecar (its container trailer must stay last), so this pair
+    // exercises the data+metadata two-file layout that reconcile must pair and reclaim.
     let keep = store
         .stage_fixture(
             &bucket,
             body(b"keep".to_vec()),
             StageOptions {
+                encryption: Some(SecretKey32::new([0x11; 32])),
                 metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"2".repeat(32))),
                 ..opts(None, "text/plain")
             },
@@ -3801,6 +3871,7 @@ async fn reconcile_keeps_a_live_sidecar_with_its_data_and_reclaims_an_orphan_pai
             &bucket,
             body(b"orphan".to_vec()),
             StageOptions {
+                encryption: Some(SecretKey32::new([0x22; 32])),
                 metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"3".repeat(32))),
                 ..opts(None, "text/plain")
             },

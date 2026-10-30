@@ -1268,12 +1268,15 @@ impl BlobStore for LocalBlobStore {
         let sidecar = match &opts.metadata_seed {
             Some(seed) => {
                 let record = ObjectMetadataRecord::from_staged(seed, &staged);
-                // Small plaintext objects carry the record as a trailer in the data file: one
-                // create, one fsync, one rename, one directory entry. Compressed/encrypted
-                // objects keep the separate sidecar (their container trailer must stay last).
+                // A plaintext object carries the record as a trailer in its data file: one create,
+                // one fsync, one rename, one directory entry, and the reader recovers the payload
+                // length from the same trailer. Compressed/encrypted objects keep the separate
+                // sidecar (their container trailer must stay last). This is size-independent: the
+                // trailer is appended after the streamed body and the payload stays a byte range at
+                // offset 0, so a 1 MiB or 5 GiB object pays for no second file either.
                 let plaintext = matches!(staged.compression, CompressionDescriptor::Uncompressed)
                     && opts.encryption.is_none();
-                if plaintext && staged.size_logical <= cairn_types::storage::INLINE_MAX_BYTES {
+                if plaintext {
                     let trailer = match record.encode_inline_trailer(staged.size_physical) {
                         Ok(trailer) => trailer,
                         Err(error) => {

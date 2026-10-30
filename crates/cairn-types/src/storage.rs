@@ -619,9 +619,6 @@ pub struct ObjectMetadataSeed {
     pub lock_intent: ExplicitObjectLockIntent,
 }
 
-/// Largest logical object stored as one inline file (payload + metadata trailer).
-pub const INLINE_MAX_BYTES: u64 = 128 * 1024;
-
 /// Trailer magic: `payload || metadata JSON || u32 meta_len || u64 payload_len || magic`.
 pub const INLINE_TRAILER_MAGIC: [u8; 4] = *b"CRNI";
 

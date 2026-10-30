@@ -56,7 +56,7 @@ impl Overlay {
     /// Start the fold task and return the shared overlay.
     #[must_use]
     pub fn start(meta: Arc<dyn MetadataStore>, capacity: usize) -> Arc<Self> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueueItem>(capacity.max(1));
+        let (tx, rx) = tokio::sync::mpsc::channel::<QueueItem>(capacity.max(1));
         let overlay = Arc::new(Self {
             latest: RwLock::new(HashMap::new()),
             tx,
