@@ -10,6 +10,9 @@ description = "The S3 protocol layer for Cairn: request lifecycles, the chunked 
 workspace = true
 
 [dependencies]
+# The aws-chunked decoder hashes every chunk to verify its signature. This is the per-byte hot
+# path of a streaming upload; aws-lc-rs selects SHA-NI/AVX at runtime.
+aws-lc-rs.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 cairn-types.workspace = true
 cairn-auth.workspace = true

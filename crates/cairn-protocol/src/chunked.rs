@@ -9,9 +9,9 @@
 //! Chunk framing: `<hex-size>[;chunk-signature=<hex>]\r\n<payload>\r\n` repeated, ended by a
 //! zero-size chunk and an optional trailer section terminated by a blank line.
 
+use aws_lc_rs::digest::{Context as Sha256, SHA256};
 use bytes::Bytes;
 use cairn_types::SecretKey32;
-use sha2::{Digest, Sha256};
 
 /// Maximum length of a single chunk header line (defense against a non-terminating header).
 const MAX_HEADER_LINE: usize = 16 * 1024;
@@ -120,7 +120,7 @@ impl ChunkDecoder {
             max_payload,
             verifier,
             chunk_signature: None,
-            chunk_hash: Sha256::new(),
+            chunk_hash: Sha256::new(&SHA256),
             trailer: Vec::new(),
         }
     }
@@ -244,14 +244,15 @@ impl ChunkDecoder {
             self.chunk_signature = Some(sig.ok_or(DecodeError::BadHeader)?);
         }
         self.remaining = size;
-        self.chunk_hash = Sha256::new();
+        self.chunk_hash = Sha256::new(&SHA256);
         self.header.clear();
         Ok(())
     }
 
     fn finish_chunk(&mut self) -> Result<(), DecodeError> {
         if let Some(v) = &mut self.verifier {
-            let hash_hex = hex::encode(std::mem::take(&mut self.chunk_hash).finalize());
+            let finished = std::mem::replace(&mut self.chunk_hash, Sha256::new(&SHA256)).finish();
+            let hash_hex = hex::encode(finished.as_ref());
             let sts = cairn_auth::chunk_string_to_sign(
                 &v.amzdate,
                 &v.scope,

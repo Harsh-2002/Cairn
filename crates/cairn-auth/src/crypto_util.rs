@@ -1,12 +1,17 @@
 //! Hashing, HMAC, AWS URI-encoding, and timestamp helpers shared by the SigV4 code.
 
+use aws_lc_rs::digest::{SHA256, digest};
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 /// SHA-256 of `data`, lowercase hex.
+///
+/// `aws-lc-rs` selects SHA-NI/AVX at runtime. This runs over every chunk of a streaming upload (the
+/// chunk signature binds the chunk hash), so the backend matters: the pure-Rust path processed a
+/// 1 MiB body at a fraction of the hardware rate and dominated CPU on large PUTs.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
+    hex::encode(digest(&SHA256, data).as_ref())
 }
 
 /// HMAC-SHA256(key, data) raw bytes.
