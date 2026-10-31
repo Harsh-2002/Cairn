@@ -147,10 +147,41 @@ def recovered_database_rows(before, after):
 def recovered_artifacts_absent(root, state):
     live = {row["storage_path"] for table in ("object_versions", "multipart_parts")
             for row in state[table] if row.get("storage_path")}
+    retired = set()
     for table in ("storage_intent_paths", "storage_cleanups"):
         for row in state[table]:
             if row["storage_path"] not in live:
-                assert not os.path.lexists(root / row["storage_path"]), "retired physical artifact remains"
+                retired.add(row["storage_path"])
+                sidecar = metadata_sidecar(row["storage_path"])
+                if sidecar is not None:
+                    # A retired data path owns its sidecar: leaving `<data>.meta` behind is the
+                    # half-retired state this fidelity check exists to catch.
+                    retired.add(sidecar)
+    for path in retired:
+        assert not os.path.lexists(root / path), "retired physical artifact remains"
+
+
+def metadata_sidecar(path):
+    """The protocol-3 `<data>.meta` sibling of an opaque object file, or None for other shapes."""
+    head, _, name = path.rpartition("/")
+    if len(name) == 32 and all(char in "0123456789abcdef" for char in name):
+        return f"{head}/{name}.meta" if head else f"{name}.meta"
+    return None
+
+
+def data_files(directory):
+    """Committed object data files; metadata sidecars and staging aliases are not data."""
+    return [path for path in sorted(directory.iterdir())
+            if path.is_file() and not path.name.endswith((".meta", ".tmp"))]
+
+
+def assert_object_files(directory, count):
+    """Exact authoritative object set: `count` data files, each with exactly one sidecar."""
+    names = sorted(path.name for path in directory.iterdir() if path.is_file())
+    data = [name for name in names if not name.endswith(".meta")]
+    sidecars = [name for name in names if name.endswith(".meta")]
+    assert len(data) == count, (data, sidecars)
+    assert sidecars == sorted(f"{name}.meta" for name in data), (data, sidecars)
 
 
 def digest(path):
@@ -168,6 +199,16 @@ def same_live_files(snapshot_blobs, restored, state):
             path = row.get("storage_path")
             if path:
                 assert digest(snapshot_blobs / path) == digest(restored / path), "live file changed during restore"
+                sidecar = metadata_sidecar(path)
+                if sidecar is not None:
+                    # The sidecar is the object's durability authority; a restore that preserves
+                    # the data file but loses (or invents) its sidecar has silently changed the
+                    # object's protocol authority. Multipart-completed objects have no sidecar.
+                    assert (snapshot_blobs / sidecar).exists() == (restored / sidecar).exists(), \
+                        "restore changed metadata sidecar presence"
+                    if (snapshot_blobs / sidecar).exists():
+                        assert digest(snapshot_blobs / sidecar) == digest(restored / sidecar), \
+                            "live metadata sidecar changed during restore"
 
 
 def wait_for(probe, label, timeout=20):
@@ -454,7 +495,7 @@ def main():
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 pending = executor.submit(request, "POST", f"/recovery/incomplete?{query}", completion)
                 wait_for(lambda: next(row for row in rows(database, "multipart_uploads") if row["id"] == upload_id)["status"] == "completing", "multipart claim")
-                wait_for(lambda: len(list((primary / "recovery").iterdir())) == 3, "durable assembled orphan")
+                wait_for(lambda: len(data_files(primary / "recovery")) == 3, "durable assembled orphan")
             stop(crash=True)
             interrupted_part.close()
             if executor:
@@ -470,7 +511,11 @@ def main():
             assert manifest["complete"] is True
             source_db = snapshot / "metadata.sqlite3"
             same_database_rows(database, source_db)
-            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox", "storage_write_intents", "storage_intent_paths", "storage_cleanups"):
+            # `storage_cleanups` is intentionally absent: a successful publication no longer
+            # enqueues debt for its consumed staging aliases, so an idle store's journal is empty.
+            # Its backup/restore behaviour is still asserted below (the restored journal drains to
+            # empty) and its crash behaviour is covered by the durability harness.
+            for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox", "storage_write_intents", "storage_intent_paths"):
                 assert rows(source_db, table), f"vacuous coverage: {table}"
             assert all(row["lock_mode"] == "COMPLIANCE" and row["legal_hold"] == 1
                        and row["retain_until"] > int(time.time() * 1000)
@@ -528,7 +573,9 @@ def main():
             assert digest(source_db) == original_database_hash, "restore preparation changed the source image"
             assert (snapshot / "manifest.json").read_bytes() == original_manifest, "restore changed the source manifest"
             # An assembled file without committed metadata is not authoritative snapshot data.
-            assert len(list((restored / "recovery").iterdir())) == 2
+            # The two live versions restore with their exact sidecars; the orphan and every
+            # staging alias are absent.
+            assert_object_files(restored / "recovery", 2)
             start(restored)
             fresh_storage_generation(restored_state["storage_recovery_state"],
                                      rows(restored / "cairn.db", "storage_recovery_state"))

@@ -20,7 +20,7 @@ exclusive recovery reclaimed it, with no intent/debt or visible object remaining
 
 Requires a binary built with --features failpoints. Config via env: BIN, DATA, PORT.
 """
-import datetime, hashlib, hmac, http.client, os, signal, subprocess, sys, time, urllib.parse
+import datetime, hashlib, hmac, http.client, json, os, signal, subprocess, sys, time, urllib.parse
 from pathlib import Path
 
 from recovery_state import database_rows, recovered_artifacts_absent, recovered_database_rows
@@ -48,13 +48,40 @@ def trailer_encrypted(blob):
         and blob[-34:-30] == b"CRNB"
         and blob[-30] == VERSION_ENCRYPTED_CURRENT
     )
+def bucket_files(bucket):
+    """Every regular file directly under the bucket directory (data, sidecars, staging aliases)."""
+    d = os.path.join(ROOT, "data", bucket)
+    if not os.path.isdir(d): return []
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if os.path.isfile(os.path.join(d, f)))
+def data_blobs(bucket):
+    """Committed object *data* files. Protocol-3 `<uuid>.meta` sidecars are the durability
+    authority's companion record, and `.tmp` aliases are staging, so neither is an object blob."""
+    return [p for p in bucket_files(bucket) if not os.path.basename(p).endswith((".meta", ".tmp"))]
+def inline_trailer(path):
+    """Decode a plaintext object's inline metadata trailer, or None if the file has none."""
+    try:
+        blob = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(blob) < 16 or blob[-4:] != b"CRNI":
+        return None
+    meta_len = int.from_bytes(blob[-16:-12], "little")
+    payload_len = int.from_bytes(blob[-12:-4], "little")
+    total = meta_len + 16
+    if total > len(blob) or payload_len + total != len(blob):
+        return None
+    try:
+        record = json.loads(blob[len(blob) - total:-16])
+    except ValueError:
+        return None
+    record["_suffix_len"] = total
+    return record
+
 def orphan_blob_bytes(bucket):
     """The durable orphan blob left under $DATA/data/<bucket>/ by a crash after the blob became
     durable but before the metadata commit (opaque id, never named by key). Fresh data dir per seam,
-    so the doomed write's blob is the largest file there."""
-    d = os.path.join(ROOT, "data", bucket)
-    if not os.path.isdir(d): return None
-    files = [os.path.join(d, f) for f in os.listdir(d) if os.path.isfile(os.path.join(d, f))]
+    so the doomed write's blob is the largest *data* file there — never its small JSON sidecar."""
+    files = data_blobs(bucket)
     if not files: return None
     with open(max(files, key=os.path.getsize), "rb") as fh:
         return fh.read()
@@ -194,6 +221,38 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
               marker not in ob)
     elif encrypt:
         note(f"[{tag}] exact-path recovery removed the encrypted blob before it could be inspected")
+    # Protocol-3 sidecar pairing: an ordinary PUT commits data and metadata under one directory
+    # barrier, so a surviving data orphan must have its sidecar (and vice versa). Multipart
+    # assembly is unchanged in P1 and owns no sidecar, so only the plain-PUT seam asserts it.
+    if seam == "blob_after_durable":
+        surviving = data_blobs(BUCKET)
+        if surviving:
+            data_path = max(surviving, key=os.path.getsize)
+            sidecar = data_path + ".meta"
+            record = None
+            if os.path.isfile(sidecar):
+                record = json.loads(Path(sidecar).read_text())
+                check(f"[{tag}] the durable orphan data blob has its protocol-3 sidecar", True)
+                check(f"[{tag}] the sidecar carries no plaintext object bytes",
+                      marker not in Path(sidecar).read_bytes())
+            else:
+                # A plaintext object is one inline file: the record rides in a trailer after the
+                # payload, so the same pairing invariant is checked in the data file itself.
+                trailer = inline_trailer(data_path)
+                if check(f"[{tag}] the durable orphan data blob carries its inline metadata trailer",
+                         trailer is not None):
+                    record = trailer
+                    check(f"[{tag}] the trailer carries no plaintext object bytes",
+                          marker not in Path(data_path).read_bytes()
+                          [len(Path(data_path).read_bytes()) - trailer["_suffix_len"]:])
+            if record is not None:
+                relative = os.path.relpath(data_path, os.path.join(ROOT, "data"))
+                check(f"[{tag}] the record names its exact data path and object identity",
+                      record.get("format_version") == 1 and record.get("bucket") == BUCKET
+                      and record.get("key") == key and record.get("storage_path") == relative,
+                      f"record={record}")
+        else:
+            note(f"[{tag}] exact-path recovery retired the data+metadata pair before pairing inspection")
     database = Path(ROOT) / "data" / "cairn.db"
     before_recovery = database_rows(database)
     exit_code, reclaimed, report = integrity()
@@ -208,6 +267,9 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
     check(f"[{tag}] fresh recovery preserved authoritative rows and retired all exact debt", True)
     check(f"[{tag}] no unreferenced final blob remains after recovery",
           orphan_blob_bytes(BUCKET) is None)
+    leftovers = bucket_files(BUCKET)
+    check(f"[{tag}] recovery retired every data blob and its sidecar together",
+          not leftovers, f"left behind {[os.path.basename(path) for path in leftovers]}")
     if serve(tag=f"{tag}_check"):
         st, _, _ = s3("GET", f"/{BUCKET}/{key}", headers={"x-amz-content-sha256": _sha(b"")}, ak=ak, sk=sk)
         check(f"[{tag}] the half-committed object is ABSENT after reconcile (no torn object)", st == 404, f"GET status={st}")

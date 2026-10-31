@@ -74,7 +74,7 @@ async fn stage_blob(
     let (plan, permit) = fixture.admit_object(meta, planned, now).await.unwrap();
     let staged = blobs
         .stage(
-            permit,
+            permit.into(),
             body(data),
             StageOptions {
                 compression: None,
@@ -83,6 +83,7 @@ async fn stage_blob(
                 content_type: "text/plain".to_owned(),
                 encryption,
                 content_length: None,
+                metadata_seed: None,
             },
         )
         .await

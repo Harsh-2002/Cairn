@@ -73,6 +73,47 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 )),
             }
         }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            activity,
+            relaxed,
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !crate::storage::object_publication_allowed(driver, &plan).await? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = match *operation {
+                Mutation::PutObjectVersion {
+                    row,
+                    precondition,
+                    initial_state,
+                    replication,
+                } => {
+                    put_version(
+                        driver,
+                        *row,
+                        &precondition,
+                        initial_state,
+                        replication,
+                        !relaxed,
+                    )
+                    .await?
+                }
+                other => apply_inner(driver, other).await?,
+            };
+            if matches!(&outcome, MutationOutcome::Put { .. }) {
+                crate::storage::resolve_paths(driver, &plan, index_spool).await?;
+                if let Some(entry) = activity {
+                    insert_activity_best_effort(driver, &entry).await?;
+                }
+            }
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            crate::storage::abandon_object(driver, &plan, &quiescence).await
+        }
         Mutation::PublishStorageWrite {
             plan,
             operation,
@@ -99,13 +140,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 // failure, so it must fail the publication instead of acknowledging an object from
                 // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
                 if let Some(entry) = activity {
-                    match insert_activity(driver, &entry).await {
-                        Ok(()) => {}
-                        Err(cairn_types::MetaError::Conflict) => {
-                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    insert_activity_best_effort(driver, &entry).await?;
                 }
             }
             Ok(outcome)
@@ -114,6 +149,20 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             cairn_types::storage::validate_unadmitted_mutation(&other)?;
             apply_inner(driver, other).await
         }
+    }
+}
+
+async fn insert_activity_best_effort(
+    driver: &dyn AsyncSqlDriver,
+    entry: &cairn_types::meta::ActivityEntry,
+) -> R<()> {
+    match insert_activity(driver, entry).await {
+        Ok(()) => Ok(()),
+        Err(cairn_types::MetaError::Conflict) => {
+            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -170,7 +219,10 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
             completed_at,
         } => crate::baseline::complete(driver, &token, completed_at).await,
 
-        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+        Mutation::AdmitStorageWrite { .. }
+        | Mutation::PublishStorageWrite { .. }
+        | Mutation::PublishObjectWrite { .. }
+        | Mutation::AbandonObjectWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => {
@@ -204,7 +256,17 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
             precondition,
             initial_state,
             replication,
-        } => put_version(driver, *row, &precondition, initial_state, replication).await,
+        } => {
+            put_version(
+                driver,
+                *row,
+                &precondition,
+                initial_state,
+                replication,
+                true,
+            )
+            .await
+        }
         Mutation::ResolveObjectWrite {
             bucket,
             key,
@@ -2167,24 +2229,29 @@ async fn put_version(
     precondition: &Precondition,
     initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
+    strict: bool,
 ) -> R<MutationOutcome> {
     check_precondition(driver, &row.bucket, &row.key, precondition).await?;
-    enforce_bucket_quota(driver, &row).await?;
-    enforce_user_quota(driver, &row).await?;
-    if replacement_is_protected(
-        driver,
-        &row.bucket,
-        &row.key,
-        &row.version_id,
-        row.created_at,
-        GovernanceBypass::Denied,
-    )
-    .await?
-    {
-        return Err(MetaError::ObjectProtected);
+    if strict {
+        enforce_bucket_quota(driver, &row).await?;
+        enforce_user_quota(driver, &row).await?;
+        if replacement_is_protected(
+            driver,
+            &row.bucket,
+            &row.key,
+            &row.version_id,
+            row.created_at,
+            GovernanceBypass::Denied,
+        )
+        .await?
+        {
+            return Err(MetaError::ObjectProtected);
+        }
     }
     let (initial_tags, lock_state) = if row.is_delete_marker {
         (Vec::new(), ObjectLockState::default())
+    } else if !strict {
+        (initial_state.tags, ObjectLockState::default())
     } else {
         let lock_state = resolve_initial_object_lock(
             driver,
@@ -2385,7 +2452,7 @@ async fn upsert_version(
     let result = upsert_version_inner(driver, row).await?;
     update_visibility(driver, &bucket, &key, before).await?;
     if let Some(path) = &result {
-        crate::storage::enqueue(driver, &bucket, path, None).await?;
+        crate::storage::enqueue_object(driver, &bucket, path).await?;
     }
     Ok(result)
 }
@@ -2632,7 +2699,7 @@ async fn delete_version_inner(
     }
     let freed = existing.get_opt_text(0).map(StoragePath::from_string);
     if let Some(path) = &freed {
-        crate::storage::enqueue(driver, bucket, path, None).await?;
+        crate::storage::enqueue_object(driver, bucket, path).await?;
     }
     let was_latest = existing.get_i64(1) != 0;
     let removed = (

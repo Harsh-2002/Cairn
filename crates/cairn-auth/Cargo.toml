@@ -19,6 +19,10 @@ cairn-types.workspace = true
 cairn-authz.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+# SHA-256 of request payloads (the per-chunk streaming signatures) runs on aws-lc-rs: it selects
+# SHA-NI/AVX at runtime, while the pure-Rust backend processes a 1 MiB body at well under 100 MB/s
+# and was 45% of all server CPU on a streaming-upload benchmark.
+aws-lc-rs.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 hmac.workspace = true

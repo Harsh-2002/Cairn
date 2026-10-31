@@ -172,6 +172,51 @@ impl Staging {
         }
     }
 
+    /// fsync the staged bytes without closing the handle, so a caller can run this concurrently
+    /// with another file's commit and rename this one afterwards.
+    pub(crate) async fn fsync_retained(mut self) -> Result<Self, BlobError> {
+        match &mut self {
+            Self::Tokio {
+                writer,
+                release_len,
+                ..
+            } => {
+                writer.flush().await.map_err(io_err)?;
+                let release_len = *release_len;
+                writer
+                    .get_ref()
+                    .owner
+                    .run(move |file| sync_staged(file, release_len))
+                    .await
+                    .map_err(io_err)?;
+                Ok(self)
+            }
+            #[cfg(feature = "io-uring")]
+            Self::Uring(writer) => {
+                writer.sync_retained().await?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Rename a retained, already-fsynced staging file into its final destination.
+    pub(crate) async fn rename_retained(self, destination: &AnchoredPath) -> Result<(), BlobError> {
+        match self {
+            Self::Tokio {
+                writer, staging, ..
+            } => {
+                let owner = writer.into_inner().into_owner().map_err(io_err)?;
+                let destination = destination.clone();
+                owner
+                    .run(move |_file| staging.rename_to(&destination))
+                    .await
+                    .map_err(io_err)
+            }
+            #[cfg(feature = "io-uring")]
+            Self::Uring(writer) => writer.rename_retained(destination.clone()).await,
+        }
+    }
+
     /// Stop producing bytes. Abandoned blocking work still owns its lease, and all provisional
     /// names remain owned by the durable intent until the retained consumer proves quiescence.
     pub(crate) async fn abort(self) {

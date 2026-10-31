@@ -9,8 +9,10 @@ pub mod error_map;
 mod httpdate;
 pub mod keyprovider;
 mod object_ttl;
+mod overlay;
 mod put_timing;
 pub mod request;
+pub use overlay::Overlay;
 pub mod service;
 mod storage_write;
 

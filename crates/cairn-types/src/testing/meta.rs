@@ -349,7 +349,7 @@ impl State {
         );
         let superseded = self.versions.get(&vk).and_then(|r| r.storage_path.clone());
         if let Some(path) = &superseded {
-            storage::enqueue(self, &row.bucket, path)?;
+            storage::enqueue_object(self, &row.bucket, path)?;
         }
         // A replica carries the source's (uuidv7-ordered) version id, which may be older than a
         // version already here; it is latest only if its id is the max for the key (mirrors the SQL
@@ -503,8 +503,8 @@ impl InMemoryMetadataStore {
             .store(true, Ordering::Release);
     }
 
-    /// Reject the next ordinary physical-write admission before applying its transaction, as a
-    /// full metadata filesystem can do before the blob body is read.
+    /// Reject the next ordinary physical-write admission or publication before applying its
+    /// transaction, as a full metadata filesystem can do.
     pub fn reject_next_storage_admission_out_of_space(&self) {
         self.reject_next_storage_admission_out_of_space
             .store(true, Ordering::Release);
@@ -896,7 +896,7 @@ impl MetadataStore for InMemoryMetadataStore {
             Mutation::Storage {
                 operation: crate::storage::StorageMutation::Reserve { .. },
                 ..
-            }
+            } | Mutation::PublishObjectWrite { .. }
         ) && self
             .reject_next_storage_admission_out_of_space
             .swap(false, Ordering::AcqRel)
@@ -2217,6 +2217,34 @@ impl State {
                     )),
                 }
             }
+            Mutation::PublishObjectWrite {
+                plan,
+                operation,
+                index_spool,
+                activity,
+                // The double keeps full checks: its tests do not exercise the relaxed fold.
+                relaxed: _,
+            } => {
+                plan.validate_object_publication(&operation)?;
+                if !storage::object_publication_allowed(st, &plan)? {
+                    return Ok(MutationOutcome::StoragePublicationNotApplied);
+                }
+                let outcome = Self::apply_inner(st, *operation)?;
+                if matches!(&outcome, MutationOutcome::Put { .. }) {
+                    let mut journal = st.storage.clone();
+                    storage::resolve_paths(st, &mut journal, &plan, index_spool)?;
+                    st.storage = journal;
+                    if let Some(entry) = activity
+                        && !st.activity.iter().any(|existing| existing.id == entry.id)
+                    {
+                        st.activity.push(*entry);
+                    }
+                }
+                Ok(outcome)
+            }
+            Mutation::AbandonObjectWrite { plan, quiescence } => {
+                storage::abandon_object(st, &plan, &quiescence)
+            }
             Mutation::PublishStorageWrite {
                 plan,
                 operation,
@@ -2288,7 +2316,10 @@ impl State {
                 completed_at,
             } => storage::baseline_complete(st, token, completed_at),
 
-            Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+            Mutation::AdmitStorageWrite { .. }
+            | Mutation::PublishStorageWrite { .. }
+            | Mutation::PublishObjectWrite { .. }
+            | Mutation::AbandonObjectWrite { .. } => {
                 Err(MetaError::Engine("nested storage operation".into()))
             }
             Mutation::BeginStorageGeneration { generation } => Ok(storage::begin(st, generation)),
@@ -2500,7 +2531,7 @@ impl State {
                 st.invalid_lock_rows.remove(&vk);
                 let freed = removed.as_ref().and_then(|r| r.storage_path.clone());
                 if let Some(path) = &freed {
-                    storage::enqueue(st, &bucket, path)?;
+                    storage::enqueue_object(st, &bucket, path)?;
                 }
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;

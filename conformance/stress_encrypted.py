@@ -70,9 +70,11 @@ def body_of(size):
 
 
 def committed_blobs(bucket):
-    """Opaque-id blob files committed under $DATA/<bucket>/ (never named by key)."""
+    """Opaque-id object *data* files committed under $DATA/<bucket>/ (never named by key).
+    Protocol-3 `<uuid>.meta` sidecars and staging aliases are not object data."""
     d = os.path.join(DATA_DIR, bucket)
-    return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+    return [os.path.join(d, f) for f in sorted(os.listdir(d))
+            if not f.endswith((".meta", ".tmp"))] if os.path.isdir(d) else []
 
 
 def trailer_encrypted(blob):
@@ -85,8 +87,11 @@ def trailer_encrypted(blob):
 
 def assert_disk_encrypted(bucket, label, sample=8):
     blobs = committed_blobs(bucket)
-    check(f"{label}: committed blobs exist on disk ({len(blobs)})", len(blobs) > 0)
-    bad_trailer, bad_marker = [], []
+    check(f"{label}: committed data blobs exist on disk ({len(blobs)})", len(blobs) > 0)
+    missing = [os.path.basename(path) for path in blobs if not os.path.isfile(path + ".meta")]
+    check(f"{label}: every committed data blob has a metadata sidecar "
+          f"(missing: {missing or 'none'})", not missing)
+    bad_trailer, bad_marker, sidecar_marker = [], [], []
     for path in blobs[:sample]:
         with open(path, "rb") as fh:
             blob = fh.read()
@@ -94,10 +99,17 @@ def assert_disk_encrypted(bucket, label, sample=8):
             bad_trailer.append(os.path.basename(path))
         if MARKER in blob:
             bad_marker.append(os.path.basename(path))
+        sidecar = path + ".meta"
+        if os.path.isfile(sidecar):
+            with open(sidecar, "rb") as fh:
+                if MARKER in fh.read():
+                    sidecar_marker.append(os.path.basename(sidecar))
     check(f"{label}: every sampled blob is a VERSION_ENCRYPTED CRNB container "
           f"(bad: {bad_trailer or 'none'})", not bad_trailer)
     check(f"{label}: the known plaintext marker is ABSENT from every sampled blob "
           f"(leaked: {bad_marker or 'none'})", not bad_marker)
+    check(f"{label}: no metadata sidecar carries plaintext object bytes "
+          f"(leaked: {sidecar_marker or 'none'})", not sidecar_marker)
 
 
 # Sizes straddle the 256 KiB small-object inline-read threshold: an encrypted object is disqualified

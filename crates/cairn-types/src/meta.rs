@@ -136,6 +136,29 @@ pub enum Mutation {
         /// never fails the object; a multi-shard router submits it separately to the global shard.
         activity: Option<Box<ActivityEntry>>,
     },
+    /// Publish a planned ordinary object write that was never journaled through
+    /// `Storage { Reserve }`. Inside one savepoint the Writer re-establishes the current
+    /// generation, the authorized bucket identity (owner and creation time) and exact path
+    /// availability, then applies the inner write. It consumes no intent and records cleanup debt
+    /// only for planned paths that remain unreferenced. Only `PutObjectVersion` is accepted.
+    PublishObjectWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        operation: Box<Mutation>,
+        index_spool: crate::blob::IndexSpoolState,
+        activity: Option<Box<ActivityEntry>>,
+        /// The acknowledged write already proved no byte quota, no Object Lock configuration and
+        /// no precondition, so the fold may skip those checks (a quota or lock configured after
+        /// acknowledgement must never reject or mutate an acknowledged object).
+        relaxed: bool,
+    },
+    /// Abandon a planned ordinary object write after the recovery worker proved actual backend
+    /// quiescence. Object targets only. A still-present intent for the same attempt (an older
+    /// admitted plan) is resolved exactly as `StorageMutation::Resolve` would resolve it;
+    /// otherwise cleanup debt is recorded only for planned paths that no row references.
+    AbandonObjectWrite {
+        plan: Box<crate::storage::StorageWritePlan>,
+        quiescence: crate::storage::io::StorageQuiescence,
+    },
     /// Read a bounded page of prior-generation intents through the Writer. This does not resolve
     /// ownership: exclusive restart must probe each plan's actual backend quiescence first.
     ListStorageIntents {

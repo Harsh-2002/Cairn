@@ -133,13 +133,22 @@ async fn resolve_storage(
         .await
         .unwrap();
     }
-    let outcome = meta
-        .submit(Mutation::Storage {
+    // Ordinary object plans have no intent: their abandonment is reference-checked directly.
+    let outcome = if matches!(record.plan.target, StorageWriteTarget::Object { .. }) {
+        meta.submit(Mutation::AbandonObjectWrite {
+            plan: Box::new(record.plan.clone()),
+            quiescence: proof,
+        })
+        .await
+        .unwrap()
+    } else {
+        meta.submit(Mutation::Storage {
             bucket: record.plan.bucket.clone(),
             operation: StorageMutation::Resolve { quiescence: proof },
         })
         .await
-        .unwrap();
+        .unwrap()
+    };
     loop {
         let MutationOutcome::StorageCleanupBatch(batch) = meta
             .submit(Mutation::ClaimStorageCleanup {
@@ -382,9 +391,9 @@ async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMeta
 /// Admission can hit a full metadata filesystem before staging ever observes blob ENOSPC.
 /// Preserve the storage-capacity response and leave the body/files untouched until a later retry.
 #[tokio::test]
-async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
+async fn publication_out_of_space_is_507_after_durable_stage_and_leaks_no_object() {
     let (h, meta) = in_memory_harness().await;
-    let bucket = "full-admission";
+    let bucket = "full-publication";
     assert_eq!(
         send(
             &h.svc,
@@ -395,33 +404,27 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
         StatusCode::OK
     );
     meta.reject_next_storage_admission_out_of_space();
-    let staging_entries = || {
-        let mut names = std::fs::read_dir(h._dir.path().join(".staging"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
-    let before = staging_entries();
-    let (request, _) = req(Method::PUT, Some(bucket), Some("object"), &[], &[], vec![]);
-    let polled = Arc::new(AtomicBool::new(false));
-    let observed = polled.clone();
-    let body = Box::pin(futures_util::stream::once(async move {
-        observed.store(true, Ordering::Release);
-        Ok(Bytes::from_static(b"must not stage"))
-    }));
-    let (status, _, response) = drain(h.svc.handle(request, body).await).await;
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some("object"),
+                &[],
+                &[],
+                b"durable but unpublishable".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     assert!(
         String::from_utf8(response)
             .unwrap()
             .contains("InsufficientStorage")
     );
-    assert!(!polled.load(Ordering::Acquire));
-    h.settle_recovery().await;
-    assert!(!h._dir.path().join(bucket).exists());
-    assert_eq!(staging_entries(), before);
     assert!(
         meta.current_version(
             &BucketName::parse(bucket).unwrap(),
@@ -429,7 +432,14 @@ async fn storage_admission_out_of_space_is_507_before_body_or_file_creation() {
         )
         .await
         .unwrap()
-        .is_none()
+        .is_none(),
+        "a refused publication must install no row"
+    );
+    h.settle_recovery().await;
+    assert_eq!(
+        blob_file_count(h._dir.path()),
+        0,
+        "the staged data and sidecar must be reclaimed"
     );
 
     let expected = b"capacity restored".to_vec();
@@ -544,7 +554,7 @@ impl BlobStore for AbortAfterStagePartBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: cairn_types::storage::ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -751,7 +761,7 @@ impl BlobStore for AssembleGateBlob {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: cairn_types::storage::ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
@@ -1896,7 +1906,7 @@ async fn sampled_put_timing_covers_one_successful_response_path() {
 }
 
 #[tokio::test]
-async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
+async fn sampled_put_timing_marks_failed_publication_after_stage() {
     let (h, meta) = in_memory_harness().await;
     let (status, _, _) = drain(
         send(
@@ -1907,6 +1917,7 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    h.svc.drain_put_timings();
     meta.reject_next_storage_admission_out_of_space();
     let (status, _, _) = drain(
         send(
@@ -1925,7 +1936,6 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     .await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     let samples = h.svc.drain_put_timings();
-    assert_eq!(samples.len(), 3);
     assert!(
         samples
             .iter()
@@ -1934,17 +1944,24 @@ async fn sampled_put_timing_marks_failed_admission_without_blob_stage() {
     assert!(
         samples
             .iter()
-            .any(|sample| sample.stage == PutStage::StorageAdmission && !sample.completed)
+            .any(|sample| sample.stage == PutStage::StorageAdmission && sample.completed),
+        "planning is in-memory and completes before the body"
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::BlobStage && sample.completed),
+        "the body was durably staged before the publication failed"
+    );
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.stage == PutStage::Publication && !sample.completed)
     );
     assert!(
         samples
             .iter()
             .any(|sample| sample.stage == PutStage::Total && !sample.completed)
-    );
-    assert!(
-        !samples
-            .iter()
-            .any(|sample| sample.stage == PutStage::BlobStage)
     );
 }
 
@@ -8158,9 +8175,11 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
             .await
             .is_ok()
     );
+    // An ordinary object plan has no intent to be consumed twice: abandonment is
+    // reference-checked and applies, while the live row keeps the final path.
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
 
     // A later null-version overwrite replaces the row. Delayed recovery now proves only the old
@@ -8193,7 +8212,7 @@ async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe(
     );
     assert!(matches!(
         resolve_storage(&*h.meta, &*h.blob, &recovery).await,
-        cairn_types::MutationOutcome::StorageUpdated { applied: false }
+        cairn_types::MutationOutcome::StorageUpdated { applied: true }
     ));
     let (status, _, body) = drain(
         send(
@@ -19490,4 +19509,81 @@ async fn expired_ttl_objects_disappear_from_reads_and_listings() {
         !String::from_utf8(body).unwrap().contains("<Version>"),
         "ListObjectVersions must omit expired versions"
     );
+}
+
+#[tokio::test]
+async fn put_writes_a_sidecar_that_matches_the_published_row() {
+    let h = harness().await;
+    let bucket = BucketName::parse("sidecar-identity").unwrap();
+    assert_eq!(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket.as_str()), None, &[], &[], vec![])
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket.as_str()),
+                Some("dir/object"),
+                &[("content-type", "text/plain")],
+                &[],
+                b"sidecar identity".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = h
+        .meta
+        .current_version(&bucket, &ObjectKey::parse("dir/object").unwrap())
+        .await
+        .unwrap()
+        .expect("published row");
+    let data = row.storage_path.clone().expect("physical row");
+    let data_path = h._dir.path().join(data.as_str());
+    let data_bytes = std::fs::read(&data_path).unwrap();
+    // A small plaintext object carries one inline trailer instead of a separate sidecar.
+    let record = match cairn_types::storage::object_metadata_path(&data)
+        .map(|metadata| h._dir.path().join(metadata.as_str()))
+        .filter(|metadata| metadata.exists())
+    {
+        Some(metadata) => {
+            let bytes = std::fs::read(metadata).unwrap();
+            cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap()
+        }
+        None => {
+            let (record, payload_len) =
+                cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&data_bytes)
+                    .unwrap()
+                    .expect("inline trailer");
+            assert_eq!(
+                &data_bytes[..payload_len as usize],
+                b"sidecar identity",
+                "inline payload must be exactly the client body"
+            );
+            record
+        }
+    };
+    assert_eq!(record.bucket, row.bucket);
+    assert_eq!(record.key, row.key);
+    assert_eq!(record.version_id, row.version_id);
+    assert_eq!(record.row_id, row.id);
+    assert_eq!(record.storage_path, data);
+    assert_eq!(record.size_logical, row.size_logical);
+    assert_eq!(record.size_physical, row.size_physical);
+    assert_eq!(record.etag, row.etag);
+    assert_eq!(record.content_type, row.content_type);
+    assert_eq!(record.internal_sha256, row.internal_sha256);
+    assert_eq!(record.checksums, row.checksums);
+    assert_eq!(record.sse_descriptor, row.sse_descriptor);
+    if record.storage_path == data && data_bytes.len() == row.size_physical as usize {
+        assert_eq!(data_bytes, b"sidecar identity");
+    }
 }

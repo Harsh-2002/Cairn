@@ -487,6 +487,8 @@ impl CachedMetadataStore {
             | Mutation::Storage { .. }
             | Mutation::AdmitStorageWrite { .. }
             | Mutation::PublishStorageWrite { .. }
+            | Mutation::PublishObjectWrite { .. }
+            | Mutation::AbandonObjectWrite { .. }
             | Mutation::ListStorageIntents { .. }
             | Mutation::ClaimStorageCleanup { .. }
             | Mutation::ReplicationUpload { .. }

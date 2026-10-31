@@ -669,9 +669,11 @@ def verify_latest_pointer():
 
 
 def committed_blobs(data_dir, bucket):
-    """Opaque-id blob files committed under <data-dir>/<bucket>/ (never named by key)."""
+    """Opaque-id object *data* files committed under <data-dir>/<bucket>/ (never named by key).
+    Protocol-3 `<uuid>.meta` sidecars and staging aliases are not object data."""
     d = os.path.join(data_dir, bucket)
-    return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+    return [os.path.join(d, f) for f in sorted(os.listdir(d))
+            if not f.endswith((".meta", ".tmp"))] if os.path.isdir(d) else []
 
 
 def trailer_encrypted(blob):
@@ -683,8 +685,8 @@ def trailer_encrypted(blob):
 
 
 def scan_blobs(data_dir, bucket, sample):
-    enc = plain_marker = total = 0
-    names_not_enc, names_with_marker = [], []
+    enc = plain_marker = total = sidecar_marker = 0
+    names_not_enc, names_with_marker, sidecars_with_marker = [], [], []
     paths = committed_blobs(data_dir, bucket)
     for path in paths[:sample]:
         try:
@@ -700,9 +702,18 @@ def scan_blobs(data_dir, bucket, sample):
         if MARKER in blob:
             plain_marker += 1
             names_with_marker.append(os.path.basename(path))
+        sidecar = path + ".meta"
+        # Sidecars are JSON authority records, not CRNB object containers, and must never carry
+        # object bytes. Some objects (multipart-completed in P1) legitimately have no sidecar.
+        if os.path.isfile(sidecar):
+            with open(sidecar, "rb") as fh:
+                if MARKER in fh.read():
+                    sidecar_marker += 1
+                    sidecars_with_marker.append(os.path.basename(sidecar))
     return {"files": len(paths), "sampled": total, "encrypted": enc,
             "with_marker": plain_marker, "not_encrypted": names_not_enc[:4],
-            "marker_leaked": names_with_marker[:4]}
+            "marker_leaked": names_with_marker[:4], "sidecar_marker": sidecar_marker,
+            "sidecar_marker_leaked": sidecars_with_marker[:4]}
 
 
 # --- main -----------------------------------------------------------------------------------------
@@ -841,6 +852,13 @@ def main():
          tgt_plain_disk["sampled"] > 0
          and tgt_plain_disk["encrypted"] == tgt_plain_disk["sampled"]
          and tgt_plain_disk["with_marker"] == 0)
+    gate(f"no TARGET metadata sidecar carries plaintext object bytes "
+         f"({tgt_plain_disk['sidecar_marker']} leaked, "
+         f"{tgt_plain_disk['sidecar_marker_leaked'] or 'none'})",
+         tgt_plain_disk["sidecar_marker"] == 0)
+    gate(f"no SOURCE metadata sidecar carries plaintext object bytes "
+         f"({src_plain_disk['sidecar_marker'] + src_sse_disk['sidecar_marker']} leaked)",
+         src_plain_disk["sidecar_marker"] == 0 and src_sse_disk["sidecar_marker"] == 0)
     gate(f"the matching SOURCE blobs are NOT containers and DO carry the plaintext marker — so the "
          f"ciphertext on the target is the TARGET's own doing "
          f"({src_plain_disk['sampled'] - src_plain_disk['encrypted']}/{src_plain_disk['sampled']} "

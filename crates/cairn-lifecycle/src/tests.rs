@@ -6,7 +6,9 @@ use crate::{
     Action, BucketLifecycle, Expiration, Filter, LifecycleRule, LifecycleScanner,
     earliest_expiration, parse_lifecycle,
 };
-use cairn_types::storage::{StorageToken, StorageWriteTarget};
+use cairn_types::storage::{
+    StorageToken, StorageWriteTarget, object_data_path_for_metadata, object_metadata_path,
+};
 use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, TestClock};
 use cairn_types::{
@@ -68,6 +70,41 @@ async fn drain_cleanup(
             ));
         }
     }
+}
+
+/// Count exact object *data* cleanup debt under `prefix`, proving each retired data path carries
+/// its protocol-3 metadata sidecar in the same batch. A "two blobs reclaimed" assertion must not
+/// silently count a sidecar as a second object (or accept a half-retired pair).
+fn object_data_paths<'a>(removed: &'a [StoragePath], prefix: &str) -> Vec<&'a StoragePath> {
+    let mut data = Vec::new();
+    let mut metadata = Vec::new();
+    for path in removed
+        .iter()
+        .filter(|path| path.as_str().starts_with(prefix))
+    {
+        if object_data_path_for_metadata(path).is_some() {
+            metadata.push(path);
+        } else {
+            data.push(path);
+        }
+    }
+    for path in &data {
+        let sidecar = object_metadata_path(path).expect("object data path");
+        assert!(
+            metadata.contains(&&sidecar),
+            "sidecar cleanup debt missing for {}",
+            path.as_str()
+        );
+    }
+    for sidecar in &metadata {
+        let data_path = object_data_path_for_metadata(sidecar).expect("sidecar path");
+        assert!(
+            data.contains(&&data_path),
+            "sidecar cleanup debt lacks its data path: {}",
+            sidecar.as_str()
+        );
+    }
+    data
 }
 
 fn owner() -> UserId {
@@ -160,7 +197,7 @@ async fn put_object_with_ttl(
     let stream = once_body(body.to_vec());
     let staged = blob
         .stage(
-            permit,
+            permit.into(),
             stream,
             cairn_types::StageOptions {
                 compression: None,
@@ -169,6 +206,7 @@ async fn put_object_with_ttl(
                 content_type: "application/octet-stream".to_owned(),
                 encryption: None,
                 content_length: None,
+                metadata_seed: None,
             },
         )
         .await
@@ -794,11 +832,9 @@ async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
     assert_eq!(blob.blob_count(), 4, "expiration queues physical debt");
     let removed = drain_cleanup(&fixture, &meta, &blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("test-bucket/"))
-            .count(),
-        2
+        object_data_paths(&removed, "test-bucket/").len(),
+        2,
+        "two expired versions' data files and their sidecars were retired"
     );
     assert_eq!(blob.blob_count(), 2, "two blobs reclaimed");
 }
@@ -918,11 +954,9 @@ async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
     );
     let removed = drain_cleanup(&fixture, &meta, &blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("test-bucket/"))
-            .count(),
-        expected_expired
+        object_data_paths(&removed, "test-bucket/").len(),
+        expected_expired,
+        "every expired version's data file and sidecar debt was retired"
     );
     assert_eq!(
         blob.blob_count(),
@@ -1897,11 +1931,9 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
     );
     let removed = drain_cleanup(&fixture, &meta, &blob).await;
     assert_eq!(
-        removed
-            .iter()
-            .filter(|path| path.as_str().starts_with("test-bucket/"))
-            .count(),
-        1
+        object_data_paths(&removed, "test-bucket/").len(),
+        1,
+        "the unlocked version's data file and sidecar were retired"
     );
     assert_eq!(blob.blob_count(), 2);
     let protected = meta

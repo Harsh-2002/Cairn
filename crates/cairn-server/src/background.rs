@@ -2690,7 +2690,7 @@ mod tests {
             let staged = stack
                 .blob
                 .stage(
-                    planned.admit(receipt, lease).unwrap(),
+                    planned.admit(receipt, lease).unwrap().into(),
                     Box::pin(futures_util::stream::once(async {
                         Ok(bytes::Bytes::from_static(b"durable"))
                     })),
@@ -2834,6 +2834,10 @@ mod tests {
             )
             .await
             .unwrap();
+            // A plaintext object is one inline file, so its plan owns three exact journal names
+            // (staging alias, final data, index spool) rather than the five of the two-file layout
+            // (staging tmp, sidecar tmp, final data, final sidecar, index spool). The locked data
+            // file is the one that cannot retire.
             assert_eq!((batch.claimed, batch.retired), (3, 2));
             assert_eq!(cleanup_counts(&cfg), (1, 1));
             assert!(path.exists());
@@ -2862,6 +2866,7 @@ mod tests {
             let (_dir, cfg, stack) = fixture().await;
             let path = publish_and_delete(&stack, &cfg.data_dir).await;
             let before = cleanup_counts(&cfg);
+            // Three journal names for an inline plaintext object: staging alias, final data, spool.
             assert_eq!(before, (3, 0));
             let (stop, rx) = watch::channel(false);
             stop.send(true).unwrap();
@@ -3336,6 +3341,7 @@ mod tests {
                         content_type: "application/octet-stream".to_owned(),
                         encryption: dek,
                         content_length: None,
+                        metadata_seed: None,
                     },
                 )
                 .await

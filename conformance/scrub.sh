@@ -106,7 +106,11 @@ ge1() { [ "${1%.*}" -ge 1 ] 2>/dev/null; }
 # object's real blob intact, so the scrub reads it clean and the arm "detects nothing" nondeterministically.
 corrupt_blob() {
   local bucket="$1" blob size
-  blob="$(find "$DATADIR/$bucket" -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-)"
+  # Protocol-3 writes a `<uuid>.meta` sidecar beside every data blob. A compressed data container
+  # can be SMALLER than its JSON sidecar, so "largest regular file" can select the sidecar — which
+  # the scrub never reads, making a genuinely corrupt data blob read as a missed detection. Select
+  # data blobs only; staging aliases (`.tmp`) are never committed object data either.
+  blob="$(find "$DATADIR/$bucket" -type f ! -name '*.meta' ! -name '*.tmp' -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-)"
   [ -n "$blob" ] || fail "could not locate a stored blob under $DATADIR/$bucket"
   size="$(wc -c <"$blob")"
   # Guard the selection: the object blobs these arms create are ~1 KiB+; a tiny file means we picked
@@ -139,11 +143,16 @@ PY
   [ "$before" != "$after" ] || fail \
     "the corrupting write did not change $blob (offset $off of ${size}B) — the scrub is not at fault"
   echo "  corrupted one byte of $blob ($size bytes) at offset $off [md5 ${before:0:8} -> ${after:0:8}]"
-  # More than one blob under the bucket means `find | sort | head` may have hit a superseded orphan
-  # that the scrub correctly never reads. Surface it instead of letting it read as a missed detection.
-  local nblobs
-  nblobs="$(find "$DATADIR/$bucket" -type f | wc -l)"
-  [ "$nblobs" -eq 1 ] || echo "  NOTE: $nblobs blob files under $DATADIR/$bucket — the corrupted one may be an orphan"
+  # More than one data blob under the bucket means `find | sort | head` may have hit a superseded
+  # orphan that the scrub correctly never reads. Surface it instead of letting it read as a missed
+  # detection. When a bucket has protocol-3 sidecars, they must pair exactly with their data blobs;
+  # a multipart-only bucket has none in P1 (assembly is unchanged).
+  local ndata nmeta
+  ndata="$(find "$DATADIR/$bucket" -type f ! -name '*.meta' ! -name '*.tmp' | wc -l)"
+  nmeta="$(find "$DATADIR/$bucket" -type f -name '*.meta' | wc -l)"
+  [ "$nmeta" -eq 0 ] || [ "$nmeta" -eq "$ndata" ] || fail \
+    "$ndata data blob(s) under $DATADIR/$bucket but $nmeta metadata sidecar(s) — a protocol-3 sidecar set must pair exactly"
+  [ "$ndata" -eq 1 ] || echo "  NOTE: $ndata data blob files under $DATADIR/$bucket — the corrupted one may be an orphan"
 }
 
 # Prove the corruption landed on the blob the OBJECT RESOLVES TO, not on an orphaned or superseded

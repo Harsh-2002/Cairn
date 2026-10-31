@@ -54,7 +54,9 @@ use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
 use cairn_types::id::StoragePath;
 use cairn_types::object::{ChecksumSet, CompressionDescriptor, ETag};
-use cairn_types::storage::{StorageCreationPermit, StorageWriteTarget};
+use cairn_types::storage::{
+    ObjectCreationPermit, ObjectMetadataRecord, StorageCreationPermit, StorageWriteTarget,
+};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
@@ -436,6 +438,34 @@ struct StagedWrite {
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
+/// If `file` ends with the inline metadata trailer, return the declared payload length. The
+/// payload itself is an ordinary byte range at offset 0; the trailer only carries the record.
+pub(crate) fn inline_payload_len(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> std::io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FIXED: u64 = 16;
+    if file_len < FIXED {
+        return Ok(None);
+    }
+    if file.metadata()?.len() != file_len {
+        return Ok(None);
+    }
+    let mut fixed = [0u8; 16];
+    file.seek(SeekFrom::Start(file_len - FIXED))?;
+    file.read_exact(&mut fixed)?;
+    if fixed[12..16] != cairn_types::storage::INLINE_TRAILER_MAGIC {
+        return Ok(None);
+    }
+    let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
+    let payload_len = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
+    if file_len != payload_len.saturating_add(meta_len).saturating_add(FIXED) {
+        return Ok(None);
+    }
+    Ok(Some(payload_len))
+}
+
 async fn write_staged(
     file: &mut Staging,
     mut body: cairn_types::BodyStream,
@@ -968,14 +998,27 @@ impl LocalBlobStore {
                 }
                 Err(e) => return Err(io_err(e)),
             };
-            let file_len = f.metadata().map_err(io_err)?.len();
+            let mut file_len = f.metadata().map_err(io_err)?.len();
             // Plaintext framing is an authoritative metadata declaration. Validate its one
             // independent physical invariant instead of sniffing the body: plaintext and
             // logical lengths must match exactly. This catches the ordinary missing-DEK case
             // (an encrypted/uncompressed CRNB file has framing overhead), yet preserves S3's
             // arbitrary-byte contract when a legitimate plaintext object's bytes themselves
             // happen to form a complete CRNB file.
+            let mut inline = false;
             if !is_container && file_len != expected_logical_len {
+                // A small object may carry its metadata as a trailer after the payload. The row's
+                // physical length is the payload length; the trailer is not client data.
+                if let Some(payload_len) = inline_payload_len(&mut f, file_len).map_err(io_err)?
+                    && payload_len == expected_logical_len
+                {
+                    // The trailer probe moved the cursor; every read below starts at the payload.
+                    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0)).map_err(io_err)?;
+                    file_len = payload_len;
+                    inline = true;
+                }
+            }
+            if !is_container && !inline && file_len != expected_logical_len {
                 plaintext_length_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     path = %probe_path.display(),
@@ -1098,6 +1141,25 @@ impl LocalBlobStore {
     }
 }
 
+/// Write the protocol-3 sidecar's temporary alias without syncing it. The caller runs the
+/// sidecar's fsync concurrently with the data commit, then renames data first and metadata last
+/// under one directory barrier.
+async fn stage_metadata_sidecar(
+    paths: &AdmittedPaths,
+    record: &ObjectMetadataRecord,
+) -> Result<Staging, BlobError> {
+    let staging = paths
+        .metadata_staging
+        .as_ref()
+        .ok_or_else(|| BlobError::Io("storage plan lacks an object metadata alias".into()))?;
+    let bytes = record
+        .encode()
+        .map_err(|error| BlobError::Io(error.to_string()))?;
+    let mut sink = Staging::create(staging.clone(), false, None, paths.lease.try_child()?).await?;
+    sink.write_all(&bytes).await?;
+    Ok(sink)
+}
+
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     fn read_memory_bound(
@@ -1122,7 +1184,7 @@ impl BlobStore for LocalBlobStore {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: ObjectCreationPermit,
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -1191,29 +1253,6 @@ impl BlobStore for LocalBlobStore {
             }
         };
         let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Finalize));
-        sink.commit_sampled(
-            &paths.final_file,
-            sampled.then(|| self.object_write_timings.clone()),
-        )
-        .await?;
-        if let Some(timer) = timer {
-            timer.complete();
-        }
-        drop(copy_permit);
-        let timer = sampled.then(|| {
-            self.object_write_timings
-                .start(ObjectWriteStage::DirectorySync)
-        });
-        self.dir_sync
-            .sync_file(paths.final_file.parent.clone(), &paths.lease)
-            .await?;
-        if let Some(timer) = timer {
-            timer.complete();
-        }
-        // The crash window the durability ordering protects: the blob is now durable but no
-        // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
-        fail::fail_point!("blob_after_durable");
-
         let staged = StagedBlob {
             storage_path,
             size_logical: write.logical,
@@ -1225,6 +1264,94 @@ impl BlobStore for LocalBlobStore {
             compression: write.compression,
             index_spool: write.index_spool,
         };
+        // Protocol 3: write the sidecar alias, then overlap the data commit (flush, fsync,
+        // rename) with the sidecar fsync. Data is renamed first and metadata second, under one
+        // destination-directory barrier. A sidecar failure aborts before any acknowledgement;
+        // a SQLite publication (P1) still follows this function and remains the ACK authority.
+        let sidecar = match &opts.metadata_seed {
+            Some(seed) => {
+                let record = ObjectMetadataRecord::from_staged(seed, &staged);
+                // A plaintext object carries the record as a trailer in its data file: one create,
+                // one fsync, one rename, one directory entry, and the reader recovers the payload
+                // length from the same trailer. Compressed/encrypted objects keep the separate
+                // sidecar (their container trailer must stay last). This is size-independent: the
+                // trailer is appended after the streamed body and the payload stays a byte range at
+                // offset 0, so a 1 MiB or 5 GiB object pays for no second file either.
+                let plaintext = matches!(staged.compression, CompressionDescriptor::Uncompressed)
+                    && opts.encryption.is_none();
+                if plaintext {
+                    let trailer = match record.encode_inline_trailer(staged.size_physical) {
+                        Ok(trailer) => trailer,
+                        Err(error) => {
+                            sink.abort().await;
+                            return Err(BlobError::Io(error.to_string()));
+                        }
+                    };
+                    if let Err(error) = sink.write_all(&trailer).await {
+                        sink.abort().await;
+                        return Err(error);
+                    }
+                    None
+                } else {
+                    match stage_metadata_sidecar(&paths, &record).await {
+                        Ok(sidecar) => Some(sidecar),
+                        Err(error) => {
+                            sink.abort().await;
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+        fail::fail_point!("blob_after_sidecar_stage", |_| Err(BlobError::Io(
+            "injected failure after sidecar staging, before the data commit".into()
+        )));
+        let data_commit = sink.commit_sampled(
+            &paths.final_file,
+            sampled.then(|| self.object_write_timings.clone()),
+        );
+        let sidecar = match sidecar {
+            Some(sidecar) => {
+                let ((), sidecar) = tokio::try_join!(data_commit, sidecar.fsync_retained())?;
+                Some(sidecar)
+            }
+            None => {
+                data_commit.await?;
+                None
+            }
+        };
+        if let Some(timer) = timer {
+            timer.complete();
+        }
+        if let Some(sidecar) = sidecar {
+            fail::fail_point!("blob_after_data_rename", |_| Err(BlobError::Io(
+                "injected failure after data rename, before metadata rename".into()
+            )));
+            let destination = paths.metadata_file.clone().ok_or_else(|| {
+                BlobError::Io("storage plan lacks an object metadata path".into())
+            })?;
+            sidecar.rename_retained(&destination).await?;
+        }
+        drop(copy_permit);
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::DirectorySync)
+        });
+        // The destination directory barrier makes the new names durable. The rename's source
+        // entries in `.staging` are not separately synchronized: a crash that resurrects one
+        // leaves an unreferenced alias that the mandatory full scan reclaims, never a missing
+        // object. RustFS and MinIO likewise persist only the destination entry.
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
+        // The crash window the durability ordering protects: the blob is now durable but no
+        // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
+        fail::fail_point!("blob_after_durable");
+
         Ok(staged)
     }
 

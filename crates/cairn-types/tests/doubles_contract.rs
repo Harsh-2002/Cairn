@@ -178,6 +178,7 @@ async fn put_get_list_delete_roundtrip() {
                     content_type: "text/plain".to_owned(),
                     encryption: None,
                     content_length: None,
+                    metadata_seed: None,
                 },
             )
             .await
@@ -599,6 +600,7 @@ fn opts() -> StageOptions {
         content_type: "application/octet-stream".to_owned(),
         encryption: None,
         content_length: None,
+        metadata_seed: None,
     }
 }
 

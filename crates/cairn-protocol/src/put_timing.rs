@@ -14,7 +14,8 @@ pub enum PutStage {
     Total,
     /// Bucket/config reads and synchronous request preparation before storage admission.
     Preflight,
-    /// Preparing a storage plan and awaiting its durable Writer admission.
+    /// Preparing a bounded storage plan. Ordinary objects plan in memory; multipart writes also
+    /// await their durable Writer admission inside this stage.
     StorageAdmission,
     /// Awaiting the blob store's stage operation.
     BlobStage,

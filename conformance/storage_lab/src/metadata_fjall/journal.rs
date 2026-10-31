@@ -85,6 +85,19 @@ pub fn enqueue(
     }
     save(view, &debt)
 }
+
+/// A superseded object owns both its data file and its protocol-3 sidecar.
+pub fn enqueue_object(
+    view: &mut Overlay<'_>,
+    bucket: &BucketName,
+    path: &StoragePath,
+) -> Result<(), MetaError> {
+    enqueue(view, bucket, path, None, None)?;
+    if let Some(metadata) = cairn_types::storage::object_metadata_path(path) {
+        enqueue(view, bucket, &metadata, None, None)?;
+    }
+    Ok(())
+}
 #[allow(clippy::too_many_arguments)]
 pub fn quota_debt(
     view: &mut Overlay<'_>,
@@ -227,11 +240,96 @@ pub fn publication_allowed(view: &dyn View, plan: &StorageWritePlan) -> Result<b
     }
     Ok(true)
 }
+/// Whether an ordinary object plan may publish without an intent: current generation, exact
+/// bucket incarnation, no intent for the attempt, and every planned alias unowned.
+pub fn object_publication_allowed(
+    view: &dyn View,
+    plan: &StorageWritePlan,
+) -> Result<bool, MetaError> {
+    plan.validate()?;
+    if generation(view)?.as_ref() != Some(&plan.generation) {
+        return Ok(false);
+    }
+    let Some(bucket) = get::<Bucket>(view, &key(BUCKET, &[plan.bucket.as_str()]))? else {
+        return Ok(false);
+    };
+    let owner = plan
+        .bucket_owner
+        .as_ref()
+        .ok_or_else(|| kv::error("object publication requires a bucket owner"))?;
+    let created_at = plan
+        .bucket_created_at
+        .ok_or_else(|| kv::error("object publication requires a bucket incarnation"))?;
+    if bucket.owner_id != *owner || bucket.created_at != created_at {
+        return Ok(false);
+    }
+    if get::<Intent>(view, &key(INTENT, &[plan.attempt.as_str()]))?.is_some() {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if referenced(view, &path.path)?
+            || intent_path(view, &path.path)?
+            || debt_by_path(view, &path.path)?.is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Abandon an unadmitted object plan after backend quiescence. A mixed state that still carries an
+/// intent for the attempt is resolved exactly like an admitted plan.
+pub fn abandon_object(
+    view: &mut Overlay<'_>,
+    plan: &StorageWritePlan,
+    quiescence: &cairn_types::storage::io::StorageQuiescence,
+) -> Result<MutationOutcome, MetaError> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(kv::error("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(kv::error("storage quiescence identity mismatch"));
+    }
+    if generation(view)?.as_ref() != Some(quiescence.generation()) {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    if let Some(intent) = get::<Intent>(view, &key(INTENT, &[plan.attempt.as_str()]))? {
+        resolve(
+            view,
+            &intent.plan,
+            cairn_types::blob::IndexSpoolState::Materialized,
+        )?;
+    } else {
+        resolve_paths(view, plan, cairn_types::blob::IndexSpoolState::Materialized)?;
+    }
+    Ok(MutationOutcome::StorageUpdated { applied: true })
+}
+
 pub fn resolve(
     view: &mut Overlay<'_>,
     plan: &StorageWritePlan,
     index_spool: cairn_types::blob::IndexSpoolState,
 ) -> Result<(), MetaError> {
+    resolve_paths(view, plan, index_spool)?;
+    view.remove(key(INTENT, &[plan.attempt.as_str()]))?;
+    for path in &plan.paths {
+        view.remove(key(INTENT_PATH, &[path.path.as_str()]))?;
+        if let Some(debt) = debt_by_path(view, &path.path)? {
+            refresh(view, &debt)?;
+        }
+    }
+    Ok(())
+}
+
+/// Enqueue reference-checked cleanup without requiring or deleting an intent.
+pub fn resolve_paths(
+    view: &mut Overlay<'_>,
+    plan: &StorageWritePlan,
+    index_spool: cairn_types::blob::IndexSpoolState,
+) -> Result<(), MetaError> {
+    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
+        && referenced(view, plan.final_path()?)?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().map(|p| p.as_str().to_owned()))
         .transpose()?;
@@ -267,6 +365,10 @@ pub fn resolve(
         }
     }
     for path in &plan.paths {
+        // A live object keeps its durable metadata sidecar; every provisional alias is retired.
+        if path.role == cairn_types::storage::StoragePathRole::ObjectMetadata && published_object {
+            continue;
+        }
         if path.role == cairn_types::storage::StoragePathRole::IndexSpool
             && index_spool == cairn_types::blob::IndexSpoolState::NeverCreated
         {
@@ -280,13 +382,6 @@ pub fn resolve(
                 quota.as_deref(),
                 owner.as_deref(),
             )?;
-        }
-    }
-    view.remove(key(INTENT, &[plan.attempt.as_str()]))?;
-    for path in &plan.paths {
-        view.remove(key(INTENT_PATH, &[path.path.as_str()]))?;
-        if let Some(debt) = debt_by_path(view, &path.path)? {
-            refresh(view, &debt)?;
         }
     }
     Ok(())

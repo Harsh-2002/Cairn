@@ -23,8 +23,9 @@ TLS removes only that acknowledgement requirement and does not make either liste
 itself. These are installer controls that render the environment or Compose port mapping, not
 additional server-configuration flags.
 
-Storage lifecycle protocol 2 has no environment toggle: durable admission and exact cleanup
-accounting apply to every physical write. Full startup reconciliation remains mandatory. Storage
+Storage lifecycle protocol 2 has no environment toggle: durable admission for multipart writes,
+publication fencing for ordinary object writes and exact cleanup accounting apply to every physical
+write. Full startup reconciliation remains mandatory. Storage
 requires Linux 5.6+ `openat2`; the configured root may be a mount, but descendant mounts and
 symlinks are refused (Section 8). Request timeouts do not bound backend I/O lifetime or authorize
 forgiving multipart quota. The existing sweeper checks exact storage cleanup every second while

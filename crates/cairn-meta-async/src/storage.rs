@@ -214,15 +214,15 @@ async fn validate_index(db: &DB<'_>, plan: &StorageWritePlan) -> R<()> {
         vec![text(plan.attempt.as_str())],
     )
     .await?;
-    if rows.len() != plan.paths.len() {
+    let journaled = plan.journaled_paths().collect::<Vec<_>>();
+    if rows.len() != journaled.len() {
         return Err(invalid("storage intent path count mismatch"));
     }
-    for expected in &plan.paths {
-        let role = match expected.role {
-            StoragePathRole::Temporary => "temporary",
-            StoragePathRole::Final => "final",
-            StoragePathRole::IndexSpool => "index_spool",
-        };
+    for expected in journaled {
+        let role = expected
+            .role
+            .journal_name()
+            .ok_or_else(|| invalid("non-journaled storage role"))?;
         let mut found = false;
         for row in &rows {
             if string(row, 0)? == role && string(row, 1)? == expected.path.as_str() {
@@ -349,12 +349,11 @@ pub async fn reserve(
         vec![text(plan.attempt.as_str()), text(plan.generation.as_str()), text(bucket.as_str()),
             Cell::Text(encoded), Cell::Int(now.0), upload.map_or(Cell::Null, text),
             reservation.map_or(Cell::Null, text)]).await?;
-    for path in &plan.paths {
-        let role = match path.role {
-            StoragePathRole::Temporary => "temporary",
-            StoragePathRole::Final => "final",
-            StoragePathRole::IndexSpool => "index_spool",
-        };
+    for path in plan.journaled_paths() {
+        let role = path
+            .role
+            .journal_name()
+            .ok_or_else(|| invalid("non-journaled storage role"))?;
         x(
             db,
             "INSERT INTO storage_intent_paths(attempt_id,role,storage_path) VALUES (?1,?2,?3)",
@@ -405,10 +404,97 @@ async fn referenced(db: &DB<'_>, path: &StoragePath) -> R<bool> {
         vec![text(path.as_str())]).await?.is_empty())
 }
 
+/// Whether an ordinary object plan may publish in this savepoint. It replaces the admission fence
+/// the request used to carry: the generation is current, the bucket is the exact authorized
+/// incarnation (owner and creation time), no intent exists for the attempt, and every planned
+/// alias is free of authoritative references, intent ownership and cleanup debt.
+pub async fn object_publication_allowed(db: &DB<'_>, plan: &StorageWritePlan) -> R<bool> {
+    crate::baseline::ensure_unheld(db).await?;
+    if !current(db, &plan.generation).await? {
+        return Ok(false);
+    }
+    let bucket_row = q(
+        db,
+        "SELECT owner_id,created_at FROM buckets WHERE name=?1",
+        vec![text(plan.bucket.as_str())],
+    )
+    .await?;
+    let Some(bucket_row) = bucket_row.first() else {
+        return Ok(false);
+    };
+    let owner = plan
+        .bucket_owner
+        .as_ref()
+        .ok_or_else(|| invalid("object publication requires a bucket owner"))?;
+    let created_at = plan
+        .bucket_created_at
+        .ok_or_else(|| invalid("object publication requires a bucket incarnation"))?;
+    if string(bucket_row, 0)? != owner.0 || integer(bucket_row, 1)? != created_at.0 {
+        return Ok(false);
+    }
+    if !q(
+        db,
+        "SELECT 1 FROM storage_write_intents WHERE attempt_id=?1",
+        vec![text(plan.attempt.as_str())],
+    )
+    .await?
+    .is_empty()
+    {
+        return Ok(false);
+    }
+    for path in &plan.paths {
+        if !matches!(
+            path.role,
+            StoragePathRole::Final | StoragePathRole::ObjectMetadata
+        ) {
+            continue;
+        }
+        if referenced(db, &path.path).await? || !q(db,
+            "SELECT 1 FROM storage_intent_paths WHERE storage_path=?1 UNION ALL SELECT 1 FROM storage_cleanups WHERE storage_path=?1 LIMIT 1",
+            vec![text(path.path.as_str())]).await?.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Abandon a planned ordinary object write after the caller proved backend quiescence. There is
+/// usually no intent, so cleanup is reference-checked directly. A mixed/rollback state that does
+/// still carry an intent for this attempt is resolved exactly like `StorageMutation::Resolve`.
+pub async fn abandon_object(
+    db: &DB<'_>,
+    plan: &StorageWritePlan,
+    quiescence: &cairn_types::storage::io::StorageQuiescence,
+) -> R<MutationOutcome> {
+    if !matches!(plan.target, StorageWriteTarget::Object { .. }) {
+        return Err(invalid("object abandonment requires an object target"));
+    }
+    plan.validate()?;
+    if quiescence.attempt() != &plan.attempt || quiescence.generation() != &plan.generation {
+        return Err(invalid("storage quiescence identity mismatch"));
+    }
+    if !current(db, quiescence.generation()).await? {
+        return Ok(MutationOutcome::StorageUpdated { applied: false });
+    }
+    if let Some(stored) = load(db, &plan.bucket, &plan.attempt, &plan.generation).await? {
+        resolve(db, &stored, IndexSpoolState::Materialized).await?;
+        return Ok(MutationOutcome::StorageUpdated { applied: true });
+    }
+    resolve_paths(db, plan, IndexSpoolState::Materialized).await?;
+    Ok(MutationOutcome::StorageUpdated { applied: true })
+}
+
 /// Enqueue aliases even when rename/unlink probably removed them: retirement still needs the
 /// containing namespace barrier. Reference checks are Writer-serialized, never stale WAL reads.
-async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
-    validate_index(db, plan).await?;
+/// Ordinary object plans have no intent, so this never validates or removes one.
+pub(crate) async fn resolve_paths(
+    db: &DB<'_>,
+    plan: &StorageWritePlan,
+    index_spool: IndexSpoolState,
+) -> R<()> {
+    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
+        && referenced(db, plan.final_path()?).await?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
         .transpose()?;
@@ -457,6 +543,17 @@ async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolSt
         None
     };
     for path in &plan.paths {
+        // A live object keeps its durable metadata sidecar; every provisional alias is retired.
+        if path.role == StoragePathRole::ObjectMetadata && published_object {
+            continue;
+        }
+        // A successful publication renamed the staging data and metadata aliases into their
+        // final names. The old names no longer exist, so enqueueing them as cleanup debt would
+        // only feed the cleanup worker a storm of no-op unlinks (and stall the Writer behind its
+        // reference checks) at high small-object rates. A failed/abandoned write keeps them.
+        if path.role == StoragePathRole::Temporary && published_object {
+            continue;
+        }
         // A write that never opened the index spool created no name, so its absence owes no
         // namespace barrier. Recovery keeps the conservative `Materialized` state.
         if path.role == StoragePathRole::IndexSpool && index_spool == IndexSpoolState::NeverCreated
@@ -467,6 +564,14 @@ async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolSt
             enqueue_owned(db, &plan.bucket, &path.path, quota.as_deref(), owner).await?;
         }
     }
+    Ok(())
+}
+
+/// Resolve an admitted plan: validate its normalized index, enqueue reference-checked cleanup and
+/// then discard its exact intent. Parts and completions keep this path.
+async fn resolve(db: &DB<'_>, plan: &StorageWritePlan, index_spool: IndexSpoolState) -> R<()> {
+    validate_index(db, plan).await?;
+    resolve_paths(db, plan, index_spool).await?;
     discard_unacknowledged(db, plan).await
 }
 
@@ -610,6 +715,16 @@ pub async fn enqueue(
     quota: Option<&str>,
 ) -> R<()> {
     enqueue_owned(db, bucket, path, quota, None).await
+}
+
+/// A superseded object owns both its data file and its protocol-3 sidecar. Legacy objects have no
+/// sidecar; the extra exact name is an idempotent absence barrier in that case.
+pub async fn enqueue_object(db: &DB<'_>, bucket: &BucketName, path: &StoragePath) -> R<()> {
+    enqueue(db, bucket, path, None).await?;
+    if let Some(metadata) = cairn_types::storage::object_metadata_path(path) {
+        enqueue(db, bucket, &metadata, None).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn enqueue_owned(

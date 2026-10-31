@@ -3,7 +3,10 @@
 
 use crate::io_err;
 use crate::timing::{ObjectWriteStage, ObjectWriteTimings};
-use cairn_types::storage::{StorageCreationPermit, StoragePathRole, io::StorageIoLease};
+use cairn_types::storage::{
+    ObjectCreationPermit, StorageCreationPermit, StoragePathRole, StorageWritePlan,
+    io::StorageIoLease,
+};
 use cairn_types::{BlobError, StoragePath};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, mkdirat, open, unlinkat};
 use std::collections::HashMap;
@@ -264,25 +267,66 @@ impl AnchoredPath {
 
 pub(crate) struct AdmittedPaths {
     pub(crate) staging: AnchoredPath,
+    /// Final metadata sidecar path (protocol 3 ordinary objects only).
+    pub(crate) metadata_file: Option<AnchoredPath>,
+    /// Temporary metadata sidecar alias (protocol 3 ordinary objects only).
+    pub(crate) metadata_staging: Option<AnchoredPath>,
     pub(crate) final_file: AnchoredPath,
     pub(crate) spool: AnchoredPath,
     pub(crate) storage_path: StoragePath,
     pub(crate) lease: StorageIoLease,
 }
 
+/// Either a Writer-admitted multipart permit or a file-free ordinary object permit. Both name a
+/// bounded plan and own live I/O; only the admission strength differs, and the backend treats the
+/// names identically.
+pub(crate) enum AdmittedPermit {
+    Object(ObjectCreationPermit),
+    Admitted(StorageCreationPermit),
+}
+
+impl AdmittedPermit {
+    fn plan(&self) -> &StorageWritePlan {
+        match self {
+            Self::Object(permit) => permit.plan(),
+            Self::Admitted(permit) => permit.plan(),
+        }
+    }
+
+    fn into_parts(self) -> (StorageWritePlan, StorageIoLease) {
+        match self {
+            Self::Object(permit) => permit.into_parts(),
+            Self::Admitted(permit) => permit.into_parts(),
+        }
+    }
+}
+
+impl From<ObjectCreationPermit> for AdmittedPermit {
+    fn from(permit: ObjectCreationPermit) -> Self {
+        Self::Object(permit)
+    }
+}
+
+impl From<StorageCreationPermit> for AdmittedPermit {
+    fn from(permit: StorageCreationPermit) -> Self {
+        Self::Admitted(permit)
+    }
+}
+
 impl AdmittedPaths {
     pub(crate) async fn open(
         root: &Path,
-        permit: StorageCreationPermit,
+        permit: impl Into<AdmittedPermit>,
     ) -> Result<Self, BlobError> {
         Self::open_sampled(root, permit, None).await
     }
 
     pub(crate) async fn open_sampled(
         root: &Path,
-        permit: StorageCreationPermit,
+        permit: impl Into<AdmittedPermit>,
         timing: Option<Arc<ObjectWriteTimings>>,
     ) -> Result<Self, BlobError> {
+        let permit = permit.into();
         permit
             .plan()
             .validate()
@@ -309,15 +353,29 @@ impl AdmittedPaths {
             let mut directories = HashMap::from([(String::new(), Arc::new(root))]);
             let mut barriers = ParentBarriers::default();
             let mut staging = None;
+            let mut metadata_file = None;
+            let mut metadata_staging = None;
             let mut final_file = None;
             let mut spool = None;
             for intent in &plan.paths {
                 let path = prepare_path(&mut directories, intent.path.as_str(), &mut barriers)
                     .map_err(io_err)?;
                 match intent.role {
-                    StoragePathRole::Temporary => staging = Some(path),
+                    StoragePathRole::Temporary => {
+                        if intent
+                            .path
+                            .as_str()
+                            .rsplit_once('/')
+                            .is_some_and(|(_, name)| name.ends_with(".meta.tmp"))
+                        {
+                            metadata_staging = Some(path);
+                        } else {
+                            staging = Some(path);
+                        }
+                    }
                     StoragePathRole::Final => final_file = Some(path),
                     StoragePathRole::IndexSpool => spool = Some(path),
+                    StoragePathRole::ObjectMetadata => metadata_file = Some(path),
                 }
             }
             // Complete every prepared parent barrier before any dependent file is created.
@@ -326,6 +384,8 @@ impl AdmittedPaths {
                 final_file.ok_or_else(|| BlobError::Io("missing admitted final path".into()))?;
             let paths = Self {
                 staging: staging.unwrap_or_else(|| final_file.clone()),
+                metadata_file,
+                metadata_staging,
                 final_file,
                 spool: spool.ok_or_else(|| BlobError::Io("missing admitted spool path".into()))?,
                 storage_path: plan

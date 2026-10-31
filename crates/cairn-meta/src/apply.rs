@@ -71,6 +71,44 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 )),
             }
         }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            activity,
+            relaxed,
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !crate::storage::object_publication_allowed(conn, &plan)? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let outcome = match *operation {
+                Mutation::PutObjectVersion {
+                    row,
+                    precondition,
+                    initial_state,
+                    replication,
+                } => put_version(
+                    conn,
+                    *row,
+                    &precondition,
+                    initial_state,
+                    replication,
+                    !relaxed,
+                )?,
+                other => apply_inner(conn, other)?,
+            };
+            if matches!(&outcome, MutationOutcome::Put { .. }) {
+                crate::storage::resolve_paths(conn, &plan, index_spool)?;
+                if let Some(entry) = activity {
+                    insert_activity_best_effort(conn, &entry)?;
+                }
+            }
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            crate::storage::abandon_object(conn, &plan, &quiescence)
+        }
         Mutation::PublishStorageWrite {
             plan,
             operation,
@@ -97,13 +135,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 // failure, so it must fail the publication instead of acknowledging an object from
                 // a broken commit. The Writer's outer savepoint/COMMIT check remains authoritative.
                 if let Some(entry) = activity {
-                    match insert_activity(conn, &entry) {
-                        Ok(()) => {}
-                        Err(cairn_types::MetaError::Conflict) => {
-                            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    insert_activity_best_effort(conn, &entry)?;
                 }
             }
             Ok(outcome)
@@ -145,7 +177,10 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             completed_at,
         } => crate::baseline::complete(conn, &token, completed_at),
 
-        Mutation::AdmitStorageWrite { .. } | Mutation::PublishStorageWrite { .. } => {
+        Mutation::AdmitStorageWrite { .. }
+        | Mutation::PublishStorageWrite { .. }
+        | Mutation::PublishObjectWrite { .. }
+        | Mutation::AbandonObjectWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => crate::storage::begin(conn, &generation),
@@ -175,7 +210,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             precondition,
             initial_state,
             replication,
-        } => put_version(conn, *row, &precondition, initial_state, replication),
+        } => put_version(conn, *row, &precondition, initial_state, replication, true),
         Mutation::ResolveObjectWrite {
             bucket,
             key,
@@ -2050,23 +2085,26 @@ fn put_version(
     precondition: &Precondition,
     initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
+    strict: bool,
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
-    enforce_bucket_quota(conn, &row)?;
-    enforce_user_quota(conn, &row)?;
-    if replacement_is_protected(
-        conn,
-        &row.bucket,
-        &row.key,
-        &row.version_id,
-        row.created_at,
-        GovernanceBypass::Denied,
-    )? {
-        return Err(MetaError::ObjectProtected);
+    if strict {
+        enforce_bucket_quota(conn, &row)?;
+        enforce_user_quota(conn, &row)?;
+        if replacement_is_protected(
+            conn,
+            &row.bucket,
+            &row.key,
+            &row.version_id,
+            row.created_at,
+            GovernanceBypass::Denied,
+        )? {
+            return Err(MetaError::ObjectProtected);
+        }
     }
     let (tags, lock_state) = if row.is_delete_marker {
         (Vec::new(), ObjectLockState::default())
-    } else {
+    } else if strict {
         (
             initial_state.tags,
             resolve_initial_object_lock(
@@ -2076,6 +2114,8 @@ fn put_version(
                 row.created_at,
             )?,
         )
+    } else {
+        (initial_state.tags, ObjectLockState::default())
     };
     if row.expire_at.is_some() && lock_state.is_protected(row.created_at) {
         return Err(MetaError::ObjectTtlConflict);
@@ -2240,7 +2280,7 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
     let result = upsert_version_inner(conn, row)?;
     update_visibility(conn, &bucket, &key, before)?;
     if let Some(path) = &result {
-        crate::storage::enqueue(conn, &bucket, path, None)?;
+        crate::storage::enqueue_object(conn, &bucket, path)?;
     }
     Ok(result)
 }
@@ -2507,7 +2547,7 @@ fn delete_version_inner(
     }
     let freed = storage_path.map(StoragePath::from_string);
     if let Some(path) = &freed {
-        crate::storage::enqueue(conn, bucket, path, None)?;
+        crate::storage::enqueue_object(conn, bucket, path)?;
     }
     let was_latest = latest != 0;
     conn.prepare_cached(
@@ -3251,6 +3291,20 @@ fn owns_replication_claim(
         "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
         params![id, token.as_str(), now.0], |row| row.get(0),
     ).map_err(engine_err)
+}
+
+fn insert_activity_best_effort(
+    conn: &Connection,
+    entry: &cairn_types::meta::ActivityEntry,
+) -> R<()> {
+    match insert_activity(conn, entry) {
+        Ok(()) => Ok(()),
+        Err(cairn_types::MetaError::Conflict) => {
+            tracing::debug!(id = %entry.id, "duplicate activity id ignored");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn insert_activity(conn: &Connection, entry: &cairn_types::meta::ActivityEntry) -> R<()> {

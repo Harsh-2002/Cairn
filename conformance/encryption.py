@@ -63,9 +63,26 @@ def hh(resp):
     return resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
 
 def committed_blobs(bucket):
-    """Opaque-id blob files committed under $DATA/<bucket>/ (never named by key)."""
+    """Opaque-id object *data* files committed under $DATA/<bucket>/ (never named by key).
+    Protocol-3 `<uuid>.meta` sidecars and staging aliases are not object data."""
     d = os.path.join(DATA_DIR, bucket)
-    return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+    return [os.path.join(d, f) for f in sorted(os.listdir(d))
+            if not f.endswith((".meta", ".tmp"))] if os.path.isdir(d) else []
+
+def assert_sidecars(blobs, label):
+    """Each committed data blob owns exactly one sidecar; sidecars never carry object bytes."""
+    missing = [os.path.basename(path) for path in blobs if not os.path.isfile(path + ".meta")]
+    check(f"{label}: every committed data blob has a metadata sidecar "
+          f"(missing: {missing or 'none'})", not missing)
+    leaked = []
+    for path in blobs:
+        sidecar = path + ".meta"
+        if os.path.isfile(sidecar):
+            with open(sidecar, "rb") as fh:
+                if MARKER in fh.read():
+                    leaked.append(os.path.basename(sidecar))
+    check(f"{label}: no metadata sidecar contains plaintext object bytes "
+          f"(leaked: {leaked or 'none'})", not leaked)
 
 def staged_parts(upload_id):
     d = os.path.join(DATA_DIR, ".staging", "multipart", upload_id)
@@ -148,7 +165,8 @@ def case_b():
     head = s3.head_object(Bucket="atrest", Key="silent")
     check("at-rest HEAD advertises NO ServerSideEncryption", head.get("ServerSideEncryption") is None)
     blobs = committed_blobs("atrest")
-    check("at-rest: exactly one committed blob on disk", len(blobs) == 1)
+    check("at-rest: exactly one committed data blob on disk", len(blobs) == 1)
+    assert_sidecars(blobs, "at-rest")
     if blobs:
         assert_encrypted_on_disk(blobs[0], "at-rest")
 
@@ -229,7 +247,8 @@ def case_d():
     check("AES256-default GET body is byte-exact", g["Body"].read() == body)
     check("AES256-default GET advertises AES256", g.get("ServerSideEncryption") == "AES256")
     blobs = committed_blobs("defaes")
-    check("AES256-default: one committed blob on disk", len(blobs) == 1)
+    check("AES256-default: one committed data blob on disk", len(blobs) == 1)
+    assert_sidecars(blobs, "AES256-default")
     if blobs:
         assert_encrypted_on_disk(blobs[0], "AES256-default")
 
@@ -247,7 +266,8 @@ def case_d():
     check("kms-default GET advertises aws:kms", gk.get("ServerSideEncryption") == "aws:kms")
     check("kms-default GET echoes the default key id", gk.get("SSEKMSKeyId") == KEY_ID)
     kblobs = committed_blobs("defkms")
-    check("kms-default: one committed blob on disk", len(kblobs) == 1)
+    check("kms-default: one committed data blob on disk", len(kblobs) == 1)
+    assert_sidecars(kblobs, "kms-default")
     assert_encrypted_on_disk(kblobs[0], "kms-default")
 
 
@@ -300,8 +320,9 @@ def case_f():
     body = MARKER * 200
     s3.put_object(Bucket="tamper", Key="obj", Body=body, ServerSideEncryption="AES256")
     blobs = committed_blobs("tamper")
-    if not check("tamper: located exactly one committed blob", len(blobs) == 1):
+    if not check("tamper: located exactly one committed data blob", len(blobs) == 1):
         return
+    assert_sidecars(blobs, "tamper")
     path = blobs[0]
     with open(path, "rb") as fh:
         raw = bytearray(fh.read())

@@ -559,6 +559,26 @@ pub async fn build(
     let storage_lifetime: Arc<dyn Send + Sync> = node_lock;
     let storage_generation = begin_storage_generation(&*meta).await?;
 
+    // Protocol-3 object publications acknowledge after the data and metadata files are durable,
+    // before the index commit is guaranteed. Repair the index from those files before serving, so a
+    // power loss can never hide an acknowledged object from GET/LIST.
+    let rebuilt = crate::sidecar_rebuild::rebuild_missing_object_rows(
+        &*meta,
+        &cfg.data_dir,
+        &storage_generation,
+    )
+    .await;
+    if rebuilt.scanned > 0 || rebuilt.failed > 0 {
+        tracing::info!(
+            scanned = rebuilt.scanned,
+            inserted = rebuilt.inserted,
+            already_indexed = rebuilt.already_indexed,
+            skipped = rebuilt.skipped,
+            failed = rebuilt.failed,
+            "object index rebuilt from metadata files"
+        );
+    }
+
     let blob_impl = LocalBlobStore::open(
         cfg.data_dir.clone(),
         maintenance_lease(&storage_generation, storage_lifetime.clone()),
@@ -637,7 +657,10 @@ pub async fn build(
         storage_lifetime.clone(),
         multipart_claim_recovery.admission_callback(),
         multipart_claim_recovery.callback(),
-    ));
+    ))
+    // Ordinary object acknowledgements fold their index row asynchronously; reads and every key
+    // mutation drain this bounded overlay first.
+    .with_overlay(cairn_protocol::Overlay::start(meta.clone(), 8192usize));
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));

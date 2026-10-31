@@ -26,10 +26,11 @@ Every S3 request traverses the same outer pipeline before reaching an operation 
 
 The process hosts, besides request handling: the metadata writer task and the read-connection pool (Section 11); the blob I/O facility (Section 9); the replication engine and its worker pool (Section 20); the webhook event-delivery engine; the lifecycle scanner (Section 19); the multipart-upload sweeper; the background S3-import worker; the WAL checkpointer; the opt-in integrity scrub (Section 26.4); the opt-in encrypted-suspect replication audit loop; and the metrics and audit facilities (Section 26). Startup wires these, runs reconciliation (Section 8), and only then binds the listener. Shutdown reverses this in a defined order (Section 31).
 
-The shutdown order is externally observable and therefore contractual. The signal coordinator first withdraws readiness and only then publishes the stop signal. Accept loops stop accepting, and every periodic background worker checks the signal before beginning another scan, claim batch, or pass. Existing HTTP connections and already-started ordinary worker work drain concurrently under one 30-second grace; every retained task handle is joined, and an overrun is aborted and then joined rather than detached. The optional blocking `sendfile` path retains a duplicate socket on the async side: shutdown closes that duplicate to interrupt a stalled peer write and awaits the blocking closure before its HTTP connection can report stopped. A cancelled replication, webhook, or import operation leaves its durable lease/cursor intact; pre-bind startup recovery releases orphaned replication claims on every metadata shard and resumes durable import state. Storage ownership is durable (Section 8). Before admission, every physical write captures a fresh
-plan and a bounded recovery slot. The Writer persists intent before permitting filesystem creation;
-publication consumes that exact intent and atomically records cleanup debt. Cancellation or lost
-acknowledgement transfers the plan and slot to the retained FIFO recovery consumer. It waits for
+The shutdown order is externally observable and therefore contractual. The signal coordinator first withdraws readiness and only then publishes the stop signal. Accept loops stop accepting, and every periodic background worker checks the signal before beginning another scan, claim batch, or pass. Existing HTTP connections and already-started ordinary worker work drain concurrently under one 30-second grace; every retained task handle is joined, and an overrun is aborted and then joined rather than detached. The optional blocking `sendfile` path retains a duplicate socket on the async side: shutdown closes that duplicate to interrupt a stalled peer write and awaits the blocking closure before its HTTP connection can report stopped. A cancelled replication, webhook, or import operation leaves its durable lease/cursor intact; pre-bind startup recovery releases orphaned replication claims on every metadata shard and resumes durable import state. Storage ownership is durable (Section 8). Before creating a file, every physical write captures a fresh plan and a
+bounded recovery slot. A multipart plan is durably admitted before creation; an ordinary object
+plan is fenced by its single publication savepoint, which atomically applies the row and records
+cleanup debt. Cancellation or lost acknowledgement transfers the plan and slot to the retained FIFO
+recovery consumer. It waits for
 actual backend jobs and kernel file ownership to quiesce before resolving through the Writer.
 The I/O lease retains node exclusivity even after its async request disappears. The consumer stays
 alive until both HTTP connections and ordinary workers, including imports that invoke the S3
@@ -68,11 +69,13 @@ Object bytes are handled separately from metadata. On the baseline runtime, file
 
 ### 7.5 The write data path
 
-Before consuming bytes, the handler plans all temporary, final and optional spool names, and
-awaits durable Writer admission under the current process generation (Section 8). Part quota
-reservation and completion claim acquisition include this admission in their existing savepoint.
-This additional ordinary PUT/Copy transaction is a durability cost; group commit can share its
-barrier but cannot remove the dependency before I/O.
+Before consuming bytes, the handler plans all temporary, final, sidecar and optional spool names.
+A multipart part or assembly awaits durable Writer admission under the current process generation
+(Section 8); its quota reservation or completion claim includes that admission in the same
+savepoint. An ordinary PUT or Copy does not take a pre-write Writer transaction: the plan names the
+authorized bucket owner and creation time, and the single publication savepoint re-verifies the
+generation, bucket incarnation, absent intent and path availability before applying the row. This
+removes one SQLite barrier from the object write path without weakening the durability order.
 
 On a write, bytes arrive from the socket as a stream. They pass through a fan-out that simultaneously feeds the content hashers (always the MD5 that becomes the ETag, plus any client-requested checksum algorithms, computed once over the plaintext) and the disk writer, sharing the same buffers by reference rather than copying. When the object's length is known in advance from the content-length header, the default staging backend attempts `KEEP_SIZE` preallocation for objects at least 1 MiB, allowing contiguous placement without extending the visible file length. Placement hints are best-effort; actual writes remain responsible for reporting ENOSPC. After all bytes, framing and buffered writes are flushed, finalization releases reserved allocation beyond the descriptor's actual EOF before the existing file sync. It never truncates to the plaintext or declared input length; encrypted framing can exceed either. Failure to inspect or trim a hinted file aborts publication. The optional io_uring backend does not preallocate. For large transfers the kernel can be advised that access is sequential and, after the transfer, that the just-written pages are no longer needed, so a stream of large uploads does not evict the page cache that hot reads depend on. Where the deployment opts into it for objects above a size threshold, the staging write can bypass the page cache entirely, which gives more predictable write latency and avoids polluting the cache with write-once bulk data, at the cost of requiring aligned buffers and transfer sizes that the blob facility manages internally.
 

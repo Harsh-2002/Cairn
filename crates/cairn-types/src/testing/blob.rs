@@ -142,7 +142,7 @@ impl BlobStore for InMemoryBlobStore {
 
     async fn stage(
         &self,
-        permit: StorageCreationPermit,
+        permit: crate::storage::ObjectCreationPermit,
         body: crate::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
@@ -471,7 +471,8 @@ pub trait FixtureBlobStore: BlobStore {
                     version_id: crate::VersionId::null(),
                     row_id: crate::storage::StorageToken::generate().as_str().to_owned(),
                 },
-            )?,
+            )?
+            .into(),
             body,
             opts,
         )

@@ -98,7 +98,7 @@ fn put(
             && let Some(path) = previous.storage_path
         {
             view.remove(key(REFERENCE, &[path.as_str()]))?;
-            journal::enqueue(view, &row.bucket, &path, None, None)?;
+            journal::enqueue_object(view, &row.bucket, &path)?;
             superseded = Some(path);
         }
     }
@@ -253,7 +253,7 @@ fn delete(
     let freed = row.storage_path.clone();
     if let Some(path) = &freed {
         view.remove(key(REFERENCE, &[path.as_str()]))?;
-        journal::enqueue(view, &bucket, path, None, None)?;
+        journal::enqueue_object(view, &bucket, path)?;
     }
     let mut promoted_latest = false;
     if row.is_latest {
@@ -380,6 +380,34 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             };
             journal::resolve(view, &plan, index_spool)?;
             Ok(outcome)
+        }
+        Mutation::PublishObjectWrite {
+            plan,
+            operation,
+            index_spool,
+            ..
+        } => {
+            plan.validate_object_publication(&operation)?;
+            if !journal::object_publication_allowed(view, &plan)? {
+                return Ok(MutationOutcome::StoragePublicationNotApplied);
+            }
+            let Mutation::PutObjectVersion {
+                row,
+                precondition,
+                initial_state,
+                replication,
+            } = *operation
+            else {
+                return Err(kv::error(
+                    "candidate object publication shape is unsupported",
+                ));
+            };
+            let outcome = put(view, *row, precondition, initial_state, replication)?;
+            journal::resolve_paths(view, &plan, index_spool)?;
+            Ok(outcome)
+        }
+        Mutation::AbandonObjectWrite { plan, quiescence } => {
+            journal::abandon_object(view, &plan, &quiescence)
         }
         Mutation::ResolveObjectWrite {
             bucket,

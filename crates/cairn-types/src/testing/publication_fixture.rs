@@ -124,26 +124,41 @@ impl PublicationFixture {
             return Err(invalid("fixture object path belongs to another bucket"));
         }
         let attempt = StorageToken::try_from(name.to_owned())?;
+        // Only an ordinary object write owns a protocol-3 metadata sidecar (and its staging
+        // alias). Multipart completion keeps the pre-P1 path set, exactly like the live planner.
+        let object_metadata = matches!(target, StorageWriteTarget::Object { .. });
+        let mut paths = vec![StorageIntentPath {
+            role: StoragePathRole::Temporary,
+            path: StoragePath::from_string(format!(".staging/{name}.tmp")),
+        }];
+        if object_metadata {
+            paths.push(StorageIntentPath {
+                role: StoragePathRole::Temporary,
+                path: StoragePath::from_string(format!(".staging/{name}.meta.tmp")),
+            });
+        }
+        paths.push(StorageIntentPath {
+            role: StoragePathRole::Final,
+            path: path.clone(),
+        });
+        if object_metadata {
+            paths.push(StorageIntentPath {
+                role: StoragePathRole::ObjectMetadata,
+                path: StoragePath::from_string(format!("{}.meta", path.as_str())),
+            });
+        }
+        paths.push(StorageIntentPath {
+            role: StoragePathRole::IndexSpool,
+            path: StoragePath::from_string(format!(".staging/{name}.index.tmp")),
+        });
         let plan = StorageWritePlan {
             attempt,
             generation: self.generation.clone(),
             bucket: row.bucket.clone(),
             bucket_owner: None,
+            bucket_created_at: None,
             target,
-            paths: vec![
-                StorageIntentPath {
-                    role: StoragePathRole::Temporary,
-                    path: StoragePath::from_string(format!(".staging/{name}.tmp")),
-                },
-                StorageIntentPath {
-                    role: StoragePathRole::Final,
-                    path: path.clone(),
-                },
-                StorageIntentPath {
-                    role: StoragePathRole::IndexSpool,
-                    path: StoragePath::from_string(format!(".staging/{name}.index.tmp")),
-                },
-            ],
+            paths,
         };
         plan.validate()?;
         Ok(plan)

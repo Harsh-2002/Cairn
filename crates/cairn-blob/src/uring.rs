@@ -151,6 +151,8 @@ enum WriteCmd {
     Chunk(Vec<u8>, oneshot::Sender<Result<(), BlobError>>),
     Commit(AnchoredPath, oneshot::Sender<Result<(), BlobError>>),
     FsyncInPlace(oneshot::Sender<Result<(), BlobError>>),
+    Sync(oneshot::Sender<Result<(), BlobError>>),
+    Rename(AnchoredPath, oneshot::Sender<Result<(), BlobError>>),
     Abort(oneshot::Sender<Result<(), BlobError>>),
 }
 
@@ -228,6 +230,36 @@ impl UringStaging {
         self.terminal().await
     }
 
+    /// fsync without closing or renaming, so another file's commit can run concurrently.
+    pub(crate) async fn sync_retained(&mut self) -> Result<(), BlobError> {
+        let _operation = self.owner.child().map_err(io_err)?;
+        let (reply, result) = oneshot::channel();
+        self.cmd_tx
+            .send(WriteCmd::Sync(reply))
+            .await
+            .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
+        result
+            .await
+            .map_err(|_| BlobError::Io("io_uring sync acknowledgement lost".into()))?
+    }
+
+    /// Rename an already-fsynced staging file and wind the writer task down.
+    pub(crate) async fn rename_retained(
+        mut self,
+        destination: AnchoredPath,
+    ) -> Result<(), BlobError> {
+        let _operation = self.owner.child().map_err(io_err)?;
+        let (reply, result) = oneshot::channel();
+        self.cmd_tx
+            .send(WriteCmd::Rename(destination, reply))
+            .await
+            .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
+        result
+            .await
+            .map_err(|_| BlobError::Io("io_uring rename acknowledgement lost".into()))??;
+        self.terminal().await
+    }
+
     pub(crate) async fn abort(mut self) {
         let (reply, result) = oneshot::channel();
         if self.cmd_tx.send(WriteCmd::Abort(reply)).await.is_ok() {
@@ -301,6 +333,28 @@ async fn writer_task(
                 let closed = file.close().await.map_err(io_err);
                 let result = result.and(closed);
                 drop(staging);
+                let _lease = owner.into_lease();
+                let _ = reply.send(result.clone_shallow());
+                let _ = final_result.send(result);
+                return;
+            }
+            WriteCmd::Sync(reply) => {
+                let result = file.sync_data().await.map_err(io_err);
+                let _ = reply.send(result);
+            }
+            WriteCmd::Rename(destination, reply) => {
+                let closed = file.close().await.map_err(io_err);
+                let result = match closed {
+                    Ok(()) => owner
+                        .run(move |_| staging.rename_to(&destination))
+                        .await
+                        .map_err(io_err),
+                    Err(error) => {
+                        drop(staging);
+                        drop(destination);
+                        Err(error)
+                    }
+                };
                 let _lease = owner.into_lease();
                 let _ = reply.send(result.clone_shallow());
                 let _ = final_result.send(result);

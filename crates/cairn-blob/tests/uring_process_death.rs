@@ -257,13 +257,15 @@ fn writer() {
                 unreachable!()
             };
             let manifest = format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 plan.attempt.as_str(),
                 plan.generation.as_str(),
                 row_id,
                 plan.paths[0].path,
                 plan.paths[1].path,
-                plan.paths[2].path
+                plan.paths[2].path,
+                plan.paths[3].path,
+                plan.paths[4].path
             );
             // Staging has already created and flocked the exact file, and the production ring
             // executor is ready. This barrier controls timing only; kernel evidence is required
@@ -277,7 +279,7 @@ fn writer() {
         }));
         store
             .stage(
-                permit,
+                permit.into(),
                 body,
                 StageOptions {
                     size_ceiling: 1024 * 1024,
@@ -293,12 +295,13 @@ fn writer() {
 fn plan_from_ready(path: &Path) -> StorageWritePlan {
     let manifest = std::fs::read_to_string(path).unwrap();
     let fields: Vec<_> = manifest.lines().collect();
-    assert_eq!(fields.len(), 6);
+    assert_eq!(fields.len(), 8);
     let plan = StorageWritePlan {
         attempt: StorageToken::try_from(fields[0].to_owned()).unwrap(),
         generation: StorageToken::try_from(fields[1].to_owned()).unwrap(),
         bucket: BucketName::parse("bucket").unwrap(),
         bucket_owner: None,
+        bucket_created_at: None,
         target: StorageWriteTarget::Object {
             key: ObjectKey::parse("key").unwrap(),
             version_id: VersionId::null(),
@@ -306,7 +309,9 @@ fn plan_from_ready(path: &Path) -> StorageWritePlan {
         },
         paths: [
             StoragePathRole::Temporary,
+            StoragePathRole::Temporary,
             StoragePathRole::Final,
+            StoragePathRole::ObjectMetadata,
             StoragePathRole::IndexSpool,
         ]
         .into_iter()

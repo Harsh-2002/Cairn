@@ -3455,3 +3455,466 @@ async fn reconcile_preserves_flat_and_nested_reads_and_prunes_empty_leaves() {
         .unwrap();
     assert_eq!(fresh.storage_path.as_str().split('/').count(), 2);
 }
+
+fn metadata_seed(
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    row_id: &str,
+) -> cairn_types::storage::ObjectMetadataSeed {
+    cairn_types::storage::ObjectMetadataSeed {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version_id.clone(),
+        row_id: row_id.to_owned(),
+        is_delete_marker: false,
+        content_type: "text/plain".to_owned(),
+        content_encoding: None,
+        cache_control: Some("max-age=60".to_owned()),
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        expire_at: None,
+        storage_class: StorageClass::Standard,
+        owner_id: UserId("owner".to_owned()),
+        user_metadata: vec![("colour".to_owned(), "blue".to_owned())],
+        acl: None,
+        stored_checksums: ChecksumSet::none(),
+        sse_descriptor: None,
+        created_at: Timestamp(10),
+        updated_at: Timestamp(11),
+        tags: vec![("team".to_owned(), "storage".to_owned())],
+        lock_intent: ExplicitObjectLockIntent::default(),
+    }
+}
+
+#[tokio::test]
+async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("metadata-bucket").unwrap();
+    let key = ObjectKey::parse("dir/object").unwrap();
+    let version = VersionId::null();
+    let seed = metadata_seed(&bucket, &key, &version, &"a".repeat(32));
+    let staged = store
+        .stage_fixture(
+            &bucket,
+            body(b"sidecar bytes".to_vec()),
+            StageOptions {
+                metadata_seed: Some(seed.clone()),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    // A plaintext object is one file: the record rides in a trailer after the payload, so no
+    // separate metadata file exists.
+    let metadata = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    assert!(
+        !dir.path().join(metadata.as_str()).exists(),
+        "plaintext objects must not write a sidecar"
+    );
+    let bytes = std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap();
+    let (record, payload_len) =
+        cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&bytes)
+            .unwrap()
+            .expect("plaintext object ends with the inline trailer");
+    assert_eq!(payload_len, staged.size_logical);
+    assert_eq!(
+        record.format_version,
+        cairn_types::storage::OBJECT_METADATA_FORMAT_VERSION
+    );
+    assert_eq!(record.bucket, bucket);
+    assert_eq!(record.key, key);
+    assert_eq!(record.version_id, version);
+    assert_eq!(record.row_id, seed.row_id);
+    assert_eq!(record.storage_path, staged.storage_path);
+    assert_eq!(record.size_logical, staged.size_logical);
+    assert_eq!(record.size_physical, staged.size_physical);
+    assert_eq!(record.etag, staged.etag);
+    assert_eq!(record.internal_sha256, Some(staged.internal_sha256.clone()));
+    assert_eq!(record.cache_control.as_deref(), Some("max-age=60"));
+    assert_eq!(record.user_metadata, seed.user_metadata);
+    assert_eq!(record.tags, seed.tags);
+    assert_eq!(record.created_at, Timestamp(10));
+    assert_eq!(record.updated_at, Timestamp(11));
+    assert_eq!(
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical
+        )
+        .await,
+        b"sidecar bytes"
+    );
+}
+
+#[tokio::test]
+async fn large_plaintext_object_is_one_inline_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("large-inline").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let version = VersionId::null();
+    let payload: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    let staged = store
+        .stage_fixture(
+            &bucket,
+            body(payload.clone()),
+            StageOptions {
+                metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"d".repeat(32))),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    // Size does not select the representation: a plaintext object is always payload plus trailer,
+    // so it never pays for a second file, a second fsync, or a second directory entry.
+    let metadata = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    assert!(!dir.path().join(metadata.as_str()).exists());
+    let bytes = std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap();
+    let (record, payload_len) =
+        cairn_types::storage::ObjectMetadataRecord::decode_inline_file(&bytes)
+            .unwrap()
+            .expect("large plaintext object ends with the inline trailer");
+    assert_eq!(payload_len, 256 * 1024);
+    assert_eq!(record.size_logical, 256 * 1024);
+    assert_eq!(
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical
+        )
+        .await,
+        payload
+    );
+    let ranged = read_all(
+        &store,
+        &staged.storage_path,
+        Some(ByteRange {
+            offset: 1000,
+            length: 4096,
+        }),
+        &staged.compression,
+        staged.size_logical,
+    )
+    .await;
+    assert_eq!(ranged, payload[1000..5096]);
+}
+
+#[tokio::test]
+async fn encrypted_and_compressed_sidecar_keeps_the_descriptor_without_key_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("encrypted-metadata").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let version = VersionId::null();
+    let dek = SecretKey32::new([0xAB; 32]);
+    let descriptor = r#"{"alg":"AES256","wrapped_dek_b64":"sealed","nonce_b64":"nonce"}"#;
+    let mut seed = metadata_seed(&bucket, &key, &version, &"b".repeat(32));
+    seed.sse_descriptor = Some(descriptor.to_owned());
+    let staged = store
+        .stage_fixture(
+            &bucket,
+            body(vec![7; 256 * 1024]),
+            StageOptions {
+                encryption: Some(dek.clone()),
+                metadata_seed: Some(seed),
+                ..opts(Some(CompressionPolicy::default()), "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    let metadata = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    let bytes = std::fs::read(dir.path().join(metadata.as_str())).unwrap();
+    let record = cairn_types::storage::ObjectMetadataRecord::decode(&bytes).unwrap();
+    assert!(matches!(
+        record.compression,
+        CompressionDescriptor::Compressed { .. }
+    ));
+    assert_eq!(record.sse_descriptor.as_deref(), Some(descriptor));
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    let hex_key = hex::encode([0xAB; 32]);
+    let base64_key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([0xAB; 32])
+    };
+    assert!(!json.contains(&hex_key), "raw DEK leaked as hex");
+    assert!(!json.contains(&base64_key), "raw DEK leaked as base64");
+    assert!(!json.contains("wrapped_dek_plaintext"));
+}
+
+#[tokio::test]
+async fn metadata_only_orphan_is_reclaimed_and_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = dir.path().join("orphan-bucket");
+    std::fs::create_dir(&bucket).unwrap();
+    std::fs::write(bucket.join(format!("{}.meta", "c".repeat(32))), b"{}").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(format!(".staging/{}.meta.tmp", "d".repeat(32))),
+        b"{}",
+    )
+    .unwrap();
+    let report = store
+        .reconcile_fixture(
+            &SetReconcileOracle::default(),
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.orphans_reclaimed, 1);
+    assert_eq!(report.staging_cleaned, 1);
+    assert!(!bucket.exists());
+    assert!(
+        !dir.path()
+            .join(format!(".staging/{}.meta.tmp", "d".repeat(32)))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn exact_cleanup_removes_data_and_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("cleanup-bucket").unwrap();
+    let id = "e".repeat(32);
+    let data = StoragePath::from_string(format!("{bucket}/{id}"));
+    let metadata = cairn_types::storage::object_metadata_path(&data).unwrap();
+    std::fs::create_dir(dir.path().join(bucket.as_str())).unwrap();
+    std::fs::write(dir.path().join(data.as_str()), b"data").unwrap();
+    std::fs::write(dir.path().join(metadata.as_str()), b"meta").unwrap();
+    for path in [data.clone(), metadata.clone()] {
+        let (cleanup, lease) = fixture_storage_cleanup(bucket.clone(), path);
+        store.cleanup_storage(&cleanup, lease).await.unwrap();
+    }
+    assert!(!dir.path().join(data.as_str()).exists());
+    assert!(!dir.path().join(metadata.as_str()).exists());
+    assert!(!dir.path().join(bucket.as_str()).exists());
+}
+
+#[tokio::test]
+async fn legacy_object_without_a_sidecar_still_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("legacy-bucket").unwrap();
+    let id = "f".repeat(32);
+    let data = StoragePath::from_string(format!("{bucket}/{id}"));
+    std::fs::create_dir(dir.path().join(bucket.as_str())).unwrap();
+    std::fs::write(dir.path().join(data.as_str()), b"legacy bytes").unwrap();
+    assert!(!dir.path().join(format!("{}.meta", data.as_str())).exists());
+    assert_eq!(
+        read_all(
+            &store,
+            &data,
+            None,
+            &CompressionDescriptor::Uncompressed,
+            12
+        )
+        .await,
+        b"legacy bytes"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn sidecar_failure_before_the_data_commit_leaves_no_final_name() {
+    let _scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("sidecar-abort-bucket").unwrap();
+    let key = ObjectKey::parse("abort").unwrap();
+    let version = VersionId::null();
+    // The injected seam sits between the metadata sidecar and the data commit. A plaintext object
+    // is one inline file with no sidecar stage, so this uses the encrypted two-file layout.
+    let mut seed = metadata_seed(&bucket, &key, &version, &"4".repeat(32));
+    seed.sse_descriptor =
+        Some(r#"{"alg":"AES256","wrapped_dek_b64":"sealed","nonce_b64":"nonce"}"#.to_owned());
+    fail::cfg("blob_after_sidecar_stage", "return").unwrap();
+    let result = store
+        .stage_fixture(
+            &bucket,
+            body(b"never committed".to_vec()),
+            StageOptions {
+                encryption: Some(SecretKey32::new([0x42; 32])),
+                metadata_seed: Some(seed),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await;
+    fail::remove("blob_after_sidecar_stage");
+    assert!(result.is_err(), "the injected failure must prevent an ACK");
+    let bucket_dir = dir.path().join(bucket.as_str());
+    assert!(
+        !bucket_dir.exists() || std::fs::read_dir(&bucket_dir).unwrap().next().is_none(),
+        "neither the data nor the sidecar may reach a final name"
+    );
+    let staging: Vec<_> = std::fs::read_dir(dir.path().join(".staging"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        staging.iter().any(|name| name.ends_with(".meta.tmp")),
+        "the sidecar staging alias is durable evidence for recovery"
+    );
+    assert!(
+        staging
+            .iter()
+            .any(|name| name.ends_with(".tmp") && !name.ends_with(".meta.tmp")),
+        "the data staging alias is retained for recovery"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn crash_after_data_rename_before_metadata_rename_is_reclaimed_by_scan() {
+    let _scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("crash-bucket").unwrap();
+    let key = ObjectKey::parse("crash").unwrap();
+    let version = VersionId::null();
+    let mut seed = metadata_seed(&bucket, &key, &version, &"1".repeat(32));
+    // A plaintext object is one inline file and has no metadata rename to interrupt; encryption
+    // keeps the separate sidecar so this window (data durable, metadata still staged) exists.
+    seed.sse_descriptor =
+        Some(r#"{"alg":"AES256","wrapped_dek_b64":"sealed","nonce_b64":"nonce"}"#.to_owned());
+    fail::cfg("blob_after_data_rename", "return").unwrap();
+    let result = store
+        .stage_fixture(
+            &bucket,
+            body(b"durable data".to_vec()),
+            StageOptions {
+                encryption: Some(SecretKey32::new([0x41; 32])),
+                metadata_seed: Some(seed),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await;
+    fail::remove("blob_after_data_rename");
+    assert!(result.is_err(), "the injected crash must prevent an ACK");
+    let data_name = std::fs::read_dir(dir.path().join(bucket.as_str()))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().len() == 32)
+        .expect("data was renamed before the injected crash");
+    let data = StoragePath::from_string(format!(
+        "{bucket}/{}",
+        data_name.file_name().to_string_lossy()
+    ));
+    let metadata = cairn_types::storage::object_metadata_path(&data).unwrap();
+    assert!(!dir.path().join(metadata.as_str()).exists());
+    assert!(
+        std::fs::read_dir(dir.path().join(".staging"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".meta.tmp")),
+        "the metadata staging alias survives the crash"
+    );
+    let report = store
+        .reconcile_fixture(
+            &SetReconcileOracle::default(),
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.orphans_reclaimed, 1);
+    assert_eq!(report.staging_cleaned, 1);
+    assert!(!dir.path().join(data.as_str()).exists());
+    assert!(!dir.path().join(metadata.as_str()).exists());
+    assert!(!dir.path().join(bucket.as_str()).exists());
+}
+
+#[tokio::test]
+async fn reconcile_keeps_a_live_sidecar_with_its_data_and_reclaims_an_orphan_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("paired-bucket").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let version = VersionId::null();
+    // Encryption keeps the separate sidecar (its container trailer must stay last), so this pair
+    // exercises the data+metadata two-file layout that reconcile must pair and reclaim.
+    let keep = store
+        .stage_fixture(
+            &bucket,
+            body(b"keep".to_vec()),
+            StageOptions {
+                encryption: Some(SecretKey32::new([0x11; 32])),
+                metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"2".repeat(32))),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    let orphan = store
+        .stage_fixture(
+            &bucket,
+            body(b"orphan".to_vec()),
+            StageOptions {
+                encryption: Some(SecretKey32::new([0x22; 32])),
+                metadata_seed: Some(metadata_seed(&bucket, &key, &version, &"3".repeat(32))),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    let keep_metadata =
+        cairn_types::storage::object_metadata_path(&keep.storage_path).expect("keep sidecar");
+    let orphan_metadata =
+        cairn_types::storage::object_metadata_path(&orphan.storage_path).expect("orphan sidecar");
+    assert!(dir.path().join(keep_metadata.as_str()).exists());
+    assert!(dir.path().join(orphan_metadata.as_str()).exists());
+    let mut live = std::collections::HashSet::new();
+    live.insert(keep.storage_path.as_str().to_owned());
+    let oracle = SetReconcileOracle {
+        live_paths: live,
+        live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
+    };
+    let report = store
+        .reconcile_fixture(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.blobs_scanned, 4);
+    assert_eq!(report.orphans_reclaimed, 2);
+    assert!(dir.path().join(keep.storage_path.as_str()).exists());
+    assert!(dir.path().join(keep_metadata.as_str()).exists());
+    assert!(!dir.path().join(orphan.storage_path.as_str()).exists());
+    assert!(!dir.path().join(orphan_metadata.as_str()).exists());
+}

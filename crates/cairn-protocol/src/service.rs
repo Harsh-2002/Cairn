@@ -7,6 +7,7 @@ use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
 use crate::object_ttl::{self, TtlSpec};
+use crate::overlay::Overlay;
 use crate::put_timing::{PutStage, PutTiming, PutTimings};
 use crate::request::{S3Body, S3Request, S3Response};
 use crate::storage_write::{PreparedStorageWrite, StorageWriteGuard, StorageWriteRuntime};
@@ -37,7 +38,8 @@ use cairn_types::object::{
 };
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::storage::{
-    StorageAdmission, StorageCreationPermit, StorageMutation, StorageWriteTarget,
+    ObjectCreationPermit, ObjectMetadataSeed, StorageAdmission, StorageCreationPermit,
+    StorageWriteTarget,
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
@@ -80,6 +82,8 @@ pub struct S3Service {
     storage_runtime: Option<StorageWriteRuntime>,
     /// Bounded one-in-32 ordinary PUT response-path samples shared by service clones.
     put_timings: Arc<PutTimings>,
+    /// Acknowledged object writes whose index fold is still pending.
+    overlay: Option<Arc<Overlay>>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -119,6 +123,7 @@ impl S3Service {
             replication_wake: None,
             storage_runtime: None,
             put_timings: Arc::new(PutTimings::default()),
+            overlay: None,
         }
     }
 
@@ -165,6 +170,24 @@ impl S3Service {
         self
     }
 
+    /// Attach the acknowledged-write overlay that keeps the index fold off the PUT path.
+    #[must_use]
+    pub fn with_overlay(mut self, overlay: Arc<Overlay>) -> Self {
+        self.overlay = Some(overlay);
+        self
+    }
+
+    /// Wait until every acknowledged object write has reached the index.
+    async fn drain_overlay(&self) -> Result<()> {
+        if let Some(overlay) = &self.overlay {
+            overlay
+                .drain()
+                .await
+                .map_err(|error| Error::Internal(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Drain fixed-label sampled PUT response-path timings for the metrics task.
     pub fn drain_put_timings(&self) -> Vec<PutTiming> {
         self.put_timings.drain()
@@ -189,37 +212,22 @@ impl S3Service {
                 &*self.blob,
                 bucket.name.clone(),
                 bucket.owner_id.clone(),
+                bucket.created_at,
                 target,
             )
             .await
     }
 
-    async fn admit_object_storage(
+    /// Plan an ordinary object write without a Writer round-trip. The retained guard abandons the
+    /// plan through the recovery worker if the request fails or is cancelled; the single
+    /// publication savepoint re-establishes bucket identity and path ownership.
+    async fn plan_object_storage(
         &self,
         bucket: &Bucket,
         target: StorageWriteTarget,
-    ) -> Result<(StorageCreationPermit, StorageWriteGuard)> {
+    ) -> Result<(ObjectCreationPermit, StorageWriteGuard)> {
         let prepared = self.prepare_storage(bucket, target).await?;
-        let outcome = self
-            .meta
-            .submit(Mutation::Storage {
-                bucket: bucket.name.clone(),
-                operation: StorageMutation::Reserve {
-                    plan: Box::new(prepared.plan().clone()),
-                    now: self.clock.now(),
-                },
-            })
-            .await?;
-        match outcome {
-            MutationOutcome::StorageAdmission(StorageAdmission::NotApplied) => {
-                prepared.reject();
-                Err(Error::Internal("storage admission lost ownership".into()))
-            }
-            MutationOutcome::StorageAdmission(receipt) => prepared.admit(receipt),
-            _ => Err(Error::Internal(
-                "unexpected storage admission outcome".into(),
-            )),
-        }
+        prepared.into_object()
     }
 
     async fn admit_part_storage(
@@ -704,6 +712,9 @@ impl S3Service {
 
     async fn delete_bucket(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // Pending acknowledged writes are not in the index yet; fold them before the emptiness
+        // check so a bucket with a just-written object is never reported empty.
+        self.drain_overlay().await?;
         if !self.meta.is_bucket_empty(&bucket.name).await? {
             return Err(Error::BucketNotEmpty);
         }
@@ -730,6 +741,7 @@ impl S3Service {
 
     async fn list_objects(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        self.drain_overlay().await?;
         let v1 = req.query("list-type").map(|v| v != "2").unwrap_or(true);
         let prefix = req.query("prefix").map(str::to_owned);
         // An empty but PRESENT `delimiter=` means "no delimiter" (S3 semantics): normalize it to
@@ -891,6 +903,7 @@ impl S3Service {
                 .then(|| v.to_ascii_lowercase())
         });
         let store_sha256 = extra.0.contains(&ChecksumAlgorithm::Sha256);
+        let stored_checksums = extra.clone();
         let mut stage_checksums = extra;
         if signed_sha256.is_some() && !store_sha256 {
             stage_checksums.0.push(ChecksumAlgorithm::Sha256);
@@ -957,14 +970,6 @@ impl S3Service {
                 .and_then(|v| v.parse::<u64>().ok()),
             self.max_object_size,
         );
-        let opts = StageOptions {
-            compression: bucket.compression,
-            extra_checksums: stage_checksums,
-            size_ceiling: self.max_object_size,
-            content_type: content_type.clone(),
-            encryption: sse_dek,
-            content_length,
-        };
         let versioned = bucket.versioning == VersioningState::Enabled;
         // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
         // a version then has the same identity on every node, and re-delivery is an idempotent
@@ -977,12 +982,69 @@ impl S3Service {
             replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
         };
         let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
+        // instead reproduces the SOURCE grants carried as a base64(JSON) header (ARCH 20.4). Either
+        // way `BucketOwnerEnforced` disables object ACLs, so any ACL — client or replicated — is
+        // dropped under it. Block-Public-Access is enforced at read time uniformly (cairn-authz), so a
+        // replicated public-read ACL is subject to the destination's BPA exactly like a client one;
+        // nothing extra is needed here.
+        let acl = if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
+            None
+        } else if is_replica {
+            replica_acl(&req)
+        } else {
+            req.header("x-amz-acl")
+                .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
+        };
+        // The system response headers (ARCH 13.4) are stored verbatim from the request — except
+        // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
+        let header_owned = |name: &str| req.header(name).map(str::to_owned);
+        // Absolute TTL deadlines are known before staging. Relative deadlines are resolved against
+        // the commit timestamp below; until protocol 3 P2 refreshes the sidecar they remain
+        // SQLite-authoritative.
+        let seed_expire_at = match ttl_request {
+            Some((TtlSpec::Absolute { at }, _)) => Some(at),
+            _ => None,
+        };
+        let metadata_seed = ObjectMetadataSeed {
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            row_id: row_id.clone(),
+            is_delete_marker: false,
+            content_type: content_type.clone(),
+            content_encoding: stored_content_encoding(&req),
+            cache_control: header_owned("cache-control"),
+            content_disposition: header_owned("content-disposition"),
+            content_language: header_owned("content-language"),
+            expires: header_owned("expires"),
+            expire_at: seed_expire_at,
+            storage_class: StorageClass::Standard,
+            owner_id: bucket.owner_id.clone(),
+            user_metadata: user_metadata.clone(),
+            acl: acl.clone(),
+            stored_checksums,
+            sse_descriptor: sse_descriptor.clone(),
+            created_at: intent_validation_now,
+            updated_at: intent_validation_now,
+            tags: initial_tags.clone(),
+            lock_intent,
+        };
+        let opts = StageOptions {
+            compression: bucket.compression,
+            extra_checksums: stage_checksums,
+            size_ceiling: self.max_object_size,
+            content_type: content_type.clone(),
+            encryption: sse_dek,
+            content_length,
+            metadata_seed: Some(metadata_seed),
+        };
         if let Some(timer) = preflight_timer {
             timer.complete();
         }
         let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
         let admitted = self
-            .admit_object_storage(
+            .plan_object_storage(
                 bucket,
                 StorageWriteTarget::Object {
                     key: key.clone(),
@@ -1077,23 +1139,6 @@ impl S3Service {
         // version-id handling.
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
-        // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
-        // instead reproduces the SOURCE grants carried as a base64(JSON) header (ARCH 20.4). Either
-        // way `BucketOwnerEnforced` disables object ACLs, so any ACL — client or replicated — is
-        // dropped under it. Block-Public-Access is enforced at read time uniformly (cairn-authz), so a
-        // replicated public-read ACL is subject to the destination's BPA exactly like a client one;
-        // nothing extra is needed here.
-        let acl = if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
-            None
-        } else if is_replica {
-            replica_acl(&req)
-        } else {
-            req.header("x-amz-acl")
-                .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
-        };
-        // The system response headers (ARCH 13.4) are stored verbatim from the request — except
-        // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
-        let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
             id: row_id,
             bucket: bucket.name.clone(),
@@ -1155,30 +1200,78 @@ impl S3Service {
             timer.complete();
         }
         let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
-        let publication = self
-            .meta
-            .submit(write_guard.publication(
-                Mutation::PutObjectVersion {
-                    row: Box::new(row),
-                    precondition: precond,
-                    initial_state: InitialObjectState {
-                        tags: initial_tags,
-                        lock_intent,
-                    },
-                    replication,
+        // An unconditional write to a bucket with no byte quota and no Object Lock can acknowledge
+        // after the file barrier: the row goes into the bounded overlay and folds afterwards. Every
+        // key mutation and LIST drains the overlay first, so the index never acts on a stale view.
+        let overlay_fast = self.overlay.is_some()
+            && precond.is_unconditional()
+            && ttl_request.is_none()
+            && !is_replica
+            && replication.is_empty()
+            && lock_intent.retention.is_none()
+            && lock_intent.legal_hold.is_none()
+            && matches!(self.meta.get_bucket_quota(&bucket.name).await, Ok(None))
+            && matches!(
+                self.meta
+                    .get_bucket_config(&bucket.name, ConfigAspect::ObjectLock)
+                    .await,
+                Ok(None)
+            );
+        let row = std::sync::Arc::new(row);
+        let mutation = write_guard.planned_publication(
+            Mutation::PutObjectVersion {
+                row: Box::new((*row).clone()),
+                precondition: precond,
+                initial_state: InitialObjectState {
+                    tags: initial_tags,
+                    lock_intent,
                 },
-                staged.index_spool,
-                Some(Box::new(self.activity_entry(
-                    "PutObject",
-                    bucket.name.as_str(),
-                    Some(key.as_str()),
-                    Some(staged.size_logical),
-                    Some(staged.etag.as_str()),
-                    req.principal.as_ref(),
-                    now,
-                ))),
-            ))
-            .await;
+                replication,
+            },
+            staged.index_spool,
+            Some(Box::new(self.activity_entry(
+                "PutObject",
+                bucket.name.as_str(),
+                Some(key.as_str()),
+                Some(staged.size_logical),
+                Some(staged.etag.as_str()),
+                req.principal.as_ref(),
+                now,
+            ))),
+            overlay_fast,
+        );
+        let publication = if overlay_fast {
+            let overlay = self.overlay.as_ref().expect("checked above");
+            let _stripe = overlay.stripe(&bucket.name, &key).await;
+            let same_bucket = matches!(
+                self.meta.get_bucket(&bucket.name).await,
+                Ok(Some(current))
+                    if current.created_at == bucket.created_at
+                        && current.owner_id == bucket.owner_id
+            );
+            if same_bucket {
+                overlay
+                    .acknowledge(&bucket.name, &key, Arc::clone(&row), mutation)
+                    .await;
+                Ok(MutationOutcome::Put {
+                    version_id: version_id.clone(),
+                    superseded: None,
+                })
+            } else {
+                drop(_stripe);
+                self.meta.submit(mutation).await
+            }
+        } else if self.overlay.is_some() {
+            let overlay = self.overlay.as_ref().expect("checked above");
+            let _stripe = overlay.stripe(&bucket.name, &key).await;
+            if let Err(error) = overlay.wait_key(&bucket.name, &key).await {
+                self.recover_object_write(&mut write_guard).await;
+                return Err(Error::Internal(error.to_string()));
+            }
+            self.meta.submit(mutation).await
+        } else {
+            self.meta.submit(mutation).await
+        };
         if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
             if let Some(timer) = publication_timer {
                 timer.complete();
@@ -1420,6 +1513,7 @@ impl S3Service {
         bucket: &Bucket,
     ) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
+        self.drain_overlay().await?;
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
         let event_key = key.clone();
         let now = self.clock.now();
@@ -2540,6 +2634,8 @@ impl S3Service {
             content_length: None,
             content_type: session.content_type.clone(),
             encryption: sse_dek,
+            // Multipart assembly is unchanged: no protocol-3 sidecar yet.
+            metadata_seed: None,
         };
         // The completion claim owns the session while assembly reads its part files. Abort can only
         // remove `active`, so it cannot delete these bytes after the active->completing transition.
@@ -3136,6 +3232,61 @@ impl S3Service {
         // mutation below — a copy whose destination is SseS3/Kms (explicit header or bucket default)
         // must advertise it, exactly as PUT does. `AtRest` advertises nothing.
         let dest_sse_descriptor = dest_plan.descriptor_json.clone();
+        let versioned = dest_bucket.versioning == VersioningState::Enabled;
+        let version_id = if versioned {
+            VersionId::generate()
+        } else {
+            VersionId::null()
+        };
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
+        // under COPY they are the source version's stored values, under REPLACE this request's.
+        // They were hard-coded `None` before audit 2026-07, so every copy silently lost them.
+        let sys = |name: &str, src: &Option<String>| -> Option<String> {
+            if replace {
+                req.header(name).map(str::to_owned)
+            } else {
+                src.clone()
+            }
+        };
+        // `content-encoding` needs the same normalizer the PUT path uses: under REPLACE the header
+        // may carry the `aws-chunked` TRANSFER coding, which describes how this request's body was
+        // framed on the wire and is not a property of the stored object. Storing it makes every
+        // later GET advertise a coding the response does not use.
+        let content_encoding = if replace {
+            stored_content_encoding(req)
+        } else {
+            src_row.content_encoding.clone()
+        };
+        let seed_expire_at = match ttl_request {
+            Some((TtlSpec::Absolute { at }, _)) => Some(at),
+            _ if carry_source_ttl => src_row.expire_at,
+            _ => None,
+        };
+        let metadata_seed = ObjectMetadataSeed {
+            bucket: dest_bucket.name.clone(),
+            key: dest_key.clone(),
+            version_id: version_id.clone(),
+            row_id: row_id.clone(),
+            is_delete_marker: false,
+            content_type: content_type.clone(),
+            content_encoding: content_encoding.clone(),
+            cache_control: sys("cache-control", &src_row.cache_control),
+            content_disposition: sys("content-disposition", &src_row.content_disposition),
+            content_language: sys("content-language", &src_row.content_language),
+            expires: sys("expires", &src_row.expires),
+            expire_at: seed_expire_at,
+            storage_class: StorageClass::Standard,
+            owner_id: dest_bucket.owner_id.clone(),
+            user_metadata: user_meta.clone(),
+            acl: None,
+            stored_checksums: ChecksumSet::none(),
+            sse_descriptor: dest_sse_descriptor.clone(),
+            created_at: intent_validation_now,
+            updated_at: intent_validation_now,
+            tags: dest_tags.clone(),
+            lock_intent,
+        };
         let opts = StageOptions {
             compression: dest_bucket.compression,
             extra_checksums: ChecksumSet::none(),
@@ -3144,16 +3295,10 @@ impl S3Service {
             encryption: dest_plan.dek,
             // The source object's plaintext size is known, so preallocate the destination blob.
             content_length: Some(src_row.size_logical),
+            metadata_seed: Some(metadata_seed),
         };
-        let versioned = dest_bucket.versioning == VersioningState::Enabled;
-        let version_id = if versioned {
-            VersionId::generate()
-        } else {
-            VersionId::null()
-        };
-        let row_id = uuid::Uuid::new_v4().simple().to_string();
         let (creation, mut write_guard) = self
-            .admit_object_storage(
+            .plan_object_storage(
                 dest_bucket,
                 StorageWriteTarget::Object {
                     key: dest_key.clone(),
@@ -3188,16 +3333,6 @@ impl S3Service {
         };
 
         let dest_key_for_event = dest_key.clone();
-        // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
-        // under COPY they are the source version's stored values, under REPLACE this request's.
-        // They were hard-coded `None` before audit 2026-07, so every copy silently lost them.
-        let sys = |name: &str, src: &Option<String>| -> Option<String> {
-            if replace {
-                req.header(name).map(str::to_owned)
-            } else {
-                src.clone()
-            }
-        };
         let row = ObjectVersionRow {
             id: row_id,
             bucket: dest_bucket.name.clone(),
@@ -3209,15 +3344,7 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
-            // `content-encoding` needs the same normalizer the PUT path uses: under REPLACE the
-            // header may carry the `aws-chunked` TRANSFER coding, which describes how this request's
-            // body was framed on the wire and is not a property of the stored object. Storing it
-            // makes every later GET advertise a coding the response does not use.
-            content_encoding: if replace {
-                stored_content_encoding(req)
-            } else {
-                src_row.content_encoding.clone()
-            },
+            content_encoding,
             cache_control: sys("cache-control", &src_row.cache_control),
             content_disposition: sys("content-disposition", &src_row.content_disposition),
             content_language: sys("content-language", &src_row.content_language),
@@ -3233,7 +3360,7 @@ impl S3Service {
             checksums: staged.checksums.clone(),
             // The copy destination's own encryption descriptor (a fresh DEK per the resolver above);
             // `None` when the plan resolved to plaintext.
-            sse_descriptor: dest_plan.descriptor_json,
+            sse_descriptor: dest_sse_descriptor.clone(),
             replication_status: None,
             internal_sha256: Some(staged.internal_sha256.clone()),
             replicated_at: None,
@@ -3265,7 +3392,7 @@ impl S3Service {
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
-            .submit(write_guard.publication(
+            .submit(write_guard.planned_publication(
                 Mutation::PutObjectVersion {
                     row: Box::new(row),
                     precondition: Precondition::default(),
@@ -3277,6 +3404,7 @@ impl S3Service {
                 },
                 staged.index_spool,
                 None,
+                false,
             ))
             .await
         {
@@ -3355,6 +3483,9 @@ impl S3Service {
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // A multi-object delete must see an acknowledged write that is still waiting to fold,
+        // otherwise it reports success for a key whose row has not reached the index yet.
+        self.drain_overlay().await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
         // S3 caps a multi-object delete at 1000 keys per request (ARCH 21.5); reject a larger
@@ -3810,6 +3941,9 @@ impl S3Service {
 
     async fn list_object_versions(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
+        // Pending acknowledged writes live only in the overlay until the index fold lands; a
+        // version listing must reflect an acknowledged PUT before it consults the index.
+        self.drain_overlay().await?;
         let prefix = req.query("prefix").map(str::to_owned);
         // Empty delimiter == no grouping (S3 semantics); normalize to None. See `list_objects`.
         let delimiter = req
@@ -5341,16 +5475,25 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let row = match req.query("versionId") {
-            Some(vid) => self
-                .meta
-                .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
-                .await?
-                .ok_or(Error::NoSuchVersion)?,
-            None => self
-                .meta
-                .current_version(&bucket.name, &key)
-                .await?
-                .ok_or(Error::NoSuchKey)?,
+            Some(vid) => {
+                self.drain_overlay().await?;
+                self.meta
+                    .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                    .await?
+                    .ok_or(Error::NoSuchVersion)?
+            }
+            None => match self
+                .overlay
+                .as_ref()
+                .and_then(|overlay| overlay.latest(&bucket.name, &key))
+            {
+                Some(row) => (*row).clone(),
+                None => self
+                    .meta
+                    .current_version(&bucket.name, &key)
+                    .await?
+                    .ok_or(Error::NoSuchKey)?,
+            },
         };
         if row.is_delete_marker {
             return Err(Error::NoSuchKey);
@@ -5370,6 +5513,7 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         match req.query("versionId") {
             Some(vid) => {
+                self.drain_overlay().await?;
                 let row = self
                     .meta
                     .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
@@ -5384,6 +5528,16 @@ impl S3Service {
                 Ok(ReadTarget::Object(Box::new(row)))
             }
             None => {
+                if let Some(row) = self
+                    .overlay
+                    .as_ref()
+                    .and_then(|overlay| overlay.latest(&bucket.name, &key))
+                {
+                    if row.is_delete_marker {
+                        return Ok(ReadTarget::DeleteMarker(not_found_marker(req, &row)));
+                    }
+                    return Ok(ReadTarget::Object(Box::new((*row).clone())));
+                }
                 let row = self
                     .meta
                     .current_version(&bucket.name, &key)
