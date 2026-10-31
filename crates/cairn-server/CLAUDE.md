@@ -86,11 +86,17 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   is resolved before bind. Wires the S3 service's SSE `KeyProvider`
   (`cairn_protocol::LocalRingProvider` from `CAIRN_KMS_KEY_IDS`), `with_encrypt_at_rest`, and the
   `StorageWriteRuntime` with the committed generation, actual node-lock lifetime, bounded
-  recovery admission and synchronous enqueue into the retained FIFO worker. Each request captures
-  its complete plan before Writer admission. Recovery waits for backend and kernel quiescence,
+  recovery admission and synchronous enqueue into the retained FIFO worker. Multipart requests
+  capture their complete plan before Writer admission; ordinary PUT/Copy capture theirs before the
+  publication savepoint. Recovery waits for backend and kernel quiescence,
   resolves exact intent through the Writer and drains cleanup claims. Startup retains full
   reconciliation; intents and all cleanup claims protect paths. Only a successful full scan may
   retire legacy accounting; protocol-2 debt still requires exact durable cleanup.
+- `sidecar_rebuild.rs` — the protocol-3 startup index rebuild: walks every bucket directory, reads
+  each `CRNI` trailer or `<uuid>.meta` sidecar, validates it against its data file, and inserts the
+  missing index row before readiness. It never invents or deletes rows, logs and skips corrupt or
+  mismatched metadata, and runs in addition to the mandatory full reconciliation scan. It creates no
+  buckets, users or policies.
 - `sts.rs` — the **AWS-STS wire surface** (ARCH 14): `Action=AssumeRole` / `Action=GetSessionToken`
   as a form `POST /` on the S3 data-plane port, returning AWS-STS XML. A dedicated `sts`-scoped
   SigV4 verification (`AuthChain::authenticate_sts`, no dev bypass) mints a `CAIRNTMP…` session over

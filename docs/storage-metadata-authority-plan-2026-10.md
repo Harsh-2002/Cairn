@@ -1,6 +1,6 @@
 # Object metadata authority — execution plan (protocol 3)
 
-**Status:** approved architecture, implementation in progress. Human decision recorded 2026-10-28:
+**Status:** shipped in `7eb31a1`; this record preserves the phased plan. Human decision recorded 2026-10-28:
 object bytes and per-object metadata files become the durable authority for object data; SQLite is a
 rebuildable index plus the control-plane authority. `CONTRACT.md` carries this ceiling.
 
@@ -151,7 +151,7 @@ P2 is adopted only if, on fr38 with strict durability and c16:
 
 Stage instrumentation and a CPU profile on the quiet benchmark host (fr38, 1 MiB, c16, strict
 durability) changed the diagnosis the P2 phase was based on. The original premise was that the
-extra SQLite publication flush is the remaining PUT gap. It is not.
+extra SQLite publication flush is the remaining PUT gap. It was not.
 
 | PUT 1 MiB (c16) | Control |
 |---|---:|
@@ -167,7 +167,7 @@ extra SQLite publication flush is the remaining PUT gap. It is not.
 Decisive checks:
 
 - `CAIRN_META_SYNCHRONOUS=normal` (no per-commit fsync) made PUT **slower** (537 vs 565 obj/s):
-  the publication barrier is not the cost.
+  the publication barrier was not the cost.
 - A CPU profile put **74% of server CPU** in `sha2::sha256::compress256`.
 - Removing SHA-256 entirely in a scratch build bought only ~10-20%, because the hash overlaps the
   client's body delivery rather than adding to it.
@@ -182,20 +182,20 @@ Actions taken instead (both merged as request-path CPU fixes, no protocol change
 - The internal SHA-256 baseline runs on `aws-lc-rs` (already a rustls dependency): PUT 502 → 530
   obj/s with identical digests.
 
-Current strict-harness scoreboard (3 pairs, c16): **LIST 3.76x, GET 2.13x, PUT 0.69x**.
+Current strict-harness scoreboard at this revision (3 pairs, c16): **LIST 3.76x, GET 2.13x, PUT 0.69x**.
 
 Consequences for P2:
 
-- P2's async fold removes the ~2.5 ms publication wait, not the 8 ms gap. It cannot reach the
-  acceptance threshold alone, and the overlay/rebuild machinery is not justified by that gain.
-- Removing the pre-write admission (PR #141) adds ~1.6 ms back but weakens recovery precision.
-- The remaining large PUT item is the mandatory plaintext SHA-256. Moving it off the ACK path would
-  close most of the gap on paper, at the cost of a window where an acknowledged object has no
+- P2's async fold removed the ~2.5 ms publication wait, not the 8 ms gap. It could not reach the
+  acceptance threshold alone, and the overlay/rebuild machinery was not justified by that gain.
+- Removing the pre-write admission (PR #141) added ~1.6 ms back but weakened recovery precision.
+- The remaining large PUT item was the mandatory plaintext SHA-256. Moving it off the ACK path would
+  have closed most of the gap on paper, at the cost of a window where an acknowledged object has no
   integrity baseline for the scrub.
 
-P2 is therefore **suspended**, not rejected: it stays the right design only if a non-performance
-requirement (file-level metadata authority, restore without SQLite) justifies it. Protocol 3 remains
-unshipped.
+P2 was therefore **suspended** at this revision, not rejected: it stayed the right design only if a
+non-performance requirement (file-level metadata authority, restore without SQLite) justified it.
+Protocol 3 was unshipped then.
 
 ## Measured revision — 2026-10-30
 

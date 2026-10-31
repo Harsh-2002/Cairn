@@ -11,8 +11,9 @@ and entirely achievable with the building blocks below. Read `backup-restore.md`
 A Cairn node has two pieces of state on one filesystem (the one-filesystem invariant,
 `operations.md` §1):
 
-- the **metadata database** (SQLite) — the single source of truth for the namespace; and
-- the **blob files** — the object bytes under opaque IDs.
+- the **metadata database** (SQLite) — the control-plane authority and the object index, the index
+  rebuildable from the object files but not replaceable for buckets, users or keys; and
+- the **object files** — the object bytes under opaque IDs, carrying their own per-object metadata.
 
 | Failure | Protection |
 |---|---|
@@ -74,11 +75,14 @@ Suggested alerts: `cairn_replication_lag_seconds` above your RPO budget for N mi
    encrypted object reads. Resume a saved multipart upload where one exists and check replication
    backlog recovery before returning clients to the node.
 
-Metadata is the namespace authority. A blob written after the snapshot has no recovered key/version
-mapping merely because its bytes survive; reconciliation treats it as an orphan and may reclaim it.
-Post-snapshot writes need an independent replica or newer complete backup. The original master-key
-ring is also required; snapshots deliberately exclude it. Supported native backup/restore is offline
-single SQLite only, never a metadata-engine or shard-count migration.
+Metadata is the namespace authority. SQLite is the control-plane authority and the object index:
+the index is rebuildable from the protocol-3 object files, so the startup rebuild restores a lost
+index tail, but a lost database still loses the namespace — buckets, users, keys and policies
+cannot be reconstructed from object files. A blob written after the snapshot has no recovered
+key/version mapping merely because its bytes survive; reconciliation treats it as an orphan and may
+reclaim it. Post-snapshot writes need an independent replica or newer complete backup. The original
+master-key ring is also required; snapshots deliberately exclude it. Supported native backup/restore
+is offline single SQLite only, never a metadata-engine or shard-count migration.
 
 ### 4.2 Whole node lost — promote a replication destination
 

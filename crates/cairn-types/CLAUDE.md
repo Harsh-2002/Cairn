@@ -24,9 +24,10 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
     takes an optional DEK because every encrypted write emits current v3; `PartRef.cipher` carries
     the persisted version declaration when assembly reads an already-staged part.
 - `storage.rs` — protocol-2 file-free plans, exact admission/publication validation, move-only
-  creation permits and leased cleanup claims. `storage/io.rs` owns backend-operation leases,
-  node-lock retention and unforgeable quiescence proofs. Cloned plans carry metadata only; they
-  never grant a second creation permit.
+  creation permits and leased cleanup claims; protocol 3's `ObjectMetadataRecord` (the versioned
+  per-object record) and `INLINE_TRAILER_MAGIC` (`CRNI`) live here too. `storage/io.rs` owns
+  backend-operation leases, node-lock retention and unforgeable quiescence proofs. Cloned plans
+  carry metadata only; they never grant a second creation permit.
 - `error.rs` — the typed error tree: per-subsystem errors (`BlobError`, `MetaError`, `AuthError`,
   `CryptoError`, `ReplicationError`, `BodyError`, `ConfigError`) **fold into the canonical `Error`**
   via the `From` impls at the bottom. `Error` is the wire-mappable enum the single translator maps

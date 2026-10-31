@@ -11,7 +11,9 @@ an admitted multipart completion may already hold its final directory descriptor
 The local-filesystem `BlobStore` (`LocalBlobStore`) — **the only crate in the workspace that performs
 filesystem syscalls**. It owns the durable commit sequence, the self-describing CRNB block format
 (compression + SSE-S3 encryption at rest), and the reconcile (orphan-reclaim) path. Object bytes are
-plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
+plain files under opaque IDs, and the blob layer writes the durable per-object metadata record into
+that file's `CRNI` trailer (or a `<uuid>.meta` sidecar when the CRNB container must stay last); the
+SQLite index remains `cairn-meta`'s.
 
 ## Layout (`src/`)
 - `lib.rs` — `LocalBlobStore`, the `BlobStore` + `ReconcileOracle` impls, `reconcile_inner`, the
@@ -56,14 +58,18 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 ## Notes
 - **The durability ordering IS the contract** (`docs/storage-durability.md` 8, ARCH 8.2) — do not
   reorder: stream → `sync_data` (fdatasync, *not* `sync_all`) the staged file → rename into the bucket
-  dir → fsync that dir (via the coalescer) → only then is the blob durable. `stage` returns *before*
-  an authoritative object row references it; a crash here leaves admitted paths for startup intent
-  resolution and exact cleanup.
-- **Every physical write requires committed admission.** `stage`, `stage_part` and `assemble`
-  consume a `StorageCreationPermit` for the exact Writer-admitted plan and its `StorageIoLease`.
-  The plan includes all possible temporary, final and index-spool names before creation; namespace
-  operations may not invent more names. Multipart reservation/completion ownership and admission
-  share a Writer savepoint. Publication consumes the matching intent atomically with metadata.
+  dir → fsync that dir (via the coalescer) → only then is the blob durable. A plaintext protocol-3
+  object is that one file: payload, then the `CRNI` trailer; a compressed or encrypted blob ends in
+  its CRNB container and also keeps a `<uuid>.meta` sidecar. `stage` returns *before*
+  an authoritative object row references it; a crash here leaves admitted paths (or a durable file
+  for the startup rebuild) rather than a half-visible object.
+- **Every physical write requires a committed permit.** `stage_part` and `assemble` consume a
+  `StorageCreationPermit` for the exact Writer-admitted plan and its `StorageIoLease`; `stage`
+  consumes a move-only `ObjectCreationPermit` that the publication savepoint fences.
+  The plan includes all possible temporary, final, metadata and index-spool names before creation;
+  namespace operations may not invent more names. Multipart reservation/completion ownership and
+  admission share a Writer savepoint. Publication consumes the matching intent atomically with
+  metadata.
 - **Cancellation retains ownership; it does not unlink on Drop.** Recovery admission and the exact
   plan guard precede the Writer submission. Blocking jobs, io_uring work, returned descriptors and
   buffers, and coalesced directory-sync requests retain child leases through actual completion.

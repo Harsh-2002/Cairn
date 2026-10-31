@@ -232,10 +232,14 @@ Cairn guarantees that after any crash it converges, with no manual intervention,
 where every visible metadata row references a present, durable blob and no orphan remains. The
 commit sequence is: stream to staging → fsync the file → rename into place → **fsync the
 directory** → validate hashes → commit the metadata transaction (the single linearization
-point) → reclaim superseded blobs. A write is acknowledged only after its metadata commit is
-durable. Drive-failure survival is delegated to the storage layer; host-failure survival comes
-from bucket replication. Every write first commits its exact intended filenames through the Writer; admission is not an
-S3 success. If PUT/Copy, part upload or completion is cancelled or loses an acknowledgement,
+point) → reclaim superseded blobs. For an ordinary unconditional object write the object's own
+durable file is the commit, so the write is acknowledged after the file barrier and the index row
+folds asynchronously; a conditional, quota-governed, Object-Lock, replica or multipart write is
+acknowledged only after its metadata commit is durable. Drive-failure survival is delegated to the
+storage layer; host-failure survival comes from bucket replication. Multipart writes admit their
+exact intended filenames through the Writer before creation; admission is not an S3 success, and an
+ordinary write is fenced by its publication savepoint instead. If PUT/Copy, part upload or completion
+is cancelled or loses an acknowledgement,
 the retained recovery worker waits for backend I/O and kernel file ownership to quiesce, then
 resolves the intent through the Writer. Deletes and replacements persist exact cleanup debt;
 quota remains charged until unlink and namespace sync succeed. Errors preserve accounting for
@@ -254,6 +258,14 @@ may itself be a mount; descendant symlinks and mounts are rejected. Keep one fil
 that root. Do not change the namespace or use unsupported older writers behind Cairn's node lock.
 Upgrade offline with a verified backup and fresh restore drill; rollback uses the pre-upgrade
 snapshot into a fresh directory, not an older binary pointed at protocol-2 state.
+
+### Startup index rebuild
+
+Startup walks every bucket directory, reads each inline trailer or `<uuid>.meta` sidecar, verifies
+it against its data file, and inserts missing index rows before readiness. Corrupt or mismatched
+metadata is logged and skipped: the rebuild never invents and never deletes a row. It runs in
+addition to the mandatory full reconciliation scan, and it creates no buckets, users or policies —
+a lost database still loses the namespace.
 
 The built-in backup/restore path is **offline and single-SQLite only**: it refuses a live node and
 any configured topology/backend mismatch rather than produce an incomplete snapshot. Its

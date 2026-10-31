@@ -78,14 +78,17 @@ metadata commit.
 
 **Profile (b) — small-object rate.** N concurrent workers PUT many 4 KiB objects. Reports ops/s
 and p50/p99/p999 PUT latency, swept across concurrency **1, 4, 16**. Per ARCH 30.1 the binding
-constraint here is the single group-committing metadata writer and the fsync rate; the sweep makes
-the ceiling visible.
+constraint here is the staging fsync and the directory barrier; the writer bounds conditional and
+control-plane writes. The sweep makes the ceiling visible.
 
 Between phases the harness GETs `/metrics` and extracts the `cairn_*` gauges and the
 `cairn_request_duration_seconds` summary, so the server's own view sits alongside the client-side
 numbers.
 
 ### Observed results (default profile, this host)
+
+> Historical: recorded before storage protocol 3, kept as the shape of the harness output. §8 has
+> the current numbers.
 
 **Profile (a) — large-object bandwidth** (16 × 32 MiB = 512 MiB, 8 concurrent workers):
 
@@ -115,13 +118,17 @@ with multi-second p999 outliers from the cold-start window — see below).
 
 ### Interpreting the single-writer ceiling (ARCH 8.3 / 30.2)
 
+> Historical: these figures describe the writer-bound regime that storage protocol 3 replaced. The
+> current figures are in §8.
+
 The defining number: **concurrency 1 → 16 (16×) moved ops/s only 165.6 → 275.4 (1.66×) while p999
 latency grew 18.3 ms → 198.2 ms (10.8×).** That is the single-writer ceiling, made visible.
 
 Why it happens, per the spec:
 
 - A **single group-committing writer** owns the one write connection (ARCH 7.2/11.6). Every
-  small-object PUT must pass through it.
+  conditional, quota-governed or Object-Locked PUT must pass through it; an unconditional PUT does
+  not.
 - **Group commit** (ARCH 8.3) coalesces the mutations that arrive during one durability barrier
   into a single COMMIT and a single fsync, then acks every member of the batch after that barrier.
   This is why ops/s *rises at all* as concurrency goes 1 → 4: more concurrent arrivals mean a
@@ -648,3 +655,25 @@ The fix also passed the full local gate: 1,470 workspace tests (5 skipped), doct
 variants, formatting, Rust/npm audits, console lint/build and installer checks. Regression coverage
 includes trim failure, cancellation ownership and plaintext/encrypted single-object/multipart
 containers across the three compression settings.
+
+## 8. Protocol 3 head-to-head vs RustFS
+
+Measured 2026-10-30 on fr38 with strict durability, interleaved same-session pairs through
+`warp` (`conformance/warp.sh`) in 23-second arms: Cairn and RustFS take turns on the same host so
+that a load swing hits both. The host is shared and swings ±25% run to run, so the ratio is the
+number to trust, not the absolute throughput.
+
+| Workload | main before | now | RustFS | Ratio |
+|---|---:|---:|---:|---:|
+| PUT 4 KiB, c32, host defaults | 1,700 obj/s | 5,062–5,153 (median 5,112) | 4,335–5,564 (median 4,646) | **1.10×** |
+| PUT 4 KiB, c32, 8 pinned cores | — | 4,202 | 1,764 | **2.38×** |
+| PUT 1 MiB, c16, host defaults | 366–417 obj/s | 418–480 | 423–637 | ~0.95× |
+| PUT 1 MiB, c16, 8 pinned cores | — | 466 | 358 | **1.30×** |
+| GET 1 MiB | — | — | — | **2.13×** |
+| LIST 1,000 keys | — | — | — | **3.76×** |
+
+CPU per 1 MiB object is now ≈40M cycles, parity with RustFS. It was 1.7× before streaming chunk
+hashing moved from the pure-Rust `sha2` to `aws-lc-rs`, which is the change that closed it.
+
+The unpinned 1 MiB number is dominated by whatever else runs on the host; the pinned ratio is the
+deployment-relevant one, because it holds the core budget fixed the way a dedicated node does.

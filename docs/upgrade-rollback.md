@@ -14,12 +14,16 @@ decision that is **fixed at first init** and cannot be changed later.
 - Cairn is **pre-1.0** (`Cargo.toml` is `0.x`). Until a tagged `1.0`, minor releases may change
   behaviour; pin to a specific tag or commit for production and read the release notes before
   upgrading.
-- The **on-disk contract is the stable part**: object bytes are plain files and all metadata is the
-  embedded SQLite database. The schema evolves only through **append-only migrations**
+- The **on-disk contract is the stable part**: object bytes and their per-object metadata are plain
+  files, and SQLite holds the object index and the control-plane state. The schema evolves only
+  through **append-only migrations**
   (`crates/cairn-meta/src/schema.rs`): a new version adds a migration; an applied migration is never
   edited. A newer binary opens an older database and runs the outstanding migrations forward on
   startup. The wire protocol (S3 SigV4/Bearer) and the `CAIRN_*` configuration surface are intended
   to be stable; additive changes (new endpoints, new optional knobs) are the norm.
+- A pre-protocol-3 release **fails closed** on a trailer-bearing plaintext object: it reads the
+  declared length from the index and finds a mismatch instead of serving the trailer as payload.
+  That is a refusal, not a migration, so rollback still requires the pre-upgrade snapshot.
 
 ## 2. Forward upgrade (newer binary, same data)
 
