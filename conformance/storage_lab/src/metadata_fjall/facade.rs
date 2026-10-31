@@ -262,6 +262,14 @@ impl MetadataStore for Store {
             "list_failed_webhooks is outside the isolated Fjall workload contract",
         ))
     }
+    async fn get_user_quota(&self, _user: &UserId) -> Result<Option<u64>, MetaError> {
+        // The isolated Fjall workload models the object index, not user rows; the publication
+        // eligibility check never runs in this harness.
+        Err(kv::error(
+            "get_user_quota is outside the isolated Fjall workload contract",
+        ))
+    }
+
     async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
         let bucket = bucket.clone();
         self.read(move |view| {
