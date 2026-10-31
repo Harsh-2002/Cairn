@@ -91,8 +91,9 @@ impl ControlResponse {
 
     /// An error envelope `{ "error": <message>, "request_id": "" }` at `status`. The request id is
     /// filled in centrally by [`ControlResponse::stamp_request_id`] once it is known, so every
-    /// error path carries the same id as the response header.
-    fn error(status: StatusCode, message: &str) -> Self {
+    /// error path carries the same id as the response header. Public so the server adapter can
+    /// report a stack-level failure before the router runs, in the same envelope.
+    pub fn error(status: StatusCode, message: &str) -> Self {
         let body = serde_json::to_vec(&wire::ErrorResp {
             error: message.to_owned(),
             request_id: String::new(),

@@ -16,7 +16,7 @@ use cairn_types::traits::MetadataStore;
 use cairn_types::{Bucket, BucketName, ObjectKey, Timestamp};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The bucket incarnation an acknowledged row belongs to. A bucket deleted and re-created under
 /// the same name is a different incarnation; a row from the old one must never be served for the
@@ -32,6 +32,8 @@ struct FoldItem {
     key: ObjectKey,
     row_id: String,
     mutation: Mutation,
+    /// When the write was acknowledged, so the fold histogram measures acknowledgement-to-index.
+    enqueued_at: Instant,
 }
 
 /// A request to wait until every prior write has been folded.
@@ -117,6 +119,16 @@ impl Overlay {
         self.stripes[index].lock().await
     }
 
+    /// Rows acknowledged but not yet folded (unique keys, not counting the in-flight window).
+    fn record_pending(&self) {
+        let pending = self
+            .latest
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        metrics::gauge!("cairn_overlay_pending").set(pending as f64);
+    }
+
     /// The newest acknowledged row for a key that is not yet folded, provided it belongs to the
     /// caller's bucket incarnation.
     #[must_use]
@@ -147,11 +159,13 @@ impl Overlay {
                     row: Arc::clone(&row),
                 },
             );
+        self.record_pending();
         let item = QueueItem::Write(Box::new(FoldItem {
             bucket: bucket.name.clone(),
             key: key.clone(),
             row_id: row.id.clone(),
             mutation,
+            enqueued_at: Instant::now(),
         }));
         if self.tx.send(item).await.is_err() {
             // The fold task is gone; the write stays in the overlay and the startup rebuild
@@ -201,6 +215,8 @@ impl Overlay {
         {
             latest.remove(&(bucket.clone(), key.clone()));
         }
+        drop(latest);
+        self.record_pending();
     }
 }
 
@@ -333,6 +349,8 @@ async fn settle(
         if let Some(overlay) = overlay.upgrade() {
             overlay.forget(&item.bucket, &item.key, &item.row_id);
         }
+        metrics::histogram!("cairn_overlay_fold_seconds")
+            .record(item.enqueued_at.elapsed().as_secs_f64());
         return;
     }
     if attempts + 1 < MAX_ATTEMPTS {
@@ -344,6 +362,7 @@ async fn settle(
             .failed
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+    metrics::counter!("cairn_overlay_fold_failures_total").increment(1);
     tracing::error!(
         bucket = item.bucket.as_str(),
         key = item.key.as_str(),

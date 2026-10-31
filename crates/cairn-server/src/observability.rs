@@ -93,6 +93,18 @@ fn describe_metrics() {
         "cairn_writer_batch_size",
         "Mutations coalesced into one metadata group-commit batch"
     );
+    describe_gauge!(
+        "cairn_overlay_pending",
+        "Acknowledged object writes whose index row has not folded yet (unique keys)"
+    );
+    describe_histogram!(
+        "cairn_overlay_fold_seconds",
+        "Acknowledgement-to-index latency of an asynchronously folded object row"
+    );
+    describe_counter!(
+        "cairn_overlay_fold_failures_total",
+        "Object index folds that exhausted their retries and remain in the overlay"
+    );
 
     // Replication observability (ARCH 20/26).
     describe_gauge!(

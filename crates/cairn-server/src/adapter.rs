@@ -199,6 +199,18 @@ pub(crate) fn listener_route(role: ListenerRole, method: &Method, path: &str) ->
     }
 }
 
+/// Routes whose answer is derived from object rows, so the acknowledged-write overlay must be
+/// folded before they run.
+fn control_observes_objects(method: &Method, subpath: &str) -> bool {
+    let parts: Vec<&str> = subpath.trim_matches('/').split('/').collect();
+    matches!(
+        (method, parts.as_slice()),
+        (&Method::GET, ["buckets", _, "objects"])
+            | (&Method::DELETE, ["buckets", _, "objects"])
+            | (&Method::DELETE, ["buckets", _])
+    )
+}
+
 fn console_only_path(path: &str) -> bool {
     let subpath = path
         .strip_prefix("/api/v1")
@@ -580,6 +592,19 @@ pub async fn handle(
                 session_transport,
             )
             .await;
+        }
+        // Console operations that page or delete object rows read the index directly. Fold any
+        // acknowledged write that is still in flight first, so a just-written object is listed and
+        // a force-empty cannot miss a row that has not landed yet.
+        if control_observes_objects(&method, subpath) {
+            if let Some(overlay) = &stack.overlay {
+                if let Err(error) = overlay.drain().await {
+                    return render_control_response(cairn_control::ControlResponse::error(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        &format!("object index is catching up: {error}"),
+                    ));
+                }
+            }
         }
         let resp = stack
             .control
@@ -2478,6 +2503,34 @@ fn hex_val(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_object_routes_drain_the_acknowledged_write_overlay() {
+        use super::control_observes_objects;
+        // Object-paging and deleting routes see rows that may still be folding.
+        assert!(control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos/objects"
+        ));
+        assert!(control_observes_objects(
+            &http::Method::DELETE,
+            "buckets/photos/objects"
+        ));
+        assert!(control_observes_objects(
+            &http::Method::DELETE,
+            "buckets/photos"
+        ));
+        // Everything else keeps its current cost and does not wait for the fold.
+        assert!(!control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos"
+        ));
+        assert!(!control_observes_objects(&http::Method::GET, "overview"));
+        assert!(!control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos/objects/shares"
+        ));
+    }
+
     use super::*;
     use cairn_types::auth::{AuthMethod, Principal};
     use cairn_types::error::BlobError;

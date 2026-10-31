@@ -58,10 +58,16 @@ precondition or nonempty bucket; it does not always mean a database failure. Can
 Timings include scheduler delay and I/O waiting; they do not establish CPU leakage or isolate fsync
 from other COMMIT work. Blob assembly/durability timings are documented with the multipart follow-up.
 
-Storage protocol 3 adds no metric of its own. Startup logs one info line, `object index rebuilt from
-metadata files`, carrying `scanned`, `inserted`, `already_indexed`, `skipped` and `failed`. There is
-currently no overlay-depth or fold-lag metric, so a slow index fold shows up as PUT latency and in
-the `publication` stage samples rather than as a dedicated gauge.
+Storage protocol 3 exports its own signals. The acknowledged-write overlay publishes
+`cairn_overlay_pending`, the number of unique keys whose index row has not folded yet;
+`cairn_overlay_fold_seconds`, the acknowledgement-to-index latency of a folded row; and
+`cairn_overlay_fold_failures_total`, folds that exhausted their retries and remain in the overlay
+(a non-zero value means a `drain` reports the index as incomplete rather than pretending it caught
+up). Startup logs one info line, `object index rebuilt from metadata files`, carrying `scanned`,
+`inserted`, `already_indexed`, `skipped` and `failed`, and emits the same counts as
+`cairn_index_rebuild_rows_total{result}`. A rising pending gauge with flat insert throughput is the
+signature of a fold that cannot keep up; a slow fold otherwise shows up as PUT latency and in the
+`publication` stage samples.
 
 Multipart completion publishes `cairn_blob_multipart_stage_seconds{stage}` with fixed stages
 `permit_wait`, `assembly`, and `durability`. Assembly includes staging creation, part reads,
