@@ -10,6 +10,8 @@ description = "The S3 protocol layer for Cairn: request lifecycles, the chunked 
 workspace = true
 
 [dependencies]
+# Overlay depth and fold latency are recorded at the source.
+metrics.workspace = true
 # The aws-chunked decoder hashes every chunk to verify its signature. This is the per-byte hot
 # path of a streaming upload; aws-lc-rs selects SHA-NI/AVX at runtime.
 aws-lc-rs.workspace = true

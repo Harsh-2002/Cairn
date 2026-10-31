@@ -38,6 +38,10 @@ pub struct AppStack {
     pub s3: S3Service,
     /// The management JSON API service.
     pub control: cairn_control::ControlService,
+    /// The acknowledged-write overlay shared with the S3 service. Console operations that page or
+    /// delete object rows drain it first, so they never act on a view the index has not caught up
+    /// with.
+    pub overlay: Option<Arc<cairn_protocol::Overlay>>,
     /// Shared release-update status, written by the background update-check loop and read live by
     /// `GET /system` (a clone is also held inside `SystemInfo` so the console sees the freshest value).
     pub update_status: Arc<std::sync::RwLock<cairn_control::UpdateStatus>>,
@@ -569,6 +573,16 @@ pub async fn build(
     )
     .await;
     if rebuilt.scanned > 0 || rebuilt.failed > 0 {
+        metrics::counter!("cairn_index_rebuild_rows_total", "result" => "scanned")
+            .increment(rebuilt.scanned);
+        metrics::counter!("cairn_index_rebuild_rows_total", "result" => "inserted")
+            .increment(rebuilt.inserted);
+        metrics::counter!("cairn_index_rebuild_rows_total", "result" => "already_indexed")
+            .increment(rebuilt.already_indexed);
+        metrics::counter!("cairn_index_rebuild_rows_total", "result" => "skipped")
+            .increment(rebuilt.skipped);
+        metrics::counter!("cairn_index_rebuild_rows_total", "result" => "failed")
+            .increment(rebuilt.failed);
         tracing::info!(
             scanned = rebuilt.scanned,
             inserted = rebuilt.inserted,
@@ -660,7 +674,8 @@ pub async fn build(
     ))
     // Ordinary object acknowledgements fold their index row asynchronously; reads and every key
     // mutation drain this bounded overlay first.
-    .with_overlay(cairn_protocol::Overlay::start(meta.clone(), 8192usize));
+    .with_overlay(Arc::clone(&overlay));
+    let overlay = Arc::new(cairn_protocol::Overlay::start(meta.clone(), 8192usize));
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));
@@ -766,6 +781,7 @@ pub async fn build(
     Ok(AppStack {
         s3,
         control,
+        overlay: Some(overlay),
         update_status,
         auth,
         auth_chain,
