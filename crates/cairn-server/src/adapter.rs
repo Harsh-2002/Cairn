@@ -203,12 +203,12 @@ pub(crate) fn listener_route(role: ListenerRole, method: &Method, path: &str) ->
 /// folded before they run.
 fn control_observes_objects(method: &Method, subpath: &str) -> bool {
     let parts: Vec<&str> = subpath.trim_matches('/').split('/').collect();
-    match (method, parts.as_slice()) {
-        (&Method::GET, ["buckets", _, "objects"]) => true,
-        (&Method::DELETE, ["buckets", _, "objects"]) => true,
-        (&Method::DELETE, ["buckets", _]) => true,
-        _ => false,
-    }
+    matches!(
+        (method, parts.as_slice()),
+        (&Method::GET, ["buckets", _, "objects"])
+            | (&Method::DELETE, ["buckets", _, "objects"])
+            | (&Method::DELETE, ["buckets", _])
+    )
 }
 
 fn console_only_path(path: &str) -> bool {
@@ -2503,6 +2503,34 @@ fn hex_val(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_object_routes_drain_the_acknowledged_write_overlay() {
+        use super::control_observes_objects;
+        // Object-paging and deleting routes see rows that may still be folding.
+        assert!(control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos/objects"
+        ));
+        assert!(control_observes_objects(
+            &http::Method::DELETE,
+            "buckets/photos/objects"
+        ));
+        assert!(control_observes_objects(
+            &http::Method::DELETE,
+            "buckets/photos"
+        ));
+        // Everything else keeps its current cost and does not wait for the fold.
+        assert!(!control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos"
+        ));
+        assert!(!control_observes_objects(&http::Method::GET, "overview"));
+        assert!(!control_observes_objects(
+            &http::Method::GET,
+            "buckets/photos/objects/shares"
+        ));
+    }
+
     use super::*;
     use cairn_types::auth::{AuthMethod, Principal};
     use cairn_types::error::BlobError;

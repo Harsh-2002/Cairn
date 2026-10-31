@@ -647,6 +647,10 @@ pub async fn build(
     let multipart_claim_recovery = Arc::new(
         crate::multipart_claim_recovery::MultipartClaimRecoveryQueue::new(cfg.concurrency_limit),
     );
+    // Ordinary object acknowledgements fold their index row asynchronously; reads and every key
+    // mutation drain this bounded overlay first. The control plane shares it so console operations
+    // that page or delete object rows see the same view.
+    let overlay = cairn_protocol::Overlay::start(meta.clone(), 8192usize);
     let s3 = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -675,7 +679,6 @@ pub async fn build(
     // Ordinary object acknowledgements fold their index row asynchronously; reads and every key
     // mutation drain this bounded overlay first.
     .with_overlay(Arc::clone(&overlay));
-    let overlay = Arc::new(cairn_protocol::Overlay::start(meta.clone(), 8192usize));
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));
