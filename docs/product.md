@@ -25,9 +25,9 @@ becoming an expert in S3 IAM or Cairn's internals.
 ## Positioning
 
 Cairn is the self-contained alternative for workloads that need a trustworthy single-node S3
-endpoint rather than a distributed object-storage cluster. Object bytes remain ordinary files on a
-POSIX filesystem, embedded SQLite is the metadata source of truth, and the optimized React console
-ships inside the same binary. This gives operators a small deployment artifact, inspectable storage,
+endpoint rather than a distributed object-storage cluster. Object bytes and per-object metadata remain ordinary files on a
+POSIX filesystem, embedded SQLite is the rebuildable object index and the control-plane authority,
+and the optimized React console ships inside the same binary. This gives operators a small deployment artifact, inspectable storage,
 crash-consistent metadata semantics, and an approachable control surface while retaining standard S3
 client compatibility.
 
