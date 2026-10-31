@@ -45,7 +45,9 @@ trailer must stay last; the sidecar is written, fsynced and renamed with the dat
 by the same coalesced destination-directory barrier. Multipart parts and assembled multipart
 objects keep neither. Startup rebuild walks the bucket directories, reads each trailer or sidecar,
 validates it against its data file, and inserts missing index rows before readiness; it never
-invents or deletes rows (Section 8.5).
+invents or deletes rows (Section 8.5). When the index already holds a row for the same version, the
+rebuild keeps the newer generation — commit time first, then the UUIDv7 row id — and republishes it,
+so a lost index tail can never revert an acknowledged overwrite to the previous object.
 
 Sidecar ownership is derived exactly from the admitted object attempt rather than stored in the protocol-2 intent journal, so the journal schema and its four backends are unchanged. A successful publication keeps the final sidecar; abandonment, cancellation and recovery reclaim both provisional aliases; replacement and permanent deletion enqueue the data file together with the derived `<uuid>.meta` name (for a plaintext object an idempotent absence barrier); reconciliation pairs each `<uuid>.meta` entry with its data path, keeps it exactly when that data file is referenced, and reclaims sidecar-only or data-only orphans. Objects written before protocol 3 have no sidecar and remain fully readable. The offline baseline treats a sidecar as authoritative when its data path is authoritative and otherwise records exact cleanup debt.
 
