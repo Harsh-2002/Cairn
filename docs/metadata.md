@@ -155,8 +155,11 @@ intents can still be recovered. Section 8.2 defines the ordering.
 An acknowledged row is visible immediately: GET/HEAD read the newest row from a bounded in-memory
 overlay keyed by (bucket, key) before the index; every key mutation, both listings, `DeleteObjects`
 and `?versionId` reads drain the overlay first. The fold task submits rows in FIFO order through the
-Writer and retries a failed row a bounded number of times. Startup runs the index rebuild after
-migrations and before readiness.
+Writer and retries a failed row a bounded number of times. An entry belongs to the bucket
+incarnation that acknowledged it: a bucket deleted and re-created under the same name never serves
+the previous incarnation's row, and a fold that can no longer apply is forgotten instead of retried
+forever. A barrier reports failure if a fold failed while it was draining. Startup runs the index
+rebuild after migrations and before readiness.
 
 `PublishStorageWrite` validates the original mutation against that plan, then checks the current
 generation, exact persisted intent and normalized ownership index, and the cancellation flag.

@@ -1089,6 +1089,22 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+        let id = user.0.clone();
+        self.with_read(move |conn| {
+            let quota: Option<i64> = conn
+                .prepare_cached("SELECT quota_bytes FROM users WHERE id=?1")
+                .map_err(engine_err)?
+                .query_row(params![id], |r| r.get(0))
+                .optional()
+                .map_err(engine_err)?
+                .flatten();
+            // "no such user" and "quota NULL" both present as "no quota"; clamp a stored negative.
+            Ok(quota.map(|q| q.max(0) as u64))
+        })
+        .await
+    }
+
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         let name = name.as_str().to_owned();
         self.with_read(move |conn| {

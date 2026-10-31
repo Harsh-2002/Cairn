@@ -432,6 +432,16 @@ impl MetadataStore for AsyncMetadataStore {
         Ok(row.and_then(|r| r.get_opt_i64(0)).map(|q| q.max(0) as u64))
     }
 
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+        let row = query_one(
+            &**self.reader().await,
+            "SELECT quota_bytes FROM users WHERE id=?1",
+            vec![Value::Text(user.0.clone())],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.get_opt_i64(0)).map(|q| q.max(0) as u64))
+    }
+
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         let row = query_one(
             &**self.reader().await,

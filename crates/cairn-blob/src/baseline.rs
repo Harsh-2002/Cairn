@@ -530,7 +530,7 @@ fn cursor_key(cursor: &StorageAuthorityCursor) -> (u32, u8, &str, u16) {
 
 fn verify_authority(root: &File, authority: StorageAuthority) -> Result<bool, BlobError> {
     let mut encrypted_part = None;
-    let (bucket, path, size) = match authority {
+    let (bucket, path, size, inline_layout) = match authority {
         StorageAuthority::Object(row) => {
             if row.is_delete_marker {
                 if row.storage_path.is_some() {
@@ -544,7 +544,13 @@ fn verify_authority(root: &File, authority: StorageAuthority) -> Result<bool, Bl
             if path.as_str().split('/').next() != Some(row.bucket.as_str()) {
                 return Err(invalid("object path does not belong to its bucket"));
             }
-            (row.bucket, path, Some(row.size_physical))
+            // Only an uncompressed, unencrypted object is one file with an inline metadata
+            // trailer; a container's own trailer must stay last, so its file length is exact.
+            let inline_layout = matches!(
+                row.compression,
+                cairn_types::object::CompressionDescriptor::Uncompressed
+            ) && row.sse_descriptor.is_none();
+            (row.bucket, path, Some(row.size_physical), inline_layout)
         }
         StorageAuthority::Part {
             bucket,
@@ -580,6 +586,7 @@ fn verify_authority(root: &File, authority: StorageAuthority) -> Result<bool, Bl
                 bucket,
                 part.storage_path,
                 part.part_dek.is_none().then_some(part.size),
+                false,
             )
         }
     };
@@ -613,7 +620,8 @@ fn verify_authority(root: &File, authority: StorageAuthority) -> Result<bool, Bl
     // validates the framing and returns the declared payload length; a file that merely ends in
     // the magic without a consistent length is still a mismatch below.
     let mut actual = on_disk;
-    if let Some(expected) = size
+    if inline_layout
+        && let Some(expected) = size
         && expected != actual
         && let Some(payload) = crate::inline_payload_len(&mut file, on_disk).map_err(io_err)?
         && payload == expected

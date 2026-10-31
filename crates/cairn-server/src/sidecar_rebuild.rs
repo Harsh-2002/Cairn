@@ -135,11 +135,17 @@ pub(crate) async fn rebuild_missing_object_rows(
             Ok(Some(existing)) => {
                 if existing.id == record.row_id {
                     report.already_indexed += 1;
-                } else {
-                    // A different row owns this version: the sidecar is a superseded generation.
-                    report.skipped += 1;
+                    continue;
                 }
-                continue;
+                if !record_supersedes(&record, &existing) {
+                    // A newer row owns this version: the file is a superseded generation.
+                    report.skipped += 1;
+                    continue;
+                }
+                // The index holds an older generation whose replacement commit was lost with the
+                // relaxed WAL tail. Republish the durable newer file: on an unversioned bucket every
+                // write shares the `null` version id, and skipping here would silently revert an
+                // acknowledged overwrite to the previous object's bytes.
             }
             Ok(None) => {}
             Err(error) => {
@@ -203,6 +209,27 @@ fn sidecar_rebuild_paths(
     ]
 }
 
+/// Whether a durable record is a newer generation than the index row that owns the same version.
+/// Row ids are UUIDv7 (time-ordered), so the pair orders writes even when the commit clock is
+/// coarse; the `null` version id of an unversioned bucket is exactly where this matters.
+fn record_supersedes(record: &ObjectMetadataRecord, existing: &ObjectVersionRow) -> bool {
+    supersedes(
+        record.updated_at,
+        &record.row_id,
+        existing.updated_at,
+        &existing.id,
+    )
+}
+
+fn supersedes(
+    record_updated: cairn_types::Timestamp,
+    record_id: &str,
+    existing_updated: cairn_types::Timestamp,
+    existing_id: &str,
+) -> bool {
+    (record_updated, record_id) > (existing_updated, existing_id)
+}
+
 /// Read an inline object's metadata from the trailer of its data file, if present.
 fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaError> {
     use std::io::{Read, Seek, SeekFrom};
@@ -224,6 +251,13 @@ fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaE
         return Ok(None);
     }
     let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
+    // The trailer lives in bytes an unauthenticated writer can choose (a multipart assembly carries
+    // no metadata record), so an implausible declared length is not our metadata: skip it instead of
+    // allocating up to the object size on every restart.
+    const MAX_INLINE_RECORD: u64 = 64 * 1024;
+    if meta_len > MAX_INLINE_RECORD {
+        return Ok(None);
+    }
     let suffix_len = meta_len
         .checked_add(FIXED)
         .filter(|total| *total <= len)
@@ -369,5 +403,40 @@ fn rebuilt_row(record: &ObjectMetadataRecord) -> ObjectVersionRow {
         replicated_at: None,
         created_at: record.created_at,
         updated_at: record.updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_generation_supersedes_an_older_row_with_the_same_version() {
+        use cairn_types::Timestamp;
+        // Later commit time wins.
+        assert!(supersedes(Timestamp(2), "b", Timestamp(1), "a"));
+        assert!(!supersedes(Timestamp(1), "a", Timestamp(2), "b"));
+        // Row ids are UUIDv7, so an equal timestamp falls back to their order.
+        assert!(supersedes(Timestamp(5), "b", Timestamp(5), "a"));
+        assert!(!supersedes(Timestamp(5), "a", Timestamp(5), "b"));
+        // The same row never supersedes itself.
+        assert!(!supersedes(Timestamp(5), "a", Timestamp(5), "a"));
+    }
+
+    #[test]
+    fn an_implausible_trailer_length_is_skipped_without_allocating() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"payload").unwrap();
+        // meta_len = 1 GiB, payload_len = 7, magic = CRNI.
+        file.write_all(&(1024u32 * 1024 * 1024).to_le_bytes())
+            .unwrap();
+        file.write_all(&7u64.to_le_bytes()).unwrap();
+        file.write_all(&cairn_types::storage::INLINE_TRAILER_MAGIC)
+            .unwrap();
+        file.flush().unwrap();
+        assert!(read_inline_record(&path).unwrap().is_none());
     }
 }

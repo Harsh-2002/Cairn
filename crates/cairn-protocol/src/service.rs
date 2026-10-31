@@ -1211,6 +1211,7 @@ impl S3Service {
             && lock_intent.retention.is_none()
             && lock_intent.legal_hold.is_none()
             && matches!(self.meta.get_bucket_quota(&bucket.name).await, Ok(None))
+            && matches!(self.meta.get_user_quota(&bucket.owner_id).await, Ok(None))
             && matches!(
                 self.meta
                     .get_bucket_config(&bucket.name, ConfigAspect::ObjectLock)
@@ -1251,7 +1252,7 @@ impl S3Service {
             );
             if same_bucket {
                 overlay
-                    .acknowledge(&bucket.name, &key, Arc::clone(&row), mutation)
+                    .acknowledge(bucket, &key, Arc::clone(&row), mutation)
                     .await;
                 Ok(MutationOutcome::Put {
                     version_id: version_id.clone(),
@@ -1264,7 +1265,7 @@ impl S3Service {
         } else if self.overlay.is_some() {
             let overlay = self.overlay.as_ref().expect("checked above");
             let _stripe = overlay.stripe(&bucket.name, &key).await;
-            if let Err(error) = overlay.wait_key(&bucket.name, &key).await {
+            if let Err(error) = overlay.wait_key(bucket, &key).await {
                 self.recover_object_write(&mut write_guard).await;
                 return Err(Error::Internal(error.to_string()));
             }
@@ -2826,6 +2827,25 @@ impl S3Service {
             }
         };
         let enqueued_repl = !replication.is_empty();
+        // The completed object publishes synchronously; order it behind any acknowledged write to
+        // the same key that has not folded yet.
+        let _overlay_stripe = match &self.overlay {
+            Some(overlay) => {
+                let stripe = overlay.stripe(&bucket.name, &key).await;
+                if let Err(error) = overlay.wait_key(bucket, &key).await {
+                    return Err(self
+                        .multipart_failure_after_claim(
+                            &upload_id,
+                            &claim_token,
+                            Error::Internal(error.to_string()),
+                            &mut claim_guard,
+                        )
+                        .await);
+                }
+                Some(stripe)
+            }
+            None => None,
+        };
         match self
             .meta
             .submit(claim_guard.publication(
@@ -3390,6 +3410,21 @@ impl S3Service {
             }
         };
         let enqueued_repl = !replication.is_empty();
+        // A copy publishes synchronously while an acknowledged write to the same destination may
+        // still be folding. Take the key's stripe and wait for that row before submitting, so the
+        // older folded row can never land after this newer one.
+        let _overlay_stripe = match &self.overlay {
+            Some(overlay) => {
+                let stripe = overlay.stripe(&dest_bucket.name, &dest_key_for_event).await;
+                if let Err(error) = overlay.wait_key(dest_bucket, &dest_key_for_event).await {
+                    self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                        .await;
+                    return Err(Error::Internal(error.to_string()));
+                }
+                Some(stripe)
+            }
+            None => None,
+        };
         match self
             .meta
             .submit(write_guard.planned_publication(
@@ -5333,8 +5368,23 @@ impl S3Service {
             match &resource {
                 Resource::Service => None,
                 Resource::Object { key, .. } => match acl_version {
-                    Some(vid) => self.meta.get_version(&bucket.name, key, vid).await?,
-                    None => self.meta.current_version(&bucket.name, key).await?,
+                    Some(vid) => {
+                        // A named version exists only in the index; fold the overlay first so an
+                        // acknowledged write is not invisible to this authorization decision.
+                        self.drain_overlay().await?;
+                        self.meta.get_version(&bucket.name, key, vid).await?
+                    }
+                    // Decide against exactly the row the request will serve: an acknowledged
+                    // overwrite may still be waiting to fold, and authorizing it with the previous
+                    // object's ACL would apply stale permissions to the new body.
+                    None => match self
+                        .overlay
+                        .as_ref()
+                        .and_then(|overlay| overlay.latest(bucket, key))
+                    {
+                        Some(row) => Some((*row).clone()),
+                        None => self.meta.current_version(&bucket.name, key).await?,
+                    },
                 },
                 Resource::Bucket(_) => None,
             }
@@ -5485,7 +5535,7 @@ impl S3Service {
             None => match self
                 .overlay
                 .as_ref()
-                .and_then(|overlay| overlay.latest(&bucket.name, &key))
+                .and_then(|overlay| overlay.latest(&bucket, &key))
             {
                 Some(row) => (*row).clone(),
                 None => self
@@ -5531,7 +5581,7 @@ impl S3Service {
                 if let Some(row) = self
                     .overlay
                     .as_ref()
-                    .and_then(|overlay| overlay.latest(&bucket.name, &key))
+                    .and_then(|overlay| overlay.latest(&bucket, &key))
                 {
                     if row.is_delete_marker {
                         return Ok(ReadTarget::DeleteMarker(not_found_marker(req, &row)));
