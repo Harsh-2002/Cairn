@@ -34,8 +34,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (AES256/aws:kms), multipart+SSE incl. UploadPartCopy, cross-policy copy (upgrade/downgrade), and the
   on-disk proofs — committed/staged blobs are VERSION_ENCRYPTED CRNB with the plaintext marker absent,
   a tampered ciphertext byte makes GET fail closed, transparent at-rest (leg 2) advertises nothing.
-  Protocol-3 `<uuid>.meta` sidecars are JSON authority records, not CRNB containers: the helpers
-  sample data files only and assert every data blob has its sidecar and no sidecar leaks object bytes.
+  Protocol-3 `<uuid>.meta` sidecars are JSON metadata records, not CRNB containers: the helpers
+  assert every compressed or encrypted data blob has its sidecar and every plaintext data blob ends
+  with the `CRNI` trailer, and that no sidecar leaks object bytes. A mixed bucket pairs sidecars with
+  its compressed/encrypted data only.
 - `share.sh` — object sharing (one-time data-origin bearer URL, capability-free list/get, stable-id
   revoke + durable-session-backed interoperable SigV4 presigned URLs), pure curl. **Control listener
   ON for minting.**

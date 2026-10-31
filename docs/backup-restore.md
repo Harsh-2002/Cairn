@@ -27,7 +27,9 @@ The command:
 3. creates the metadata image with SQLite `VACUUM INTO`—the live database file is never raw-copied;
 4. runs `PRAGMA integrity_check` and `PRAGMA foreign_key_check` on that image;
 5. durably copies committed object blobs and active multipart-part files, excluding transient
-   `.staging/*.tmp`, SQLite sidecars, and Cairn lock files; and
+   `.staging/*.tmp`, SQLite sidecars, and Cairn lock files. A `<uuid>.meta` sidecar is part of its
+   object and is copied with its data file, and a plaintext object's metadata is inside the data
+   file; and
 6. streams every `object_versions.storage_path` and `multipart_parts.storage_path` from the
    snapshot and verifies that the corresponding regular file exists; then
 7. writes `manifest.json` last, after all earlier files and directories are synced.
@@ -115,7 +117,9 @@ The SQLite image preserves complete metadata rows, including historical versions
 markers, tags, ACLs, Object Lock retention/legal hold, sealed object and multipart-part data keys,
 and multipart reservations, storage generations/intents/path ownership/cleanup records, replication
 outbox work, and remote multipart journals. These are database state;
-there is no second manifest inventory that can replace them. Restoring the database does not restore
+there is no second manifest inventory that can replace them. The per-object files can rebuild the
+object index, but they carry no bucket, user, key or policy rows: no manifest can replace
+control-plane state. Restoring the database does not restore
 the external master-key ring or recreate the outcome of an ambiguous remote request.
 
 Restore prepares fresh ownership before database publication; startup commits another fresh

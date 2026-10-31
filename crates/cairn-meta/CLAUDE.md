@@ -2,7 +2,8 @@
 
 The default SQLite `MetadataStore` (the metadata trait's reference impl): one serialized,
 **group-committing writer** + a pool of read-only WAL connections + a read-through cache. The
-metadata commit is **the single linearization point of every mutation** (ARCH 11).
+metadata commit is **the single linearization point of control-plane and multipart mutations**
+(ARCH 11); an ordinary object publication folds its index row after the ACK.
 
 ## Layout (`src/`)
 - `lib.rs` — `open`/`open_in_memory` + `OpenOptions`; the per-connection PRAGMAs and the
@@ -10,6 +11,8 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   (the background loop is the *sole* checkpointer) and `synchronous` from `OpenOptions`.
 - `writer.rs` — the single `Writer` thread: group-commit, **one savepoint per mutation**, one
   `COMMIT` = one durability barrier. ALL writes go through it; never open an ad-hoc write connection.
+  A batch containing only object publications (and recoverable storage-journal mutations) commits at
+  `synchronous=NORMAL`; control-plane and mixed batches keep `FULL`.
   Carries `Control::{Checkpoint,Probe,Exec}` on the same queue — `run_exec` runs the master-key
   re-wrap closure (#29) serialized with mutations. `run_checkpoint` drops the conn's `busy_timeout`
   for the TRUNCATE so a reader-contended checkpoint returns `busy` **immediately** (the background
@@ -84,8 +87,9 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   an exact leased Writer cleanup claim. Replacement/deletion records cleanup debt atomically with
   reference removal; a returned superseded path is not cleanup authority.
 - The library `OpenOptions::default` is `synchronous=NORMAL` (benchmark/test posture); the **server
-  overrides this to FULL** via `CAIRN_META_SYNCHRONOUS`. NORMAL never corrupts the DB — on power loss
-  it loses at most the last uncheckpointed txn, which blob-first ordering downgrades to a GC'd orphan.
+  overrides this to FULL** via `CAIRN_META_SYNCHRONOUS`, and publication-only batches drop back to
+  NORMAL. NORMAL never corrupts the DB — on power loss it loses at most the last uncheckpointed txn,
+  which blob-first ordering downgrades to a rebuildable index row or a GC'd orphan.
 - `shard_for_bucket` uses a hand-rolled **FNV-1a**, not `std`'s `DefaultHasher` (whose internals may
   drift) — the mapping must be stable across processes/releases. Under sharding, user quota is
   **eventually-consistent** (it spans buckets on different shards) — a documented relaxation.

@@ -2,9 +2,10 @@
 
 Self-hosted, S3-compatible object storage with an embedded web console.
 
-Cairn runs as one binary. It stores object data in filesystem files and metadata in embedded
-SQLite, with no external database or storage service to operate. It is designed for a single
-node; asynchronous bucket replication provides copies on other hosts.
+Cairn runs as one binary. It stores each object as durable files on the local filesystem — a
+plaintext object is one file, its payload followed by a metadata trailer — and keeps its index in
+embedded SQLite, rebuildable from those files. No external database or storage service to operate.
+It is designed for a single node; asynchronous bucket replication provides copies on other hosts.
 
 [![Cairn web console](https://harsh-2002.github.io/Cairn/screenshots/overview-dashboard.webp)](https://harsh-2002.github.io/Cairn/)
 
@@ -105,8 +106,11 @@ The [engineering specification](docs/CLAUDE.md) describes the architecture and i
 ## Performance and planned work
 
 [Benchmarks and reproduction commands](docs/benchmarks.md) include workload, hardware and
-measurement limits. Optional io_uring writes, plaintext sendfile and kTLS encryption offload are
-experimental and disabled in standard builds; see [the I/O reference](docs/data-plane.md#76-the-read-data-path-and-zero-copy).
+measurement limits. At strict durability on the reference host, Cairn sustained 5,062–5,153 4 KiB
+PUT/s (1.10× RustFS), 2.13× RustFS on a 1 MiB GET and 3.76× on a 1,000-key LIST; see
+[benchmarks](docs/benchmarks.md#8-protocol-3-head-to-head-vs-rustfs). Optional io_uring writes,
+plaintext sendfile and kTLS encryption offload are experimental and disabled in standard builds; see
+[the I/O reference](docs/data-plane.md#76-the-read-data-path-and-zero-copy).
 
 [Planned work](docs/delivery.md#32-phased-implementation-roadmap) includes external KMS integration,
 remote cold-tier transition/restore and zero-copy HTTPS reads.
