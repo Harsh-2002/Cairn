@@ -58,6 +58,11 @@ precondition or nonempty bucket; it does not always mean a database failure. Can
 Timings include scheduler delay and I/O waiting; they do not establish CPU leakage or isolate fsync
 from other COMMIT work. Blob assembly/durability timings are documented with the multipart follow-up.
 
+Storage protocol 3 adds no metric of its own. Startup logs one info line, `object index rebuilt from
+metadata files`, carrying `scanned`, `inserted`, `already_indexed`, `skipped` and `failed`. There is
+currently no overlay-depth or fold-lag metric, so a slow index fold shows up as PUT latency and in
+the `publication` stage samples rather than as a dedicated gauge.
+
 Multipart completion publishes `cairn_blob_multipart_stage_seconds{stage}` with fixed stages
 `permit_wait`, `assembly`, and `durability`. Assembly includes staging creation, part reads,
 hashing, transforms and trailer writes; durability includes bucket creation, file sync, rename

@@ -6,7 +6,7 @@
 
 ### 11.1 Role and engine
 
-The metadata store is the source of truth for every fact about the system that is not the object bytes themselves: users and credentials, buckets and their configuration, object versions and their attributes, multipart sessions, tags, the replication queue, and the activity log. It is an embedded SQLite database in write-ahead-log mode. SQLite is chosen because it is a single file with no separate process to operate, because its WAL concurrency model maps exactly onto Cairn's one-writer-many-readers design, and because the relational query surface is genuinely useful for the access patterns here, particularly ordered prefix-range listing, which is awkward over a bare key-value store. The operator's interest in a Rust-native SQLite is honoured by keeping the entire store behind the metadata interface of Section 12; the engine underneath is already swappable, with `sqlite` (the default, bundled-C `rusqlite`), `libsql` (an async embedded engine), and `turso` (the pure-Rust SQLite rewrite) all backing the same `MetadataStore` interface and chosen by `CAIRN_META_BACKEND`, without any change to protocol or control code.
+The metadata store is the source of truth for every fact about the system that is not carried by the object files themselves: users and credentials, buckets and their configuration, object versions and their attributes, multipart sessions, tags, the replication queue, and the activity log. It is an embedded SQLite database in write-ahead-log mode. SQLite is chosen because it is a single file with no separate process to operate, because its WAL concurrency model maps exactly onto Cairn's one-writer-many-readers design, and because the relational query surface is genuinely useful for the access patterns here, particularly ordered prefix-range listing, which is awkward over a bare key-value store. The operator's interest in a Rust-native SQLite is honoured by keeping the entire store behind the metadata interface of Section 12; the engine underneath is already swappable, with `sqlite` (the default, bundled-C `rusqlite`), `libsql` (an async embedded engine), and `turso` (the pure-Rust SQLite rewrite) all backing the same `MetadataStore` interface and chosen by `CAIRN_META_BACKEND`, without any change to protocol or control code.
 
 ### 11.2 Connection topology
 
@@ -135,16 +135,28 @@ unreferenced. An abandoned plan is resolved only after proven I/O quiescence thr
 The Writer's FIFO ordering is the proof: a publication is either already enqueued before the
 abandonment or can never be enqueued afterwards, so cleanup cannot race a visible row.
 
-Protocol 3 P1 rewrites object writes as a dual-write: the plan also names the exact
-`<final>.meta` sidecar and its staging alias, the blob layer overlaps the sidecar fsync with the data commit,
-then renames data and sidecar under the same directory barrier (including the staging directory, so a successful publication's consumed aliases owe no cleanup debt), and the existing Writer publication still commits the row before
-the client is acknowledged. SQLite therefore remains the read and ACK authority throughout P1; the
-sidecar is durable evidence, not a read source. The deterministic sidecar names are derived from
-the attempt instead of adding `storage_intent_paths` roles, so schema v39 and all four metadata
-backends keep their current mutation and savepoint semantics. Resolution keeps a live object's
-sidecar, retires provisional aliases, and replacement or deletion enqueues the sidecar with its
-data file as two exact cleanup claims. Legacy protocol-2 plans with only the original three paths
-remain decodable so pre-upgrade intents can still be recovered. Section 8.2 defines the ordering.
+Protocol 3 takes the object index off the acknowledgement path. An ordinary unconditional write
+publishes its durable object file first — the payload with its inline trailer, or the data file with
+its `.meta` sidecar — and acknowledges after that barrier; the index row folds afterwards. The fold
+is a bounded in-memory overlay keyed by object, with per-key stripes serializing every mutation of
+that key and a FIFO fold task submitting rows through the Writer. When the overlay is full the
+request falls back to the synchronous path. Conditional, quota-governed, Object-Lock, TTL, replica
+and replicated writes keep the synchronous Writer publication, so their preconditions, counters and
+lock decisions remain inseparable from the row they guard. Multipart keeps durable admission:
+`AdmitStorageWrite` joins the reservation or exact-token completion claim in one savepoint, and a
+matching admission plus a live I/O lease is still required before any file is created. The
+deterministic `<uuid>.meta` names are derived from the attempt instead of adding
+`storage_intent_paths` roles, so schema v39 and all four metadata backends keep their current
+mutation and savepoint semantics. A successful publication owes no cleanup debt for a consumed
+staging alias: a plaintext object's plan owns three journal names — the staging alias, the final
+data file and the index spool — not five. Legacy protocol-2 plans remain decodable so pre-upgrade
+intents can still be recovered. Section 8.2 defines the ordering.
+
+An acknowledged row is visible immediately: GET/HEAD read the newest row from a bounded in-memory
+overlay keyed by (bucket, key) before the index; every key mutation, both listings, `DeleteObjects`
+and `?versionId` reads drain the overlay first. The fold task submits rows in FIFO order through the
+Writer and retries a failed row a bounded number of times. Startup runs the index rebuild after
+migrations and before readiness.
 
 `PublishStorageWrite` validates the original mutation against that plan, then checks the current
 generation, exact persisted intent and normalized ownership index, and the cancellation flag.
@@ -226,10 +238,10 @@ Cairn's protocol and control layers are written against a small set of internal 
 
 ### 12.1 The blob store interface
 
-The blob store owns object bytes on some medium and knows nothing of S3, identity, or metadata. It exposes the ability to stage a single object by consuming a byte stream, during which it computes the plaintext MD5 that becomes the ETag and any additional checksum algorithms the caller requests, applies the bucket's compression policy producing the self-describing blob format when compression is selected, enforces a hard size ceiling by aborting if exceeded, and performs the durable commit prefix of fsyncing the file and its directory before returning; on return it guarantees the blob is durable and reports the storage path, the logical and physical sizes, and the computed hashes, but it writes no metadata and does not itself verify against client-supplied checksums, which the caller does with the returned hashes. It exposes opening a committed blob through `open_raw(path, range, cipher, compression, expected_logical_len)`, whose `cipher` selector is `BlobCipher::KnownPlaintext`, `BlobCipher::LegacyV2(DEK)`, or `BlobCipher::AuthenticatedV3(DEK)`; it returns a handle that serves the whole object or a byte range, transparently decompressing each block and — for an encrypted declaration — decrypting each AES-256-GCM block. Cipher, compression, container generation, and full logical length come from authoritative metadata. A declared raw plaintext file must equal that trusted length; compressed layout is bound to its trusted block geometry; and the reader requires an encrypted on-disk version to match its declaration exactly, so body bytes cannot select their own parser. A DEK-free `probe(path)` inspects a blob's physical form without decrypting it. There is no DEK-less open. It exposes idempotent deletion of an exact path, including the durable absence barrier when the path is already missing; callers must hold the Writer cleanup claim described in Section 11.6. It exposes staging a multipart part, reporting the part's plaintext size and MD5 and storage path, and assembling ordered parts into a single committed blob through the same durable sequence with compression applied during assembly, and legacy session cleanup for exclusive full-scan recovery. Online protocol-2 reclamation uses exact claimed paths. Finally it exposes reconciliation, which must be bounded in memory and which is given batched membership oracles for live blobs and live upload sessions so it can stream the filesystem and reclaim orphans without materialising the keyspace. The default implementation is the local filesystem engine of Sections 7 through 10; an in-memory implementation backs unit tests; future implementations behind the same interface include an io_uring engine and a remote-S3-backed cold tier used by lifecycle transition.
+The blob store owns object bytes on some medium and knows nothing of S3 or identity. It exposes the ability to stage a single object by consuming a byte stream, during which it computes the plaintext MD5 that becomes the ETag and any additional checksum algorithms the caller requests, applies the bucket's compression policy producing the self-describing blob format when compression is selected, enforces a hard size ceiling by aborting if exceeded, and performs the durable commit prefix of fsyncing the file and its directory before returning; on return it guarantees the blob is durable and reports the storage path, the logical and physical sizes, and the computed hashes, but it writes the durable per-object metadata record — the inline trailer, or the `<uuid>.meta` sidecar for a compressed or encrypted blob — and does not itself verify against client-supplied checksums, which the caller does with the returned hashes. It exposes opening a committed blob through `open_raw(path, range, cipher, compression, expected_logical_len)`, whose `cipher` selector is `BlobCipher::KnownPlaintext`, `BlobCipher::LegacyV2(DEK)`, or `BlobCipher::AuthenticatedV3(DEK)`; it returns a handle that serves the whole object or a byte range, transparently decompressing each block and — for an encrypted declaration — decrypting each AES-256-GCM block. Cipher, compression, container generation, and full logical length come from authoritative metadata. A declared raw plaintext file must equal that trusted length; compressed layout is bound to its trusted block geometry; and the reader requires an encrypted on-disk version to match its declaration exactly, so body bytes cannot select their own parser. A DEK-free `probe(path)` inspects a blob's physical form without decrypting it. There is no DEK-less open. It exposes idempotent deletion of an exact path, including the durable absence barrier when the path is already missing; callers must hold the Writer cleanup claim described in Section 11.6. It exposes staging a multipart part, reporting the part's plaintext size and MD5 and storage path, and assembling ordered parts into a single committed blob through the same durable sequence with compression applied during assembly, and legacy session cleanup for exclusive full-scan recovery. Online protocol-2 reclamation uses exact claimed paths. Finally it exposes reconciliation, which must be bounded in memory and which is given batched membership oracles for live blobs and live upload sessions so it can stream the filesystem and reclaim orphans without materialising the keyspace. The default implementation is the local filesystem engine of Sections 7 through 10; an in-memory implementation backs unit tests; future implementations behind the same interface include an io_uring engine and a remote-S3-backed cold tier used by lifecycle transition.
 
-`stage`, `stage_part` and `assemble` consume a move-only `StorageCreationPermit` produced from a
-matching Writer admission. File-free plans and cloned plan DTOs cannot create files. Each actual
+`stage` consumes a move-only `ObjectCreationPermit`; `stage_part` and `assemble` consume a
+`StorageCreationPermit` produced from a matching Writer admission. File-free plans and cloned plan DTOs cannot create files. Each actual
 backend operation, including blocking work and prepared results, retains the storage I/O lease
 and node-lock lifetime until completion. Errors and cancellation leave physical cleanup to exact
 Writer claims; they do not make the request future's lifetime a reclamation barrier.

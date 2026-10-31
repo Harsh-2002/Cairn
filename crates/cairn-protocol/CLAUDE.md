@@ -17,6 +17,9 @@ Clock/Crypto>`) — never a concrete engine.
   each selected request covers admission, blob, publication and post-commit waits
   with fixed labels and interrupted-stage reporting. The server's existing metrics
   task drains these samples; this is diagnostic timing, not a change to durability.
+- `overlay.rs` — `Overlay`: the bounded acknowledged-write overlay keyed by (bucket, key), its
+  per-key stripes and its FIFO fold task. An ordinary PUT inserts its row before the ACK; GET/HEAD
+  read the overlay before the index, and mutations and listings drain it first.
 - `keyprovider.rs` — the SSE-KMS `KeyProvider` trait + `LocalRingProvider` (v1). Maps a KMS key id
   to DEK-sealing crypto and gates writes via the `CAIRN_KMS_KEY_IDS` allow-list. **Label-only**: every
   DEK is sealed under the same node master ring regardless of key id — the id is a label, not
@@ -41,11 +44,14 @@ Clock/Crypto>`) — never a concrete engine.
   returns `NotImplemented`. Add new `?subresource` arms *above* those guards (the `?encryption`
   Get/Put/Delete arms sit above the bucket guard, exactly like `cors`).
 - **Durability ordering is the contract** (ARCH 8/21.1): obtain a bounded recovery slot,
-  plan every fresh filename and arm `StorageWriteGuard`, await durable Writer admission, then
-  stage → fsync file → rename → fsync directories → verify hashes → publish metadata. Admission
+  plan every fresh filename and arm `StorageWriteGuard`, await durable Writer admission for
+  multipart, then stage → fsync file → rename → fsync directories → verify hashes → publish.
+  Ordinary writes are fenced at their single publication savepoint instead of admitted before
+  staging, and an unconditional one acknowledges after the file barrier. Admission
   publishes no object. Only its typed receipt becomes a move-only creation permit.
-- `storage_write.rs` owns the runtime-neutral `StorageWriteRuntime` and guard. PUT/Copy, parts,
-  and Complete capture exact target/generation/path ownership before their first admission await.
+- `storage_write.rs` owns the runtime-neutral `StorageWriteRuntime` and guard. Parts and Complete
+  capture exact target/generation/path ownership before their first admission await; PUT/Copy
+  capture theirs before the publication savepoint.
   `PublishStorageWrite` validates the admitted plan and atomically installs authoritative metadata,
   retires intent and enqueues superseded/temporary/spool cleanup. Disarm only on acknowledged
   publication. Cancellation, validation failures and ambiguous acknowledgements enqueue the same

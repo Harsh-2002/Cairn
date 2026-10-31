@@ -1,9 +1,10 @@
 # CLAUDE.md — Cairn
 
 Cairn is a production-grade, **S3-compatible object store** written from scratch in pure Rust.
-Object bytes are plain files on a POSIX filesystem; all metadata is an embedded SQLite database
-(the single source of truth). It ships as one static binary with transparent compression, native
-TLS, async bucket replication, an embedded React console, and a CLI.
+Object bytes are plain files on a POSIX filesystem; per-object metadata rides in the object's own
+durable file; SQLite is the rebuildable object index and the control-plane authority. It ships as one
+static binary with transparent compression, native TLS, async bucket replication, an embedded React
+console, and a CLI.
 
 > The **engineering specification is the single source of truth** and lives in [`docs/`](./docs),
 > split into focused, section-numbered reference documents. The
@@ -97,7 +98,8 @@ above remain the source of truth.
 - `cairn-protocol` — S3 handlers, the request lifecycles, the streaming chunked decoder. The S3
   surface lives in `service.rs`; SSE (SSE-S3, transparent at-rest, SSE-KMS incl. part-level multipart)
   seals/opens here, with the `KeyProvider` trait + `LocalRingProvider` (label-only KMS) in
-  `keyprovider.rs`.
+  `keyprovider.rs`. `overlay.rs` holds the bounded acknowledged-write overlay and its asynchronous
+  index fold.
 - `cairn-replication` / `cairn-lifecycle` — outbox-driven replication engine; lifecycle scanner.
 - `cairn-webhook` — outbox-driven webhook event-notification delivery engine (mirrors `cairn-replication`).
 - `cairn-import` — streaming, bounded-concurrency engine that imports buckets + objects from a
@@ -105,7 +107,8 @@ above remain the source of truth.
   `cairn-replication`, wired to a concrete `SourceReader`/`DestWriter` by `cairn-server`.
 - `cairn-control` / `cairn-web` — management JSON API (`/api/v1`); embedded React console (source in `web/`).
 - `cairn-server` — the binary: wires the concrete stack (`stack.rs`), the hyper/rustls server,
-  background loops (`background.rs`), config (`config.rs`), and the CLI subcommands (`main.rs`).
+  background loops (`background.rs`), config (`config.rs`), the CLI subcommands (`main.rs`), and the
+  startup index rebuild from object files (`sidecar_rebuild.rs`).
 
 ## Conventions & invariants (get these right)
 
@@ -145,7 +148,9 @@ above remain the source of truth.
   `docs/operations.md`).
 - **Durability is the contract** (ARCH 8): stage → fsync file → rename → fsync dir → validate hashes
   → commit the metadata transaction (the single linearization point) → reclaim superseded blobs.
-  Don't reorder these steps.
+  Don't reorder these steps. For a protocol-3 ordinary object the ACK follows the file barrier and
+  the index fold is asynchronous; the metadata transaction is the linearization point for
+  control-plane and multipart writes.
 - Every fix lands with a regression test in the owning crate, and the applicable validation gate is green, before it
   is "done". Match the surrounding code's style, comment density, and idioms.
 
@@ -184,3 +189,8 @@ move-only BlobStore creation permit and retain its I/O/node lifetime through act
 with the exact plan; all authoritative removals atomically record cleanup debt. Reclaim only under
 exact Writer claims after I/O quiescence and retire only after namespace sync. Full scans remain
 mandatory. The data namespace requires Linux 5.6+ `openat2` and refuses descendant mounts/symlinks.
+
+Storage protocol 3 keeps durable admission for multipart writes, fences ordinary writes with the
+single publication savepoint, rebuilds the object index from the object files at startup, and owes
+no cleanup debt for a consumed staging alias on a successful publication. A plaintext object is one
+file ending in its `CRNI` trailer; compressed and encrypted objects also keep `<uuid>.meta`.

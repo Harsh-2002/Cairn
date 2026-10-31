@@ -19,13 +19,15 @@ multi-node HA, no leader election, no shared-nothing sharding across machines. D
 machines is *asynchronous replication* and *backup/restore*, and that is the whole story. This is a
 deliberate product position, not a gap waiting to be filled.
 
-**Metadata — one embedded SQLite database, one writer, plus versioned object-metadata files.**
+**Metadata — one embedded SQLite database, one writer, plus durable per-object metadata.**
 No external database, no Redis, no message broker, no queue service. All index and control-plane
 writes go through the single group-committing `Writer`; reads use the WAL pool. From storage
 protocol 3, object bytes and their per-object metadata files are the durable authority for object
 data: SQLite is a rebuildable index for object listings and the authority for control-plane state
-(buckets, policies, users, locks, quotas, replication, activity). Before protocol 3, SQLite remains
-the object authority as well. The object-metadata file is part of the storage format, not a second
+(buckets, policies, users, locks, quotas, replication, activity). An object's durable file is the
+per-object authority. A plaintext object is one file — its payload followed by a `CRNI` metadata
+trailer; a compressed or encrypted object carries a `<uuid>.meta` sidecar because its container
+trailer must stay last. That per-object metadata is part of the storage format, not a second
 control-plane store. If something seems to need another datastore, it needs a human decision first.
 
 **Configuration — environment variables only.** Every knob is a `CAIRN_*` env var parsed by strict
@@ -37,10 +39,13 @@ There is no down-migration story and none is wanted.
 
 **Durability — the ordering is fixed.** Stage → fsync file → rename → fsync dir → validate hashes →
 commit the metadata transaction → reclaim superseded blobs. Do not reorder these, do not make any
-step conditional, do not "optimise" one away. For a protocol-3 ordinary object write, the
-object-metadata file is staged and renamed with the data file, and the same directory barrier makes
-both durable; that file is the object's metadata commit for acknowledgement. The SQLite index fold
-is a post-acknowledgement index update and is not the object durability authority.
+step conditional, do not "optimise" one away. For a protocol-3 ordinary object write the commit is
+the object's durable file — the data file with its trailer, or the data file and its `.meta`
+sidecar — committed under the same file and directory barriers; a plaintext object has no second
+file to stage, so one barrier covers both its payload and its metadata. The SQLite index fold is a
+post-acknowledgement index update and is not the object durability authority. Visibility is not
+deferred: an acknowledged row is served from a bounded in-memory overlay until its index fold
+lands, and every index-dependent read drains that overlay first.
 
 **Crypto — fails closed, one ring.** A missing key, a wrong key, or a tampered envelope returns an
 error. Never plaintext, never zeros, never partial data, never a warning-and-continue. Every DEK is
