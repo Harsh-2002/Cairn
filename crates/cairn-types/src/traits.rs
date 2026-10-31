@@ -472,6 +472,13 @@ pub trait MetadataStore: Send + Sync {
     /// this reader exposes the configured value to the control plane.
     async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError>;
 
+    // --- user quota ---
+    /// Read a user's optional byte quota (`users.quota_bytes`), `None` when the user has no quota
+    /// set. The quota is enforced inside the writer's commit transaction (ARCH 27.5); the
+    /// asynchronous object-publication path reads it before acknowledging, so an owner with a
+    /// quota always takes the synchronous publication path.
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError>;
+
     // --- users ---
     /// Look up a user by Bearer access-key id (returns the stored secret hash).
     async fn user_by_bearer_key(

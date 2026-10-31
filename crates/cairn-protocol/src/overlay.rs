@@ -13,10 +13,18 @@ use cairn_types::error::MetaError;
 use cairn_types::meta::{Mutation, MutationOutcome};
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::traits::MetadataStore;
-use cairn_types::{BucketName, ObjectKey};
+use cairn_types::{Bucket, BucketName, ObjectKey, Timestamp};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// The bucket incarnation an acknowledged row belongs to. A bucket deleted and re-created under
+/// the same name is a different incarnation; a row from the old one must never be served for the
+/// new one, even if its fold has not been resolved yet.
+struct Latest {
+    created_at: Timestamp,
+    row: Arc<ObjectVersionRow>,
+}
 
 /// One acknowledged write waiting for its index fold.
 struct FoldItem {
@@ -43,9 +51,12 @@ const STRIPES: usize = 256;
 
 /// The overlay itself.
 pub struct Overlay {
-    latest: RwLock<HashMap<(BucketName, ObjectKey), Arc<ObjectVersionRow>>>,
+    latest: RwLock<HashMap<(BucketName, ObjectKey), Latest>>,
     tx: tokio::sync::mpsc::Sender<QueueItem>,
     stripes: Box<[tokio::sync::Mutex<()>]>,
+    /// Rows whose fold exhausted its retries. A retained row is still served from `latest`, so a
+    /// barrier that covers it must report failure instead of pretending the index is complete.
+    failed: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Overlay {
@@ -66,6 +77,7 @@ impl Overlay {
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            failed: std::sync::atomic::AtomicU64::new(0),
         });
         let fold = Arc::downgrade(&overlay);
         tokio::spawn(async move {
@@ -77,7 +89,7 @@ impl Overlay {
     /// Wait until this key has no acknowledged-but-unfolded row. A synchronous publication for the
     /// same key uses this instead of draining the whole queue, so one slow fold never stalls every
     /// other key's writes.
-    pub async fn wait_key(&self, bucket: &BucketName, key: &ObjectKey) -> Result<(), MetaError> {
+    pub async fn wait_key(&self, bucket: &Bucket, key: &ObjectKey) -> Result<(), MetaError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while self.latest(bucket, key).is_some() {
             if tokio::time::Instant::now() >= deadline {
@@ -105,20 +117,22 @@ impl Overlay {
         self.stripes[index].lock().await
     }
 
-    /// The newest acknowledged row for a key that is not yet folded.
+    /// The newest acknowledged row for a key that is not yet folded, provided it belongs to the
+    /// caller's bucket incarnation.
     #[must_use]
-    pub fn latest(&self, bucket: &BucketName, key: &ObjectKey) -> Option<Arc<ObjectVersionRow>> {
+    pub fn latest(&self, bucket: &Bucket, key: &ObjectKey) -> Option<Arc<ObjectVersionRow>> {
         self.latest
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(bucket.clone(), key.clone()))
-            .cloned()
+            .get(&(bucket.name.clone(), key.clone()))
+            .filter(|entry| entry.created_at == bucket.created_at)
+            .map(|entry| Arc::clone(&entry.row))
     }
 
     /// Acknowledge `row` and queue its fold. The caller holds the key's stripe.
     pub async fn acknowledge(
         &self,
-        bucket: &BucketName,
+        bucket: &Bucket,
         key: &ObjectKey,
         row: Arc<ObjectVersionRow>,
         mutation: Mutation,
@@ -126,9 +140,15 @@ impl Overlay {
         self.latest
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((bucket.clone(), key.clone()), Arc::clone(&row));
+            .insert(
+                (bucket.name.clone(), key.clone()),
+                Latest {
+                    created_at: bucket.created_at,
+                    row: Arc::clone(&row),
+                },
+            );
         let item = QueueItem::Write(Box::new(FoldItem {
-            bucket: bucket.clone(),
+            bucket: bucket.name.clone(),
             key: key.clone(),
             row_id: row.id.clone(),
             mutation,
@@ -137,7 +157,7 @@ impl Overlay {
             // The fold task is gone; the write stays in the overlay and the startup rebuild
             // repairs the index. Never fail an already-durable acknowledgement for this.
             tracing::error!(
-                bucket = bucket.as_str(),
+                bucket = bucket.name.as_str(),
                 key = key.as_str(),
                 "object index fold queue is closed"
             );
@@ -147,19 +167,27 @@ impl Overlay {
     /// Wait until every acknowledged write has been folded. Mutations and LIST call this before
     /// consulting the index so they never act on a stale view.
     pub async fn drain(&self) -> Result<(), MetaError> {
+        let failed_before = self.failed.load(std::sync::atomic::Ordering::Acquire);
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.tx.send(QueueItem::Barrier(Barrier(tx))).await.is_err() {
             return Err(MetaError::Engine(
                 "object index fold queue is closed".into(),
             ));
         }
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        let outcome = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(MetaError::Engine("object index fold aborted".into())),
             Err(_) => Err(MetaError::Engine(
                 "object index fold did not catch up within 30s".into(),
             )),
+        };
+        outcome?;
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) != failed_before {
+            return Err(MetaError::Engine(
+                "object index fold failed; the index is incomplete until the next rebuild".into(),
+            ));
         }
+        Ok(())
     }
 
     fn forget(&self, bucket: &BucketName, key: &ObjectKey, row_id: &str) {
@@ -169,7 +197,7 @@ impl Overlay {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if latest
             .get(&(bucket.clone(), key.clone()))
-            .is_some_and(|row| row.id == row_id)
+            .is_some_and(|entry| entry.row.id == row_id)
         {
             latest.remove(&(bucket.clone(), key.clone()));
         }
@@ -275,8 +303,20 @@ async fn settle(
 ) {
     let forget = match result {
         Ok(MutationOutcome::StoragePublicationNotApplied) => {
-            // A vanished bucket can never apply; a conflicting path is retried instead.
-            matches!(meta.get_bucket(&item.bucket).await, Ok(None))
+            // A vanished bucket can never apply, and neither can a row from a previous incarnation
+            // of a bucket that was deleted and re-created under the same name; a conflicting path
+            // inside the same incarnation is retried instead.
+            match meta.get_bucket(&item.bucket).await {
+                Ok(None) => true,
+                Ok(Some(current)) => match &item.mutation {
+                    Mutation::PublishObjectWrite { plan, .. } => {
+                        plan.bucket_created_at != Some(current.created_at)
+                            || plan.bucket_owner.as_ref() != Some(&current.owner_id)
+                    }
+                    _ => false,
+                },
+                Err(_) => false,
+            }
         }
         Ok(_) => true,
         Err(error) => {
@@ -298,6 +338,11 @@ async fn settle(
     if attempts + 1 < MAX_ATTEMPTS {
         inflight.push(submit(meta, item, attempts + 1));
         return;
+    }
+    if let Some(overlay) = overlay.upgrade() {
+        overlay
+            .failed
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     tracing::error!(
         bucket = item.bucket.as_str(),

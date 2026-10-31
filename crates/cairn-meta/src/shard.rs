@@ -1217,6 +1217,10 @@ impl MetadataStore for ShardedMetadataStore {
             .await
     }
 
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+        self.global().get_user_quota(user).await
+    }
+
     // --- users (global, shard 0) ---
     async fn user_by_bearer_key(
         &self,

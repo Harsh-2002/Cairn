@@ -831,6 +831,10 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.get_bucket_quota(bucket).await
     }
 
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+        self.inner.get_user_quota(user).await
+    }
+
     async fn user_by_bearer_key(
         &self,
         access_key_id: &str,
@@ -1262,6 +1266,10 @@ mod tests {
         }
         async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
             self.inner.get_bucket_quota(bucket).await
+        }
+
+        async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+            self.inner.get_user_quota(user).await
         }
         async fn user_by_bearer_key(
             &self,

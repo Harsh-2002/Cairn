@@ -1077,6 +1077,16 @@ impl MetadataStore for InMemoryMetadataStore {
             .copied())
     }
 
+    async fn get_user_quota(&self, user: &UserId) -> Result<Option<u64>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .users
+            .get(&user.0)
+            .and_then(|record| record.user.quota_bytes))
+    }
+
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         // Empty means NO versions (any version or delete marker) AND no in-progress multipart uploads,
         // matching S3 DeleteBucket semantics (audit #3; multipart added 2026-07).
