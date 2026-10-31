@@ -3747,13 +3747,18 @@ async fn sidecar_failure_before_the_data_commit_leaves_no_final_name() {
     let bucket = BucketName::parse("sidecar-abort-bucket").unwrap();
     let key = ObjectKey::parse("abort").unwrap();
     let version = VersionId::null();
-    let seed = metadata_seed(&bucket, &key, &version, &"4".repeat(32));
+    // The injected seam sits between the metadata sidecar and the data commit. A plaintext object
+    // is one inline file with no sidecar stage, so this uses the encrypted two-file layout.
+    let mut seed = metadata_seed(&bucket, &key, &version, &"4".repeat(32));
+    seed.sse_descriptor =
+        Some(r#"{"alg":"AES256","wrapped_dek_b64":"sealed","nonce_b64":"nonce"}"#.to_owned());
     fail::cfg("blob_after_sidecar_stage", "return").unwrap();
     let result = store
         .stage_fixture(
             &bucket,
             body(b"never committed".to_vec()),
             StageOptions {
+                encryption: Some(SecretKey32::new([0x42; 32])),
                 metadata_seed: Some(seed),
                 ..opts(None, "text/plain")
             },
