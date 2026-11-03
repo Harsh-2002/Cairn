@@ -221,10 +221,10 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
               marker not in ob)
     elif encrypt:
         note(f"[{tag}] exact-path recovery removed the encrypted blob before it could be inspected")
-    # Protocol-3 sidecar pairing: an ordinary PUT commits data and metadata under one directory
-    # barrier, so a surviving data orphan must have its sidecar (and vice versa). Multipart
-    # assembly is unchanged in P1 and owns no sidecar, so only the plain-PUT seam asserts it.
-    if seam == "blob_after_durable":
+    # Protocol-3 sidecar pairing: every object commits data and metadata under one directory
+    # barrier, so a surviving data orphan must have its sidecar (and vice versa). An ordinary PUT
+    # writes a v1 record; a completed multipart object writes a v2 record carrying its part layout.
+    if seam in ("blob_after_durable", "blob_after_assemble"):
         surviving = data_blobs(BUCKET)
         if surviving:
             data_path = max(surviving, key=os.path.getsize)
@@ -247,10 +247,17 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
                           [len(Path(data_path).read_bytes()) - trailer["_suffix_len"]:])
             if record is not None:
                 relative = os.path.relpath(data_path, os.path.join(ROOT, "data"))
-                check(f"[{tag}] the record names its exact data path and object identity",
-                      record.get("format_version") == 1 and record.get("bucket") == BUCKET
-                      and record.get("key") == key and record.get("storage_path") == relative,
+                expected_version = 2 if seam == "blob_after_assemble" else 1
+                check(f"[{tag}] the record names its exact data path, object identity and format",
+                      record.get("format_version") == expected_version
+                      and record.get("bucket") == BUCKET
+                      and record.get("key") == key
+                      and record.get("storage_path") == relative,
                       f"record={record}")
+                if seam == "blob_after_assemble":
+                    check(f"[{tag}] the completed-multipart sidecar carries the exact part layout",
+                          record.get("multipart_parts") == [{"part_number": 1, "size": len(b"part-data" * 1024)}],
+                          f"parts={record.get('multipart_parts')}")
         else:
             note(f"[{tag}] exact-path recovery retired the data+metadata pair before pairing inspection")
     database = Path(ROOT) / "data" / "cairn.db"

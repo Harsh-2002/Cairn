@@ -704,7 +704,8 @@ def scan_blobs(data_dir, bucket, sample):
             names_with_marker.append(os.path.basename(path))
         sidecar = path + ".meta"
         # Sidecars are JSON authority records, not CRNB object containers, and must never carry
-        # object bytes. Some objects (multipart-completed in P1) legitimately have no sidecar.
+        # object bytes. Objects written before protocol 3 (or before the multipart sidecar) have
+        # none; a completed multipart object now writes one.
         if os.path.isfile(sidecar):
             with open(sidecar, "rb") as fh:
                 if MARKER in fh.read():

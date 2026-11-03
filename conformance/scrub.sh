@@ -146,7 +146,7 @@ PY
   # More than one data blob under the bucket means `find | sort | head` may have hit a superseded
   # orphan that the scrub correctly never reads. Surface it instead of letting it read as a missed
   # detection. When a bucket has protocol-3 sidecars, they must pair exactly with their data blobs;
-  # a multipart-only bucket has none in P1 (assembly is unchanged).
+  # a completed multipart object now has one too (v2, with its part layout).
   local ndata nmeta
   ndata="$(find "$DATADIR/$bucket" -type f ! -name '*.meta' ! -name '*.tmp' | wc -l)"
   nmeta="$(find "$DATADIR/$bucket" -type f -name '*.meta' | wc -l)"

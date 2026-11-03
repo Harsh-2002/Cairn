@@ -203,7 +203,7 @@ def same_live_files(snapshot_blobs, restored, state):
                 if sidecar is not None:
                     # The sidecar is the object's durability authority; a restore that preserves
                     # the data file but loses (or invents) its sidecar has silently changed the
-                    # object's protocol authority. Multipart-completed objects have no sidecar.
+                    # object's protocol authority. A completed multipart object has one too.
                     assert (snapshot_blobs / sidecar).exists() == (restored / sidecar).exists(), \
                         "restore changed metadata sidecar presence"
                     if (snapshot_blobs / sidecar).exists():
