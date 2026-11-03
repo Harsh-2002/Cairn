@@ -606,21 +606,23 @@ def cairn_metrics(endpoint):
             if line.startswith(prefixes) and not line.startswith("#")]
 
 
-def prefill_pool(port, secret, count, size):
+def prefill_pool(port, secret, count, size, deadline):
     """Create an exact delete pool through the normal S3 PUT path, not warp's uploader.
 
     Warp's `put` has no object-count flag; using its timed upload would make the pool size and
     measurement window depend on throughput. This issues exactly `count` signed PUTs with bounded
-    concurrency and raises on the first failure.
+    concurrency and raises on the first failure or when the arm deadline leaves no room for the
+    scored delete.
     """
     body = b"x" * size
+
+    def put(index):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("DELETE prefill exceeded the arm deadline")
+        signed_request(port, secret, "PUT", f"/{BUCKET}/prefill-{index:09d}", body=body)
+
     with ThreadPoolExecutor(max_workers=32) as pool:
-        for _ in pool.map(
-            lambda index: signed_request(
-                port, secret, "PUT", f"/{BUCKET}/prefill-{index:09d}", body=body
-            ),
-            range(count),
-        ):
+        for _ in pool.map(put, range(count)):
             pass
 
 
@@ -697,7 +699,13 @@ def run_arm(args, root, case, engine, index, deadline):
             # its monitor window starts only after this completes.
             prefill_count = 100_000
             prefill_start = time.monotonic()
-            prefill_pool(port, secret, prefill_count, 4 * 1024)
+            prefill_pool(
+                port,
+                secret,
+                prefill_count,
+                4 * 1024,
+                deadline - args.duration - 30,
+            )
             prefill = {
                 "objects": prefill_count,
                 "seconds": round(time.monotonic() - prefill_start, 3),
