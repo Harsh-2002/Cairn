@@ -25,6 +25,26 @@ decision that is **fixed at first init** and cannot be changed later.
   declared length from the index and finds a mismatch instead of serving the trailer as payload.
   That is a refusal, not a migration, so rollback still requires the pre-upgrade snapshot.
 
+### Multipart sidecars across versions
+
+Assembled multipart objects keep `<uuid>.meta` beside their data file: a v2 record carries the
+ordered part layout, so startup rebuild can restore both the row and `GET`/`HEAD ?partNumber`
+after index loss. A binary that predates the v2 record still serves the object from SQLite, but it
+cannot decode the sidecar, so a later index loss cannot rebuild that row. A v2 binary reads both
+generations. An object whose sidecar is still v1 restores the row but not its part layout, so
+part-number reads fail closed.
+
+Objects completed before the multipart sidecar existed can be backfilled after stopping the node:
+
+```sh
+cairn backfill-sidecars --dry-run
+cairn backfill-sidecars
+```
+
+The command takes the node lock, writes only missing sidecars, never overwrites an existing one, and
+is safe to rerun. It does not upgrade an existing v1 sidecar to v2; those objects still restore the
+row without a layout.
+
 ## 2. Forward upgrade (newer binary, same data)
 
 1. **Snapshot first.** Take a backup per [`backup-restore.md`](./backup-restore.md) (database-first
