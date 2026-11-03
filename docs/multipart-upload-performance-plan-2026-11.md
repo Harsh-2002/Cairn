@@ -148,12 +148,18 @@ its own `MultipartStage` timings; do not conflate assembly with part upload.
   ~3% of a part; collapsing one is not the next win. Assembly p50 340.5 ms and durability 0.77 ms
   under the same load. The body/sink path is the remaining candidate and needs its own A/B.
 
+- 2026-11-03: body/sink buffer A/B (negative). A 1 MiB part-only staging buffer reduced direct
+  p50 sink+finalize from 28–32 ms to 20–25 ms, but body p50 stayed 59–76 ms and throughput ~68
+  obj/s because client input wait varied 24–32 ms. The 256 KiB buffer stays; the change was
+  reverted. Remaining part cost is client input wait (~27 ms), MD5 (~15 ms) and sink (~27 ms).
+
 ## Remaining gap
 
-The measured residual is not a single missing micro-optimization. Hashing is now ~14 ms; the
-staging write plus data fsync is ~40-55 ms; client input wait is ~21-26 ms; the two commits are
-~12 ms. The next candidates are the single post-stage publication (about 6 ms) and a direct
-comparison of the part fsync shape against RustFS strict mode. If RustFS defers the per-part
+The measured residual is not a single missing micro-optimization. Hashing is now ~15 ms; the
+staging write plus data fsync is ~25-32 ms; client input wait is ~24-32 ms; the two commits are
+~2.6 ms. The one-commit publication and the 1 MiB sink buffer were both measured and rejected as
+not worth their durability/memory cost. The remaining candidates are the part fsync shape against
+RustFS strict mode and client-side input pacing, not a server micro-optimization. If RustFS defers the per-part
 data barrier, Cairn's stricter acknowledgement is the remaining difference and should be
 documented rather than removed.
 
