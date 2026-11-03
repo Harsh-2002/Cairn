@@ -81,9 +81,15 @@ inline-trailer skip; completion sidecar carries the same layout and composed che
 `rebuilt_row` restores it, a v1 record restores no layout, and an end-to-end in-memory rebuild
 restores the row, layout and checksums from the durable files. The backfill record reconstruction
 and sidecar write are unit-tested, and the command was exercised end to end on a three-part object
-with dry-run, write and idempotence. Still outstanding for a full restore drill: wiping a real
-SQLite database and asserting `?partNumber` through the S3 surface, backup/restore, and crash points
-around sidecar publication.
+with dry-run, write and idempotence.
+
+**Restore drill (2026-11-03):** a 21,000,000-byte, three-part object was uploaded, then its
+`object_versions` row was deleted while the node was stopped; the bucket and user rows were kept.
+Startup rebuilt the row from the v2 sidecar (composite ETag `41910554e065a005e26fed75f5ee71b8-3`,
+21,000,000 bytes), and `GET ?partNumber=1/2/3` returned the three parts byte-exactly
+(8,388,608 + 8,388,608 + 4,222,784). Deleting the whole database is a different failure: the rebuild
+creates no buckets, users or policies, so the namespace is lost by design. Still outstanding:
+backup/restore and crash points around sidecar publication.
 
 ## 3. Multipart upload performance — measure before optimizing
 
