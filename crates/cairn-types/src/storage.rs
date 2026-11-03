@@ -5,7 +5,7 @@ use crate::authz::Acl;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::object::{
     ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ExplicitObjectLockIntent,
-    MultipartPartRecord, StorageClass, UserMetadata,
+    MultipartPartRecord, ObjectVersionRow, StorageClass, UserMetadata,
 };
 use crate::time::Timestamp;
 use crate::{BlobError, MetaError};
@@ -770,6 +770,64 @@ impl ObjectMetadataRecord {
         }
     }
 
+    /// Build the sidecar record for an object version that predates the sidecar.
+    ///
+    /// The row is SQLite truth at the moment of the call; callers must hold the node lock so no
+    /// live writer can supersede the version while the record is staged. Tags and Object Lock live
+    /// in side tables, so they are supplied separately. A version with a recorded part layout gets
+    /// a v2 record; a legacy assembled object without one gets v1 and keeps the fail-closed
+    /// part-number behavior.
+    pub fn from_existing(
+        row: &ObjectVersionRow,
+        tags: Vec<(String, String)>,
+        lock_intent: ExplicitObjectLockIntent,
+    ) -> Result<Self, MetaError> {
+        if row.is_delete_marker {
+            return Err(invalid("a delete marker has no object metadata record"));
+        }
+        let storage_path = row
+            .storage_path
+            .clone()
+            .ok_or_else(|| invalid("object version has no storage path"))?;
+        let format_version = if row.multipart_parts.is_some() {
+            OBJECT_METADATA_V2_FORMAT_VERSION
+        } else {
+            OBJECT_METADATA_V1_FORMAT_VERSION
+        };
+        Ok(Self {
+            format_version,
+            bucket: row.bucket.clone(),
+            key: row.key.clone(),
+            version_id: row.version_id.clone(),
+            row_id: row.id.clone(),
+            is_delete_marker: false,
+            size_logical: row.size_logical,
+            multipart_parts: row.multipart_parts.clone(),
+            size_physical: row.size_physical,
+            etag: row.etag.clone(),
+            content_type: row.content_type.clone(),
+            content_encoding: row.content_encoding.clone(),
+            cache_control: row.cache_control.clone(),
+            content_disposition: row.content_disposition.clone(),
+            content_language: row.content_language.clone(),
+            expires: row.expires.clone(),
+            expire_at: row.expire_at,
+            storage_path,
+            compression: row.compression.clone(),
+            storage_class: row.storage_class,
+            owner_id: row.owner_id.clone(),
+            user_metadata: row.user_metadata.clone(),
+            acl: row.acl.clone(),
+            checksums: row.checksums.clone(),
+            sse_descriptor: row.sse_descriptor.clone(),
+            internal_sha256: row.internal_sha256.clone(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            tags,
+            lock_intent,
+        })
+    }
+
     /// Canonical bytes for the sidecar file.
     pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
         let bytes =
@@ -1009,7 +1067,7 @@ pub fn validate_unadmitted_mutation(operation: &crate::meta::Mutation) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::ChecksumAlgorithm;
+    use crate::object::{ChecksumAlgorithm, ObjectLockMode, ObjectRetention};
     use std::sync::Arc;
 
     fn metadata_seed(parts: Option<Vec<MultipartPartRecord>>) -> ObjectMetadataSeed {
@@ -1040,6 +1098,120 @@ mod tests {
             tags: Vec::new(),
             lock_intent: ExplicitObjectLockIntent::default(),
         }
+    }
+
+    fn object_row(
+        parts: Option<Vec<MultipartPartRecord>>,
+        is_delete_marker: bool,
+        storage_path: Option<StoragePath>,
+    ) -> ObjectVersionRow {
+        ObjectVersionRow {
+            id: "a".repeat(32),
+            bucket: BucketName::parse("bucket").unwrap(),
+            key: ObjectKey::parse("assembled.bin").unwrap(),
+            version_id: VersionId::null(),
+            is_latest: true,
+            is_delete_marker,
+            size_logical: 11,
+            size_physical: 11,
+            etag: ETag::from_string("0123456789abcdef0123456789abcdef-2".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: Some("max-age=60".to_owned()),
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: Some(Timestamp(99)),
+            storage_path,
+            compression: CompressionDescriptor::Uncompressed,
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: UserId("owner".to_owned()),
+            user_metadata: vec![("colour".to_owned(), "blue".to_owned())],
+            acl: None,
+            checksums: vec![ChecksumValue {
+                algorithm: ChecksumAlgorithm::Crc32,
+                value: "AAAAAA==-2".to_owned(),
+            }],
+            sse_descriptor: Some("sealed".to_owned()),
+            internal_sha256: Some("00".repeat(32)),
+            replication_status: None,
+            replicated_at: None,
+            multipart_parts: parts,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(2),
+        }
+    }
+
+    #[test]
+    fn an_existing_version_reconstructs_its_sidecar_record() {
+        let path = StoragePath::generate(&BucketName::parse("bucket").unwrap());
+        let parts = vec![
+            MultipartPartRecord {
+                part_number: 1,
+                size: 5,
+            },
+            MultipartPartRecord {
+                part_number: 3,
+                size: 6,
+            },
+        ];
+        let tags = vec![("team".to_owned(), "storage".to_owned())];
+        let retention = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until: Timestamp(100),
+        };
+        let intent = ExplicitObjectLockIntent {
+            retention: Some(retention),
+            legal_hold: Some(true),
+        };
+        let record = ObjectMetadataRecord::from_existing(
+            &object_row(Some(parts.clone()), false, Some(path.clone())),
+            tags.clone(),
+            intent,
+        )
+        .unwrap();
+        assert_eq!(record.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(record.multipart_parts.as_deref(), Some(parts.as_slice()));
+        assert_eq!(record.storage_path, path);
+        assert_eq!(record.etag.as_str(), "0123456789abcdef0123456789abcdef-2");
+        assert_eq!(record.checksums.len(), 1);
+        assert_eq!(record.internal_sha256, Some("00".repeat(32)));
+        assert_eq!(record.tags, tags);
+        assert_eq!(record.lock_intent, intent);
+        assert_eq!(record.expire_at, Some(Timestamp(99)));
+        assert_eq!(
+            ObjectMetadataRecord::decode(&record.encode().unwrap()).unwrap(),
+            record
+        );
+
+        // A legacy assembly without a recorded layout stays v1: the row is restorable, and
+        // part-number reads fail closed rather than inventing offsets.
+        let legacy = ObjectMetadataRecord::from_existing(
+            &object_row(None, false, Some(path)),
+            Vec::new(),
+            ExplicitObjectLockIntent::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy.format_version, OBJECT_METADATA_V1_FORMAT_VERSION);
+        assert!(legacy.multipart_parts.is_none());
+
+        assert!(
+            ObjectMetadataRecord::from_existing(
+                &object_row(None, true, None),
+                Vec::new(),
+                ExplicitObjectLockIntent::default()
+            )
+            .is_err()
+        );
+        assert!(
+            ObjectMetadataRecord::from_existing(
+                &object_row(None, false, None),
+                Vec::new(),
+                ExplicitObjectLockIntent::default()
+            )
+            .is_err()
+        );
     }
 
     fn staged_blob() -> crate::blob::StagedBlob {

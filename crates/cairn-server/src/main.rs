@@ -1,7 +1,8 @@
 //! The Cairn server binary entrypoint. Parses configuration, initialises observability, builds
 //! the engine stack, and runs the HTTP server with ordered graceful shutdown. Also carries the
 //! node-local commands that operate directly on the data dir from config: `bootstrap` (mint the
-//! first administrator), `integrity` (on-demand reconciliation), `migrate` (run migrations and
+//! first administrator), `integrity` (on-demand reconciliation), `backfill-sidecars` (write
+//! missing metadata sidecars for pre-sidecar assembled objects), `migrate` (run migrations and
 //! report the schema version), and `backup`/`restore` (the ARCH 31.4 offline single-SQLite snapshot
 //! and its inverse). The full remote-admin CLI ships as `cairn-cli` in a later wave.
 
@@ -33,6 +34,7 @@ mod observability;
 mod proxy;
 mod replication_audit;
 mod server;
+mod sidecar_backfill;
 mod sidecar_rebuild;
 mod sse;
 mod sts;
@@ -91,6 +93,15 @@ enum Command {
         /// Also drop metadata rows whose backing blob is missing (destructive repair).
         #[arg(long)]
         repair: bool,
+    },
+    /// Write metadata sidecars for pre-sidecar assembled objects (offline; node lock required).
+    BackfillSidecars {
+        /// Report what would be written without creating files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after this many candidate versions.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Open the store (running migrations) and report the applied schema version.
     Migrate,
@@ -269,6 +280,15 @@ fn main() -> ExitCode {
             node_lock_guard
                 .as_ref()
                 .expect("integrity owns node lock")
+                .clone(),
+        ),
+        Command::BackfillSidecars { dry_run, limit } => sidecar_backfill::run(
+            cfg,
+            dry_run,
+            limit,
+            node_lock_guard
+                .as_ref()
+                .expect("sidecar backfill owns node lock")
                 .clone(),
         ),
         Command::Migrate => migrate(cfg),
@@ -2684,7 +2704,7 @@ async fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
         .map_err(|error| std::io::Error::other(format!("directory sync task failed: {error}")))?
 }
 
-fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
+pub(crate) fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     // Size the blocking pool to cover the metadata read pool + blob I/O concurrency so neither

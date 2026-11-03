@@ -3645,6 +3645,70 @@ async fn assembly_with_an_explicit_etag_skips_the_unused_full_object_md5() {
 }
 
 #[tokio::test]
+async fn backfill_writes_a_missing_sidecar_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("backfill-bucket").unwrap();
+    let key = ObjectKey::parse("assembled.bin").unwrap();
+    let staged = store
+        .stage_fixture(&bucket, body(b"data".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let seed = metadata_seed(&bucket, &key, &VersionId::null(), &"f".repeat(32));
+    let record = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
+    let permit = || {
+        use cairn_types::storage::{
+            PlannedStorageWrite, StorageToken, StorageWriteTarget, io::StorageIoWatch,
+        };
+        let generation = StorageToken::generate();
+        let planned = PlannedStorageWrite::new(
+            bucket.clone(),
+            generation.clone(),
+            StorageWriteTarget::Object {
+                key: key.clone(),
+                version_id: VersionId::null(),
+                row_id: StorageToken::generate().as_str().to_owned(),
+            },
+        )
+        .unwrap();
+        let attempt = planned.plan().attempt.clone();
+        let (_watch, lease) = StorageIoWatch::new(attempt, generation, std::sync::Arc::new(()));
+        planned.into_object_permit(lease).unwrap()
+    };
+
+    assert!(
+        store
+            .backfill_metadata_sidecar(permit(), &staged.storage_path, &record)
+            .await
+            .unwrap()
+    );
+    let sidecar = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    let decoded = cairn_types::storage::ObjectMetadataRecord::decode(
+        &std::fs::read(dir.path().join(sidecar.as_str())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded, record);
+    assert!(
+        !store
+            .backfill_metadata_sidecar(permit(), &staged.storage_path, &record)
+            .await
+            .unwrap(),
+        "an existing sidecar is skipped, not overwritten"
+    );
+
+    let nested = StoragePath::from_string(format!("{}/ab/{}", bucket.as_str(), "c".repeat(32)));
+    assert!(
+        store
+            .backfill_metadata_sidecar(permit(), &nested, &record)
+            .await
+            .is_err(),
+        "nested legacy paths need their own parent; the offline command skips them"
+    );
+}
+
+#[tokio::test]
 async fn large_plaintext_object_is_one_inline_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
