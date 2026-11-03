@@ -161,7 +161,12 @@ pub(crate) fn run(
                         }
                     }
                     match std::fs::symlink_metadata(cfg.data_dir.join(data_path.as_str())) {
-                        Ok(metadata) if metadata.file_type().is_file() => {}
+                        // An assembled object's data file is the payload or container itself; the
+                        // record's physical size is its exact length. Never bless a truncated or
+                        // replaced file with a fresh sidecar.
+                        Ok(metadata)
+                            if metadata.file_type().is_file()
+                                && metadata.len() == row.size_physical => {}
                         _ => {
                             missing_data += 1;
                             continue;
