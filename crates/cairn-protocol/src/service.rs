@@ -1012,6 +1012,7 @@ impl S3Service {
             bucket: bucket.name.clone(),
             key: key.clone(),
             version_id: version_id.clone(),
+            etag: None,
             row_id: row_id.clone(),
             is_delete_marker: false,
             content_type: content_type.clone(),
@@ -2687,80 +2688,10 @@ impl S3Service {
                 }
             }
         }
-        let opts = StageOptions {
-            compression: bucket.compression,
-            extra_checksums: assemble_checksums,
-            size_ceiling: self.max_object_size,
-            // `assemble` preallocates from the sum of the parts' sizes itself.
-            content_length: None,
-            content_type: session.content_type.clone(),
-            encryption: sse_dek,
-            // Multipart assembly is unchanged: no protocol-3 sidecar yet.
-            metadata_seed: None,
-        };
-        // The completion claim owns the session while assembly reads its part files. Abort can only
-        // remove `active`, so it cannot delete these bytes after the active->completing transition.
-        // A genuine assembly failure releases the claim through the writer before returning, making
-        // the upload retryable without ever resurrecting a terminal session.
-        let staged = match self.blob.assemble(creation, &refs, opts).await {
-            Ok(s) => s,
-            Err(e) => {
-                let error = self
-                    .multipart_failure_after_claim(
-                        &upload_id,
-                        &claim_token,
-                        e.into(),
-                        &mut claim_guard,
-                    )
-                    .await;
-                return Err(error);
-            }
-        };
+        // Completion identity and TTL are captured before assembly so the per-object metadata
+        // sidecar is written from the same durable plan as the assembled data file.
         let etag = multipart_etag(&part_md5s);
-
-        // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
-        // just recomputed by `assemble`, verifying any client-supplied expected value (BadDigest on
-        // mismatch, deleting the assembled blob first so a rejected completion leaves no orphan).
-        let mut object_checksums = match checksum_plan {
-            ChecksumPlan::None => Vec::new(),
-            ChecksumPlan::Composite(value) => vec![value],
-            ChecksumPlan::FullObject { algo, expected } => {
-                match staged.checksums.iter().find(|c| c.algorithm == algo) {
-                    Some(cv) => {
-                        if expected.is_some_and(|e| e != cv.value) {
-                            return Err(self
-                                .multipart_failure_after_claim(
-                                    &upload_id,
-                                    &claim_token,
-                                    Error::BadDigest,
-                                    &mut claim_guard,
-                                )
-                                .await);
-                        }
-                        vec![cv.clone()]
-                    }
-                    None => Vec::new(),
-                }
-            }
-        };
-
-        if let Some(intent) = &session.replica_intent {
-            if intent
-                .checksums
-                .iter()
-                .any(|expected| !staged.checksums.contains(expected))
-            {
-                return Err(self
-                    .multipart_failure_after_claim(
-                        &upload_id,
-                        &claim_token,
-                        Error::BadDigest,
-                        &mut claim_guard,
-                    )
-                    .await);
-            }
-            object_checksums.clone_from(&intent.checksums);
-        }
+        let stored_checksums = assemble_checksums.clone();
         let now = self.clock.now();
         // Resolve the opt-in TTL pinned in the session's user metadata (or the replica intent).
         // A client-supplied TTL is anchored at completion; a replica carries an absolute deadline.
@@ -2811,6 +2742,117 @@ impl S3Service {
         };
         if expire_at.is_some() {
             assembled_user_metadata.retain(|(name, _)| name != "object-expires");
+        }
+        let metadata_seed = ObjectMetadataSeed {
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            etag: Some(etag.clone()),
+            row_id: row_id.clone(),
+            is_delete_marker: false,
+            content_type: session.content_type.clone(),
+            content_encoding: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.content_encoding.clone()),
+            cache_control: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.cache_control.clone()),
+            content_disposition: session.content_disposition.clone(),
+            content_language: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.content_language.clone()),
+            expires: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.expires.clone()),
+            expire_at,
+            storage_class: StorageClass::Standard,
+            owner_id: bucket.owner_id.clone(),
+            user_metadata: assembled_user_metadata.clone(),
+            acl: (bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced)
+                .then(|| session.intended_acl.clone())
+                .flatten(),
+            stored_checksums,
+            sse_descriptor: sse_descriptor.clone(),
+            created_at: now,
+            updated_at: now,
+            tags: session.initial_tags.clone(),
+            lock_intent: session.lock_intent,
+        };
+        let opts = StageOptions {
+            compression: bucket.compression,
+            extra_checksums: assemble_checksums,
+            size_ceiling: self.max_object_size,
+            // `assemble` preallocates from the sum of the parts' sizes itself.
+            content_length: None,
+            content_type: session.content_type.clone(),
+            encryption: sse_dek,
+            metadata_seed: Some(metadata_seed),
+        };
+        // The completion claim owns the session while assembly reads its part files. Abort can only
+        // remove `active`, so it cannot delete these bytes after the active->completing transition.
+        // A genuine assembly failure releases the claim through the writer before returning, making
+        // the upload retryable without ever resurrecting a terminal session.
+        let staged = match self.blob.assemble(creation, &refs, opts).await {
+            Ok(s) => s,
+            Err(e) => {
+                let error = self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        e.into(),
+                        &mut claim_guard,
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+
+        // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
+        // just recomputed by `assemble`, verifying any client-supplied expected value (BadDigest on
+        // mismatch, deleting the assembled blob first so a rejected completion leaves no orphan).
+        let mut object_checksums = match checksum_plan {
+            ChecksumPlan::None => Vec::new(),
+            ChecksumPlan::Composite(value) => vec![value],
+            ChecksumPlan::FullObject { algo, expected } => {
+                match staged.checksums.iter().find(|c| c.algorithm == algo) {
+                    Some(cv) => {
+                        if expected.is_some_and(|e| e != cv.value) {
+                            return Err(self
+                                .multipart_failure_after_claim(
+                                    &upload_id,
+                                    &claim_token,
+                                    Error::BadDigest,
+                                    &mut claim_guard,
+                                )
+                                .await);
+                        }
+                        vec![cv.clone()]
+                    }
+                    None => Vec::new(),
+                }
+            }
+        };
+
+        if let Some(intent) = &session.replica_intent {
+            if intent
+                .checksums
+                .iter()
+                .any(|expected| !staged.checksums.contains(expected))
+            {
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        Error::BadDigest,
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+            object_checksums.clone_from(&intent.checksums);
         }
         let row = ObjectVersionRow {
             id: row_id,
@@ -3355,6 +3397,7 @@ impl S3Service {
             bucket: dest_bucket.name.clone(),
             key: dest_key.clone(),
             version_id: version_id.clone(),
+            etag: None,
             row_id: row_id.clone(),
             is_delete_marker: false,
             content_type: content_type.clone(),

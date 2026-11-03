@@ -1621,6 +1621,7 @@ impl BlobStore for LocalBlobStore {
                 "assembly part does not belong to the admitted session".into(),
             ));
         }
+        let metadata_seed = opts.metadata_seed.clone();
         let (compress, block_pol) = encoding_policies(&opts);
         // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
         // preallocate the staging file to place it contiguously (ARCH 7.5).
@@ -1704,17 +1705,6 @@ impl BlobStore for LocalBlobStore {
             CompressionDescriptor::Uncompressed
         };
 
-        drop(assembly_timing);
-        let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
-        sink.commit(&paths.final_file).await?;
-        // Release the copy permit before parking on the coalesced directory-fsync barrier.
-        drop(copy_permit);
-        self.dir_sync
-            .sync_file(paths.final_file.parent.clone(), &paths.lease)
-            .await?;
-        drop(durability_timing);
-        fail::fail_point!("blob_after_assemble");
-
         let (md5_hex, checksums, internal_sha256) = hashers.finalize();
         let staged = StagedBlob {
             storage_path,
@@ -1727,6 +1717,38 @@ impl BlobStore for LocalBlobStore {
             compression: descriptor,
             index_spool,
         };
+        // The completed object's durable metadata sidecar is staged from the same plan as the
+        // data file. It is committed before the directory barrier, so a crash cannot acknowledge
+        // an object whose only metadata lives in SQLite.
+        let sidecar = if let Some(seed) = metadata_seed.as_ref() {
+            let record = ObjectMetadataRecord::from_staged(seed, &staged);
+            match stage_metadata_sidecar(&paths, &record).await {
+                Ok(sidecar) => Some(sidecar),
+                Err(error) => {
+                    sink.abort().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        drop(assembly_timing);
+        let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
+        sink.commit(&paths.final_file).await?;
+        if let Some(sidecar) = sidecar {
+            let destination = paths.metadata_file.clone().ok_or_else(|| {
+                BlobError::Io("storage plan lacks a multipart metadata sidecar path".into())
+            })?;
+            sidecar.commit(&destination).await?;
+        }
+        // Release the copy permit before parking on the coalesced directory-fsync barrier.
+        drop(copy_permit);
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
+        drop(durability_timing);
+        fail::fail_point!("blob_after_assemble");
         Ok(staged)
     }
 

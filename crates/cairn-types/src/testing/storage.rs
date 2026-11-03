@@ -368,8 +368,10 @@ pub(super) fn resolve_paths(
     plan: &StorageWritePlan,
     index_spool: crate::blob::IndexSpoolState,
 ) -> R<()> {
-    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
-        && referenced(st, plan.final_path()?);
+    let published_object = matches!(
+        plan.target,
+        StorageWriteTarget::Object { .. } | StorageWriteTarget::Completion { .. }
+    ) && referenced(st, plan.final_path()?);
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path().cloned())
         .transpose()?;

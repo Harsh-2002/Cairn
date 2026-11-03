@@ -3466,6 +3466,7 @@ fn metadata_seed(
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: version_id.clone(),
+        etag: None,
         row_id: row_id.to_owned(),
         is_delete_marker: false,
         content_type: "text/plain".to_owned(),

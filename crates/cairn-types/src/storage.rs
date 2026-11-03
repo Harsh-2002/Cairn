@@ -417,7 +417,10 @@ impl StorageWritePlan {
     fn expected_paths(&self) -> Result<Vec<StorageIntentPath>, MetaError> {
         let mut paths = Vec::with_capacity(5);
         let id = self.attempt.as_str();
-        let object = matches!(self.target, StorageWriteTarget::Object { .. });
+        let object = matches!(
+            self.target,
+            StorageWriteTarget::Object { .. } | StorageWriteTarget::Completion { .. }
+        );
         let final_path = match &self.target {
             StorageWriteTarget::Part {
                 upload_id,
@@ -486,7 +489,10 @@ impl StorageWritePlan {
 
     /// The protocol-2 object path set, still accepted so pre-sidecar intents can be recovered.
     fn legacy_object_paths(&self) -> Option<Vec<StorageIntentPath>> {
-        if !matches!(self.target, StorageWriteTarget::Object { .. }) {
+        if !matches!(
+            self.target,
+            StorageWriteTarget::Object { .. } | StorageWriteTarget::Completion { .. }
+        ) {
             return None;
         }
         let id = self.attempt.as_str();
@@ -596,6 +602,9 @@ pub struct ObjectMetadataSeed {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    /// Optional ETag override for an assembled multipart object, whose composite ETag is not the
+    /// MD5 of the concatenated bytes that `assemble` hashes.
+    pub etag: Option<ETag>,
     pub row_id: String,
     pub is_delete_marker: bool,
     pub content_type: String,
@@ -690,7 +699,7 @@ impl ObjectMetadataRecord {
             is_delete_marker: seed.is_delete_marker,
             size_logical: staged.size_logical,
             size_physical: staged.size_physical,
-            etag: staged.etag.clone(),
+            etag: seed.etag.clone().unwrap_or_else(|| staged.etag.clone()),
             content_type: seed.content_type.clone(),
             content_encoding: seed.content_encoding.clone(),
             cache_control: seed.cache_control.clone(),

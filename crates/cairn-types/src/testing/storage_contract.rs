@@ -1180,8 +1180,8 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
     let debts = claim(meta, &generation, 100, 0).await;
     assert_eq!(
         debts.len(),
-        4,
-        "completed object aliases and retired part aliases must all remain durable debt"
+        3,
+        "the live completion keeps its data and sidecar aliases; the part alias and the two materialized index spools remain durable debt"
     );
     for cleanup in debts {
         update(
@@ -1208,7 +1208,11 @@ async fn assert_storage_completion(meta: &dyn MetadataStore) {
     )
     .await;
     let debts = claim(meta, &generation, 100, 2).await;
-    assert_eq!(debts.len(), 3);
+    assert_eq!(
+        debts.len(),
+        5,
+        "the abandoned completion retires its data/metadata aliases plus the materialized spool"
+    );
     for cleanup in debts {
         update(
             meta,
