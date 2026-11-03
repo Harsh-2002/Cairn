@@ -278,6 +278,7 @@ fn object_with_body(key: &str, body: &'static [u8]) -> ReplicatedObject<'static>
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(body),
+        multipart_parts: None,
     }
 }
 
@@ -309,6 +310,7 @@ async fn put_object_issues_well_formed_signed_request() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"hello"),
+        multipart_parts: None,
     };
 
     sink.put_object(&src(), object).await.unwrap();
@@ -420,6 +422,7 @@ async fn composite_checksum_is_not_replicated_but_full_object_is() {
         ],
         client_encrypted: false,
         source: test_source(b"hello"),
+        multipart_parts: None,
     };
 
     sink.put_object(&src(), object).await.unwrap();
@@ -485,6 +488,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"abc"),
+        multipart_parts: None,
     };
     sink.put_object(&src(), object).await.unwrap();
     let reqs = captured.lock().unwrap().clone();
@@ -524,6 +528,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b""),
+        multipart_parts: None,
     };
     sink2.put_object(&src(), object2).await.unwrap();
     let reqs2 = captured2.lock().unwrap().clone();
@@ -562,6 +567,7 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"hello"),
+        multipart_parts: None,
     };
 
     sink.put_object(&src(), make("a")).await.unwrap();
@@ -627,6 +633,7 @@ async fn server_5xx_is_unavailable() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"x"),
+        multipart_parts: None,
     };
     let err = sink.put_object(&src(), object).await.unwrap_err();
     assert!(
@@ -797,6 +804,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"x"),
+        multipart_parts: None,
     };
 
     // Mapped source routes to its destination bucket.
@@ -890,6 +898,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         checksums: Vec::new(),
         client_encrypted: false,
         source: test_source(b"x"),
+        multipart_parts: None,
     };
     // The handshake fails (server presents no certificate), so the call errors as unavailable.
     let err = sink.put_object(&src(), object).await.unwrap_err();
@@ -938,6 +947,7 @@ async fn put_object_replicates_system_headers_and_checksums() {
         }],
         client_encrypted: false,
         source: test_source(b"hello"),
+        multipart_parts: None,
     };
     sink.put_object(&src(), object).await.unwrap();
     let reqs = captured.lock().unwrap().clone();
@@ -980,6 +990,7 @@ fn encrypted_object(client_encrypted: bool) -> ReplicatedObject<'static> {
         checksums: Vec::new(),
         client_encrypted,
         source: test_source(b"hello"),
+        multipart_parts: None,
     }
 }
 

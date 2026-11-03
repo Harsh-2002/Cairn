@@ -61,7 +61,7 @@ use cairn_types::SecretString;
 use cairn_types::blob::ReadBufferLease;
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
-use cairn_types::object::{ChecksumAlgorithm, StorageClass};
+use cairn_types::object::{ChecksumAlgorithm, MultipartPartRecord, StorageClass};
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
@@ -1076,7 +1076,9 @@ impl HttpS3Sink {
             user_headers.push(("x-amz-tagging".to_owned(), tagging));
         }
 
-        if object.size <= SINGLE_PUT_MAX_BYTES {
+        if object.size == 0
+            || (object.size <= SINGLE_PUT_MAX_BYTES && object.multipart_parts.is_none())
+        {
             let payload = signed_range(
                 &object.source,
                 cairn_types::blob::ByteRange {
@@ -1135,7 +1137,33 @@ impl HttpS3Sink {
                 "multipart replication requires durable upload journaling".to_owned(),
             )
         })?;
+        // A completed source object's exact layout is authoritative. Replaying it keeps the
+        // replica's part numbers, `?partNumber` bytes, ObjectParts, and composite ETag aligned.
+        // A malformed layout is terminal: fabricating transfer geometry would silently serve
+        // different bytes at the same part number.
+        let source_layout = object.multipart_parts;
+        if let Some(parts) = source_layout {
+            validate_replication_layout(parts, object.size)?;
+        }
         let part_size = multipart_part_size(object.size)?;
+        let planned: Vec<(u16, u64)> = match source_layout {
+            Some(parts) => parts
+                .iter()
+                .map(|part| (part.part_number, part.size))
+                .collect(),
+            None => {
+                let mut planned = Vec::new();
+                let mut offset = 0;
+                let mut part_number = 1u16;
+                while offset < object.size {
+                    let length = part_size.min(object.size - offset);
+                    planned.push((part_number, length));
+                    offset += length;
+                    part_number += 1;
+                }
+                planned
+            }
+        };
         // S3 multipart supports full-object CRCs. A source SHA whole-object value remains pinned
         // in Cairn receiver intent; generic S3 chooses its native checksum for that transfer.
         let full_crc = object.checksums.iter().find(|value| {
@@ -1193,12 +1221,13 @@ impl HttpS3Sink {
             let mut parts = String::with_capacity(MAX_COMPLETE_XML_BYTES);
             parts.push_str("<CompleteMultipartUpload>");
             let mut offset = 0;
-            let mut part_number = 1u16;
-            while offset < object.size {
-                let length = part_size.min(object.size - offset);
+            for (part_number, length) in &planned {
                 let payload = signed_range(
                     &object.source,
-                    cairn_types::blob::ByteRange { offset, length },
+                    cairn_types::blob::ByteRange {
+                        offset,
+                        length: *length,
+                    },
                     lease,
                 )
                 .await?;
@@ -1224,9 +1253,13 @@ impl HttpS3Sink {
                             "multipart part response lacks a valid ETag".to_owned(),
                         )
                     })?;
-                append_completed_part(&mut parts, part_number, etag)?;
-                offset += length;
-                part_number += 1;
+                append_completed_part(&mut parts, *part_number, etag)?;
+                offset += *length;
+            }
+            if offset != object.size {
+                return Err(ReplicationError::Terminal(
+                    "multipart layout does not cover the object".to_owned(),
+                ));
             }
             parts.push_str("</CompleteMultipartUpload>");
             let request = self.build_signed_payload_request(
@@ -1554,6 +1587,50 @@ fn append_completed_part(
         ));
     }
     parts.push_str(&part);
+    Ok(())
+}
+
+/// Validate a source object's recorded multipart layout before replaying it. A malformed layout
+/// is terminal rather than silently falling back to different transfer boundaries.
+fn validate_replication_layout(
+    parts: &[MultipartPartRecord],
+    size: u64,
+) -> Result<(), ReplicationError> {
+    const MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+    const MIN_NON_FINAL_PART_BYTES: u64 = 5 * 1024 * 1024;
+    if size == 0 || parts.is_empty() {
+        return Err(ReplicationError::Terminal(
+            "multipart layout is empty or the object is empty".to_owned(),
+        ));
+    }
+    let mut previous = 0u16;
+    let mut total = 0u64;
+    for (index, part) in parts.iter().enumerate() {
+        if part.part_number == 0 || part.part_number > 10_000 || part.part_number <= previous {
+            return Err(ReplicationError::Terminal(
+                "multipart layout part numbers are not strictly ascending in 1..=10000".to_owned(),
+            ));
+        }
+        if part.size > MAX_PART_BYTES {
+            return Err(ReplicationError::Terminal(
+                "multipart layout part exceeds 5 GiB".to_owned(),
+            ));
+        }
+        if index + 1 < parts.len() && part.size < MIN_NON_FINAL_PART_BYTES {
+            return Err(ReplicationError::Terminal(
+                "multipart layout non-final part is smaller than 5 MiB".to_owned(),
+            ));
+        }
+        total = total.checked_add(part.size).ok_or_else(|| {
+            ReplicationError::Terminal("multipart layout size overflows".to_owned())
+        })?;
+        previous = part.part_number;
+    }
+    if total != size {
+        return Err(ReplicationError::Terminal(
+            "multipart layout sizes do not sum to the object size".to_owned(),
+        ));
+    }
     Ok(())
 }
 
