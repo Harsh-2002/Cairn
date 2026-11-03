@@ -148,8 +148,8 @@ single-key Python comparison separately.
 ## Order
 
 1. Replicated multipart layout — done.
-2. Multipart file authority, v1 sidecar, v2 part layout and offline backfill — done, with the
-   restore drill still outstanding.
+2. Multipart file authority, v1 sidecar, v2 part layout and offline backfill — done; the
+   row-loss restore drill passed (above).
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
 4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
    body/sink work stays gated on a new measurement.
