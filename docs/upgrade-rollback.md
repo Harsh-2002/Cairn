@@ -34,16 +34,23 @@ cannot decode the sidecar, so a later index loss cannot rebuild that row. A v2 b
 generations. An object whose sidecar is still v1 restores the row but not its part layout, so
 part-number reads fail closed.
 
-Objects completed before the multipart sidecar existed can be backfilled after stopping the node:
+Objects completed before the multipart sidecar existed, and objects whose sidecar is still v1 even
+though the row records the part layout (assembled between the v1 and v2 stages), can be repaired
+after stopping the node:
 
 ```sh
 cairn backfill-sidecars --dry-run
 cairn backfill-sidecars
+cairn backfill-sidecars --upgrade-v1
 ```
 
-The command takes the node lock, writes only missing sidecars, never overwrites an existing one, and
-is safe to rerun. It does not upgrade an existing v1 sidecar to v2; those objects still restore the
-row without a layout.
+The command takes the node lock, writes only missing sidecars unless `--upgrade-v1` is given, and is
+safe to rerun. Without the flag it never overwrites an existing sidecar. `--upgrade-v1` replaces an
+existing v1 record with the row's v2 record only when the record identity (`row_id`, bucket, key,
+version id, storage path, ETag and both sizes) matches the index row; it never rewrites a v2 record,
+and reports a conflict instead of guessing. Rerun until the summary reports `candidates=0`. An
+object whose sidecar is still v1 because its row has no recorded layout restores the row but not
+its part layout, so part-number reads fail closed.
 
 ## 2. Forward upgrade (newer binary, same data)
 

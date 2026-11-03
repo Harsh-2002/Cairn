@@ -149,7 +149,7 @@ pub(crate) struct UringStaging {
 
 enum WriteCmd {
     Chunk(Vec<u8>, oneshot::Sender<Result<(), BlobError>>),
-    Commit(AnchoredPath, oneshot::Sender<Result<(), BlobError>>),
+    Commit(AnchoredPath, bool, oneshot::Sender<Result<(), BlobError>>),
     FsyncInPlace(oneshot::Sender<Result<(), BlobError>>),
     Sync(oneshot::Sender<Result<(), BlobError>>),
     Rename(AnchoredPath, oneshot::Sender<Result<(), BlobError>>),
@@ -204,11 +204,15 @@ impl UringStaging {
         Ok(())
     }
 
-    pub(crate) async fn commit(mut self, destination: AnchoredPath) -> Result<(), BlobError> {
+    pub(crate) async fn commit(
+        mut self,
+        destination: AnchoredPath,
+        replace: bool,
+    ) -> Result<(), BlobError> {
         let _operation = self.owner.child().map_err(io_err)?;
         let (reply, result) = oneshot::channel();
         self.cmd_tx
-            .send(WriteCmd::Commit(destination, reply))
+            .send(WriteCmd::Commit(destination, replace, reply))
             .await
             .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
         result
@@ -307,12 +311,18 @@ async fn writer_task(
                 }
                 let _ = reply.send(result.map_err(io_err));
             }
-            WriteCmd::Commit(destination, reply) => {
+            WriteCmd::Commit(destination, replace, reply) => {
                 let synced = file.sync_data().await.map_err(io_err);
                 let closed = file.close().await.map_err(io_err);
                 let result = match synced.and(closed) {
                     Ok(()) => owner
-                        .run(move |_| staging.rename_to(&destination))
+                        .run(move |_| {
+                            if replace {
+                                staging.replace_to(&destination)
+                            } else {
+                                staging.rename_to(&destination)
+                            }
+                        })
                         .await
                         .map_err(io_err),
                     Err(error) => {
@@ -508,7 +518,7 @@ mod tests {
                     let destination = AnchoredPath::fixture(&final_path);
                     rustix::fs::flock(&*destination.parent, rustix::fs::FlockOperation::LockShared)
                         .unwrap();
-                    Some(WriteCmd::Commit(destination, reply))
+                    Some(WriteCmd::Commit(destination, false, reply))
                 }
                 Terminal::Sync => Some(WriteCmd::FsyncInPlace(reply)),
                 Terminal::Abort => Some(WriteCmd::Abort(reply)),

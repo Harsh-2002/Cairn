@@ -2,7 +2,8 @@
 
 **Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, both stages of
 the multipart object-file authority (v1 sidecar, then the v2 part-layout record), and the offline
-sidecar backfill are implemented; performance work remains phased.
+sidecar backfill — including the opt-in v1 → v2 upgrade — are implemented; performance work remains
+phased.
 
 Five parallel reviews covered the multipart upload path: replication layout, object-file authority,
 upload performance, benchmark methodology, and an independent architecture/security review. This
@@ -73,15 +74,29 @@ protocol-3 contract.
   not a wrong answer.
 - `cairn backfill-sidecars` backfills assembled objects completed before the first stage. It takes
   the node lock, pages versions, writes v2 when a layout is recorded and v1 otherwise, and refuses
-  to overwrite an existing sidecar; `--dry-run` and `--limit` bound the pass. It never appends a
-  trailer in place to a live plaintext object.
+  to overwrite an existing sidecar unless `--upgrade-v1` is given; `--dry-run` and `--limit` bound
+  the pass. It never appends a trailer in place to a live plaintext object.
+- `cairn backfill-sidecars --upgrade-v1` closes the cross-stage gap: an object completed between the
+  v1 sidecar stage and the v2 part-layout stage keeps a v1 record, so after index loss it restores
+  the row but not `?partNumber`. For a row with a recorded layout, the command decodes the existing
+  v1 record, verifies `row_id`, bucket, key, version id, storage path, ETag and both sizes against
+  the row, and replaces it with the row's v2 record through the admitted `.meta.tmp` alias, an fsync,
+  an atomic rename over the destination and the bucket directory barrier. A v2 record is never
+  rewritten; a layout-less row is counted as `skipped_v1`; any disagreement or non-regular
+  destination is counted as `conflicts` and left untouched. Without the flag the command is
+  unchanged and still skips every existing sidecar.
 
 **Tests that landed:** v2 round-trip and v1/v2 mismatch rejection; over-cap encode/decode and
 inline-trailer skip; completion sidecar carries the same layout and composed checksum as the row;
 `rebuilt_row` restores it, a v1 record restores no layout, and an end-to-end in-memory rebuild
 restores the row, layout and checksums from the durable files. The backfill record reconstruction
 and sidecar write are unit-tested, and the command was exercised end to end on a three-part object
-with dry-run, write and idempotence.
+with dry-run, write and idempotence. The upgrade path is covered by an identity test for every
+identity field, a classifier test (v1+layout, layout-less, conflicting v1, disagreeing v2), and blob
+tests proving a v1 → v2 replacement keeps the data file byte-identical, creates no second data file,
+refuses a mismatched record, refuses a symlink/directory destination, and refuses a second pass over
+a v2 record. An end-to-end run upgraded a real v1 sidecar, deleted the `object_versions` row, and
+confirmed `GET ?partNumber=1/2` after restart.
 
 **Restore drill (2026-11-03):** a 21,000,000-byte, three-part object was uploaded, then its
 `object_versions` row was deleted while the node was stopped; the bucket and user rows were kept.

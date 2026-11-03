@@ -81,12 +81,30 @@ impl Staging {
     /// File sync precedes the exclusive rename. The caller then synchronizes the exact destination
     /// directory through the shared coalescer before reporting the blob durable (ARCH 8.2).
     pub(crate) async fn commit(self, destination: &AnchoredPath) -> Result<(), BlobError> {
-        self.commit_sampled(destination, None).await
+        self.commit_inner(destination, false, None).await
+    }
+
+    /// Atomically replace an existing destination for offline maintenance (the v1 → v2 sidecar
+    /// upgrade). Live publication always uses [`Self::commit`], whose rename refuses to replace.
+    pub(crate) async fn commit_replacing(
+        self,
+        destination: &AnchoredPath,
+    ) -> Result<(), BlobError> {
+        self.commit_inner(destination, true, None).await
     }
 
     pub(crate) async fn commit_sampled(
         self,
         destination: &AnchoredPath,
+        timing: Option<Arc<ObjectWriteTimings>>,
+    ) -> Result<(), BlobError> {
+        self.commit_inner(destination, false, timing).await
+    }
+
+    async fn commit_inner(
+        self,
+        destination: &AnchoredPath,
+        replace: bool,
         timing: Option<Arc<ObjectWriteTimings>>,
     ) -> Result<(), BlobError> {
         match self {
@@ -135,7 +153,11 @@ impl Staging {
                         let rename_timer = timing
                             .as_ref()
                             .map(|timing| timing.start(ObjectWriteStage::FinalizeRename));
-                        let result = staging.rename_to(&destination);
+                        let result = if replace {
+                            staging.replace_to(&destination)
+                        } else {
+                            staging.rename_to(&destination)
+                        };
                         if result.is_ok() {
                             if let Some(timer) = rename_timer {
                                 timer.complete();
@@ -147,7 +169,7 @@ impl Staging {
                     .map_err(io_err)
             }
             #[cfg(feature = "io-uring")]
-            Self::Uring(writer) => writer.commit(destination.clone()).await,
+            Self::Uring(writer) => writer.commit(destination.clone(), replace).await,
         }
     }
 

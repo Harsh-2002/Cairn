@@ -278,7 +278,7 @@ fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaE
     Ok(Some(record))
 }
 
-fn read_sidecar(path: &Path) -> Result<ObjectMetadataRecord, MetaError> {
+pub(crate) fn read_sidecar(path: &Path) -> Result<ObjectMetadataRecord, MetaError> {
     // Check the bound before reading: a corrupt or hostile sidecar must not make startup allocate
     // an arbitrarily large buffer just to reject it.
     let len = std::fs::metadata(path)

@@ -349,6 +349,108 @@ impl LocalBlobStore {
         Ok(true)
     }
 
+    /// Replace an existing v1 metadata sidecar with a v2 record during offline maintenance.
+    ///
+    /// This is the opt-in `backfill-sidecars --upgrade-v1` path: an object assembled between the
+    /// v1 sidecar stage and the v2 part-layout stage has a v1 record even though its index row
+    /// carries the part layout. The caller must hold the node lock. The data file is never touched
+    /// or created; only the sidecar is rewritten.
+    ///
+    /// Fail-closed preconditions: the new record must be v2 with a part layout, the data file must
+    /// still be exactly the size the record describes, the destination must be an existing regular
+    /// v1 sidecar, and its identity must agree with the replacement. The new JSON is staged under
+    /// the permit's fresh attempt alias, fsynced, atomically renamed **over** the destination, and
+    /// the bucket directory is synced; a failed write or rename leaves the old sidecar intact.
+    pub async fn replace_metadata_sidecar(
+        &self,
+        permit: ObjectCreationPermit,
+        data_path: &StoragePath,
+        record: &ObjectMetadataRecord,
+    ) -> Result<(), BlobError> {
+        if record.format_version != cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
+            || record.multipart_parts.is_none()
+        {
+            return Err(BlobError::Io(
+                "metadata replacement requires a v2 record with a part layout".into(),
+            ));
+        }
+        let mut components = data_path.as_str().split('/');
+        let bucket = components.next().unwrap_or_default();
+        let name = components.next().unwrap_or_default();
+        if bucket.is_empty() || name.is_empty() || components.next().is_some() {
+            return Err(BlobError::Io(
+                "metadata replacement requires a flat bucket/uuid storage path".into(),
+            ));
+        }
+        if record.storage_path != *data_path || record.bucket.as_str() != bucket {
+            return Err(BlobError::Io(
+                "metadata record does not name the replaced object".into(),
+            ));
+        }
+        match std::fs::symlink_metadata(self.data_root.join(data_path.as_str())) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && metadata.len() == record.size_physical => {}
+            Ok(_) => {
+                return Err(BlobError::Io(
+                    "data file length disagrees with the metadata record".into(),
+                ));
+            }
+            Err(error) => return Err(BlobError::Io(error.to_string())),
+        }
+        let sidecar_path = object_metadata_path(data_path)
+            .ok_or_else(|| BlobError::Io("object storage path has no sidecar name".into()))?;
+        let sidecar_name = sidecar_path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| BlobError::Io("object sidecar path has no file name".into()))?;
+        let bytes = namespace::read_bounded(
+            &self.data_root,
+            &sidecar_path,
+            cairn_types::storage::OBJECT_METADATA_MAX_BYTES,
+        )
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                BlobError::Io("metadata sidecar to replace does not exist".into())
+            }
+            _ => BlobError::Io(error.to_string()),
+        })?;
+        let existing = ObjectMetadataRecord::decode(&bytes)
+            .map_err(|error| BlobError::Io(format!("existing metadata sidecar: {error}")))?;
+        if existing.format_version != cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION {
+            return Err(BlobError::Io(
+                "metadata sidecar already carries a newer record generation".into(),
+            ));
+        }
+        if !existing.identity_matches(record) {
+            return Err(BlobError::Io(
+                "existing metadata sidecar does not describe this object version".into(),
+            ));
+        }
+        let paths = AdmittedPaths::open(&self.data_root, permit).await?;
+        if paths.storage_path.as_str().split('/').next() != Some(bucket) {
+            return Err(BlobError::Io(
+                "metadata replacement plan targets a different bucket".into(),
+            ));
+        }
+        let encoded = record
+            .encode()
+            .map_err(|error| BlobError::Io(error.to_string()))?;
+        let staging = paths
+            .metadata_staging
+            .clone()
+            .ok_or_else(|| BlobError::Io("storage plan lacks a metadata alias".into()))?;
+        let mut sink =
+            Staging::create(staging, self.use_uring, None, paths.lease.try_child()?).await?;
+        sink.write_all(&encoded).await?;
+        let destination = paths.final_file.sibling(sidecar_name);
+        sink.commit_replacing(&destination).await?;
+        self.dir_sync
+            .sync_file(paths.final_file.parent.clone(), &paths.lease)
+            .await?;
+        Ok(())
+    }
+
     /// Cumulative number of metadata-declared plaintext reads refused because the file's physical
     /// length differed from the authoritative logical length. Monotonic for the process lifetime
     /// and shared across clones; the server publishes it as

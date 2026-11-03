@@ -102,6 +102,9 @@ enum Command {
         /// Stop after this many candidate versions.
         #[arg(long)]
         limit: Option<usize>,
+        /// Also upgrade an existing v1 sidecar to v2 when the row records the part layout.
+        #[arg(long)]
+        upgrade_v1: bool,
     },
     /// Open the store (running migrations) and report the applied schema version.
     Migrate,
@@ -282,10 +285,15 @@ fn main() -> ExitCode {
                 .expect("integrity owns node lock")
                 .clone(),
         ),
-        Command::BackfillSidecars { dry_run, limit } => sidecar_backfill::run(
+        Command::BackfillSidecars {
+            dry_run,
+            limit,
+            upgrade_v1,
+        } => sidecar_backfill::run(
             cfg,
             dry_run,
             limit,
+            upgrade_v1,
             node_lock_guard
                 .as_ref()
                 .expect("sidecar backfill owns node lock")
