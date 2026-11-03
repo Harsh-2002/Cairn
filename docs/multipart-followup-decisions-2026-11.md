@@ -139,6 +139,15 @@ explicit ETag, while an assembly without one still computes it. `StagedBlob.md5_
 optional, and the assembly's `etag` is the authoritative value. This does not change the part
 commits, the durability barriers or `synchronous=FULL`.
 
+**Idle-host part-path split (2026-11-03):** release binary
+`7104dcf3af5b188b18dbfab716ddb56d0edf4f3c3d4400edb4dcc9fc083c6694`; 15 s
+`warp multipart-put` (10×5 MiB parts, 4 objects, part concurrency 4); p50 total **78.5 ms**,
+`blob_stage` **75.1 ms**, `storage_admission` **1.6 ms**, `publication` **1.0 ms**, Writer `commit`
+**0.08 ms**. The two per-part commits are ~3% of a part, so collapsing one is not the next win; the
+blob stage (input, hash, sink, fsync) is. Assembly p50 was 340.5 ms and durability 0.77 ms under the
+same load. The single-post-stage publication therefore remains gated and is not pursued from this
+measurement; the body/sink work needs its own A/B.
+
 **Conditions if the single post-stage publication is built later:**
 
 - One durable publication after staging, still `synchronous=FULL`; never add it to the Writer's
@@ -205,8 +214,9 @@ host-load-affected and are not pooled. See `docs/benchmarks.md` §9.
 2. Multipart file authority, v1 sidecar, v2 part layout and offline backfill — done; the
    row-loss restore drill passed (above).
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
-4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
-   body/sink work stays gated on a new measurement.
+4. Elide the unused assembly MD5 — implemented (31% of assembly). The idle part-path split puts the
+   two commits at ~3% of a part, so the one-commit change is not pursued; the body/sink work remains
+   gated on its own A/B.
 5. Implement the paired DELETE methodology and re-run the scoreboard gaps — done; the bulk mean
    ratio is 1.43× with the variance noted above. The separate single-key comparison is also
    implemented and measured at 0.49×; it is not pooled with the bulk ratio.

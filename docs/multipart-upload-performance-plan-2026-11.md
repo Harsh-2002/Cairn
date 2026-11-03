@@ -142,6 +142,12 @@ its own `MultipartStage` timings; do not conflate assembly with part upload.
   measured 326.1 ms mean / 326.0 median with the MD5 and 225.2 / 224.9 without it — a 31%
   assembly reduction. This is outside the part-upload scoreboard and changes no part barrier.
 
+- 2026-11-03: idle-host part-path split (release `7104dcf3…`, 15 s `warp multipart-put`,
+  10×5 MiB, 4 objects, part concurrency 4): p50 total 78.5 ms, `blob_stage` 75.1 ms,
+  `storage_admission` 1.6 ms, `publication` 1.0 ms, Writer `commit` 0.08 ms. The two commits are
+  ~3% of a part; collapsing one is not the next win. Assembly p50 340.5 ms and durability 0.77 ms
+  under the same load. The body/sink path is the remaining candidate and needs its own A/B.
+
 ## Remaining gap
 
 The measured residual is not a single missing micro-optimization. Hashing is now ~14 ms; the
