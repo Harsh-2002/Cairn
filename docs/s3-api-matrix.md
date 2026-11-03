@@ -26,7 +26,7 @@ authorizes.
 | DeleteObjects (bulk) | ✅ | Quiet mode; up to the request cap. |
 | CopyObject | ✅ | COPY/REPLACE metadata directive; same-key metadata change; versioned source. |
 | CreateMultipartUpload / UploadPart / UploadPartCopy / ListParts / CompleteMultipartUpload / AbortMultipartUpload | ✅ | Correct multipart ETag (`md5(concat(part-md5s))-N`); part validation; double-completion guarded; `UploadPartCopy` stages a ranged copy of a source object (`x-amz-copy-source-range`). SSE intent (`AES256`/`aws:kms`) is accepted at `CreateMultipartUpload`; each part is stored encrypted and re-encrypted under the object DEK at assembly (nothing plaintext on disk). |
-| GetObjectAttributes | ✅ | Returns ETag, object size, storage class, checksum (`FULL_OBJECT`, or `COMPOSITE` for a multipart object) with its `ChecksumType`, and the parts list while retrievable. |
+| GetObjectAttributes | ✅ | Returns the attributes selected by `x-amz-object-attributes`: ETag, object size, storage class, checksum (`FULL_OBJECT`, or `COMPOSITE` for a multipart object) with its `ChecksumType`, and paginated `ObjectParts` for completed multipart objects. |
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | ✅ | Stored as queryable rows; usable by lifecycle/policy. |
 | Presigned GET / PUT | ✅ | SigV4 query form. |
 | GetObjectAcl / PutObjectAcl, GetBucketAcl / PutBucketAcl | ◑ | ACLs are off by default under the recommended BucketOwnerEnforced mode; the policy engine is primary. |

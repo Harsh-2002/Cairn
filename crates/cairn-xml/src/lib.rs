@@ -795,13 +795,55 @@ fn checksum_element(alg: ChecksumAlgorithm) -> &'static str {
     }
 }
 
-/// `GetObjectAttributesResponse` (ARCH 21.3, 34.3). Renders the subset of attributes Cairn
-/// stores: the (unquoted) `ETag`, the `Checksum` block for any client-supplied checksums, the
-/// `ObjectParts` enumeration for multipart objects, the `StorageClass`, and the `ObjectSize`.
-///
-/// `parts` is the assembled object's `(part_number, size)` list when it is known to be a
-/// multipart object (its parts are still recorded), or `None` for a single-part object — S3
-/// omits `<ObjectParts>` entirely in that case.
+/// The attributes a `GetObjectAttributes` request asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectAttributesSelection {
+    /// Include `ETag`.
+    pub etag: bool,
+    /// Include the `Checksum` block.
+    pub checksum: bool,
+    /// Include the `ObjectParts` block.
+    pub object_parts: bool,
+    /// Include `StorageClass`.
+    pub storage_class: bool,
+    /// Include `ObjectSize`.
+    pub object_size: bool,
+}
+
+impl ObjectAttributesSelection {
+    /// Every attribute Cairn can report. Useful for tests and the legacy all-attributes shape.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            etag: true,
+            checksum: true,
+            object_parts: true,
+            storage_class: true,
+            object_size: true,
+        }
+    }
+}
+
+/// One page of a completed multipart object's part layout.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectPartsPage<'a> {
+    /// The `(part_number, size)` entries in this page, ascending.
+    pub parts: &'a [(u16, u64)],
+    /// Total parts in the object, not just this page.
+    pub total: usize,
+    /// The requested marker; zero means "from the beginning".
+    pub marker: u16,
+    /// The requested page size.
+    pub max_parts: usize,
+    /// The last returned part number when another page exists.
+    pub next_marker: Option<u16>,
+    /// Whether another page exists after this one.
+    pub is_truncated: bool,
+}
+
+/// `GetObjectAttributesResponse` (ARCH 21.3, 34.3). Renders the requested subset of attributes:
+/// the (unquoted) `ETag`, the `Checksum` block, the paginated `ObjectParts` layout for a completed
+/// multipart object, the `StorageClass`, and the `ObjectSize`.
 #[must_use]
 pub fn get_object_attributes(
     etag: &ETag,
@@ -809,7 +851,8 @@ pub fn get_object_attributes(
     storage_class: StorageClass,
     checksums: &[ChecksumValue],
     checksum_type: Option<&str>,
-    parts: Option<&[(u16, u64)]>,
+    parts: Option<&ObjectPartsPage<'_>>,
+    selection: ObjectAttributesSelection,
 ) -> String {
     let mut w = new_doc();
     w.create_element("GetObjectAttributesResponse")
@@ -817,8 +860,10 @@ pub fn get_object_attributes(
         .write_inner_content(|w| {
             // The ETag here is rendered UNQUOTED, matching the AWS GetObjectAttributes shape
             // (unlike the quoted ETag of listings and the response header).
-            leaf(w, "ETag", etag.as_str());
-            if !checksums.is_empty() {
+            if selection.etag {
+                leaf(w, "ETag", etag.as_str());
+            }
+            if selection.checksum && !checksums.is_empty() {
                 w.create_element("Checksum").write_inner_content(|w| {
                     for c in checksums {
                         leaf(w, checksum_element(c.algorithm), &c.value);
@@ -831,21 +876,36 @@ pub fn get_object_attributes(
                     Ok(())
                 })?;
             }
-            if let Some(parts) = parts {
-                w.create_element("ObjectParts").write_inner_content(|w| {
-                    leaf(w, "TotalPartsCount", &parts.len().to_string());
-                    for (number, size) in parts {
-                        w.create_element("Part").write_inner_content(|w| {
-                            leaf(w, "PartNumber", &number.to_string());
-                            leaf(w, "Size", &size.to_string());
-                            Ok(())
-                        })?;
-                    }
-                    Ok(())
-                })?;
+            if selection.object_parts {
+                if let Some(page) = parts {
+                    w.create_element("ObjectParts").write_inner_content(|w| {
+                        leaf(w, "IsTruncated", &page.is_truncated.to_string());
+                        leaf(w, "MaxParts", &page.max_parts.to_string());
+                        if let Some(next) = page.next_marker {
+                            leaf(w, "NextPartNumberMarker", &next.to_string());
+                        }
+                        if page.marker > 0 {
+                            leaf(w, "PartNumberMarker", &page.marker.to_string());
+                        }
+                        leaf(w, "PartsCount", &page.parts.len().to_string());
+                        leaf(w, "TotalPartsCount", &page.total.to_string());
+                        for (number, size) in page.parts {
+                            w.create_element("Part").write_inner_content(|w| {
+                                leaf(w, "PartNumber", &number.to_string());
+                                leaf(w, "Size", &size.to_string());
+                                Ok(())
+                            })?;
+                        }
+                        Ok(())
+                    })?;
+                }
             }
-            leaf(w, "StorageClass", storage_class_str(storage_class));
-            leaf(w, "ObjectSize", &object_size.to_string());
+            if selection.storage_class {
+                leaf(w, "StorageClass", storage_class_str(storage_class));
+            }
+            if selection.object_size {
+                leaf(w, "ObjectSize", &object_size.to_string());
+            }
             Ok(())
         })
         .expect("infallible");

@@ -221,6 +221,13 @@ st, body = raw("GET", "/mpu/hp/object.bin", query="partNumber=0")
 check("GET partNumber=0 -> 400 InvalidArgument",
       st == 400 and err_code(body) == "InvalidArgument")
 
+attrs = s3.get_object_attributes(
+    Bucket="mpu", Key="hp/object.bin", ObjectAttributes=["ObjectParts"])
+check("GetObjectAttributes lists the completed part layout",
+      attrs.get("ObjectParts", {}).get("TotalPartsCount") == 2)
+check("GetObjectAttributes reports both parts",
+      [p["PartNumber"] for p in attrs.get("ObjectParts", {}).get("Parts", [])] == [1, 2])
+
 # The session is consumed by a successful completion: a second one must not be a false success.
 try:
     s3.complete_multipart_upload(

@@ -581,7 +581,15 @@ fn copy_part_result_shape() {
 #[test]
 fn get_object_attributes_single_part() {
     let etag = ETag::from_md5_hex("d41d8cd9".to_owned());
-    let xml = get_object_attributes(&etag, 1234, StorageClass::Standard, &[], None, None);
+    let xml = get_object_attributes(
+        &etag,
+        1234,
+        StorageClass::Standard,
+        &[],
+        None,
+        None,
+        ObjectAttributesSelection::all(),
+    );
     // The ETag is rendered UNQUOTED for GetObjectAttributes.
     assert!(xml.contains("<ETag>d41d8cd9</ETag>"), "{xml}");
     assert!(xml.contains("<ObjectSize>1234</ObjectSize>"));
@@ -599,13 +607,22 @@ fn get_object_attributes_with_checksum_and_parts() {
         value: "AAAAAA==".to_owned(),
     }];
     let parts: Vec<(u16, u64)> = vec![(1, 5_242_880), (2, 8)];
+    let page = ObjectPartsPage {
+        parts: &parts,
+        total: parts.len(),
+        marker: 0,
+        max_parts: 1000,
+        next_marker: None,
+        is_truncated: false,
+    };
     let xml = get_object_attributes(
         &etag,
         5_242_888,
         StorageClass::Standard,
         &checksums,
         Some("COMPOSITE"),
-        Some(&parts),
+        Some(&page),
+        ObjectAttributesSelection::all(),
     );
     assert!(
         xml.contains(
@@ -613,10 +630,68 @@ fn get_object_attributes_with_checksum_and_parts() {
         ),
         "{xml}"
     );
-    assert!(xml.contains("<ObjectParts><TotalPartsCount>2</TotalPartsCount>"));
-    assert!(xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"));
-    assert!(xml.contains("<Part><PartNumber>2</PartNumber><Size>8</Size></Part>"));
+    assert!(xml.contains("<ObjectParts>"), "{xml}");
+    assert!(
+        xml.contains("<TotalPartsCount>2</TotalPartsCount>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<PartsCount>2</PartsCount>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+    assert!(
+        xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<Part><PartNumber>2</PartNumber><Size>8</Size></Part>"),
+        "{xml}"
+    );
     assert!(xml.contains("<ObjectSize>5242888</ObjectSize>"));
+}
+
+#[test]
+fn get_object_attributes_paginates_parts() {
+    let etag = ETag::from_md5_hex("abc-3".to_owned());
+    let parts: Vec<(u16, u64)> = vec![(1, 5), (3, 7), (5, 9)];
+    let page = ObjectPartsPage {
+        parts: &parts[1..2],
+        total: parts.len(),
+        marker: 1,
+        max_parts: 1,
+        next_marker: Some(3),
+        is_truncated: true,
+    };
+    let selection = ObjectAttributesSelection {
+        object_parts: true,
+        ..ObjectAttributesSelection::default()
+    };
+    let xml = get_object_attributes(
+        &etag,
+        21,
+        StorageClass::Standard,
+        &[],
+        None,
+        Some(&page),
+        selection,
+    );
+    assert!(
+        xml.contains("<PartNumberMarker>1</PartNumberMarker>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<MaxParts>1</MaxParts>"), "{xml}");
+    assert!(
+        xml.contains("<TotalPartsCount>3</TotalPartsCount>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<Part><PartNumber>3</PartNumber><Size>7</Size></Part>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<Part><PartNumber>1</PartNumber>"), "{xml}");
+    assert!(!xml.contains("<ETag>"), "{xml}");
 }
 
 #[test]

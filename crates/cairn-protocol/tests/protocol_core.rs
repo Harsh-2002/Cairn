@@ -2798,6 +2798,69 @@ async fn multipart_lifecycle() {
             String::from_utf8_lossy(&body)
         );
     }
+
+    // GetObjectAttributes can enumerate the completed layout, one page at a time.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("attributes", ""), ("max-parts", "1")],
+                &[("x-amz-object-attributes", "ObjectParts")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<ObjectParts>"), "{xml}");
+    assert!(
+        xml.contains("<TotalPartsCount>2</TotalPartsCount>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<PartsCount>1</PartsCount>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+    assert!(
+        xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<Part><PartNumber>3</PartNumber>"), "{xml}");
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb"),
+                Some("big.bin"),
+                &[
+                    ("attributes", ""),
+                    ("max-parts", "1"),
+                    ("part-number-marker", "1"),
+                ],
+                &[("x-amz-object-attributes", "ObjectParts")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+    assert!(
+        xml.contains("<Part><PartNumber>3</PartNumber><Size>8</Size></Part>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<NextPartNumberMarker>"), "{xml}");
     use sha2::{Digest, Sha256};
     let row = h
         .meta
@@ -9327,7 +9390,7 @@ async fn get_object_attributes_returns_size_and_etag() {
                 Some("attrb"),
                 Some("obj"),
                 &[("attributes", "")],
-                &[],
+                &[("x-amz-object-attributes", "ETag,ObjectSize,StorageClass")],
                 vec![],
             ),
         )
@@ -9349,6 +9412,29 @@ async fn get_object_attributes_returns_size_and_etag() {
     );
     assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
     assert!(header(&hdrs, "last-modified").is_some());
+}
+
+#[tokio::test]
+async fn get_object_attributes_requires_attribute_selection() {
+    let h = harness().await;
+    put_simple(&h, "attrmissing", "obj").await;
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("attrmissing"),
+                Some("obj"),
+                &[("attributes", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("InvalidArgument"));
 }
 
 #[tokio::test]
