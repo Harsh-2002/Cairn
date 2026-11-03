@@ -472,10 +472,17 @@ async fn write_staged(
     opts: &StageOptions,
     paths: &AdmittedPaths,
     mut raw_body_breakdown: Option<&mut timing::RawBodyBreakdown<'_>>,
+    part: bool,
 ) -> Result<StagedWrite, BlobError> {
     let (compress, block_pol) = encoding_policies(opts);
     validate_stage_len(opts, opts.content_length)?;
-    let mut hashers = Hashers::new(&opts.extra_checksums);
+    // A part's internal SHA-256 baseline is discarded at assembly, so the part path computes it
+    // only when the client requested SHA-256 or the signed payload needs verification.
+    let mut hashers = if part {
+        Hashers::new_for_part(&opts.extra_checksums)
+    } else {
+        Hashers::new(&opts.extra_checksums)
+    };
     let mut logical: u64 = 0;
     let mut physical: u64 = 0;
 
@@ -1237,8 +1244,15 @@ impl BlobStore for LocalBlobStore {
         let mut raw_body_breakdown = (sampled && encoding_policies(&opts).1.is_none())
             .then(|| self.object_write_timings.raw_body_breakdown());
         let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Body));
-        let outcome =
-            write_staged(&mut sink, body, &opts, &paths, raw_body_breakdown.as_mut()).await;
+        let outcome = write_staged(
+            &mut sink,
+            body,
+            &opts,
+            &paths,
+            raw_body_breakdown.as_mut(),
+            false,
+        )
+        .await;
         if let Some(timer) = timer {
             if outcome.is_ok() {
                 timer.complete();
@@ -1479,11 +1493,23 @@ impl BlobStore for LocalBlobStore {
         size_ceiling: u64,
         encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError> {
+        let sampled = self.object_write_timings.sample();
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::PermitWait)
+        });
         let _permit = self.acquire_io().await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         if !matches!(permit.plan().target, StorageWriteTarget::Part { .. }) {
             return Err(BlobError::Io("storage target is not a part write".into()));
         }
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Namespace));
         let paths = AdmittedPaths::open(&self.data_root, permit).await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         fail::fail_point!("blob_after_multipart_session_dir");
         // A part is staged as ciphertext when `encryption` is Some (SSE / bucket-default / at-rest
         // multipart, ARCH 27) so nothing plaintext hits disk; otherwise it is a plaintext intermediate
@@ -1501,6 +1527,12 @@ impl BlobStore for LocalBlobStore {
         };
         // A part's length is not known to this seam, so no preallocation here; the assembled blob
         // (whose size is the sum of the parts) is preallocated in `assemble`.
+        let mut raw_body_breakdown =
+            sampled.then(|| self.object_write_timings.raw_body_breakdown());
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::StagingCreate)
+        });
         let mut sink = Staging::create(
             paths.staging.clone(),
             self.use_uring,
@@ -1508,23 +1540,52 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        let write = match write_staged(&mut sink, body, &opts, &paths, None).await {
-            Ok(v) => v,
+        if let Some(timer) = timer {
+            timer.complete();
+        }
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Body));
+        let write = match write_staged(
+            &mut sink,
+            body,
+            &opts,
+            &paths,
+            raw_body_breakdown.as_mut(),
+            true,
+        )
+        .await
+        {
+            Ok(v) => {
+                if let Some(timer) = timer {
+                    timer.complete();
+                }
+                v
+            }
             Err(e) => {
                 sink.abort().await;
                 return Err(e);
             }
         };
+        let timer = sampled.then(|| self.object_write_timings.start(ObjectWriteStage::Finalize));
         sink.fsync_in_place().await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         // fsync the session directory so the new part's directory entry is durable. Without this, a
         // part that was acknowledged 200 OK could lose its dirent on power loss even though its bytes
         // were fdatasync'd, so a later CompleteMultipartUpload fails NoSuchUpload — a durability-
         // contract violation (ARCH 8.1) the single-part path already guards against by fsyncing the
         // bucket dir after rename (F-1). Routed through the coalescer so concurrent part uploads into
         // the same session share one fsync (audit 2026-07).
+        let timer = sampled.then(|| {
+            self.object_write_timings
+                .start(ObjectWriteStage::DirectorySync)
+        });
         self.dir_sync
             .sync_file(paths.final_file.parent.clone(), &paths.lease)
             .await?;
+        if let Some(timer) = timer {
+            timer.complete();
+        }
         Ok(StagedPart {
             storage_path: paths.storage_path.clone(),
             size: write.logical,

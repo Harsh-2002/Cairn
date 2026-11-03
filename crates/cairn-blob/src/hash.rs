@@ -1,5 +1,7 @@
-//! Streaming content hashing: always the MD5 that becomes the ETag and internal SHA-256,
-//! plus client-requested checksum algorithms, computed once over the plaintext.
+//! Streaming content hashing: always the MD5 that becomes the ETag, plus the internal SHA-256
+//! for durable objects and client-requested checksum algorithms, computed once over the
+//! plaintext. Multipart parts drop the internal SHA-256 because their baseline is recomputed
+//! over the assembled object.
 
 use crate::crc64nvme::Crc64Nvme;
 use aws_lc_rs::digest::{Context as Sha256Context, SHA256};
@@ -15,7 +17,9 @@ pub struct Hashers {
     crc32c: Option<u32>,
     crc64nvme: Option<Crc64Nvme>,
     sha1: Option<Sha1>,
-    sha256: Sha256Context,
+    /// The internal-baseline SHA-256, or the client-requested SHA-256. `None` only on a multipart
+    /// part where neither the object baseline nor an exposed checksum needs it.
+    sha256: Option<Sha256Context>,
     expose_sha256: bool,
 }
 
@@ -36,9 +40,21 @@ impl Hashers {
             crc32c: has(ChecksumAlgorithm::Crc32c).then_some(0),
             crc64nvme: has(ChecksumAlgorithm::Crc64Nvme).then(Crc64Nvme::new),
             sha1: has(ChecksumAlgorithm::Sha1).then(Sha1::new),
-            sha256: Sha256Context::new(&SHA256),
+            sha256: Some(Sha256Context::new(&SHA256)),
             expose_sha256: has(ChecksumAlgorithm::Sha256),
         }
+    }
+
+    /// Build the hasher for a multipart part. A part's internal SHA-256 is discarded when the
+    /// object is assembled, so compute it only when the client requested SHA-256 (or the signed
+    /// payload must be verified); MD5 and every requested checksum are unaffected.
+    #[must_use]
+    pub fn new_for_part(set: &ChecksumSet) -> Self {
+        let mut hashers = Self::new(set);
+        if !hashers.expose_sha256 {
+            hashers.sha256 = None;
+        }
+        hashers
     }
 
     /// Feed plaintext bytes.
@@ -56,7 +72,9 @@ impl Hashers {
         if let Some(h) = &mut self.sha1 {
             h.update(data);
         }
-        self.sha256.update(data);
+        if let Some(h) = &mut self.sha256 {
+            h.update(data);
+        }
     }
 
     /// Finalize, returning the hex MD5 (for the ETag and Content-MD5) and the base64-encoded
@@ -91,14 +109,21 @@ impl Hashers {
                 value: b64.encode(h.finalize()),
             });
         }
-        let sha256 = self.sha256.finish();
+        let sha256 = self.sha256.map(|h| h.finish());
         if self.expose_sha256 {
+            let digest = sha256
+                .as_ref()
+                .expect("expose_sha256 implies the SHA-256 hasher is present");
             checksums.push(ChecksumValue {
                 algorithm: ChecksumAlgorithm::Sha256,
-                value: b64.encode(sha256.as_ref()),
+                value: b64.encode(digest.as_ref()),
             });
         }
-        (md5_hex, checksums, hex::encode(sha256.as_ref()))
+        let internal_sha256 = sha256
+            .as_ref()
+            .map(|digest| hex::encode(digest.as_ref()))
+            .unwrap_or_default();
+        (md5_hex, checksums, internal_sha256)
     }
 }
 
@@ -137,5 +162,28 @@ mod tests {
             .find(|c| c.algorithm == ChecksumAlgorithm::Sha256)
             .unwrap();
         assert_eq!(sha.value, "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+    }
+
+    #[test]
+    fn part_hasher_skips_the_unused_internal_sha256() {
+        let mut h = Hashers::new_for_part(&ChecksumSet::none());
+        h.update(b"abc");
+        let (md5, checks, internal) = h.finalize();
+        assert_eq!(md5, "900150983cd24fb0d6963f7d28e17f72");
+        assert!(checks.is_empty());
+        assert!(internal.is_empty());
+    }
+
+    #[test]
+    fn part_hasher_keeps_a_requested_sha256() {
+        let set = ChecksumSet(vec![ChecksumAlgorithm::Sha256]);
+        let mut h = Hashers::new_for_part(&set);
+        h.update(b"abc");
+        let (_, checks, internal) = h.finalize();
+        assert_eq!(
+            internal,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(checks.len(), 1);
     }
 }

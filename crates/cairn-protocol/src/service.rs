@@ -2032,6 +2032,8 @@ impl S3Service {
         let session = self
             .scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
+        let sampled = self.put_timings.sample();
+        let total_timer = sampled.then(|| self.put_timings.start(PutStage::Total));
         let declared_size = declared_multipart_size(&req, self.max_object_size)?;
         // Compute any supplementary checksum the client requested over this part's plaintext, so a
         // client `x-amz-checksum-*` header can be validated and the per-part digest persisted for
@@ -2081,6 +2083,7 @@ impl S3Service {
             };
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let admission_timer = sampled.then(|| self.put_timings.start(PutStage::StorageAdmission));
         let (creation, mut part_guard) = self
             .admit_part_storage(
                 bucket,
@@ -2099,12 +2102,21 @@ impl S3Service {
                 },
             )
             .await?;
+        if let Some(timer) = admission_timer {
+            timer.complete();
+        }
+        let blob_timer = sampled.then(|| self.put_timings.start(PutStage::BlobStage));
         let mut staged = match self
             .blob
             .stage_part(creation, body, stage_checksums, declared_size, part_dek)
             .await
         {
-            Ok(staged) => staged,
+            Ok(staged) => {
+                if let Some(timer) = blob_timer {
+                    timer.complete();
+                }
+                staged
+            }
             Err(error) => {
                 return Err(map_stage_err(error));
             }
@@ -2158,6 +2170,7 @@ impl S3Service {
             checksum: staged.checksums.first().cloned(),
             part_dek: part_dek_sealed,
         };
+        let publication_timer = sampled.then(|| self.put_timings.start(PutStage::Publication));
         let outcome = match self
             .meta
             .submit(part_guard.publication(
@@ -2171,7 +2184,12 @@ impl S3Service {
             ))
             .await
         {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                if let Some(timer) = publication_timer {
+                    timer.complete();
+                }
+                outcome
+            }
             Err(error) => {
                 // The writer may have rejected the mutation, or committed it and lost the
                 // acknowledgement. Resolve the exact path in FIFO writer order before deletion.
@@ -2198,6 +2216,9 @@ impl S3Service {
         // Echo the computed part checksum so a modern SDK can validate the part upload end-to-end.
         if let Some(c) = staged.checksums.first() {
             resp = resp.with_header(checksum_header_name(c.algorithm), c.value.clone());
+        }
+        if let Some(timer) = total_timer {
+            timer.complete();
         }
         Ok(resp)
     }
