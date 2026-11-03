@@ -44,6 +44,7 @@ use cairn_types::storage::{
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
+use cairn_xml::{ObjectAttributesSelection, ObjectPartsPage};
 use http::{Method, StatusCode};
 use std::sync::Arc;
 
@@ -4391,13 +4392,25 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
-    /// `GetObjectAttributes` (ARCH 21.3, 34.3): return an object's metadata attributes —
-    /// `ETag`, `ObjectSize`, `StorageClass`, any stored `Checksum`, and `ObjectParts` when the
-    /// object is multipart and its parts can still be enumerated. Cairn discards a session's part
-    /// rows on completion, so `ObjectParts` is omitted for completed multipart objects (S3 also
-    /// returns it only while the parts are retrievable).
+    /// `GetObjectAttributes` (ARCH 21.3, 34.3): render the attributes the request selected in
+    /// `x-amz-object-attributes`. `ObjectParts` comes from the completed object's retained part
+    /// layout (schema v41) and is paginated by `max-parts` / `part-number-marker`.
     async fn get_object_attributes(&self, req: &S3Request) -> Result<S3Response> {
         let (row, _bucket) = self.resolve_object(req).await?;
+        let selection = requested_object_attributes(req)?;
+        let parts = if selection.object_parts {
+            selected_object_parts(req, &row)?
+        } else {
+            None
+        };
+        let page = parts.as_ref().map(|parts| ObjectPartsPage {
+            parts: &parts.parts,
+            total: parts.total,
+            marker: parts.marker,
+            max_parts: parts.max_parts,
+            next_marker: parts.next_marker,
+            is_truncated: parts.is_truncated,
+        });
         // Derive the checksum type from the stored value (COMPOSITE = the `-N` suffix) so the
         // `<Checksum>` block carries a `<ChecksumType>` matching the object's GET/HEAD headers.
         let checksum_type = row.checksums.first().map(|c| checksum_type_str(&c.value));
@@ -4407,7 +4420,8 @@ impl S3Service {
             row.storage_class,
             &row.checksums,
             checksum_type,
-            None,
+            page.as_ref(),
+            selection,
         );
         let mut resp =
             S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id);
@@ -6773,6 +6787,127 @@ fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Optio
         length,
         count: parts.len(),
     }))
+}
+
+/// One page of a completed multipart object's part layout for `GetObjectAttributes`.
+struct SelectedObjectParts {
+    parts: Vec<(u16, u64)>,
+    total: usize,
+    marker: u16,
+    max_parts: usize,
+    next_marker: Option<u16>,
+    is_truncated: bool,
+}
+
+/// Parse the required `x-amz-object-attributes` header into the attributes the client asked for.
+fn requested_object_attributes(req: &S3Request) -> Result<ObjectAttributesSelection> {
+    let raw = req
+        .header("x-amz-object-attributes")
+        .ok_or_else(|| Error::InvalidArgument("x-amz-object-attributes is required".to_owned()))?;
+    let mut selection = ObjectAttributesSelection::default();
+    let mut any = false;
+    for name in raw.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        any = true;
+        if name.eq_ignore_ascii_case("ETag") {
+            selection.etag = true;
+        } else if name.eq_ignore_ascii_case("Checksum") {
+            selection.checksum = true;
+        } else if name.eq_ignore_ascii_case("ObjectParts") {
+            selection.object_parts = true;
+        } else if name.eq_ignore_ascii_case("StorageClass") {
+            selection.storage_class = true;
+        } else if name.eq_ignore_ascii_case("ObjectSize") {
+            selection.object_size = true;
+        } else {
+            return Err(Error::InvalidArgument(format!(
+                "invalid object attribute: {name}"
+            )));
+        }
+    }
+    if !any {
+        return Err(Error::InvalidArgument(
+            "x-amz-object-attributes is required".to_owned(),
+        ));
+    }
+    Ok(selection)
+}
+
+/// Select and paginate the retained part layout for `GetObjectAttributes` `ObjectParts`.
+fn selected_object_parts(
+    req: &S3Request,
+    row: &ObjectVersionRow,
+) -> Result<Option<SelectedObjectParts>> {
+    let Some(parts) = row.multipart_parts.as_deref() else {
+        return Ok(None);
+    };
+    let max_parts =
+        request_bounded_parts_value(req, "x-amz-max-parts", "max-parts", 1_000, 1_000, true)?;
+    let marker = request_bounded_parts_value(
+        req,
+        "x-amz-part-number-marker",
+        "part-number-marker",
+        0,
+        10_000,
+        false,
+    )?;
+    if marker > 10_000 {
+        return Err(Error::InvalidArgument(
+            "part-number-marker must be between 0 and 10000".to_owned(),
+        ));
+    }
+    let marker = marker as u16;
+    let remaining = parts
+        .iter()
+        .filter(|part| part.part_number > marker)
+        .count();
+    let take = remaining.min(max_parts);
+    let page: Vec<(u16, u64)> = parts
+        .iter()
+        .filter(|part| part.part_number > marker)
+        .take(take)
+        .map(|part| (part.part_number, part.size))
+        .collect();
+    let is_truncated = take < remaining;
+    Ok(Some(SelectedObjectParts {
+        next_marker: is_truncated
+            .then(|| page.last())
+            .flatten()
+            .map(|part| part.0),
+        parts: page,
+        total: parts.len(),
+        marker,
+        max_parts,
+        is_truncated,
+    }))
+}
+
+/// Read a bounded integer from `x-amz-*` or its query fallback. `one_is_invalid` distinguishes
+/// `max-parts` (1..=max) from `part-number-marker` (0..=max).
+fn request_bounded_parts_value(
+    req: &S3Request,
+    header: &str,
+    query: &str,
+    default: usize,
+    max: usize,
+    one_is_invalid: bool,
+) -> Result<usize> {
+    let Some(raw) = req.header(header).or_else(|| req.query(query)) else {
+        return Ok(default);
+    };
+    let value: usize = raw
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("{header} must be a non-negative integer")))?;
+    let lower = usize::from(one_is_invalid);
+    if value < lower || value > max {
+        return Err(Error::InvalidArgument(format!(
+            "{header} must be between {lower} and {max}"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
