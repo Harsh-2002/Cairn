@@ -199,6 +199,28 @@ check("HEAD carries the multipart ETag", head["ETag"] == expect_etag)
 check("initiate-time ContentType survives to the assembled object",
       head["ContentType"] == "application/x-test")
 
+# A completed multipart object keeps its part layout: GET ?partNumber returns that part.
+part1_get = s3.get_object(Bucket="mpu", Key="hp/object.bin", PartNumber=1)
+check("GET partNumber=1 -> 206",
+      part1_get["ResponseMetadata"]["HTTPStatusCode"] == 206)
+check("GET partNumber=1 is the first part", part1_get["Body"].read() == BIG)
+check("GET partNumber=1 reports the part count", part1_get.get("PartsCount") == 2)
+check("GET partNumber=1 carries the content range",
+      part1_get.get("ContentRange") == f"bytes 0-{len(BIG) - 1}/{len(BIG) + len(TAIL)}")
+part2_get = s3.get_object(Bucket="mpu", Key="hp/object.bin", PartNumber=2)
+check("GET partNumber=2 -> 206",
+      part2_get["ResponseMetadata"]["HTTPStatusCode"] == 206)
+check("GET partNumber=2 is the final part", part2_get["Body"].read() == TAIL)
+check("GET partNumber=2 carries the content range",
+      part2_get.get("ContentRange") ==
+      f"bytes {len(BIG)}-{len(BIG) + len(TAIL) - 1}/{len(BIG) + len(TAIL)}")
+st, body = raw("GET", "/mpu/hp/object.bin", query="partNumber=3")
+check("GET partNumber past the end -> 400 InvalidPart",
+      st == 400 and err_code(body) == "InvalidPart")
+st, body = raw("GET", "/mpu/hp/object.bin", query="partNumber=0")
+check("GET partNumber=0 -> 400 InvalidArgument",
+      st == 400 and err_code(body) == "InvalidArgument")
+
 # The session is consumed by a successful completion: a second one must not be a false success.
 try:
     s3.complete_multipart_upload(
