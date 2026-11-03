@@ -265,6 +265,12 @@ pub struct ObjectVersionRow {
     /// `Completed`, and `created_at` is never rewritten). It is deliberately **not** `updated_at`,
     /// which feeds the client-visible S3 `LastModified`.
     pub replicated_at: Option<Timestamp>,
+    /// Ordered plaintext sizes of the parts that formed this object when it was completed by
+    /// `CompleteMultipartUpload`. `None` for a single-part PUT, a copy, an object created before
+    /// this was recorded, or an object assembled by a backend that does not retain the layout.
+    /// `Some` enables `GET`/`HEAD` `?partNumber=N`; offsets are the prefix sums of these sizes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_part_sizes: Option<Vec<u64>>,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.

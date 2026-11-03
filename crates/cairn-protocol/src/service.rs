@@ -18,7 +18,7 @@ use cairn_types::authz::{
     Acl, Action, AuthzInput, Decision, Grant, Grantee, OwnershipMode, Permission,
     PublicAccessBlock, RequestContext, Resource,
 };
-use cairn_types::blob::{ByteRange, PartRef, StageOptions};
+use cairn_types::blob::{ByteRange, ContentRange, PartRef, StageOptions};
 use cairn_types::bucket::{
     Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, ObjectTtlConfig, VersioningState,
 };
@@ -1170,6 +1170,7 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
+            multipart_part_sizes: None,
         };
 
         // An inbound replica must NOT itself enqueue replication (loop prevention, ARCH 20.4);
@@ -1368,7 +1369,14 @@ impl S3Service {
         if let Some(resp) = conditional_short_circuit(req, &row) {
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
         }
-        let range = parse_range(req.header("range"), row.size_logical)?;
+        let part = selected_object_part(req, &row)?;
+        let range = match part {
+            Some(part) => Some(ByteRange {
+                offset: part.offset,
+                length: part.length,
+            }),
+            None => parse_range(req.header("range"), row.size_logical)?,
+        };
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
         // SSE-S3 (ARCH 27): resolve both the DEK and the persisted CRNB format expectation before
         // reading. An unencrypted version is explicitly known plaintext.
@@ -1380,14 +1388,21 @@ impl S3Service {
             .blob
             .open_raw(&storage, range, cipher, &row.compression, row.size_logical)
             .await?;
-        let status = if handle.content_range.is_some() {
+        let status = if part.is_some() || handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
         } else {
             StatusCode::OK
         };
 
         let logical_len = handle.logical_len;
-        let content_range = handle.content_range;
+        let content_range = match part {
+            Some(part) => (part.length > 0).then(|| ContentRange {
+                start: part.offset,
+                end: part.offset + part.length - 1,
+                total: row.size_logical,
+            }),
+            None => handle.content_range,
+        };
         // A GET of an uncompressed, unencrypted blob carries the zero-copy hint up so the connection
         // layer can `sendfile` it on the fast path. This covers a full object AND a single resolved
         // byte-range: `open_raw` set the hint's `offset`/`len` to the sub-range and `logical_len`
@@ -1422,9 +1437,12 @@ impl S3Service {
                 format!("bytes {}-{}/{}", cr.start, cr.end, cr.total),
             );
         }
+        if let Some(part) = part {
+            resp = resp.with_header("x-amz-mp-parts-count", part.count.to_string());
+        }
         // Echo the stored checksum on a whole-object GET when the client opted in (ARCH 21.1). Never
-        // on a Range/206 — the stored digest covers the whole object, not the returned slice.
-        if content_range.is_none() && checksum_mode_enabled(req) {
+        // on a Range/206 or a part read — the stored digest covers the whole object, not the slice.
+        if content_range.is_none() && part.is_none() && checksum_mode_enabled(req) {
             resp = append_checksum_headers(resp, &row.checksums);
         }
         let bucket_name = req.bucket.clone().expect("bucket present");
@@ -1470,14 +1488,33 @@ impl S3Service {
             // Conditional HEAD returns the bare 304/412 status (no body, per S3).
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
         }
-        let resp = object_headers(S3Response::status(StatusCode::OK), &row)
-            .with_header("content-length", row.size_logical.to_string())
+        let part = selected_object_part(req, &row)?;
+        let (status, length) = match part {
+            Some(part) => (StatusCode::PARTIAL_CONTENT, part.length),
+            None => (StatusCode::OK, row.size_logical),
+        };
+        let mut resp = object_headers(S3Response::status(status), &row)
+            .with_header("content-length", length.to_string())
             .with_header("x-amz-request-id", &req.request_id);
+        if let Some(part) = part {
+            resp = resp.with_header("x-amz-mp-parts-count", part.count.to_string());
+            if part.length > 0 {
+                resp = resp.with_header(
+                    "content-range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        part.offset,
+                        part.offset + part.length - 1,
+                        row.size_logical
+                    ),
+                );
+            }
+        }
         // S3 applies the `response-*` header overrides to HEAD as well as GET.
         let resp = apply_response_overrides(resp, req);
         // Echo the stored checksum when the client opted in (ARCH 21.1). HEAD reports whole-object
-        // metadata (Cairn does not partial-HEAD), so the digest always matches.
-        let resp = if checksum_mode_enabled(req) {
+        // metadata unless a part was selected, in which case the digest does not describe it.
+        let resp = if part.is_none() && checksum_mode_enabled(req) {
             append_checksum_headers(resp, &row.checksums)
         } else {
             resp
@@ -2797,6 +2834,7 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
+            multipart_part_sizes: Some(refs.iter().map(|part| part.size).collect()),
         };
 
         // Replica completion never consults destination replication configuration or enqueues
@@ -3386,6 +3424,7 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
+            multipart_part_sizes: None,
         };
         // A server-side copy writes a brand-new object version on the destination, so it enqueues
         // replication like a PUT (ARCH 20.2). A copy is never itself an inbound replica (replicas
@@ -6646,6 +6685,62 @@ fn precondition(req: &S3Request) -> Precondition {
     }
 }
 
+/// One part selected by `?partNumber` from a completed multipart object.
+#[derive(Clone, Copy)]
+struct ObjectPart {
+    offset: u64,
+    length: u64,
+    count: usize,
+}
+
+/// Resolve `GET`/`HEAD ?partNumber=N`. A completed multipart object carries its ordered part
+/// sizes, so the selected part is the prefix-sum byte range. A single-part object has no layout:
+/// part 1 is the whole object and every other part is `InvalidPart`, matching S3.
+fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Option<ObjectPart>> {
+    let Some(raw) = req.query("partNumber") else {
+        return Ok(None);
+    };
+    if req.header("range").is_some() {
+        return Err(Error::InvalidArgument(
+            "range and partNumber cannot be combined".to_owned(),
+        ));
+    }
+    let number: u16 = raw.parse().map_err(|_| {
+        Error::InvalidArgument("partNumber must be an integer between 1 and 10000".to_owned())
+    })?;
+    if number == 0 || number > 10_000 {
+        return Err(Error::InvalidArgument(
+            "partNumber must be between 1 and 10000".to_owned(),
+        ));
+    }
+    let Some(sizes) = row.multipart_part_sizes.as_deref() else {
+        return if number == 1 {
+            Ok(None)
+        } else {
+            Err(Error::InvalidPart)
+        };
+    };
+    let index = usize::from(number - 1);
+    let Some(&length) = sizes.get(index) else {
+        return Err(Error::InvalidPart);
+    };
+    let offset = sizes[..index]
+        .iter()
+        .try_fold(0u64, |total, size| total.checked_add(*size))
+        .ok_or_else(|| Error::Internal("multipart part layout overflows".to_owned()))?;
+    // A corrupt or hand-edited layout must never read outside the object's logical extent.
+    if offset > row.size_logical || length > row.size_logical - offset {
+        return Err(Error::Internal(
+            "multipart part layout exceeds the object".to_owned(),
+        ));
+    }
+    Ok(Some(ObjectPart {
+        offset,
+        length,
+        count: sizes.len(),
+    }))
+}
+
 fn parse_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
     let Some(h) = header else { return Ok(None) };
     let spec = h.trim().strip_prefix("bytes=").ok_or(Error::InvalidRange)?;
@@ -7337,6 +7432,7 @@ fn replica_marker_row(
         replicated_at: None,
         created_at: now,
         updated_at: now,
+        multipart_part_sizes: None,
     }
 }
 

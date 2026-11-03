@@ -70,6 +70,7 @@ fn row(bucket: &BucketName, key: &str, version: &str, created_at: Timestamp) -> 
         replicated_at: None,
         created_at,
         updated_at: created_at,
+        multipart_part_sizes: None,
     }
 }
 

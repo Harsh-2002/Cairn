@@ -299,6 +299,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 replicated_at: None,
                 created_at: now,
                 updated_at: now,
+                multipart_part_sizes: None,
             };
             if replacement_is_protected(conn, &row.bucket, &row.key, &row.version_id, now, bypass)?
             {
@@ -2403,8 +2404,8 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
           etag, content_type, content_encoding, cache_control, content_disposition, content_language,
           expires, storage_path, compression, storage_class, cold_locator, owner_id,
-          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256, expire_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256, expire_at, multipart_part_sizes)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
     )
     .map_err(engine_err)?
     .execute(params![
@@ -2437,6 +2438,7 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.updated_at.0,
             row.internal_sha256,
             row.expire_at.map(|expires| expires.0),
+            row.multipart_part_sizes.as_ref().map(to_json),
         ])
     .map_err(engine_err)?;
     // Maintain the roll-up counters in lockstep: this new row adds one version and its bytes.
@@ -3377,6 +3379,7 @@ mod tests {
     ) -> ObjectVersionRow {
         ObjectVersionRow {
             owner_id: UserId(owner.to_owned()),
+            multipart_part_sizes: None,
             ..obj_row(bucket, key, version, size)
         }
     }
@@ -3425,6 +3428,7 @@ mod tests {
             replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
+            multipart_part_sizes: None,
         }
     }
 

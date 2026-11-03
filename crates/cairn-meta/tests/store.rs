@@ -52,6 +52,7 @@ fn row(
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
+        multipart_part_sizes: None,
     }
 }
 
@@ -230,6 +231,30 @@ async fn put_is_visible_only_after_commit() {
     // The submit future only resolved after the commit, so the row is immediately visible.
     let got = store.current_version(&b, &k).await.unwrap().unwrap();
     assert_eq!(got.etag.as_str(), "e1");
+}
+
+#[tokio::test]
+async fn multipart_part_layout_round_trips() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(Bucket {
+            name: b.clone(),
+            owner_id: UserId("owner".into()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".into(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("k").unwrap();
+    let mut r = row(&b, "k", VersionId::null(), "e1", false);
+    r.multipart_part_sizes = Some(vec![5 * 1024 * 1024, 9]);
+    store.submit(put(r, Precondition::default())).await.unwrap();
+    let got = store.current_version(&b, &k).await.unwrap().unwrap();
+    assert_eq!(got.multipart_part_sizes, Some(vec![5 * 1024 * 1024, 9]));
 }
 
 #[tokio::test]

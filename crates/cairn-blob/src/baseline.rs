@@ -914,6 +914,7 @@ mod tests {
             replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
+            multipart_part_sizes: None,
         };
         meta.submit_fixture(
             fixture,
@@ -1227,6 +1228,7 @@ mod tests {
             replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
+            multipart_part_sizes: None,
         };
         meta.submit_fixture(
             &fixture,

@@ -77,6 +77,7 @@ fn row(
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
+        multipart_part_sizes: None,
     };
     (row, plan)
 }

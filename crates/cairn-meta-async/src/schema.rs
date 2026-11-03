@@ -907,6 +907,16 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
     WHERE is_latest = 1;
 "#,
     },
+    Migration {
+        version: 41,
+        name: "multipart completed-object part layout",
+        sql: r#"
+-- A completed multipart object keeps its ordered plaintext part sizes so GET/HEAD
+-- ?partNumber=N can serve the exact part after the staging rows retire with the session.
+-- JSON array of u64 sizes; NULL for single-part PUTs, copies and pre-upgrade objects.
+ALTER TABLE object_versions ADD COLUMN multipart_part_sizes TEXT;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -1149,7 +1159,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 40);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 41);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
