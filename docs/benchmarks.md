@@ -677,3 +677,32 @@ hashing moved from the pure-Rust `sha2` to `aws-lc-rs`, which is the change that
 
 The unpinned 1 MiB number is dominated by whatever else runs on the host; the pinned ratio is the
 deployment-relevant one, because it holds the core budget fixed the way a dedicated node does.
+
+## 9. Local bare-metal scoreboard (2026-11-03)
+
+Measured on the local 6-core i5-9400T / NVMe host with strict durability, Warp v1.8.2, and
+interleaved Cairn/RustFS pairs. The host also runs the homelab services, so absolute numbers move
+run to run; the ratio is the stable signal. These are single-node diagnostic runs, not a
+durability-equivalence proof.
+
+| Workload | Cairn | RustFS | Ratio |
+|---|---:|---:|---:|
+| PUT 1 MiB, c16 (5 pairs) | 236.7 obj/s | 196.7 obj/s | **1.20×** |
+| Mixed 1 MiB, c16 (3 pairs) | 931.8 obj/s | 592.1 obj/s | **1.57×** |
+| GET 4 KiB, c16 (3 pairs) | 14,781 obj/s | 13,299 obj/s | **1.11×** |
+| HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
+| Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
+| Multipart upload, 10×5 MiB (1 pair, after #158) | 48.9 obj/s | 71.1 obj/s | **0.69×** |
+| DELETE 4 KiB, c16, batch 100 | ~4,050 obj/s | ~243 obj/s | **>10×** (indicative) |
+
+Notes:
+
+- The DELETE result is indicative, not a scored pair: Warp requires at least 6,400 objects, but
+  Cairn deletes that set before Warp can collect enough samples. The Cairn figure is from a
+  20,000-object run and the RustFS figure from the 6,400 minimum; both use c16/batch 100 and
+  strict durability.
+- Multipart upload was 0.59× over three pairs before #158; the part-hash fix raised the
+  single-pair result to 0.69×. The measured split and remaining I/O/durability work are in
+  [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
+- GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
+  re-run on this host.
