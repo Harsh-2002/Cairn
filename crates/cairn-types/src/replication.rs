@@ -3,7 +3,7 @@
 
 use crate::authz::Acl;
 use crate::id::{ObjectKey, VersionId};
-use crate::object::{ChecksumValue, ETag, StorageClass, UserMetadata};
+use crate::object::{ChecksumValue, ETag, MultipartPartRecord, StorageClass, UserMetadata};
 
 /// An object to put at a replication destination. Its body is a logical-byte stream read
 /// from the source blob store.
@@ -20,6 +20,11 @@ pub struct ReplicatedObject<'a> {
     pub etag: ETag,
     /// The logical size.
     pub size: u64,
+    /// The completed multipart object's exact source part layout, when known. Replaying these
+    /// boundaries makes the replica's `?partNumber`, `ObjectParts`, and composite ETag match the
+    /// source. `None` is a single-part/legacy object; a too-large object then uses the sink's
+    /// transfer geometry.
+    pub multipart_parts: Option<&'a [MultipartPartRecord]>,
     /// The object's tags.
     pub tags: Vec<(String, String)>,
     /// The object ACL to apply, if the rule dictates.

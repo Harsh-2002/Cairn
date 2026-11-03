@@ -178,8 +178,7 @@ async fn peer_with_cleanup(
                             listing.1
                         } else {
                             let xml = String::from_utf8(xml).unwrap();
-                            assert!(xml.contains("<PartNumber>1</PartNumber>"));
-                            assert!(xml.contains("<PartNumber>2</PartNumber>"));
+                            assert!(xml.contains("<CompleteMultipartUpload>"), "{xml}");
                             if error_at_complete {
                                 "<Error><Code>InternalError</Code></Error>"
                             } else {
@@ -275,6 +274,107 @@ async fn multipart_uses_two_bounded_passes_and_parses_embedded_errors() {
     }
 }
 
+#[tokio::test]
+async fn multipart_replays_the_source_part_layout() {
+    use cairn_types::object::MultipartPartRecord;
+
+    let mib = 1024 * 1024;
+    let size = 11 * mib;
+    let layout = vec![
+        MultipartPartRecord {
+            part_number: 1,
+            size: 5 * mib,
+        },
+        MultipartPartRecord {
+            part_number: 3,
+            size: 5 * mib,
+        },
+        MultipartPartRecord {
+            part_number: 7,
+            size: mib,
+        },
+    ];
+    let (endpoint, observed, task) = peer(false, false).await;
+    let sink = sink(endpoint, Duration::from_secs(60));
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let journal = Journal::default();
+    let mut object = object(size, reads.clone(), Some(&journal));
+    object.multipart_parts = Some(&layout);
+
+    sink.put_object(&BucketName::parse("source").unwrap(), object)
+        .await
+        .unwrap();
+
+    let events = observed.lock().unwrap();
+    let parts = events
+        .iter()
+        .filter(|event| event.method == Method::PUT)
+        .collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3, "exactly the source parts");
+    assert_eq!(
+        parts.iter().map(|part| part.size).collect::<Vec<_>>(),
+        vec![5 * mib, 5 * mib, mib]
+    );
+    assert!(
+        parts[0].query.starts_with("partNumber=1&"),
+        "{:?}",
+        parts[0]
+    );
+    assert!(
+        parts[1].query.starts_with("partNumber=3&"),
+        "{:?}",
+        parts[1]
+    );
+    assert!(
+        parts[2].query.starts_with("partNumber=7&"),
+        "{:?}",
+        parts[2]
+    );
+    assert_eq!(*journal.0.lock().unwrap(), ["begin", "receipt", "retire"]);
+    drop(events);
+    task.abort();
+}
+
+#[tokio::test]
+async fn multipart_rejects_a_malformed_source_layout_before_contacting_the_destination() {
+    use cairn_types::object::MultipartPartRecord;
+
+    let mib = 1024 * 1024;
+    let size = 6 * mib;
+    // Non-final part is smaller than the 5 MiB minimum.
+    let layout = vec![
+        MultipartPartRecord {
+            part_number: 1,
+            size: mib,
+        },
+        MultipartPartRecord {
+            part_number: 2,
+            size: 5 * mib,
+        },
+    ];
+    let (endpoint, observed, task) = peer(false, false).await;
+    let sink = sink(endpoint, Duration::from_secs(60));
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let journal = Journal::default();
+    let mut object = object(size, reads.clone(), Some(&journal));
+    object.multipart_parts = Some(&layout);
+
+    let error = sink
+        .put_object(&BucketName::parse("source").unwrap(), object)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, cairn_types::ReplicationError::Terminal(_)),
+        "{error:?}"
+    );
+    assert!(
+        observed.lock().unwrap().is_empty(),
+        "no destination request"
+    );
+    assert!(journal.0.lock().unwrap().is_empty(), "no journal attempt");
+    task.abort();
+}
+
 fn sink(endpoint: String, timeout: Duration) -> HttpS3Sink {
     let runtime = ReplicationSinkRuntime::new(64 * 1024 * 1024, timeout).unwrap();
     HttpS3Sink::new(
@@ -322,6 +422,7 @@ fn object<'a>(
         checksums: vec![],
         client_encrypted: false,
         source: source(size, reads),
+        multipart_parts: None,
     }
 }
 

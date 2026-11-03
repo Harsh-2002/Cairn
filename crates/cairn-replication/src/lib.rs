@@ -766,6 +766,7 @@ impl ReplicationEngine {
             user_metadata: row.user_metadata.clone(),
             etag: row.etag.clone(),
             size,
+            multipart_parts: row.multipart_parts.as_deref(),
             tags,
             acl: row.acl.clone(),
             content_encoding: row.content_encoding.clone(),

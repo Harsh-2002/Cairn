@@ -447,8 +447,9 @@ The output separates three populations:
 | `repair_pending` | In-window and queued/claimed: **repair in flight**, bytes not yet re-shipped. | Wait. |
 
 Do **not** try to narrow the set by comparing with the remote: the engine requested the *plaintext*
-length, so a corrupt replica has exactly the right number of wrong bytes, and a multipart source
-lands as a single-part PUT so the ETag differs even for a **correct** replica. `--verify` is the only
+length, so a corrupt replica has exactly the right number of wrong bytes. A layout-bearing
+multipart source now replays its part layout and its ETag matches; a legacy layout-less source
+lands as a single PUT and its ETag can differ even for a **correct** replica. `--verify` is the only
 conclusive check and it transfers every suspect object in full. `--verify` compares against the
 destination's **current** object (its GET carries no `versionId`), so it **skips non-current source
 versions** and reports them as `skipped_non_current` — comparing a superseded version against the
