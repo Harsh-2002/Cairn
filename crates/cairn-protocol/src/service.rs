@@ -1081,7 +1081,14 @@ impl S3Service {
         // Verify any client-supplied Content-MD5 (decoded above, before staging) against the computed
         // plaintext MD5. A genuine mismatch is a post-stage failure, so delete the staged blob first.
         if let Some(want) = &content_md5 {
-            if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(want.as_slice()) {
+            let Some(computed) = staged.md5_hex.as_deref() else {
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
+                return Err(Error::Internal(
+                    "a single-pass write did not compute its MD5".to_owned(),
+                ));
+            };
+            if hex::decode(computed).ok().as_deref() != Some(want.as_slice()) {
                 self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
                     .await;
                 return Err(Error::BadDigest);

@@ -92,6 +92,14 @@ Removing both commits is ~9 % and caps the result near 0.76×. The two commits a
 the existing `cairn_blob_multipart_stage_seconds` labels can measure assembly and durability, and
 that is unmeasured.
 
+**Measured (2026-11-03):** a 50 MiB assembly (10×5 MiB parts) took 326 ms mean/median with the
+unused full-object MD5 and 225 ms with it elided — a 31% reduction in the assembly stage. The
+composite multipart ETag is derived from the per-part MD5s, so no consumer ever read the
+whole-object MD5; `Hashers::new_for_assembly` now skips it whenever the completion supplies an
+explicit ETag, while an assembly without one still computes it. `StagedBlob.md5_hex` is therefore
+optional, and the assembly's `etag` is the authoritative value. This does not change the part
+commits, the durability barriers or `synchronous=FULL`.
+
 **Conditions if the single post-stage publication is built later:**
 
 - One durable publication after staging, still `synchronous=FULL`; never add it to the Writer's
@@ -129,5 +137,6 @@ not a score.
 2. Multipart file authority, v1 sidecar and v2 part layout — done, with the restore drill still
    outstanding.
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
-4. Decide on assembly work from that measurement — still gated.
+4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
+   body/sink work stays gated on a new measurement.
 5. Implement the paired DELETE methodology and re-run the scoreboard gaps — still gated.

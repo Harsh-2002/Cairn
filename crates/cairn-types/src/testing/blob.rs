@@ -179,7 +179,7 @@ impl BlobStore for InMemoryBlobStore {
             size_logical: len,
             size_physical: len,
             etag: ETag::from_md5_hex(md5.clone()),
-            md5_hex: md5,
+            md5_hex: Some(md5),
             checksums: Vec::new(),
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
@@ -327,7 +327,7 @@ impl BlobStore for InMemoryBlobStore {
         &self,
         permit: StorageCreationPermit,
         parts: &[PartRef],
-        _opts: StageOptions,
+        opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
         let (plan, lease) = permit.into_parts();
         if !matches!(plan.target, StorageWriteTarget::Completion { .. }) {
@@ -365,18 +365,31 @@ impl BlobStore for InMemoryBlobStore {
             path.as_str().to_owned(),
             StoredBlob {
                 bytes: Arc::new(buf),
-                cipher: match _opts.encryption {
+                cipher: match opts.encryption {
                     Some(dek) => BlobCipher::AuthenticatedV3(dek),
                     None => BlobCipher::KnownPlaintext,
                 },
             },
         );
+        // Mirror the real store: an explicit completion ETag replaces the concatenated-bytes MD5
+        // and makes that MD5 unnecessary.
+        let explicit_etag = opts
+            .metadata_seed
+            .as_ref()
+            .and_then(|seed| seed.etag.clone());
+        let md5_hex = explicit_etag.is_none().then_some(md5);
         Ok(StagedBlob {
             storage_path: path,
             size_logical: len,
             size_physical: len,
-            etag: ETag::from_md5_hex(md5.clone()),
-            md5_hex: md5,
+            etag: explicit_etag.unwrap_or_else(|| {
+                ETag::from_md5_hex(
+                    md5_hex
+                        .clone()
+                        .expect("an assembly without an explicit ETag keeps its MD5"),
+                )
+            }),
+            md5_hex,
             checksums: Vec::new(),
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,

@@ -288,7 +288,12 @@ async fn put_object_with_lock(
         is_delete_marker: false,
         size_logical: staged.size_logical,
         size_physical: staged.size_physical,
-        etag: ETag::from_md5_hex(staged.md5_hex.clone()),
+        etag: ETag::from_md5_hex(
+            staged
+                .md5_hex
+                .clone()
+                .expect("single-pass staging computes the MD5"),
+        ),
         content_type: "application/octet-stream".to_owned(),
         content_encoding: None,
         cache_control: None,
