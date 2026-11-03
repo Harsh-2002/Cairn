@@ -103,8 +103,21 @@ confirmed `GET ?partNumber=1/2` after restart.
 Startup rebuilt the row from the v2 sidecar (composite ETag `41910554e065a005e26fed75f5ee71b8-3`,
 21,000,000 bytes), and `GET ?partNumber=1/2/3` returned the three parts byte-exactly
 (8,388,608 + 8,388,608 + 4,222,784). Deleting the whole database is a different failure: the rebuild
-creates no buckets, users or policies, so the namespace is lost by design. Still outstanding:
-backup/restore and crash points around sidecar publication.
+creates no buckets, users or policies, so the namespace is lost by design.
+
+**Conformance coverage (2026-11-03):** the crash seam is gated by `crash_multipoint.sh`, which
+asserts that a `blob_after_assemble` orphan which survives exact-path reclamation is a data file plus
+a v2 sidecar carrying the exact part layout (and both are retired together). The offline
+backup/restore path is gated by `backup_restore.sh`: it completes a three-part object (two 5 MiB
+parts and a 1 MiB tail), records `GET ?partNumber=1/2/3` bytes, content ranges, part count and
+composite ETag, asserts `cairn backup` copies a v2 `<uuid>.meta` (format_version 2, exact layout,
+same ETag/logical size) alongside its data file, restores into a fresh data directory, requires the
+sidecar to be byte-identical and the part reads to concatenate to the original object, and finally
+downgrades one restored sidecar to a layout-less v1 record with its index row removed. Startup
+rebuild then re-creates the row without parts and `?partNumber` fails closed (`400 InvalidPart`)
+while a plain `GET` still returns the full bytes. Limits: these are point-in-time and crash-window
+checks, not payload-integrity verification; an older binary that predates v2 decoding is out of
+scope, and deleting the whole database still cannot rebuild buckets, users or policies.
 
 ## 3. Multipart upload performance — measure before optimizing
 
