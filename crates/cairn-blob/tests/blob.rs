@@ -3469,6 +3469,7 @@ fn metadata_seed(
         etag: None,
         row_id: row_id.to_owned(),
         is_delete_marker: false,
+        multipart_parts: None,
         content_type: "text/plain".to_owned(),
         content_encoding: None,
         cache_control: Some("max-age=60".to_owned()),
@@ -3481,6 +3482,7 @@ fn metadata_seed(
         user_metadata: vec![("colour".to_owned(), "blue".to_owned())],
         acl: None,
         stored_checksums: ChecksumSet::none(),
+        checksums: None,
         sse_descriptor: None,
         created_at: Timestamp(10),
         updated_at: Timestamp(11),
@@ -3525,7 +3527,8 @@ async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
     assert_eq!(payload_len, staged.size_logical);
     assert_eq!(
         record.format_version,
-        cairn_types::storage::OBJECT_METADATA_FORMAT_VERSION
+        cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION,
+        "an ordinary object keeps the v1 record so older binaries can read it"
     );
     assert_eq!(record.bucket, bucket);
     assert_eq!(record.key, key);

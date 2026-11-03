@@ -1,8 +1,8 @@
 # Multipart follow-up decisions — 2026-11-03
 
-**Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, and the v1
-metadata sidecar for assembled objects are implemented; the part-layout record and performance
-work remain phased.
+**Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, and both stages
+of the multipart object-file authority (v1 sidecar, then the v2 part-layout record) are implemented;
+performance work and the sidecar backfill remain phased.
 
 Five parallel reviews covered the multipart upload path: replication layout, object-file authority,
 upload performance, benchmark methodology, and an independent architecture/security review. This
@@ -32,13 +32,13 @@ replaces the layout.
 **Residual risk:** AWS CRR parity for `?partNumber` on replicas was not independently verified.
 The docs now describe Cairn's behavior instead of claiming single-part parity.
 
-## 2. Multipart object-file authority — phase 1, later
+## 2. Multipart object-file authority — implemented
 
 **Decision:** extend protocol-3 file authority to new completed multipart objects in two stages.
 The first stage — a v1 `<uuid>.meta` sidecar on every assembled object, written from the completion
-plan and committed before the directory barrier — is implemented. It restores the object row after
-index loss but does not carry the part layout; `?partNumber` fails closed after such a rebuild. The
-second stage adds the part layout to a v2 record with a 1 MiB bound and restores it on rebuild.
+plan and committed before the directory barrier — is implemented. The second stage — a v2 record
+that also carries the part layout under a 1 MiB bound, restored by startup rebuild — is implemented
+too. Existing assembled objects from before the first stage still need the sidecar-only backfill.
 
 **Why:** a completed multipart object has no trailer and no `.meta` sidecar. `CompleteMultipartUpload`
 commits at `synchronous=FULL`, so a crash after ACK is safe; the exposure is a lost/corrupt SQLite
@@ -47,34 +47,38 @@ mandatory reconciliation scan treats the headerless object as unreferenced and e
 it. The object's durable file is therefore not the authority for this object class, contrary to the
 protocol-3 contract.
 
-**Design (phase 1b, after the shipped v1 sidecar):**
+**Design as shipped:**
 
-- Plaintext assemblies get the inline `CRNI` trailer; compressed/encrypted assemblies get a
-  `<uuid>.meta` sidecar because the container trailer must stay last.
-- `ObjectMetadataRecord` gains `multipart_parts`; `format_version` becomes 2 only when parts are
-  present. The shared inline-record bound rises from 64 KiB to a named 1 MiB (10,000 parts is
-  ~400–450 KB); the writer must fail before commit rather than publish a record the rebuilder
-  refuses.
+- Every assembly gets a `<uuid>.meta` sidecar, not an inline trailer: one write path covers
+  plaintext, compressed and encrypted results, and the sidecar is committed after the data file
+  under the same coalesced directory barrier.
+- `ObjectMetadataRecord` gains `multipart_parts`; `format_version` is 2 only when parts are
+  present. The shared record bound is a named 1 MiB (10,000 parts is ~400–450 KB); encode and
+  decode both fail closed, and an inline trailer that declares more is skipped rather than parsed.
+- Decode rejects a v1 record that carries parts and a v2 record that lacks them, so a silent
+  downgrade cannot drop the layout while claiming a newer generation.
 - `StorageWritePlan::expected_paths` gives a `Completion` target the sidecar names and accepts the
   legacy 3-name completion plan for pre-upgrade journal rows. The `published_object` predicate in
   `resolve_paths` must include `Completion` in all three metadata backends, or a successful
   completion would enqueue its own sidecar as cleanup debt.
 - `ObjectMetadataSeed` carries the layout and the already-resolved object checksums; TTL/`expire_at`
   are captured before `assemble`.
-- `assemble` appends the trailer to the same sink for plaintext, or stages the sidecar and overlaps
-  its fsync with the data commit for containers, then one directory barrier.
-- `sidecar_rebuild` restores `multipart_parts`; the storage-protocol gate must prevent an older
-  binary from rebuilding assembled objects as single-part objects.
-- Phase 2 (optional): a rate-limited sidecar-only backfill for existing assembled objects; never
-  append a trailer in place to a live plaintext object.
+- `assemble` stages the sidecar after the data file and commits both before the directory barrier.
+- `sidecar_rebuild` copies `multipart_parts` onto the rebuilt row, so `?partNumber` survives a lost
+  index. A v1 sidecar from an earlier version restores the row with no layout, and part-number
+  reads then fail closed rather than answer with the wrong bytes.
+- No storage-protocol bump was made: the sidecar is additive and downgrade still serves data. An
+  older binary cannot rebuild the layout, which is the same fail-closed outcome as a v1 sidecar,
+  not a wrong answer.
+- Remaining: a rate-limited sidecar-only backfill for assembled objects completed before the
+  first stage; never append a trailer in place to a live plaintext object.
 
-**Tests:** completion trailer/sidecar; startup rebuild of plaintext and container assemblies with
-parts; corrupt/over-cap record; crash before/after publication; `?partNumber` after wiping the row;
-backup/restore; delete/overwrite reclaiming data and sidecar; legacy assembled objects still served
-and still not rebuilt.
-
-**Why not now:** this is a storage-format and recovery change, not a request-path tweak. It needs
-the protocol gate and a restore drill; it is not safe to bundle into the replication fix.
+**Tests that landed:** v2 round-trip and v1/v2 mismatch rejection; over-cap encode/decode and
+inline-trailer skip; completion sidecar carries the same layout and composed checksum as the row;
+`rebuilt_row` restores it, a v1 record restores no layout, and an end-to-end in-memory rebuild
+restores the row, layout and checksums from the durable files. Still outstanding for a full restore
+drill: wiping a real SQLite database and asserting `?partNumber` through the S3 surface,
+backup/restore, and crash points around sidecar publication.
 
 ## 3. Multipart upload performance — measure before optimizing
 
@@ -121,11 +125,9 @@ not a score.
 
 ## Order
 
-1. Replicated multipart layout (this change set).
-2. Multipart file-authority phase 1, with a restore drill and protocol gate.
-3. Measure multipart completion/assembly and CPU per part.
-4. Decide on the one-commit part publication and/or body/sink work from that measurement.
-5. Implement the paired DELETE methodology and re-run the scoreboard gaps.
-
-The replicated-layout fix and the fail-closed part-number guard are the only code changes accepted
-now; the rest are explicitly gated.
+1. Replicated multipart layout — done.
+2. Multipart file authority, v1 sidecar and v2 part layout — done, with the restore drill still
+   outstanding.
+3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
+4. Decide on assembly work from that measurement — still gated.
+5. Implement the paired DELETE methodology and re-run the scoreboard gaps — still gated.

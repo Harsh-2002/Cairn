@@ -43,9 +43,13 @@ timestamps, tags and explicit Object Lock intent; it never carries key material.
 encrypted objects keep a `<uuid>.meta` sidecar beside the data file, because the CRNB container
 trailer must stay last; the sidecar is written, fsynced and renamed with the data file and covered
 by the same coalesced destination-directory barrier. Multipart parts keep neither. A completed
-multipart object writes the same v1 `<uuid>.meta` sidecar, so startup rebuild can restore its row;
-the sidecar does not yet carry the part layout, so `?partNumber` fails closed after a rebuild until
-the layout is restored. Startup rebuild walks the bucket directories, reads each trailer or sidecar,
+multipart object writes the same `<uuid>.meta` sidecar for every encoding, so startup rebuild can
+restore its row and its part layout; `?partNumber` therefore survives index loss for objects
+completed by this version. Its record is `format_version=2`, which adds the ordered part numbers and
+plaintext sizes to the v1 fields; both generations are bounded by the same 1 MiB limit, and v2 is
+required to carry a layout while v1 is required not to, so a record cannot be silently downgraded.
+A v1 sidecar left by an earlier version still restores the row, but has no layout, so part-number
+reads fail closed rather than serve the wrong bytes. Startup rebuild walks the bucket directories, reads each trailer or sidecar,
 validates it against its data file, and inserts missing index rows before readiness; it never
 invents or deletes rows (Section 8.5). When the index already holds a row for the same version, the
 rebuild keeps the newer generation — commit time first, then the UUIDv7 row id — and republishes it,
@@ -219,7 +223,7 @@ Object bytes live as files named by an opaque identifier, never by key; the dura
 
 ### 9.2 Directory layout
 
-The data filesystem holds a staging area for in-progress single-part writes, a multipart staging area organised per upload session, and one directory per bucket holding that bucket's committed blobs under their opaque identifiers. A plaintext protocol-3 object is a single file; compressed and encrypted objects also keep `<uuid>.meta`; a completed multipart object keeps `<uuid>.meta` (v1, without the part layout); parts keep neither. The database file lives on the same filesystem. The staging areas exist so that the only way a blob enters a bucket directory is by atomic rename after being fully written and fsynced, which is the basis of the commit protocol. New writes use `bucket/<32-lowercase-hex-UUID>` (flat placement). On Linux, reconciliation also understands exactly `bucket/<first-two-UUID-hex-digits>/<32-lowercase-hex-UUID>`; this is a compatibility safeguard for the laboratory fanout evaluation, not adoption of nested writes. Existing metadata-named flat and nested reads remain valid. Unknown names, prefixes, depths and symlinks are preserved and reported as errors, never recursively reclaimed. Bucket enumeration streams directly into the bounded worker set; each worker holds bounded bucket/leaf entry pages and at most one nested leaf cursor. Directory-relative descriptors anchor creation, referenced input opens, traversal and exact cleanup.
+The data filesystem holds a staging area for in-progress single-part writes, a multipart staging area organised per upload session, and one directory per bucket holding that bucket's committed blobs under their opaque identifiers. A plaintext protocol-3 object is a single file; compressed and encrypted objects also keep `<uuid>.meta`; a completed multipart object keeps `<uuid>.meta` (v2, with its part layout); parts keep neither. The database file lives on the same filesystem. The staging areas exist so that the only way a blob enters a bucket directory is by atomic rename after being fully written and fsynced, which is the basis of the commit protocol. New writes use `bucket/<32-lowercase-hex-UUID>` (flat placement). On Linux, reconciliation also understands exactly `bucket/<first-two-UUID-hex-digits>/<32-lowercase-hex-UUID>`; this is a compatibility safeguard for the laboratory fanout evaluation, not adoption of nested writes. Existing metadata-named flat and nested reads remain valid. Unknown names, prefixes, depths and symlinks are preserved and reported as errors, never recursively reclaimed. Bucket enumeration streams directly into the bounded worker set; each worker holds bounded bucket/leaf entry pages and at most one nested leaf cursor. Directory-relative descriptors anchor creation, referenced input opens, traversal and exact cleanup.
 Descendant opens require Linux `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS` and
 `RESOLVE_NO_XDEV`; this rejects descendant mounts, including same-device bind mounts that device
 comparisons cannot detect. The configured root itself may be a mount. Linux 5.6 or newer with those

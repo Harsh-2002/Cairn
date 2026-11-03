@@ -2904,6 +2904,10 @@ async fn multipart_lifecycle() {
     assert_eq!(record.row_id, row.id);
     assert_eq!(record.etag, row.etag);
     assert_eq!(record.size_logical, row.size_logical);
+    assert_eq!(
+        record.multipart_parts, row.multipart_parts,
+        "the v2 sidecar must keep the part layout that ?partNumber relies on"
+    );
 }
 
 /// Audit 2026-07: an uploadId is scoped to its (bucket, key). Completing it against a different key
@@ -16034,6 +16038,35 @@ async fn multipart_crc32_composes_composite_checksum() {
         Some(expected.as_str())
     );
     assert_eq!(header(&ghdrs, "x-amz-checksum-type"), Some("COMPOSITE"));
+
+    // The sidecar must carry the composed checksum, not just the parts: `assemble` never computes a
+    // COMPOSITE value, so a rebuilt row would otherwise lose the checksum the live row advertises.
+    let row = h
+        .meta
+        .current_version(
+            &BucketName::parse("mpc-c32").unwrap(),
+            &ObjectKey::parse("obj.bin").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.checksums,
+        vec![cairn_types::object::ChecksumValue {
+            algorithm: cairn_types::object::ChecksumAlgorithm::Crc32,
+            value: expected.clone(),
+        }]
+    );
+    let sidecar_path = h._dir.path().join(format!(
+        "{}.meta",
+        row.storage_path.as_ref().expect("assembled path").as_str()
+    ));
+    let record = cairn_types::storage::ObjectMetadataRecord::decode(
+        &tokio::fs::read(&sidecar_path).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record.checksums, row.checksums);
+    assert_eq!(record.multipart_parts, row.multipart_parts);
 }
 
 /// A CRC64NVME multipart upload composes a whole-object FULL_OBJECT checksum (CRC64NVME has no

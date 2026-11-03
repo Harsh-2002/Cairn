@@ -1015,6 +1015,7 @@ impl S3Service {
             etag: None,
             row_id: row_id.clone(),
             is_delete_marker: false,
+            multipart_parts: None,
             content_type: content_type.clone(),
             content_encoding: stored_content_encoding(&req),
             cache_control: header_owned("cache-control"),
@@ -1027,6 +1028,7 @@ impl S3Service {
             user_metadata: user_metadata.clone(),
             acl: acl.clone(),
             stored_checksums,
+            checksums: None,
             sse_descriptor: sse_descriptor.clone(),
             created_at: intent_validation_now,
             updated_at: intent_validation_now,
@@ -2692,6 +2694,17 @@ impl S3Service {
         // sidecar is written from the same durable plan as the assembled data file.
         let etag = multipart_etag(&part_md5s);
         let stored_checksums = assemble_checksums.clone();
+        // A COMPOSITE value is already known; a FULL_OBJECT value is only known after assembly and
+        // is selected from the staged blob instead. A replica's pinned checksums are known too and
+        // are exactly what the row records after assembly, so the sidecar must carry those.
+        let seed_checksums = if let Some(intent) = &session.replica_intent {
+            Some(intent.checksums.clone())
+        } else {
+            match &checksum_plan {
+                ChecksumPlan::Composite(value) => Some(vec![value.clone()]),
+                _ => None,
+            }
+        };
         let now = self.clock.now();
         // Resolve the opt-in TTL pinned in the session's user metadata (or the replica intent).
         // A client-supplied TTL is anchored at completion; a replica carries an absolute deadline.
@@ -2750,6 +2763,14 @@ impl S3Service {
             etag: Some(etag.clone()),
             row_id: row_id.clone(),
             is_delete_marker: false,
+            multipart_parts: Some(
+                refs.iter()
+                    .map(|part| MultipartPartRecord {
+                        part_number: part.part_number,
+                        size: part.size,
+                    })
+                    .collect(),
+            ),
             content_type: session.content_type.clone(),
             content_encoding: session
                 .replica_intent
@@ -2776,6 +2797,7 @@ impl S3Service {
                 .then(|| session.intended_acl.clone())
                 .flatten(),
             stored_checksums,
+            checksums: seed_checksums,
             sse_descriptor: sse_descriptor.clone(),
             created_at: now,
             updated_at: now,
@@ -3400,6 +3422,7 @@ impl S3Service {
             etag: None,
             row_id: row_id.clone(),
             is_delete_marker: false,
+            multipart_parts: None,
             content_type: content_type.clone(),
             content_encoding: content_encoding.clone(),
             cache_control: sys("cache-control", &src_row.cache_control),
@@ -3412,6 +3435,7 @@ impl S3Service {
             user_metadata: user_meta.clone(),
             acl: None,
             stored_checksums: ChecksumSet::none(),
+            checksums: None,
             sse_descriptor: dest_sse_descriptor.clone(),
             created_at: intent_validation_now,
             updated_at: intent_validation_now,

@@ -32,11 +32,13 @@ LIST advantage.
 Sidecar path: `<bucket>/<uuid>.meta` (same directory as `<bucket>/<uuid>`), a new
 `StoragePathRole::ObjectMetadata` plan path, versioned and canonical.
 
-Record (serde JSON for v1; bounded by the existing metadata limits):
-`format_version=1`, bucket, key, version id, row id, delete-marker flag, logical/physical size, etag,
+Record (serde JSON; bounded by the 1 MiB object-metadata record limit):
+`format_version=1` for an ordinary object and `2` for an assembled multipart object that carries the
+ordered part layout, bucket, key, version id, row id, delete-marker flag, logical/physical size, etag,
 content type/encoding/cache-control/disposition/language/expires/expire_at, storage path,
 compression, storage class, owner, user metadata, ACL, checksums, SSE descriptor, internal SHA-256,
-created/updated timestamps, object tags, Object Lock state, and the replication intent identity.
+created/updated timestamps, object tags, and explicit Object Lock intent. Replication intent remains a
+known omission: a rebuilt row is not a replica and may need a replication rescan.
 Control-plane rows (bucket config, users, policies, quotas, activity, outbox) stay SQLite-only.
 
 Writes: serialize before the data rename; write to the staging alias; `fsync` data and metadata;
