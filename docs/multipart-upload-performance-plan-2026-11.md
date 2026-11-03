@@ -58,8 +58,9 @@ Per part (`crates/cairn-protocol/src/service.rs`, `upload_part`):
    exact storage paths.
 5. ACK the part.
 
-A completed multipart object is assembled later, in one pass, and remains SQLite-authority (the
-documented boundary).
+A completed multipart object is assembled later, in one pass. It now writes a v2 metadata sidecar
+with its part layout, so the durable file is authoritative for the object too (Section 2 of
+[`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md)).
 
 ## Findings
 
@@ -136,6 +137,10 @@ its own `MultipartStage` timings; do not conflate assembly with part upload.
   up from 44.6 vs 69.6 (0.64×). The remaining measured costs are the staging sink/fsync (~40-55
   ms), input wait (~21-26 ms), and the two commits (~12 ms). The sink/fsync cost is the part
   durability barrier; do not relax it to chase the number.
+- 2026-11-03: completion assembly no longer computes the whole-object MD5 when the composite
+  ETag is supplied. A 50 MiB A/B (10×5 MiB, release, XFS NVMe, two-file sidecar in both arms)
+  measured 326.1 ms mean / 326.0 median with the MD5 and 225.2 / 224.9 without it — a 31%
+  assembly reduction. This is outside the part-upload scoreboard and changes no part barrier.
 
 ## Remaining gap
 

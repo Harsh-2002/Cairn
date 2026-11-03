@@ -135,10 +135,13 @@ pub struct StagedBlob {
     pub size_logical: u64,
     /// The on-disk length (after any compression).
     pub size_physical: u64,
-    /// The plaintext-MD5 entity tag.
+    /// The authoritative plaintext entity tag: the plaintext MD5 for a single-pass write, or the
+    /// caller-supplied ETag for an assembly whose composite value is not that MD5.
     pub etag: ETag,
-    /// The raw hex MD5 (for content-MD5 verification).
-    pub md5_hex: String,
+    /// The raw hex MD5 of the plaintext, when it was computed. `None` for an assembly that was
+    /// given an explicit ETag, so the store does not hash the whole object a second time for a
+    /// value nothing consumes.
+    pub md5_hex: Option<String>,
     /// Always-computed internal plaintext SHA-256 (hex), independent of S3 checksums.
     pub internal_sha256: String,
     /// The computed supplementary checksums.

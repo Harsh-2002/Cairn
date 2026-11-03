@@ -708,3 +708,25 @@ Notes:
   [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
+
+## 10. Multipart assembly MD5 elision (2026-11-03)
+
+A focused A/B measured the full-object MD5 pass that assembly used to run even though a completed
+multipart object's ETag is the composite of its part MD5s. Both arms staged ten 5 MiB plaintext
+parts once, then assembled the same 50 MiB eight times each, alternating arms after one warm-up
+assembly per arm. Both arms wrote the v2 metadata sidecar and computed the internal SHA-256; the
+only difference was whether the hasher updated an MD5. Release profile, Rust 1.97.1, local 6-core
+i5-9400T, data directory on the XFS NVMe root filesystem, `LocalBlobStore` directly — no server,
+network, or metadata database.
+
+| Arm | Mean ms | Median ms | Min–max ms |
+| --- | ---: | ---: | ---: |
+| MD5 computed | 326.1 | 326.0 | 321.5–330.5 |
+| MD5 elided (composite ETag supplied) | 225.2 | 224.9 | 219.9–234.8 |
+
+Elision removed 30.9% of mean assembly time (31.0% of the median); a repeat of the skip arm
+measured 221.5 ms mean and 223.0 ms median. The saving is assembly only: it excludes the part
+upload, metadata commits and the rest of the S3 request path. A permanent test
+(`assembly_with_an_explicit_etag_skips_the_unused_full_object_md5`) checks that the elided arm
+still returns the exact bytes, the composite ETag, the internal SHA-256 and a v2 sidecar carrying
+the same layout.

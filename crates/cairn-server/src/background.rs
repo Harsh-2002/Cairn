@@ -2288,6 +2288,7 @@ async fn scrub_version_paced(
         return ScrubOutcome::Corrupt("length_mismatch");
     }
     let (md5, checksums, internal_sha256) = hasher.finalize();
+    let md5 = md5.expect("the scrub hasher always computes the MD5");
     if let Some(expected) = &row.internal_sha256 {
         return if internal_sha256.eq_ignore_ascii_case(expected) {
             ScrubOutcome::Verified

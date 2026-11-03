@@ -512,6 +512,7 @@ async fn write_staged(
         let (tail_bytes, index_spool) = enc.finish(file).await?;
         physical += tail_bytes;
         let (md5, checks, internal_sha256) = hashers.finalize();
+        let md5 = md5.expect("a single-pass write always computes the MD5");
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
         // still `Uncompressed` to readers that only care about the compression algorithm.
@@ -567,6 +568,7 @@ async fn write_staged(
             detail.begin(timing::RawBodyPhase::Hash);
         }
         let (md5, checks, internal_sha256) = hashers.finalize();
+        let md5 = md5.expect("a single-pass write always computes the MD5");
         if let Some(detail) = raw_body_breakdown.as_mut() {
             detail.end(true);
         }
@@ -1272,7 +1274,7 @@ impl BlobStore for LocalBlobStore {
             size_logical: write.logical,
             size_physical: write.physical,
             etag: ETag::from_md5_hex(write.md5.clone()),
-            md5_hex: write.md5,
+            md5_hex: Some(write.md5),
             checksums: write.checksums,
             internal_sha256: write.internal_sha256,
             compression: write.compression,
@@ -1643,11 +1645,15 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        // Hash the assembled plaintext once, computing the MD5/ETag basis plus any supplementary
+        // Hash the assembled plaintext once, computing the internal SHA-256 and any supplementary
         // checksums the caller requested via `opts.extra_checksums` (a whole-object FULL_OBJECT
-        // recompute at CompleteMultipartUpload). With no extra checksums this is byte-for-byte the
-        // same work as the previous bare-MD5 path, so the default multipart path is unchanged.
-        let mut hashers = Hashers::new(&opts.extra_checksums);
+        // recompute at CompleteMultipartUpload). A completion supplies the composite multipart
+        // ETag in its seed, so the whole-object MD5 has no consumer and is skipped; an assembly
+        // without an explicit ETag (a direct store caller) still computes it.
+        let compute_md5 = metadata_seed
+            .as_ref()
+            .is_none_or(|seed| seed.etag.is_none());
+        let mut hashers = Hashers::new_for_assembly(&opts.extra_checksums, compute_md5);
         let mut logical: u64 = 0;
         let mut physical: u64 = 0;
         let mut enc = block_pol
@@ -1706,11 +1712,21 @@ impl BlobStore for LocalBlobStore {
         };
 
         let (md5_hex, checksums, internal_sha256) = hashers.finalize();
+        let etag = metadata_seed
+            .as_ref()
+            .and_then(|seed| seed.etag.clone())
+            .unwrap_or_else(|| {
+                ETag::from_md5_hex(
+                    md5_hex
+                        .clone()
+                        .expect("an assembly without an explicit ETag computes the MD5"),
+                )
+            });
         let staged = StagedBlob {
             storage_path,
             size_logical: logical,
             size_physical: physical,
-            etag: ETag::from_md5_hex(md5_hex.clone()),
+            etag,
             md5_hex,
             checksums,
             internal_sha256,

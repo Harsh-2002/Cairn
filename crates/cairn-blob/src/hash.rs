@@ -12,7 +12,7 @@ use sha1::Sha1;
 
 /// Accumulates MD5, internal SHA-256, and requested supplementary checksums over plaintext.
 pub struct Hashers {
-    md5: Md5,
+    md5: Option<Md5>,
     crc32: Option<crc32fast::Hasher>,
     crc32c: Option<u32>,
     crc64nvme: Option<Crc64Nvme>,
@@ -35,7 +35,7 @@ impl Hashers {
     pub fn new(set: &ChecksumSet) -> Self {
         let has = |a| set.0.contains(&a);
         Self {
-            md5: Md5::new(),
+            md5: Some(Md5::new()),
             crc32: has(ChecksumAlgorithm::Crc32).then(crc32fast::Hasher::new),
             crc32c: has(ChecksumAlgorithm::Crc32c).then_some(0),
             crc64nvme: has(ChecksumAlgorithm::Crc64Nvme).then(Crc64Nvme::new),
@@ -57,9 +57,23 @@ impl Hashers {
         hashers
     }
 
+    /// Build the hasher for assembly. The composite multipart ETag is computed from the per-part
+    /// MD5s, not from the concatenated bytes, so an assembly with an explicit ETag skips the
+    /// whole-object MD5 pass while still computing the internal SHA-256 and requested checksums.
+    #[must_use]
+    pub fn new_for_assembly(set: &ChecksumSet, compute_md5: bool) -> Self {
+        let mut hashers = Self::new(set);
+        if !compute_md5 {
+            hashers.md5 = None;
+        }
+        hashers
+    }
+
     /// Feed plaintext bytes.
     pub fn update(&mut self, data: &[u8]) {
-        self.md5.update(data);
+        if let Some(md5) = &mut self.md5 {
+            md5.update(data);
+        }
         if let Some(h) = &mut self.crc32 {
             h.update(data);
         }
@@ -77,13 +91,13 @@ impl Hashers {
         }
     }
 
-    /// Finalize, returning the hex MD5 (for the ETag and Content-MD5) and the base64-encoded
-    /// supplementary checksums, followed by the internal hex SHA-256. The latter never changes
-    /// which supplementary algorithms appear in the returned vector.
+    /// Finalize, returning the hex MD5 when it was computed, the base64-encoded supplementary
+    /// checksums, and the internal hex SHA-256. The latter never changes which supplementary
+    /// algorithms appear in the returned vector.
     #[must_use]
-    pub fn finalize(self) -> (String, Vec<ChecksumValue>, String) {
+    pub fn finalize(self) -> (Option<String>, Vec<ChecksumValue>, String) {
         let b64 = base64::engine::general_purpose::STANDARD;
-        let md5_hex = hex::encode(self.md5.finalize());
+        let md5_hex = self.md5.map(|md5| hex::encode(md5.finalize()));
         let mut checksums = Vec::new();
         if let Some(h) = self.crc32 {
             checksums.push(ChecksumValue {
@@ -154,7 +168,7 @@ mod tests {
             internal,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(md5, "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5.as_deref(), Some("900150983cd24fb0d6963f7d28e17f72"));
         assert_eq!(checks.len(), 2);
         // SHA-256("abc") base64
         let sha = checks
@@ -169,9 +183,23 @@ mod tests {
         let mut h = Hashers::new_for_part(&ChecksumSet::none());
         h.update(b"abc");
         let (md5, checks, internal) = h.finalize();
-        assert_eq!(md5, "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5.as_deref(), Some("900150983cd24fb0d6963f7d28e17f72"));
         assert!(checks.is_empty());
         assert!(internal.is_empty());
+    }
+
+    #[test]
+    fn assembly_hasher_can_skip_the_unused_md5() {
+        let set = ChecksumSet(vec![ChecksumAlgorithm::Crc32]);
+        let mut h = Hashers::new_for_assembly(&set, false);
+        h.update(b"abc");
+        let (md5, checks, internal) = h.finalize();
+        assert_eq!(md5, None);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            internal,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

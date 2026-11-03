@@ -3558,6 +3558,93 @@ async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
 }
 
 #[tokio::test]
+async fn assembly_with_an_explicit_etag_skips_the_unused_full_object_md5() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("assembly-etag").unwrap();
+    let key = ObjectKey::parse("assembled").unwrap();
+    let version = VersionId::null();
+    let upload = UploadId::generate();
+    let part1 = store
+        .stage_part_fixture(
+            &upload,
+            1,
+            "part-1",
+            body(b"hello".to_vec()),
+            ChecksumSet::none(),
+            1 << 30,
+            None,
+        )
+        .await
+        .unwrap();
+    let part2 = store
+        .stage_part_fixture(
+            &upload,
+            3,
+            "part-3",
+            body(b" world".to_vec()),
+            ChecksumSet::none(),
+            1 << 30,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut seed = metadata_seed(&bucket, &key, &version, &"e".repeat(32));
+    let composite = "0123456789abcdef0123456789abcdef-2".to_owned();
+    seed.etag = Some(ETag::from_string(composite.clone()));
+    seed.multipart_parts = Some(vec![
+        cairn_types::object::MultipartPartRecord {
+            part_number: 1,
+            size: 5,
+        },
+        cairn_types::object::MultipartPartRecord {
+            part_number: 3,
+            size: 6,
+        },
+    ]);
+    let assembled = store
+        .assemble_fixture(
+            &bucket,
+            &[part_ref(1, &part1, None), part_ref(3, &part2, None)],
+            StageOptions {
+                metadata_seed: Some(seed),
+                ..opts(None, "text/plain")
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.etag.as_str(), composite);
+    assert_eq!(
+        assembled.md5_hex, None,
+        "the composite ETag is not the concatenated-bytes MD5, so that pass must be skipped"
+    );
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression,
+            assembled.size_logical
+        )
+        .await,
+        b"hello world"
+    );
+    let metadata = cairn_types::storage::object_metadata_path(&assembled.storage_path).unwrap();
+    let record = cairn_types::storage::ObjectMetadataRecord::decode(
+        &std::fs::read(dir.path().join(metadata.as_str())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record.etag.as_str(), composite);
+    assert_eq!(
+        record.format_version,
+        cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
+    );
+    assert!(record.multipart_parts.is_some());
+}
+
+#[tokio::test]
 async fn large_plaintext_object_is_one_inline_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())

@@ -1049,7 +1049,7 @@ mod tests {
             size_logical: 11,
             size_physical: 11,
             etag: ETag::from_md5_hex("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned()),
-            md5_hex: "5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned(),
+            md5_hex: Some("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned()),
             internal_sha256: "00".repeat(32),
             checksums: Vec::new(),
             compression: CompressionDescriptor::Uncompressed,
