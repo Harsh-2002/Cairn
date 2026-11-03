@@ -3,6 +3,10 @@
 
 This is a diagnostic macro benchmark, not a durability-equivalence proof or a
 production-format adoption gate. See docs/performance-execution-2026-09.md.
+
+The DELETE case prefills an exact 100,000-object pool with signed PUTs and runs
+Warp with `--list-existing`; the prefill time is recorded but excluded from the
+scored delete window.
 """
 
 import argparse
@@ -23,6 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from sync_probe import initialize as initialize_sync_probe
@@ -37,7 +42,8 @@ CASES = (
     ("get_1m", "get", "1MiB", 16, ("--objects", "64")),
     ("head_4k", "stat", "4KiB", 16, ("--objects", "1000")),
     ("list_4k", "list", "4KiB", 16, ("--objects", "1000")),
-    ("delete_4k", "delete", "4KiB", 16, ("--objects", "12000")),
+    ("delete_4k", "delete-existing", "4KiB", 16,
+     ("--objects", "100000", "--batch", "100", "--list-existing", "--noclear")),
     ("mixed_1m", "mixed", "1MiB", 16, ("--objects", "100", "--get-distrib", "45",
                                            "--stat-distrib", "30", "--put-distrib", "15",
                                            "--delete-distrib", "10")),
@@ -600,6 +606,24 @@ def cairn_metrics(endpoint):
             if line.startswith(prefixes) and not line.startswith("#")]
 
 
+def prefill_pool(port, secret, count, size):
+    """Create an exact delete pool through the normal S3 PUT path, not warp's uploader.
+
+    Warp's `put` has no object-count flag; using its timed upload would make the pool size and
+    measurement window depend on throughput. This issues exactly `count` signed PUTs with bounded
+    concurrency and raises on the first failure.
+    """
+    body = b"x" * size
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for _ in pool.map(
+            lambda index: signed_request(
+                port, secret, "PUT", f"/{BUCKET}/prefill-{index:09d}", body=body
+            ),
+            range(count),
+        ):
+            pass
+
+
 def run_arm(args, root, case, engine, index, deadline):
     capacity_before = host_capacity()
     max_load_seconds = getattr(args, "max_load_seconds", None)
@@ -663,20 +687,33 @@ def run_arm(args, root, case, engine, index, deadline):
             raise RuntimeError(f"{error}; server log tail: {log_tail}") from error
         durability = prepare_verified_bucket(port, secret, engine)
         benchdata_base, _ = warp_benchdata_paths(arm)
+        warp_env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("AWS_", "WARP_"))
+                    and key not in ("LD_PRELOAD", "SYNC_PROBE_FILE")}
+        warp_env.update(WARP_ACCESS_KEY=ACCESS, WARP_SECRET_KEY=secret)
+        prefill = None
+        if operation == "delete-existing":
+            # The same exact pool for both engines; the measured delete is a separate process and
+            # its monitor window starts only after this completes.
+            prefill_count = 100_000
+            prefill_start = time.monotonic()
+            prefill_pool(port, secret, prefill_count, 4 * 1024)
+            prefill = {
+                "objects": prefill_count,
+                "seconds": round(time.monotonic() - prefill_start, 3),
+            }
+            print(f"  prefill: {prefill_count} objects in {prefill['seconds']}s", flush=True)
+        measured_operation = "delete" if operation == "delete-existing" else operation
         warp_cmd = [
-            args.warp, operation, "--host", endpoint,
+            args.warp, measured_operation, "--host", endpoint,
             "--region", "us-east-1", "--lookup", "path",
             "--bucket", BUCKET,
             "--concurrent", str(concurrency), "--duration", f"{args.duration}s",
             "--no-color", "--benchdata", str(benchdata_base),
             *extras,
         ]
-        if operation not in ("multipart", "multipart-put"):
+        if operation not in ("multipart", "multipart-put", "delete-existing"):
             warp_cmd.extend(("--obj.size", size))
-        warp_env = {key: value for key, value in os.environ.items()
-                    if not key.startswith(("AWS_", "WARP_"))
-                    and key not in ("LD_PRELOAD", "SYNC_PROBE_FILE")}
-        warp_env.update(WARP_ACCESS_KEY=ACCESS, WARP_SECRET_KEY=secret)
         sample = {"server_peak_rss": 0, "client_peak_rss": 0, "peak_bytes": 0, "peak_inodes": 0,
                   "server_last_cpu": None, "client_last_cpu": None}
         done = threading.Event()
@@ -768,7 +805,7 @@ def run_arm(args, root, case, engine, index, deadline):
         output = output.decode(errors="replace")
         (arm / "warp.txt").write_text(output)
         after_server = cpu_rss(proc.pid)
-        parsed = parse_warp(output, operation)
+        parsed = parse_warp(output, measured_operation)
         warp_timeline = (
             analyze_warp_put_timeline(args.warp, arm, load_start_unix_seconds,
                                       load_end_unix_seconds, load_samples, deadline,
@@ -780,6 +817,7 @@ def run_arm(args, root, case, engine, index, deadline):
             "duration_requested_seconds": args.duration, "concurrency": concurrency,
             "command": warp_cmd,
             "durability": durability,
+            "prefill": prefill,
             "strict_settings": {key: env[key] for key in STRICT_SETTINGS[engine]},
             "warp_exit": client.returncode, "limit_hit": limit_hit.is_set(),
             "load_elapsed_seconds": load_elapsed,
@@ -833,6 +871,8 @@ def run_arm(args, root, case, engine, index, deadline):
             and capacity_compatible(capacity_before, capacity_after,
                                     getattr(args, "allow_ballooning", False))
             and parsed["summary"] and parsed["reported_errors"] == 0
+            and (operation != "delete-existing"
+                 or (parsed["analyzed_seconds"] or 0) >= 7)
             and put_timeline_valid(operation, warp_timeline)
             and (probe_file is None or result["sync_probe_status"] == "captured")
         ) else "INCONCLUSIVE"

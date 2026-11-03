@@ -693,16 +693,17 @@ durability-equivalence proof.
 | HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
 | Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
 | Multipart upload, 10×5 MiB (3 pairs, after #168) | 49.7 obj/s | 64.4 obj/s | **0.77×** |
-| DELETE 4 KiB, c16, batch 100 | 4,051 obj/s (20k objects) | 243 obj/s (6.4k objects) | **not comparable** |
+| DELETE 4 KiB, c16, batch 100 (3 pairs, 100k prefill) | 3,444 obj/s | 2,415 obj/s | **1.43×** |
 
 Notes:
 
-- The DELETE row is **not a ratio**. Warp requires at least 6,400 objects for a bulk delete at
-  batch 100, but Cairn deletes that set before Warp can collect enough one-second samples. The
-  Cairn figure is from a 20,000-object run and the RustFS figure from the 6,400 minimum; the
-  object counts and measured windows differ, so the numbers are not comparable. A repeatable
-  comparison needs a prefill plus `--list-existing` with the same pool and a measured window of at
-  least seven seconds; until then, this row is a diagnostic observation, not a score.
+- DELETE now uses an exact pool: 100,000 × 4 KiB objects created by signed S3 PUTs at 32-way
+  concurrency, then `warp delete --list-existing --objects 100000 --batch 100 --concurrent 16
+  --duration 12s --noclear`. Both engines started from the same pool; the scored delete excluded
+  the prefill, and every arm analyzed at least 9 seconds. Prefill took 85–95 s for Cairn and
+  148–155 s for RustFS. Cairn stayed near 3.4k obj/s while RustFS fell across pairs (3,077 →
+  2,320 → 1,849 obj/s), so the mean ratio is 1.43× and the per-pair ratios are 1.15, 1.47 and
+  1.84; the spread is host-state sensitive. The method lives in `conformance/rustfs_compare.py`.
 - Multipart upload was 0.59× over three pairs before #158; the part-hash fix raised the
   single-pair result to 0.69×. The assembly MD5 elision in #168 then measured 0.77× over three
   pairs (49.7 vs 64.4 obj/s; per-pair ratios 0.74, 0.81 and 0.76). The host is noisy, so treat the

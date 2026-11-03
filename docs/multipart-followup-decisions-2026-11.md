@@ -136,11 +136,14 @@ needs at least six one-second buckets; Cairn deletes the minimum pool before it 
 single-key and bulk-delete shapes also disagree because Cairn amortizes one Writer transaction per
 request while RustFS appears to sync per key.
 
-**Repeatable method:** fresh strict store, prefill the same 100,000 × 4 KiB pool for both engines,
-then run `warp delete --list-existing --objects 100000 --batch 100 --concurrent 16 --duration 12s
---noclear`; require an exact prefill, ≥7 scored seconds, and no pool exhaustion. Report the
-single-key Python comparison separately. Until that run exists, DELETE is a diagnostic observation,
-not a score.
+**Repeatable method (implemented):** `conformance/rustfs_compare.py --case delete_4k` creates an
+exact 100,000 × 4 KiB pool through signed S3 PUTs at 32-way concurrency, then runs `warp delete
+--list-existing --objects 100000 --batch 100 --concurrent 16 --duration 12s --noclear`; every arm
+must analyze at least seven seconds, and the prefill time is recorded but excluded from the delete
+score. Measured 2026-11-03 with the same binaries as the surrounding scoreboard: Cairn **3,444
+obj/s** mean vs RustFS **2,415 obj/s** (mean ratio **1.43×**; per-pair 1.15, 1.47, 1.84). RustFS
+fell across pairs while Cairn stayed near 3.4k, so the spread is host-state sensitive. Report the
+single-key Python comparison separately.
 
 ## Order
 
@@ -150,4 +153,5 @@ not a score.
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
 4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
    body/sink work stays gated on a new measurement.
-5. Implement the paired DELETE methodology and re-run the scoreboard gaps — still gated.
+5. Implement the paired DELETE methodology and re-run the scoreboard gaps — done; the mean ratio
+   is 1.43× with the variance noted above.
