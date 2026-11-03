@@ -713,6 +713,68 @@ Notes:
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
 
+### Single-key DELETE — separate measurement, not the bulk ratio
+
+The `DELETE 4 KiB` row above is a Warp multi-object delete (`--batch 100`); it does not describe a
+client that sends one DELETE per key. `conformance/delete_single_key.py` measures that shape
+separately. For each arm it starts a fresh single-node store, creates exactly 12,000 distinct
+4 KiB keys through signed S3 PUTs, then issues exactly one signed `DELETE /bucket/key` per key at
+16-way client concurrency. The scored interval is the full pool depletion; prefill is timed but
+excluded. An arm passes only when all 12,000 DELETEs return 200/204, the driver records no error,
+HEAD of the first/middle/last key returns 404, and (for RustFS) the bucket-durability readback is
+`strict`. Cairn pins `CAIRN_META_SYNCHRONOUS=full`, `CAIRN_META_SHARDS=1` and
+`CAIRN_META_GROUP_COMMIT_LINGER_MICROS=0`; RustFS uses `RUSTFS_DURABILITY_MODE=strict`,
+`RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict` and `RUSTFS_DRIVE_SYNC_ENABLE=true`, the same settings
+as `rustfs_compare.py`.
+
+Two independent five-pair batches were run with the pair order reversed on every other pair; the
+second used the same command with `--root /var/tmp/cairn-performance-delete-single-key-12k-b`:
+
+```sh
+python3 conformance/delete_single_key.py \
+  --root /var/tmp/cairn-performance-delete-single-key-12k \
+  --cairn target/release/cairn \
+  --rustfs /var/tmp/cairn-perf-tools/rustfs \
+  --pairs 5 --objects 12000 --concurrency 16
+```
+
+The client is Python 3 standard library only (minimal SigV4, one reused connection per worker).
+
+| Metric (10 pairs, 20 arms, 120,000 deletes per engine) | Cairn | RustFS |
+|---|---:|---:|
+| Throughput, mean of arm rates | 813.4 obj/s | 1,680.3 obj/s |
+| Arm range | 715.9–1,059.4 obj/s | 1,549.9–1,739.1 obj/s |
+| Wall time per arm, mean | 15.0 s | 7.2 s |
+| p50 / p90 / p99 latency, median arm | 15.6 / 35.9 / 92.3 ms | 8.7 / 13.5 / 21.9 ms |
+| Prefill (excluded from score), mean | 9.3 s | 17.2 s |
+| Server peak RSS, mean | 40.3 MiB | 299.5 MiB |
+
+The ten per-pair Cairn/RustFS ratios were 0.646, 0.504, 0.440, 0.415, 0.439, 0.630, 0.434, 0.462,
+0.462 and 0.429: mean **0.49×**, median 0.45×, ratio of arm means 0.48×. RustFS was faster in all
+ten pairs. Every arm deleted 12,000/12,000 keys with zero driver errors, all sampled keys returned
+404, and RustFS's strict readback held after each arm.
+
+Caveats:
+
+- This is a **single-key** measurement and is **not** a replacement for, or an input to, the
+  `delete_4k` **1.43×** bulk ratio. The two shapes measure different server work — one request per
+  key here, one request carrying up to 100 keys there — and must not be pooled. The single-key
+  shape favors RustFS while the bulk shape favors Cairn; that disagreement is the reason to report
+  both, not evidence of a regression in either.
+- The 12,000-key pool was chosen after a 3,000-key screening (943 Cairn / 656 RustFS obj/s): it puts
+  the slower Cairn arm at ~15 s and the faster RustFS arm near 7 s; a larger pool only lengthens the
+  Cairn arm. Two earlier 10,000-key batches measured 0.65× and 0.70× while RustFS ranged
+  699–1,776 obj/s, and a 3-pair pilot measured 1.25×; those host-load-affected pilots are not
+  pooled. The two 12,000-key batches agreed at 0.489× and 0.484×, with RustFS inside
+  1,550–1,739 obj/s across all ten arms.
+- Binaries: Cairn was built from this worktree with `cargo build --release --bin cairn` (Rust
+  1.97.1), local release SHA-256
+  `7175e2ba77a9060335298b6c4667310b6b465e2875842d0efa855babc483ee1a`; RustFS 1.0.0 executable
+  SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd` (publisher ZIP
+  `2d5059501745682664c3d345b22274b66079c952fbec7e1ce66980ef4515cd42`). Warp is not involved in
+  this measurement. Method and offline checks live in `conformance/delete_single_key.py` and
+  `conformance/test_delete_single_key.py`.
+
 ## 10. Multipart assembly MD5 elision (2026-11-03)
 
 A focused A/B measured the full-object MD5 pass that assembly used to run even though a completed

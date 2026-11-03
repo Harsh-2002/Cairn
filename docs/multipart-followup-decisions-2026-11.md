@@ -161,17 +161,43 @@ CPU-bound, stop and document the barrier asymmetry instead.
 **Why:** it compared a 20,000-object Cairn run with RustFS's 6,400-object minimum, with different
 measured windows. Warp requires `objects ≥ batch*concurrent*4` without `--list-existing`, and it
 needs at least six one-second buckets; Cairn deletes the minimum pool before it can score. The
-single-key and bulk-delete shapes also disagree because Cairn amortizes one Writer transaction per
-request while RustFS appears to sync per key.
+single-key and bulk-delete shapes also disagree: the measured single-key shape favors RustFS while
+the bulk shape favors Cairn, so neither number is a substitute for the other. This record does not
+attribute the difference; batching amortizes Cairn's per-request metadata commit, but the
+measurements do not isolate that from the rest of the request path.
 
-**Repeatable method (implemented):** `conformance/rustfs_compare.py --case delete_4k` creates an
+**Repeatable bulk method (implemented):** `conformance/rustfs_compare.py --case delete_4k` creates an
 exact 100,000 × 4 KiB pool through signed S3 PUTs at 32-way concurrency, then runs `warp delete
 --list-existing --objects 100000 --batch 100 --concurrent 16 --duration 12s --noclear`; every arm
 must analyze at least seven seconds, and the prefill time is recorded but excluded from the delete
 score. Measured 2026-11-03 with the same binaries as the surrounding scoreboard: Cairn **3,444
 obj/s** mean vs RustFS **2,415 obj/s** (mean ratio **1.43×**; per-pair 1.15, 1.47, 1.84). RustFS
-fell across pairs while Cairn stayed near 3.4k, so the spread is host-state sensitive. Report the
-single-key Python comparison separately.
+fell across pairs while Cairn stayed near 3.4k, so the spread is host-state sensitive.
+
+**Separate single-key comparison (implemented):** `conformance/delete_single_key.py` creates an
+exact 12,000 × 4 KiB pool through signed S3 PUTs, then issues exactly one signed DELETE per key at
+16-way concurrency. Prefill is excluded from the score; every response must be 200/204; HEAD of the
+first, middle and last key must return 404; and RustFS's bucket-durability readback must be
+`strict`. Two independent five-pair batches, with pair order reversed on alternate pairs, used the
+same strict settings as `rustfs_compare.py`:
+
+```sh
+python3 conformance/delete_single_key.py --root /var/tmp/cairn-performance-delete-single-key-12k \
+  --cairn target/release/cairn --rustfs /var/tmp/cairn-perf-tools/rustfs \
+  --pairs 5 --objects 12000 --concurrency 16
+```
+
+The repeat used the same arguments with `--root /var/tmp/cairn-performance-delete-single-key-12k-b`.
+
+Measured 2026-11-03: Cairn **813.4 obj/s** mean vs RustFS **1,680.3 obj/s**; mean per-pair ratio
+**0.49×** (median 0.45×; ratio of arm means 0.48×; per-pair 0.415–0.646; RustFS faster in 10/10).
+Every arm deleted 12,000/12,000 keys with zero errors, and the two batches agreed at 0.489× and
+0.484×. Cairn release binary SHA-256
+`7175e2ba77a9060335298b6c4667310b6b465e2875842d0efa855babc483ee1a`; RustFS 1.0.0 executable
+SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`. This result is **not**
+pooled with the bulk 1.43×: the bulk row is Warp `--batch 100`, the single-key row is one request
+per key. Earlier 10,000-key pilots (0.65× and 0.70×) and a three-pair pilot (1.25×) were
+host-load-affected and are not pooled. See `docs/benchmarks.md` §9.
 
 ## Order
 
@@ -181,5 +207,6 @@ single-key Python comparison separately.
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
 4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
    body/sink work stays gated on a new measurement.
-5. Implement the paired DELETE methodology and re-run the scoreboard gaps — done; the mean ratio
-   is 1.43× with the variance noted above.
+5. Implement the paired DELETE methodology and re-run the scoreboard gaps — done; the bulk mean
+   ratio is 1.43× with the variance noted above. The separate single-key comparison is also
+   implemented and measured at 0.49×; it is not pooled with the bulk ratio.

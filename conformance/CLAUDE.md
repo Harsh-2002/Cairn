@@ -333,6 +333,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   not wired into CI. **Report-not-gate**: the signal is the Cairn/MinIO ratio, and it fails ONLY on
   warp operation errors (not on who is faster), because throughput variance is large. Parses the
   MEASURED op, not warp's prepare-PUT.
+- `delete_single_key.py` — **exact single-key DELETE comparison vs RustFS**, separate from the Warp
+  `delete_4k` bulk ratio: a fresh store per arm, an exact 12,000 × 4 KiB pool, exactly one signed S3
+  DELETE per key at 16-way concurrency, strict durability, and exact 200/204 + 404 spot checks.
+  Reports obj/s, wall time, p50/p90/p99, errors and per-pair ratios. **NOT a gate.**
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
@@ -381,8 +385,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   escape hatch (`CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`, set by `mesh.py`) because it wires targets
   through the management API (SSRF-guarded), unlike `soak`'s config-endpoint path. The remaining
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
-  `load_profile.sh`, `sendfile_bench.sh`) whose gating signal is already covered by the CI correctness
-  jobs; run them by hand for numbers.
+  `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`) whose gating signal is already
+  covered by the CI correctness jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
 
