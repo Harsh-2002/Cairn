@@ -52,7 +52,9 @@ External-monitoring dashboard (OpenObserve, generated): [`dashboards/`](./dashbo
 ## Build, test, and the gate
 
 The binary is `cairn` (`cargo build --bin cairn`). The offline `cairn backfill-sidecars` command
-writes missing v1/v2 sidecars for assembled objects that predate them; it requires the node lock. The following is the **full validation gate**
+writes missing v1/v2 sidecars for assembled objects that predate them and, with `--upgrade-v1`,
+replaces an existing v1 record with the row's v2 part layout after an identity check; it requires
+the node lock. The following is the **full validation gate**
 for code, build, dependency, automation and mixed changes. CI uses `.github/workflows/validate.yml`
 and must be green before the change is finished. Ordinary documentation-only PRs use local-link,
 anchor, shell-example and workflow-policy checks instead (ARCH 31.7):

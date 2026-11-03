@@ -248,6 +248,33 @@ impl AnchoredPath {
         }
     }
 
+    /// Atomically replace an existing destination.
+    ///
+    /// Offline maintenance only (the node lock excludes live writers): the v1 → v2 sidecar
+    /// upgrade rewrites the durable record in place. Every live publication keeps the
+    /// [`Self::rename_to`] no-replace guarantee.
+    pub(crate) fn replace_to(&self, destination: &Self) -> std::io::Result<()> {
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        {
+            rustix::fs::renameat_with(
+                &*self.parent,
+                self.name.as_str(),
+                &*destination.parent,
+                destination.name.as_str(),
+                rustix::fs::RenameFlags::empty(),
+            )?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        {
+            let _ = destination;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "atomic storage replacement unavailable",
+            ))
+        }
+    }
+
     /// Immediate scratch unlink is allowed only for the descriptor just created by this attempt.
     /// Its journal alias still needs a namespace barrier before cleanup debt can be retired.
     pub(crate) fn unlink_created(&self, file: &File) -> std::io::Result<()> {
@@ -486,6 +513,33 @@ pub(crate) fn read_file(root: &Path, path: &StoragePath) -> std::io::Result<File
         directory = file;
     }
     Err(std::io::Error::other("empty storage input path"))
+}
+
+/// Read one small existing file through the same no-follow boundary, refusing a non-regular
+/// destination and enforcing a hard byte bound before allocating.
+pub(crate) fn read_bounded(
+    root: &Path,
+    path: &StoragePath,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = read_file(root, path)?;
+    let len = fstat(&file)?.st_size;
+    if len < 0 || len as u64 > max as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stored file exceeds its size bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    (&file).read_to_end(&mut bytes)?;
+    if bytes.len() != len as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stored file changed while it was read",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// A completed exact unlink whose namespace barrier is still owed.

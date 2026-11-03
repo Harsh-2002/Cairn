@@ -284,18 +284,35 @@ treat the headerless data as unreferenced. After stopping the server, run the of
 cairn backfill-sidecars --dry-run    # count candidates, write nothing
 cairn backfill-sidecars             # write every supported missing sidecar
 cairn backfill-sidecars --limit 10000
+cairn backfill-sidecars --upgrade-v1 # also replace an existing v1 record with v2
 ```
 
 The command takes the node lock, so it refuses to run while `serve` or any other node-local command
 holds it. It pages every bucket's versions, selects composite-ETag versions whose data file exists,
 reads the row plus its tags and effective Object Lock state, and writes the sidecar through the
-same fsync → rename → directory-barrier sequence as a live write. It is idempotent and never
-overwrites an existing sidecar. A version with a recorded part layout gets a v2 record; a legacy
-layout-less assembly gets v1, which restores the row while keeping `?partNumber` fail-closed. Only
-flat `bucket/uuid` paths are supported; nested laboratory paths are counted as `nested` and
-skipped. `--limit` bounds candidates per run; rerun until `candidates=0`. The command never
-invents, changes, or deletes an index row, and it does not backfill ordinary pre-protocol-3
-objects.
+same fsync → rename → directory-barrier sequence as a live write. It is idempotent and, without
+`--upgrade-v1`, never overwrites an existing sidecar. A version with a recorded part layout gets a
+v2 record; a legacy layout-less assembly gets v1, which restores the row while keeping
+`?partNumber` fail-closed. Only flat `bucket/uuid` paths are supported; nested laboratory paths are
+counted as `nested` and skipped. `--limit` bounds candidates per run; rerun until `candidates=0`.
+The command never invents, changes, or deletes an index row, and it does not backfill ordinary
+pre-protocol-3 objects.
+
+**Upgrading a v1 sidecar (`--upgrade-v1`).** An object assembled between the v1 sidecar stage and
+the v2 part-layout stage can have a v1 `<uuid>.meta` even though its `object_versions` row records
+`multipart_parts`. That v1 record restores the row after index loss but not `?partNumber`. With the
+flag, the command decodes each existing sidecar and, only when the row records a layout, replaces a
+v1 record with the row's v2 record after verifying that `row_id`, bucket, key, version id, storage
+path, ETag and both sizes agree with the row. The replacement is written to the admitted
+`.meta.tmp`, fsynced, atomically renamed over the existing destination and followed by the bucket
+directory barrier; the data file is never touched. A v2 record is never rewritten, a v1 record whose
+row has no layout is reported as `skipped_v1`, and any identity disagreement (or a destination that
+is not a regular file) is reported as `conflicts` and left untouched while the pass continues.
+
+The summary line reports `scanned`, `candidates` (versions this run would create or upgrade),
+`written`, `existing`, `upgraded`, `skipped_v1`, `conflicts`, `missing_data`, `nested` and `failed`.
+Exit status is non-zero only when `failed` is non-zero; investigate any `conflicts` before trusting
+the index, and rerun with `--upgrade-v1` until `candidates=0`.
 
 ## 7. Master-key rotation
 

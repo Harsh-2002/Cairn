@@ -828,6 +828,36 @@ impl ObjectMetadataRecord {
         })
     }
 
+    /// Whether both records name the same object version and its exact staged file.
+    ///
+    /// The offline v1 → v2 sidecar upgrade compares the durable record against the record rebuilt
+    /// from the index row before it replaces anything. A mismatch means the two disagree about the
+    /// object and the existing sidecar must be left untouched.
+    #[must_use]
+    pub fn identity_matches(&self, other: &Self) -> bool {
+        self.row_id == other.row_id
+            && self.bucket == other.bucket
+            && self.key == other.key
+            && self.version_id == other.version_id
+            && self.storage_path == other.storage_path
+            && self.etag == other.etag
+            && self.size_logical == other.size_logical
+            && self.size_physical == other.size_physical
+    }
+
+    /// Whether this record names exactly the object version in `row`.
+    #[must_use]
+    pub fn matches_row_identity(&self, row: &ObjectVersionRow) -> bool {
+        self.row_id == row.id
+            && self.bucket == row.bucket
+            && self.key == row.key
+            && self.version_id == row.version_id
+            && row.storage_path.as_ref() == Some(&self.storage_path)
+            && self.etag == row.etag
+            && self.size_logical == row.size_logical
+            && self.size_physical == row.size_physical
+    }
+
     /// Canonical bytes for the sidecar file.
     pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
         let bytes =
@@ -1212,6 +1242,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_sidecar_identity_must_agree_with_the_row() {
+        let path = StoragePath::generate(&BucketName::parse("bucket").unwrap());
+        let row = object_row(None, false, Some(path));
+        let record = ObjectMetadataRecord::from_existing(
+            &row,
+            Vec::new(),
+            ExplicitObjectLockIntent::default(),
+        )
+        .unwrap();
+        assert!(record.matches_row_identity(&row));
+        assert!(record.identity_matches(&record));
+
+        fn assert_conflict(
+            record: &ObjectMetadataRecord,
+            row: &ObjectVersionRow,
+            mutate: impl Fn(&mut ObjectMetadataRecord),
+        ) {
+            let mut changed = record.clone();
+            mutate(&mut changed);
+            assert!(!changed.matches_row_identity(row));
+            assert!(!record.identity_matches(&changed));
+        }
+
+        // Every identity-bearing field can independently invalidate the record: the offline
+        // upgrade must never overwrite a sidecar that disagrees with the index row.
+        assert_conflict(&record, &row, |record| record.row_id = "b".repeat(32));
+        assert_conflict(&record, &row, |record| {
+            record.bucket = BucketName::parse("other").unwrap();
+        });
+        assert_conflict(&record, &row, |record| {
+            record.key = ObjectKey::parse("other.bin").unwrap();
+        });
+        assert_conflict(&record, &row, |record| {
+            record.version_id = VersionId::from_string("v1".to_owned());
+        });
+        assert_conflict(&record, &row, |record| {
+            record.storage_path = StoragePath::generate(&record.bucket);
+        });
+        assert_conflict(&record, &row, |record| {
+            record.etag = ETag::from_string("other".into());
+        });
+        assert_conflict(&record, &row, |record| record.size_logical += 1);
+        assert_conflict(&record, &row, |record| record.size_physical += 1);
     }
 
     fn staged_blob() -> crate::blob::StagedBlob {

@@ -3708,6 +3708,219 @@ async fn backfill_writes_a_missing_sidecar_and_is_idempotent() {
     );
 }
 
+fn object_permit(
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version: &VersionId,
+) -> cairn_types::storage::ObjectCreationPermit {
+    use cairn_types::storage::{
+        PlannedStorageWrite, StorageToken, StorageWriteTarget, io::StorageIoWatch,
+    };
+    let generation = StorageToken::generate();
+    let planned = PlannedStorageWrite::new(
+        bucket.clone(),
+        generation.clone(),
+        StorageWriteTarget::Object {
+            key: key.clone(),
+            version_id: version.clone(),
+            row_id: StorageToken::generate().as_str().to_owned(),
+        },
+    )
+    .unwrap();
+    let attempt = planned.plan().attempt.clone();
+    let (_watch, lease) = StorageIoWatch::new(attempt, generation, std::sync::Arc::new(()));
+    planned.into_object_permit(lease).unwrap()
+}
+
+#[tokio::test]
+async fn replacing_a_v1_sidecar_writes_v2_without_touching_the_data_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("upgrade-bucket").unwrap();
+    let key = ObjectKey::parse("assembled.bin").unwrap();
+    let version = VersionId::null();
+    let seed = metadata_seed(&bucket, &key, &version, &"a".repeat(32));
+    let mut v2_seed = seed.clone();
+    v2_seed.multipart_parts = Some(vec![cairn_types::object::MultipartPartRecord {
+        part_number: 1,
+        size: 4,
+    }]);
+    let staged = store
+        .stage_fixture(&bucket, body(b"data".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let v1 = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
+    let v2 = cairn_types::storage::ObjectMetadataRecord::from_staged(&v2_seed, &staged);
+    assert_eq!(
+        v1.format_version,
+        cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION
+    );
+    assert_eq!(
+        v2.format_version,
+        cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
+    );
+    assert_eq!(v2.multipart_parts, v2_seed.multipart_parts);
+    assert!(v1.identity_matches(&v2));
+
+    let sidecar = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    let sidecar_abs = dir.path().join(sidecar.as_str());
+    std::fs::write(&sidecar_abs, v1.encode().unwrap()).unwrap();
+    let data_before = std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap();
+    let entries_before = std::fs::read_dir(dir.path().join(bucket.as_str()))
+        .unwrap()
+        .count();
+
+    store
+        .replace_metadata_sidecar(
+            object_permit(&bucket, &key, &version),
+            &staged.storage_path,
+            &v2,
+        )
+        .await
+        .unwrap();
+
+    let decoded =
+        cairn_types::storage::ObjectMetadataRecord::decode(&std::fs::read(&sidecar_abs).unwrap())
+            .unwrap();
+    assert_eq!(
+        decoded.format_version,
+        cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
+    );
+    assert_eq!(decoded.multipart_parts, v2.multipart_parts);
+    assert_eq!(
+        std::fs::read(dir.path().join(staged.storage_path.as_str())).unwrap(),
+        data_before,
+        "only the sidecar may change"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join(bucket.as_str()))
+            .unwrap()
+            .count(),
+        entries_before,
+        "the replacement must not create a data file"
+    );
+
+    // A second replace with the now-v2 destination is refused: never silently rewrite a v2 record.
+    assert!(
+        store
+            .replace_metadata_sidecar(
+                object_permit(&bucket, &key, &version),
+                &staged.storage_path,
+                &v2,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_abs).unwrap(),
+        decoded.encode().unwrap(),
+        "the durable v2 record is unchanged by the refused second pass"
+    );
+}
+
+#[tokio::test]
+async fn replacing_a_sidecar_refuses_a_mismatched_record_or_a_non_regular_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("upgrade-refusals").unwrap();
+    let key = ObjectKey::parse("assembled.bin").unwrap();
+    let version = VersionId::null();
+    let seed = metadata_seed(&bucket, &key, &version, &"c".repeat(32));
+
+    let mut v2_seed = seed.clone();
+    v2_seed.multipart_parts = Some(vec![cairn_types::object::MultipartPartRecord {
+        part_number: 1,
+        size: 4,
+    }]);
+
+    // Stage the object first, then write the v1 sidecar the upgrade is expected to replace.
+    let staged = store
+        .stage_fixture(&bucket, body(b"data".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let v1 = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
+    let v2 = cairn_types::storage::ObjectMetadataRecord::from_staged(&v2_seed, &staged);
+    let sidecar = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    let sidecar_abs = dir.path().join(sidecar.as_str());
+    std::fs::write(&sidecar_abs, v1.encode().unwrap()).unwrap();
+
+    // A v1 record cannot be "replaced" with another v1: this path exists only to add the layout.
+    assert!(
+        store
+            .replace_metadata_sidecar(
+                object_permit(&bucket, &key, &version),
+                &staged.storage_path,
+                &v1,
+            )
+            .await
+            .is_err()
+    );
+
+    // A record that disagrees with the durable sidecar is refused and the file is untouched.
+    let mut mismatched = v2.clone();
+    mismatched.etag = ETag::from_string("different".into());
+    assert!(
+        store
+            .replace_metadata_sidecar(
+                object_permit(&bucket, &key, &version),
+                &staged.storage_path,
+                &mismatched,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_abs).unwrap(),
+        v1.encode().unwrap(),
+        "a refused replacement leaves the v1 record intact"
+    );
+
+    // A symlink at the destination is not a regular sidecar: refuse it and do not follow it.
+    std::fs::remove_file(&sidecar_abs).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::write(&outside, b"not a sidecar").unwrap();
+    std::os::unix::fs::symlink(&outside, &sidecar_abs).unwrap();
+    assert!(
+        store
+            .replace_metadata_sidecar(
+                object_permit(&bucket, &key, &version),
+                &staged.storage_path,
+                &v2,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"not a sidecar");
+
+    // A directory at the destination is refused too, and no data file appears beside it.
+    std::fs::remove_file(&sidecar_abs).unwrap();
+    std::fs::create_dir(&sidecar_abs).unwrap();
+    assert!(
+        store
+            .replace_metadata_sidecar(
+                object_permit(&bucket, &key, &version),
+                &staged.storage_path,
+                &v2,
+            )
+            .await
+            .is_err()
+    );
+    assert!(sidecar_abs.is_dir());
+    let entries: Vec<_> = std::fs::read_dir(dir.path().join(bucket.as_str()))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "only the data file and the refused destination exist: {entries:?}"
+    );
+}
+
 #[tokio::test]
 async fn large_plaintext_object_is_one_inline_file() {
     let dir = tempfile::tempdir().unwrap();
