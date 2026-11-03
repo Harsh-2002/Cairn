@@ -24,7 +24,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   initial tags/Object Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27;
   lifecycle row identity in the partial current-listing covering index v28; exact multipart
   completion claim ownership tokens v29; multipart download filename metadata v39; object TTL
-  expiry and its indexes v40; multipart completed-object part sizes for `GET`/`HEAD ?partNumber`
+  expiry and its indexes v40; multipart completed-object part layout for `GET`/`HEAD ?partNumber`
   v41).
   Turso
   builders deliberately enable its experimental VACUUM support

@@ -158,7 +158,7 @@ fn version_row(
         replicated_at: None,
         created_at: now,
         updated_at: now,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 

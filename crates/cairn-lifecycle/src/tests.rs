@@ -244,7 +244,7 @@ async fn put_object_with_ttl(
         replicated_at: None,
         created_at: ts,
         updated_at: ts,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     };
     meta.submit(
         PublicationFixture::publication(

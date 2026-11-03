@@ -291,7 +291,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
             .map(|s| repl_status_from(&s)),
         internal_sha256: row.get("internal_sha256")?,
         replicated_at: row.get::<_, Option<i64>>("replicated_at")?.map(Timestamp),
-        multipart_part_sizes: match row.get::<_, Option<String>>("multipart_part_sizes")? {
+        multipart_parts: match row.get::<_, Option<String>>("multipart_parts")? {
             Some(s) => Some(json_col(&s)?),
             None => None,
         },

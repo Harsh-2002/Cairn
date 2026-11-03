@@ -2642,7 +2642,7 @@ async fn multipart_lifecycle() {
                 Method::PUT,
                 Some("mpb"),
                 Some("big.bin"),
-                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[("uploadId", upload_id.as_str()), ("partNumber", "3")],
                 &[],
                 part2.clone(),
             ),
@@ -2650,12 +2650,12 @@ async fn multipart_lifecycle() {
         .await,
     )
     .await;
-    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+    let etag3 = header(&hdrs, "etag").unwrap().to_owned();
 
-    // Complete.
+    // Complete. Part numbers are deliberately non-contiguous (1 and 3), which S3 permits.
     let complete = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
-         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+         <Part><PartNumber>3</PartNumber><ETag>{etag3}</ETag></Part></CompleteMultipartUpload>"
     );
     let (st, _, body) = drain(
         send(
@@ -2725,7 +2725,7 @@ async fn multipart_lifecycle() {
                 Method::GET,
                 Some("mpb"),
                 Some("big.bin"),
-                &[("partNumber", "2")],
+                &[("partNumber", "3")],
                 &[],
                 vec![],
             ),
@@ -2749,7 +2749,7 @@ async fn multipart_lifecycle() {
                 Method::HEAD,
                 Some("mpb"),
                 Some("big.bin"),
-                &[("partNumber", "2")],
+                &[("partNumber", "3")],
                 &[],
                 vec![],
             ),
@@ -2767,10 +2767,11 @@ async fn multipart_lifecycle() {
     assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), Some("2"));
 
     for (query, headers, expected_code) in [
-        (&[("partNumber", "3")][..], &[][..], "InvalidPart"),
+        (&[("partNumber", "2")][..], &[][..], "InvalidPart"),
+        (&[("partNumber", "4")][..], &[][..], "InvalidPart"),
         (&[("partNumber", "0")][..], &[][..], "InvalidArgument"),
         (
-            &[("partNumber", "2")][..],
+            &[("partNumber", "3")][..],
             &[("range", "bytes=0-99")][..],
             "InvalidArgument",
         ),
@@ -2808,8 +2809,17 @@ async fn multipart_lifecycle() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.multipart_part_sizes,
-        Some(vec![part1.len() as u64, part2.len() as u64])
+        row.multipart_parts,
+        Some(vec![
+            cairn_types::object::MultipartPartRecord {
+                part_number: 1,
+                size: part1.len() as u64,
+            },
+            cairn_types::object::MultipartPartRecord {
+                part_number: 3,
+                size: part2.len() as u64,
+            },
+        ])
     );
     assert_eq!(
         row.internal_sha256,

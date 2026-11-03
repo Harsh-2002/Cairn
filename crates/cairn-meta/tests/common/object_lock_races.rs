@@ -37,7 +37,7 @@ fn object_row(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId) -> O
         replicated_at: None,
         created_at: Timestamp(10),
         updated_at: Timestamp(10),
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 

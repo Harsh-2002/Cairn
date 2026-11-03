@@ -403,7 +403,7 @@ fn rebuilt_row(record: &ObjectMetadataRecord) -> ObjectVersionRow {
         replicated_at: None,
         created_at: record.created_at,
         updated_at: record.updated_at,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 

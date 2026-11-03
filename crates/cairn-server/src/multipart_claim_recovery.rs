@@ -361,7 +361,7 @@ mod tests {
             replicated_at: None,
             created_at: Timestamp(0),
             updated_at: Timestamp(0),
-            multipart_part_sizes: None,
+            multipart_parts: None,
         }
     }
 

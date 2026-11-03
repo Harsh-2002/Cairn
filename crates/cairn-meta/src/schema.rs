@@ -978,10 +978,11 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
         version: 41,
         name: "multipart completed-object part layout",
         sql: r#"
--- A completed multipart object keeps its ordered plaintext part sizes so GET/HEAD
--- ?partNumber=N can serve the exact part after the staging rows retire with the session.
--- JSON array of u64 sizes; NULL for single-part PUTs, copies and pre-upgrade objects.
-ALTER TABLE object_versions ADD COLUMN multipart_part_sizes TEXT;
+-- A completed multipart object keeps its ordered part layout so GET/HEAD ?partNumber=N can
+-- serve the exact part after the staging rows retire with the session. JSON array of
+-- {part_number,size} records; part numbers need not be contiguous. NULL for single-part PUTs,
+-- copies and pre-upgrade objects.
+ALTER TABLE object_versions ADD COLUMN multipart_parts TEXT;
 "#,
     },
 ];
@@ -2158,11 +2159,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate_fixture_through(&conn, 40);
         run_migrations(&conn).unwrap();
-        assert!(column_exists(
-            &conn,
-            "object_versions",
-            "multipart_part_sizes"
-        ));
+        assert!(column_exists(&conn, "object_versions", "multipart_parts"));
     }
 
     #[test]

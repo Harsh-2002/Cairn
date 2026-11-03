@@ -34,7 +34,8 @@ use cairn_types::meta::{
 use cairn_types::notification::{EventKind, NotificationConfig};
 use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag,
-    ExplicitObjectLockIntent, GovernanceBypass, ObjectRetention, ObjectVersionRow, StorageClass,
+    ExplicitObjectLockIntent, GovernanceBypass, MultipartPartRecord, ObjectRetention,
+    ObjectVersionRow, StorageClass,
 };
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::storage::{
@@ -1170,7 +1171,7 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
-            multipart_part_sizes: None,
+            multipart_parts: None,
         };
 
         // An inbound replica must NOT itself enqueue replication (loop prevention, ARCH 20.4);
@@ -2834,7 +2835,14 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
-            multipart_part_sizes: Some(refs.iter().map(|part| part.size).collect()),
+            multipart_parts: Some(
+                refs.iter()
+                    .map(|part| MultipartPartRecord {
+                        part_number: part.part_number,
+                        size: part.size,
+                    })
+                    .collect(),
+            ),
         };
 
         // Replica completion never consults destination replication configuration or enqueues
@@ -3424,7 +3432,7 @@ impl S3Service {
             replicated_at: None,
             created_at: now,
             updated_at: now,
-            multipart_part_sizes: None,
+            multipart_parts: None,
         };
         // A server-side copy writes a brand-new object version on the destination, so it enqueues
         // replication like a PUT (ARCH 20.2). A copy is never itself an inbound replica (replicas
@@ -6694,8 +6702,9 @@ struct ObjectPart {
 }
 
 /// Resolve `GET`/`HEAD ?partNumber=N`. A completed multipart object carries its ordered part
-/// sizes, so the selected part is the prefix-sum byte range. A single-part object has no layout:
-/// part 1 is the whole object and every other part is `InvalidPart`, matching S3.
+/// number/size layout, so the selected part is found by its S3 number and read as a prefix-sum
+/// byte range. A single-part object has no layout: part 1 is the whole object and every other part
+/// is `InvalidPart`, matching S3.
 fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Option<ObjectPart>> {
     let Some(raw) = req.query("partNumber") else {
         return Ok(None);
@@ -6713,20 +6722,24 @@ fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Optio
             "partNumber must be between 1 and 10000".to_owned(),
         ));
     }
-    let Some(sizes) = row.multipart_part_sizes.as_deref() else {
+    let Some(parts) = row.multipart_parts.as_deref() else {
         return if number == 1 {
             Ok(None)
         } else {
             Err(Error::InvalidPart)
         };
     };
-    let index = usize::from(number - 1);
-    let Some(&length) = sizes.get(index) else {
-        return Err(Error::InvalidPart);
-    };
-    let offset = sizes[..index]
+    // The requested value is the S3 part number, not the array position: a completion may list
+    // 1, 3, 5. A number absent from the completed object is InvalidPart; the offset is the sum of
+    // the sizes of the parts that precede it in completion order.
+    let index = parts
         .iter()
-        .try_fold(0u64, |total, size| total.checked_add(*size))
+        .position(|part| part.part_number == number)
+        .ok_or(Error::InvalidPart)?;
+    let length = parts[index].size;
+    let offset = parts[..index]
+        .iter()
+        .try_fold(0u64, |total, part| total.checked_add(part.size))
         .ok_or_else(|| Error::Internal("multipart part layout overflows".to_owned()))?;
     // A corrupt or hand-edited layout must never read outside the object's logical extent.
     if offset > row.size_logical || length > row.size_logical - offset {
@@ -6737,7 +6750,7 @@ fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Optio
     Ok(Some(ObjectPart {
         offset,
         length,
-        count: sizes.len(),
+        count: parts.len(),
     }))
 }
 
@@ -7432,7 +7445,7 @@ fn replica_marker_row(
         replicated_at: None,
         created_at: now,
         updated_at: now,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 

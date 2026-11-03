@@ -3,7 +3,9 @@
 //! reconcile oracle.
 
 use cairn_types::meta::MultipartLimits;
-use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::object::{
+    CompressionDescriptor, ETag, MultipartPartRecord, ObjectVersionRow, StorageClass,
+};
 use cairn_types::testing::{FixtureMetadataStore, PublicationFixture};
 use cairn_types::traits::{MetadataStore, ReconcileOracle};
 use cairn_types::*;
@@ -52,7 +54,7 @@ fn row(
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 
@@ -251,10 +253,31 @@ async fn multipart_part_layout_round_trips() {
         .unwrap();
     let k = ObjectKey::parse("k").unwrap();
     let mut r = row(&b, "k", VersionId::null(), "e1", false);
-    r.multipart_part_sizes = Some(vec![5 * 1024 * 1024, 9]);
+    r.multipart_parts = Some(vec![
+        MultipartPartRecord {
+            part_number: 1,
+            size: 5 * 1024 * 1024,
+        },
+        MultipartPartRecord {
+            part_number: 3,
+            size: 9,
+        },
+    ]);
     store.submit(put(r, Precondition::default())).await.unwrap();
     let got = store.current_version(&b, &k).await.unwrap().unwrap();
-    assert_eq!(got.multipart_part_sizes, Some(vec![5 * 1024 * 1024, 9]));
+    assert_eq!(
+        got.multipart_parts,
+        Some(vec![
+            MultipartPartRecord {
+                part_number: 1,
+                size: 5 * 1024 * 1024,
+            },
+            MultipartPartRecord {
+                part_number: 3,
+                size: 9,
+            },
+        ])
+    );
 }
 
 #[tokio::test]

@@ -66,7 +66,7 @@ fn row_from(
         replicated_at: None,
         created_at: now,
         updated_at: now,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     }
 }
 
@@ -677,7 +677,7 @@ async fn plant_outbox_entry_at(
         replicated_at: None,
         created_at: Timestamp::EPOCH,
         updated_at: Timestamp::EPOCH,
-        multipart_part_sizes: None,
+        multipart_parts: None,
     };
     meta.submit_fixture(
         fixture,

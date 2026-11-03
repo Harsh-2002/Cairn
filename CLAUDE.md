@@ -138,8 +138,8 @@ above remain the source of truth.
   v36 exact storage intent/cleanup journals, v37 multipart scratch-alias ownership,
   v38 offline baseline identity and legacy-accounting hold, v39 multipart download filename
   metadata, v40 object TTL expiry (`object_versions.expire_at`, due-sweep index, and the
-  current-listing covering index), v41 multipart completed-object part sizes
-  (`object_versions.multipart_part_sizes`) for `GET`/`HEAD ?partNumber`.
+  current-listing covering index), v41 multipart completed-object part layout
+  (`object_versions.multipart_parts`) for `GET`/`HEAD ?partNumber`.
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is

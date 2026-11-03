@@ -44,7 +44,7 @@ metadata commit is **the single linearization point of control-plane and multipa
   Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27; lifecycle row identity
   in the partial current-listing covering index v28; exact-token multipart completion ownership
   v29; multipart download filename metadata v39; object TTL expiry and its indexes v40; multipart
-  completed-object part sizes for `GET`/`HEAD ?partNumber` v41); never edit an applied migration,
+  completed-object part layout for `GET`/`HEAD ?partNumber` v41); never edit an applied migration,
   never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.

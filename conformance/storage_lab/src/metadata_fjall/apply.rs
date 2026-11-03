@@ -199,7 +199,7 @@ fn marker(
         internal_sha256: None,
         replication_status: None,
         replicated_at: None,
-        multipart_part_sizes: None,
+        multipart_parts: None,
         created_at: now,
         updated_at: now,
     };
