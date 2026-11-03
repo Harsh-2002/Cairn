@@ -261,7 +261,7 @@ snapshot into a fresh directory, not an older binary pointed at protocol-2 state
 
 ### Startup index rebuild
 
-Startup walks every bucket directory, reads each inline trailer or `<uuid>.meta` sidecar — including the v1 sidecar written for completed multipart objects — verifies it against its data file, and inserts missing index rows before readiness. Corrupt or mismatched
+Startup walks every bucket directory, reads each inline trailer or `<uuid>.meta` sidecar — including the sidecar written for completed multipart objects (v2 carries the part layout) — verifies it against its data file, and inserts missing index rows before readiness. Corrupt or mismatched
 metadata is logged and skipped: the rebuild never invents and never deletes a row. It runs in
 addition to the mandatory full reconciliation scan, and it creates no buckets, users or policies —
 a lost database still loses the namespace.

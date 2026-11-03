@@ -5,7 +5,7 @@ use crate::authz::Acl;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::object::{
     ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ExplicitObjectLockIntent,
-    StorageClass, UserMetadata,
+    MultipartPartRecord, StorageClass, UserMetadata,
 };
 use crate::time::Timestamp;
 use crate::{BlobError, MetaError};
@@ -525,17 +525,34 @@ impl StorageWritePlan {
 
 /// Versioned, canonical per-object metadata sidecar format (protocol 3, P1 dual-write).
 ///
-/// The sidecar sits beside the data file as `<final>.meta`. It is serialized JSON in v1, bounded by
-/// the existing object-metadata limits, and carries no secret plaintext: an SSE descriptor is the
-/// same sealed record SQLite stores, never a raw data-encryption key.
-pub const OBJECT_METADATA_FORMAT_VERSION: u32 = 1;
+/// The sidecar sits beside the data file as `<final>.meta`. It is serialized JSON, bounded by
+/// [`OBJECT_METADATA_MAX_BYTES`], and carries no secret plaintext: an SSE descriptor is the same
+/// sealed record SQLite stores, never a raw data-encryption key.
+///
+/// v2 adds the optional completed-multipart part layout. v1 records remain readable; a v2 record
+/// must carry the layout and a v1 record must not, so a silently downgraded record cannot lose it.
+pub const OBJECT_METADATA_V2_FORMAT_VERSION: u32 = 2;
+
+/// The latest record generation this binary understands.
+pub const OBJECT_METADATA_FORMAT_VERSION: u32 = OBJECT_METADATA_V2_FORMAT_VERSION;
+
+/// The original metadata record generation, still written for objects without a part layout.
+pub const OBJECT_METADATA_V1_FORMAT_VERSION: u32 = 1;
+
+/// Hard bound on one encoded metadata record.
+///
+/// The record lives in an unauthenticated file trailer that startup recovery reads into memory, so
+/// its size must be bounded independently of the object it describes. One MiB is far above the S3
+/// object limits this record mirrors (2 KiB user metadata, 10 tags, one ACL) while keeping a
+/// corrupt length from turning restart into a large allocation.
+pub const OBJECT_METADATA_MAX_BYTES: usize = 1024 * 1024;
 
 /// One durable object metadata sidecar record. SQLite remains the ACK authority in P1; the record
 /// is written with the data file so a later protocol-3 phase can rebuild a missing index row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectMetadataRecord {
-    /// Format generation; v1 is the only accepted value in this phase.
+    /// Format generation: v1, or v2 when `multipart_parts` is present.
     pub format_version: u32,
     /// The owning bucket.
     pub bucket: BucketName,
@@ -549,6 +566,12 @@ pub struct ObjectMetadataRecord {
     pub is_delete_marker: bool,
     /// The plaintext length.
     pub size_logical: u64,
+    /// The ordered part layout of a completed multipart object, absent for an ordinary object.
+    ///
+    /// This is what keeps `GET`/`HEAD ?partNumber=N` available after a rebuild from the data
+    /// files alone. It is skipped when absent so an ordinary record stays byte-compatible with v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_parts: Option<Vec<MultipartPartRecord>>,
     /// The on-disk length after compression/encryption framing.
     pub size_physical: u64,
     /// The entity tag.
@@ -607,6 +630,8 @@ pub struct ObjectMetadataSeed {
     pub etag: Option<ETag>,
     pub row_id: String,
     pub is_delete_marker: bool,
+    /// The completed-multipart part layout, when the write is an assembly.
+    pub multipart_parts: Option<Vec<MultipartPartRecord>>,
     pub content_type: String,
     pub content_encoding: Option<String>,
     pub cache_control: Option<String>,
@@ -621,6 +646,10 @@ pub struct ObjectMetadataSeed {
     /// Checksum algorithms that belong on the row. Verification-only digests are computed but not
     /// recorded, matching the protocol's post-stage filtering.
     pub stored_checksums: ChecksumSet,
+    /// Exact checksums to record instead of selecting them from the staged blob. Multipart
+    /// COMPOSITE values are composed from the part digests before assembly, so `assemble` never
+    /// computes them and the sidecar must carry the completed value explicitly.
+    pub checksums: Option<Vec<ChecksumValue>>,
     pub sse_descriptor: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -637,8 +666,7 @@ pub const INLINE_TRAILER_FIXED: usize = 4 + 8 + 4;
 impl ObjectMetadataRecord {
     /// Encode the metadata JSON and its trailer for a file that already holds `payload_len` bytes.
     pub fn encode_inline_trailer(&self, payload_len: u64) -> Result<Vec<u8>, MetaError> {
-        let json =
-            serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))?;
+        let json = self.encode()?;
         let meta_len = u32::try_from(json.len())
             .map_err(|_| MetaError::Engine("inline metadata exceeds 4 GiB".into()))?;
         let mut out = Vec::with_capacity(json.len() + INLINE_TRAILER_FIXED);
@@ -680,8 +708,12 @@ impl ObjectMetadataRecord {
         if suffix.len() != meta_len + INLINE_TRAILER_FIXED {
             return Err(MetaError::Engine("inline metadata length mismatch".into()));
         }
-        let record: Self = serde_json::from_slice(&suffix[..meta_len])
-            .map_err(|error| MetaError::Engine(error.to_string()))?;
+        // A trailer larger than the record bound was not written by this format; it is not our
+        // metadata rather than a record to parse.
+        if meta_len > OBJECT_METADATA_MAX_BYTES {
+            return Ok(None);
+        }
+        let record = Self::decode(&suffix[..meta_len])?;
         Ok(Some((record, payload_len)))
     }
 }
@@ -690,14 +722,22 @@ impl ObjectMetadataRecord {
     /// Bind the pre-stage fields to the exact staged blob.
     #[must_use]
     pub fn from_staged(seed: &ObjectMetadataSeed, staged: &crate::blob::StagedBlob) -> Self {
+        // Only a record that actually carries a layout advertises v2, so v1 stays the common case
+        // and an older binary can still read every ordinary object's sidecar.
+        let format_version = if seed.multipart_parts.is_some() {
+            OBJECT_METADATA_V2_FORMAT_VERSION
+        } else {
+            OBJECT_METADATA_V1_FORMAT_VERSION
+        };
         Self {
-            format_version: OBJECT_METADATA_FORMAT_VERSION,
+            format_version,
             bucket: seed.bucket.clone(),
             key: seed.key.clone(),
             version_id: seed.version_id.clone(),
             row_id: seed.row_id.clone(),
             is_delete_marker: seed.is_delete_marker,
             size_logical: staged.size_logical,
+            multipart_parts: seed.multipart_parts.clone(),
             size_physical: staged.size_physical,
             etag: seed.etag.clone().unwrap_or_else(|| staged.etag.clone()),
             content_type: seed.content_type.clone(),
@@ -713,12 +753,14 @@ impl ObjectMetadataRecord {
             owner_id: seed.owner_id.clone(),
             user_metadata: seed.user_metadata.clone(),
             acl: seed.acl.clone(),
-            checksums: staged
-                .checksums
-                .iter()
-                .filter(|checksum| seed.stored_checksums.0.contains(&checksum.algorithm))
-                .cloned()
-                .collect(),
+            checksums: seed.checksums.clone().unwrap_or_else(|| {
+                staged
+                    .checksums
+                    .iter()
+                    .filter(|checksum| seed.stored_checksums.0.contains(&checksum.algorithm))
+                    .cloned()
+                    .collect()
+            }),
             sse_descriptor: seed.sse_descriptor.clone(),
             internal_sha256: Some(staged.internal_sha256.clone()),
             created_at: seed.created_at,
@@ -730,17 +772,31 @@ impl ObjectMetadataRecord {
 
     /// Canonical bytes for the sidecar file.
     pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
-        serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))?;
+        if bytes.len() > OBJECT_METADATA_MAX_BYTES {
+            return Err(invalid("object metadata record exceeds its 1 MiB bound"));
+        }
+        Ok(bytes)
     }
 
-    /// Parse and reject an unsupported format generation.
+    /// Parse one bounded record and reject an unsupported or inconsistent format generation.
     pub fn decode(bytes: &[u8]) -> Result<Self, MetaError> {
+        if bytes.len() > OBJECT_METADATA_MAX_BYTES {
+            return Err(invalid("object metadata record exceeds its 1 MiB bound"));
+        }
         let record: Self =
             serde_json::from_slice(bytes).map_err(|error| MetaError::Engine(error.to_string()))?;
-        if record.format_version != OBJECT_METADATA_FORMAT_VERSION {
-            return Err(invalid("unsupported object metadata format version"));
+        match record.format_version {
+            OBJECT_METADATA_V1_FORMAT_VERSION if record.multipart_parts.is_some() => Err(invalid(
+                "object metadata v1 must not carry a multipart part layout",
+            )),
+            OBJECT_METADATA_V2_FORMAT_VERSION if record.multipart_parts.is_none() => Err(invalid(
+                "object metadata v2 requires a multipart part layout",
+            )),
+            OBJECT_METADATA_V1_FORMAT_VERSION | OBJECT_METADATA_V2_FORMAT_VERSION => Ok(record),
+            _ => Err(invalid("unsupported object metadata format version")),
         }
-        Ok(record)
     }
 }
 
@@ -953,7 +1009,146 @@ pub fn validate_unadmitted_mutation(operation: &crate::meta::Mutation) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::ChecksumAlgorithm;
     use std::sync::Arc;
+
+    fn metadata_seed(parts: Option<Vec<MultipartPartRecord>>) -> ObjectMetadataSeed {
+        ObjectMetadataSeed {
+            bucket: BucketName::parse("bucket").unwrap(),
+            key: ObjectKey::parse("key").unwrap(),
+            version_id: VersionId::null(),
+            etag: None,
+            row_id: "row-1".to_owned(),
+            is_delete_marker: false,
+            multipart_parts: parts,
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_class: StorageClass::Standard,
+            owner_id: UserId("owner".to_owned()),
+            user_metadata: Vec::new(),
+            acl: None,
+            stored_checksums: ChecksumSet::none(),
+            checksums: None,
+            sse_descriptor: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(2),
+            tags: Vec::new(),
+            lock_intent: ExplicitObjectLockIntent::default(),
+        }
+    }
+
+    fn staged_blob() -> crate::blob::StagedBlob {
+        let path = StoragePath::generate(&BucketName::parse("bucket").unwrap());
+        crate::blob::StagedBlob {
+            storage_path: path,
+            size_logical: 11,
+            size_physical: 11,
+            etag: ETag::from_md5_hex("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned()),
+            md5_hex: "5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned(),
+            internal_sha256: "00".repeat(32),
+            checksums: Vec::new(),
+            compression: CompressionDescriptor::Uncompressed,
+            index_spool: crate::blob::IndexSpoolState::NeverCreated,
+        }
+    }
+
+    #[test]
+    fn v1_records_stay_plain_and_v2_records_carry_the_part_layout() {
+        let ordinary = ObjectMetadataRecord::from_staged(&metadata_seed(None), &staged_blob());
+        assert_eq!(ordinary.format_version, OBJECT_METADATA_V1_FORMAT_VERSION);
+        let encoded = ordinary.encode().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("multipart_parts"));
+        assert_eq!(ObjectMetadataRecord::decode(&encoded).unwrap(), ordinary);
+
+        let parts = vec![
+            MultipartPartRecord {
+                part_number: 1,
+                size: 5,
+            },
+            MultipartPartRecord {
+                part_number: 3,
+                size: 6,
+            },
+        ];
+        let assembled =
+            ObjectMetadataRecord::from_staged(&metadata_seed(Some(parts.clone())), &staged_blob());
+        assert_eq!(assembled.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(assembled.multipart_parts.as_deref(), Some(parts.as_slice()));
+        let encoded = assembled.encode().unwrap();
+        let decoded = ObjectMetadataRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded, assembled);
+        assert_eq!(decoded.multipart_parts.as_deref(), Some(parts.as_slice()));
+
+        // A pre-composed checksum (multipart COMPOSITE, or a replica's pinned value) is recorded
+        // verbatim instead of being looked up among the staged digests.
+        let mut seeded = metadata_seed(None);
+        seeded.checksums = Some(vec![ChecksumValue {
+            algorithm: ChecksumAlgorithm::Crc32,
+            value: "AAAAAA==-2".to_owned(),
+        }]);
+        let with_composite = ObjectMetadataRecord::from_staged(&seeded, &staged_blob());
+        assert_eq!(with_composite.checksums, seeded.checksums.clone().unwrap());
+
+        // The layout also survives the inline trailer codec.
+        let trailer = assembled.encode_inline_trailer(11).unwrap();
+        let (inline, payload) = ObjectMetadataRecord::decode_inline_suffix(&trailer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload, 11);
+        assert_eq!(inline, assembled);
+    }
+
+    #[test]
+    fn a_generation_that_disagrees_with_its_layout_is_rejected() {
+        let ordinary = ObjectMetadataRecord::from_staged(&metadata_seed(None), &staged_blob());
+        let mut v1_with_parts: serde_json::Value =
+            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        v1_with_parts["multipart_parts"] = serde_json::json!([{"part_number": 1, "size": 11}]);
+        assert!(
+            ObjectMetadataRecord::decode(&serde_json::to_vec(&v1_with_parts).unwrap()).is_err()
+        );
+
+        let mut v2_without_parts: serde_json::Value =
+            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        v2_without_parts["format_version"] = serde_json::json!(OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert!(
+            ObjectMetadataRecord::decode(&serde_json::to_vec(&v2_without_parts).unwrap()).is_err()
+        );
+
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        unknown["format_version"] = serde_json::json!(99);
+        assert!(ObjectMetadataRecord::decode(&serde_json::to_vec(&unknown).unwrap()).is_err());
+    }
+
+    #[test]
+    fn an_oversized_record_is_refused_on_both_encode_and_decode() {
+        let mut seed = metadata_seed(None);
+        seed.user_metadata.push((
+            "oversized".to_owned(),
+            "x".repeat(OBJECT_METADATA_MAX_BYTES),
+        ));
+        let record = ObjectMetadataRecord::from_staged(&seed, &staged_blob());
+        assert!(record.encode().is_err());
+        assert!(record.encode_inline_trailer(11).is_err());
+        assert!(ObjectMetadataRecord::decode(&vec![b' '; OBJECT_METADATA_MAX_BYTES + 1]).is_err());
+
+        // A trailer that declares an over-bound record is not our metadata: skip it, never parse it.
+        let meta_len = OBJECT_METADATA_MAX_BYTES + 1;
+        let mut suffix = vec![0u8; meta_len + INLINE_TRAILER_FIXED];
+        suffix[meta_len..meta_len + 4].copy_from_slice(&(meta_len as u32).to_le_bytes());
+        suffix[meta_len + 12..].copy_from_slice(&INLINE_TRAILER_MAGIC);
+        assert!(
+            ObjectMetadataRecord::decode_inline_suffix(&suffix)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn object_plan() -> PlannedStorageWrite {
         PlannedStorageWrite::new(

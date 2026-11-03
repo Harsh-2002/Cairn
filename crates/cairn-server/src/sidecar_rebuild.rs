@@ -251,11 +251,10 @@ fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaE
         return Ok(None);
     }
     let meta_len = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes")) as u64;
-    // The trailer lives in bytes an unauthenticated writer can choose (a multipart assembly carries
-    // no metadata record), so an implausible declared length is not our metadata: skip it instead of
-    // allocating up to the object size on every restart.
-    const MAX_INLINE_RECORD: u64 = 64 * 1024;
-    if meta_len > MAX_INLINE_RECORD {
+    // The trailer lives in bytes an unauthenticated writer can choose, so an implausible declared
+    // length is not our metadata: skip it instead of allocating up to the object size on every
+    // restart.
+    if meta_len > cairn_types::storage::OBJECT_METADATA_MAX_BYTES as u64 {
         return Ok(None);
     }
     let suffix_len = meta_len
@@ -280,6 +279,16 @@ fn read_inline_record(path: &Path) -> Result<Option<ObjectMetadataRecord>, MetaE
 }
 
 fn read_sidecar(path: &Path) -> Result<ObjectMetadataRecord, MetaError> {
+    // Check the bound before reading: a corrupt or hostile sidecar must not make startup allocate
+    // an arbitrarily large buffer just to reject it.
+    let len = std::fs::metadata(path)
+        .map_err(|error| MetaError::Engine(error.to_string()))?
+        .len();
+    if len > cairn_types::storage::OBJECT_METADATA_MAX_BYTES as u64 {
+        return Err(MetaError::Engine(
+            "object metadata sidecar exceeds its 1 MiB bound".into(),
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|error| MetaError::Engine(error.to_string()))?;
     ObjectMetadataRecord::decode(&bytes)
 }
@@ -396,14 +405,16 @@ fn rebuilt_row(record: &ObjectMetadataRecord) -> ObjectVersionRow {
         acl: record.acl.clone(),
         checksums: record.checksums.clone(),
         sse_descriptor: record.sse_descriptor.clone(),
-        // Replication intent is not part of the v1 sidecar; a rebuilt row is not a replica, and the
+        // Replication intent is not part of the sidecar; a rebuilt row is not a replica, and the
         // pre-crash tail may need a replication rescan. Tracked as a known limitation.
         replication_status: None,
         internal_sha256: record.internal_sha256.clone(),
         replicated_at: None,
         created_at: record.created_at,
         updated_at: record.updated_at,
-        multipart_parts: None,
+        // A completed multipart object's v2 record carries its part layout, so `?partNumber`
+        // survives a rebuild. Older v1 assembled-object sidecars restore the row without it.
+        multipart_parts: record.multipart_parts.clone(),
     }
 }
 
@@ -422,6 +433,198 @@ mod tests {
         assert!(!supersedes(Timestamp(5), "a", Timestamp(5), "b"));
         // The same row never supersedes itself.
         assert!(!supersedes(Timestamp(5), "a", Timestamp(5), "a"));
+    }
+
+    #[test]
+    fn a_rebuilt_multipart_row_keeps_the_part_layout() {
+        use cairn_types::object::{
+            ChecksumSet, CompressionDescriptor, ETag, ExplicitObjectLockIntent,
+            MultipartPartRecord, StorageClass,
+        };
+        use cairn_types::storage::{
+            OBJECT_METADATA_V2_FORMAT_VERSION, ObjectMetadataRecord, ObjectMetadataSeed,
+        };
+        use cairn_types::{BucketName, ObjectKey, StoragePath, UserId, VersionId};
+
+        let bucket = BucketName::parse("bucket").unwrap();
+        let parts = vec![
+            MultipartPartRecord {
+                part_number: 1,
+                size: 5,
+            },
+            MultipartPartRecord {
+                part_number: 3,
+                size: 6,
+            },
+        ];
+        let seed = ObjectMetadataSeed {
+            bucket: bucket.clone(),
+            key: ObjectKey::parse("assembled.bin").unwrap(),
+            version_id: VersionId::null(),
+            etag: Some(ETag::from_md5_hex("0".repeat(32))),
+            row_id: "row-1".to_owned(),
+            is_delete_marker: false,
+            multipart_parts: Some(parts.clone()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_class: StorageClass::Standard,
+            owner_id: UserId("owner".to_owned()),
+            user_metadata: Vec::new(),
+            acl: None,
+            stored_checksums: ChecksumSet::none(),
+            checksums: None,
+            sse_descriptor: None,
+            created_at: cairn_types::Timestamp(1),
+            updated_at: cairn_types::Timestamp(2),
+            tags: Vec::new(),
+            lock_intent: ExplicitObjectLockIntent::default(),
+        };
+        let staged = cairn_types::StagedBlob {
+            storage_path: StoragePath::generate(&bucket),
+            size_logical: 11,
+            size_physical: 11,
+            etag: ETag::from_md5_hex("0".repeat(32)),
+            md5_hex: "0".repeat(32),
+            internal_sha256: "0".repeat(64),
+            checksums: Vec::new(),
+            compression: CompressionDescriptor::Uncompressed,
+            index_spool: IndexSpoolState::NeverCreated,
+        };
+        let record = ObjectMetadataRecord::from_staged(&seed, &staged);
+        assert_eq!(record.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+
+        let row = rebuilt_row(&record);
+        assert_eq!(row.multipart_parts.as_deref(), Some(parts.as_slice()));
+
+        // A v1 record has no layout; it restores the row without inventing parts.
+        let mut legacy = record.clone();
+        legacy.format_version = cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION;
+        legacy.multipart_parts = None;
+        assert!(rebuilt_row(&legacy).multipart_parts.is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_a_multipart_row_and_its_part_layout_end_to_end() {
+        use cairn_types::object::{
+            ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag,
+            ExplicitObjectLockIntent, MultipartPartRecord, StorageClass,
+        };
+        use cairn_types::storage::{ObjectMetadataRecord, ObjectMetadataSeed};
+        use cairn_types::testing::InMemoryMetadataStore;
+        use cairn_types::{
+            BucketName, Mutation, MutationOutcome, ObjectKey, OwnershipMode, StoragePath,
+            Timestamp, UserId, VersionId, VersioningState,
+        };
+
+        let bucket = cairn_types::Bucket {
+            name: BucketName::parse("rebuilt-bucket").unwrap(),
+            owner_id: UserId("owner".to_owned()),
+            created_at: Timestamp(0),
+            versioning: VersioningState::Unversioned,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        };
+        let meta = InMemoryMetadataStore::new();
+        meta.submit(Mutation::CreateBucket(Box::new(bucket.clone())))
+            .await
+            .unwrap();
+        let generation = StorageToken::generate();
+        assert_eq!(
+            meta.submit(Mutation::BeginStorageGeneration {
+                generation: generation.clone(),
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::Ack
+        );
+
+        let key = ObjectKey::parse("assembled.bin").unwrap();
+        let version_id = VersionId::null();
+        let parts = vec![
+            MultipartPartRecord {
+                part_number: 1,
+                size: 5,
+            },
+            MultipartPartRecord {
+                part_number: 3,
+                size: 6,
+            },
+        ];
+        let storage_path = StoragePath::from_string(format!(
+            "{}/{}",
+            bucket.name.as_str(),
+            StorageToken::generate().as_str()
+        ));
+        let checksums = vec![ChecksumValue {
+            algorithm: ChecksumAlgorithm::Crc32,
+            value: "AAAAAA==-2".to_owned(),
+        }];
+        let seed = ObjectMetadataSeed {
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            etag: Some(ETag::from_md5_hex("0".repeat(32))),
+            row_id: StorageToken::generate().as_str().to_owned(),
+            is_delete_marker: false,
+            multipart_parts: Some(parts.clone()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_class: StorageClass::Standard,
+            owner_id: UserId("owner".to_owned()),
+            user_metadata: Vec::new(),
+            acl: None,
+            stored_checksums: ChecksumSet::none(),
+            checksums: Some(checksums.clone()),
+            sse_descriptor: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(2),
+            tags: Vec::new(),
+            lock_intent: ExplicitObjectLockIntent::default(),
+        };
+        let staged = cairn_types::StagedBlob {
+            storage_path: storage_path.clone(),
+            size_logical: 11,
+            size_physical: 11,
+            etag: ETag::from_md5_hex("0".repeat(32)),
+            md5_hex: "0".repeat(32),
+            internal_sha256: "0".repeat(64),
+            checksums: Vec::new(),
+            compression: CompressionDescriptor::Uncompressed,
+            index_spool: IndexSpoolState::NeverCreated,
+        };
+        let record = ObjectMetadataRecord::from_staged(&seed, &staged);
+        let dir = tempfile::tempdir().unwrap();
+        let data_file = dir.path().join(storage_path.as_str());
+        std::fs::create_dir_all(data_file.parent().unwrap()).unwrap();
+        std::fs::write(&data_file, b"hello world").unwrap();
+        std::fs::write(
+            dir.path().join(format!("{}.meta", storage_path.as_str())),
+            record.encode().unwrap(),
+        )
+        .unwrap();
+
+        let report = rebuild_missing_object_rows(&meta, dir.path(), &generation).await;
+        assert_eq!(report.inserted, 1, "{report:?}");
+        let row = meta
+            .get_version(&bucket.name, &key, &version_id)
+            .await
+            .unwrap()
+            .expect("rebuilt row");
+        assert_eq!(row.id, record.row_id);
+        assert_eq!(row.etag, record.etag);
+        assert_eq!(row.multipart_parts.as_deref(), Some(parts.as_slice()));
+        assert_eq!(row.checksums, checksums);
     }
 
     #[test]

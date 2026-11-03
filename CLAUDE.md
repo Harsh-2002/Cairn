@@ -194,4 +194,7 @@ mandatory. The data namespace requires Linux 5.6+ `openat2` and refuses descenda
 Storage protocol 3 keeps durable admission for multipart writes, fences ordinary writes with the
 single publication savepoint, rebuilds the object index from the object files at startup, and owes
 no cleanup debt for a consumed staging alias on a successful publication. A plaintext object is one
-file ending in its `CRNI` trailer; compressed and encrypted objects also keep `<uuid>.meta`.
+file ending in its `CRNI` trailer; compressed and encrypted objects also keep `<uuid>.meta`. A
+completed multipart object keeps `<uuid>.meta` too: a `format_version=2` record with the ordered
+part layout, so startup rebuild restores `?partNumber`; v1 records (and pre-sidecar assemblies)
+restore the row but fail part-number reads closed.
