@@ -310,6 +310,7 @@ async fn put_object_with_lock(
         replicated_at: None,
         created_at: now,
         updated_at: now,
+        multipart_parts: None,
     };
     h.meta
         .submit(
@@ -2213,6 +2214,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         replicated_at: None,
         created_at: now,
         updated_at: now,
+        multipart_parts: None,
     };
     h.meta
         .submit_fixture(
@@ -3076,6 +3078,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         replicated_at: None,
         created_at: now,
         updated_at: now,
+        multipart_parts: None,
     };
     h.meta
         .submit_fixture(
@@ -3690,6 +3693,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         replicated_at: None,
         created_at: now,
         updated_at: now,
+        multipart_parts: None,
     };
     h.meta
         .submit_fixture(

@@ -35,7 +35,7 @@ metadata commit is **the single linearization point of control-plane and multipa
   quiescence resolution, bounded intent recovery and leased cleanup. Validate the normalized
   path/upload/reservation index against each persisted plan; mirror SQL and typed outcomes across
   both metadata crates and the in-memory double.
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 38 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 41 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
@@ -43,7 +43,9 @@ metadata commit is **the single linearization point of control-plane and multipa
   reservations, cleanup debt, and quota/cardinality counters v26; multipart initial tags/Object
   Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27; lifecycle row identity
   in the partial current-listing covering index v28; exact-token multipart completion ownership
-  v29); never edit an applied migration, never reorder — add a new one.
+  v29; multipart download filename metadata v39; object TTL expiry and its indexes v40; multipart
+  completed-object part layout for `GET`/`HEAD ?partNumber` v41); never edit an applied migration,
+  never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.
 - `range.rs` — `successor`/`prefix_upper_bound` for the listing range seek (UTF-8 byte order);

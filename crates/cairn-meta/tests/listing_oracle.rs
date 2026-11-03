@@ -52,6 +52,7 @@ fn row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
+        multipart_parts: None,
     }
 }
 

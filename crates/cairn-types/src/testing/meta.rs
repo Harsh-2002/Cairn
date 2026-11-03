@@ -2455,6 +2455,7 @@ impl State {
                     replicated_at: None,
                     created_at: now,
                     updated_at: now,
+                    multipart_parts: None,
                 };
                 // Presence of a malformed/disabled lock configuration is itself fatal. A generated
                 // marker receives neither tags nor default retention.
@@ -3804,6 +3805,7 @@ mod tests {
             replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
+            multipart_parts: None,
         }
     }
 

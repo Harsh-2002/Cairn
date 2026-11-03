@@ -974,6 +974,17 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
     WHERE is_latest = 1;
 "#,
     },
+    Migration {
+        version: 41,
+        name: "multipart completed-object part layout",
+        sql: r#"
+-- A completed multipart object keeps its ordered part layout so GET/HEAD ?partNumber=N can
+-- serve the exact part after the staging rows retire with the session. JSON array of
+-- {part_number,size} records; part numbers need not be contiguous. NULL for single-part PUTs,
+-- copies and pre-upgrade objects.
+ALTER TABLE object_versions ADD COLUMN multipart_parts TEXT;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -2141,6 +2152,14 @@ mod tests {
             columns.iter().any(|column| column == "expire_at"),
             "the current-listing cover must carry expire_at for expiry filtering"
         );
+    }
+
+    #[test]
+    fn migration_v41_adds_multipart_part_layout() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 40);
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "object_versions", "multipart_parts"));
     }
 
     #[test]

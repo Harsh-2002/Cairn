@@ -2737,6 +2737,7 @@ mod tests {
                 replicated_at: None,
                 created_at: Timestamp(1),
                 updated_at: Timestamp(1),
+                multipart_parts: None,
             };
             assert!(matches!(
                 stack
@@ -3313,6 +3314,7 @@ mod tests {
                 replicated_at: None,
                 created_at: Timestamp(0),
                 updated_at: Timestamp(0),
+                multipart_parts: None,
             }
         }
 

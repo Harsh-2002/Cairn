@@ -684,6 +684,7 @@ mod tests {
             replicated_at,
             created_at,
             updated_at: created_at,
+            multipart_parts: None,
         };
         meta.submit_fixture(
             fixture,

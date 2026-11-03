@@ -2956,6 +2956,7 @@ mod tests {
             replicated_at: None,
             created_at: now,
             updated_at: now,
+            multipart_parts: None,
         }
     }
 

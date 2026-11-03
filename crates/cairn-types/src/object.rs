@@ -265,8 +265,27 @@ pub struct ObjectVersionRow {
     /// `Completed`, and `created_at` is never rewritten). It is deliberately **not** `updated_at`,
     /// which feeds the client-visible S3 `LastModified`.
     pub replicated_at: Option<Timestamp>,
+    /// Ordered parts that formed this object when it was completed by `CompleteMultipartUpload`.
+    /// `None` for a single-part PUT, a copy, an object created before this was recorded, or an
+    /// object assembled by a backend that does not retain the layout. `Some` enables
+    /// `GET`/`HEAD` `?partNumber=N`; the part number is the S3 identifier, so numbers need not be
+    /// contiguous (§ part-number reads use the recorded number, not the array position).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_parts: Option<Vec<MultipartPartRecord>>,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.
     pub updated_at: Timestamp,
+}
+
+/// One part of a completed multipart object: its S3 part number and plaintext size.
+///
+/// Part numbers are ascending but not necessarily contiguous (S3 accepts 1, 3, 5), so the number
+/// is stored explicitly rather than inferred from the array position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartPartRecord {
+    /// The S3 part number (1..=10,000).
+    pub part_number: u16,
+    /// The plaintext length of this part.
+    pub size: u64,
 }

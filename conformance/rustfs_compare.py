@@ -399,7 +399,14 @@ def parse_warp(output, operation):
             "analyzed_seconds": float(ran.group(1)) if ran else None,
             "request_latency_ms": latency,
         }
-    target = reports.get("TOTAL" if operation == "mixed" else operation.upper(), {})
+    # Warp's `multipart` command uploads the parts and then reports the scored phase as `GET`
+    # (the part downloads); there is no `MULTIPART` report block to select.
+    target_name = (
+        "TOTAL" if operation == "mixed"
+        else "GET" if operation == "multipart"
+        else operation.upper()
+    )
+    target = reports.get(target_name, {})
     line = target.get("summary")
     if operation == "mixed" and line is None:
         cluster = re.search(r"^Cluster Total:.*$", text, re.MULTILINE)

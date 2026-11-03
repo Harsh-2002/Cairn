@@ -21,7 +21,7 @@ authorizes.
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |
 | ListMultipartUploads | ✅ | |
 | PutObject | ✅ | Plain, unsigned-payload, and **SigV4 streaming-chunked** bodies; conditional writes (If-Match / If-None-Match); inline metadata; Content-MD5 verification. **Flexible checksums** (CRC32, CRC32C, **CRC-64/NVME**, SHA-1, SHA-256): the default-on checksum every modern SDK sends is computed, verified (`BadDigest` on header mismatch), stored, and **echoed** on the response with `x-amz-checksum-type: FULL_OBJECT`. **Server-side encryption**: `x-amz-server-side-encryption: AES256` or `aws:kms` (`-aws-kms-key-id`, `-bucket-key-enabled`) mints a per-object DEK; a bucket default or `CAIRN_ENCRYPT_AT_REST` encrypts otherwise. |
-| GetObject / HeadObject | ✅ | Byte ranges (206), conditionals (304/412), version selection. **Echoes the stored `x-amz-checksum-<algo>`** on a whole-object read when the request sends `x-amz-checksum-mode: ENABLED` (never on a Range read). |
+| GetObject / HeadObject | ✅ | Byte ranges (206), part-number reads on locally completed multipart objects (206 + `Content-Range` + `x-amz-mp-parts-count`; a replicated object is a single-part copy), conditionals (304/412), version selection. **Echoes the stored `x-amz-checksum-<algo>`** on a whole-object read when the request sends `x-amz-checksum-mode: ENABLED` (never on a Range or part read). |
 | DeleteObject | ✅ | Delete marker in a versioned bucket; permanent with a version id. |
 | DeleteObjects (bulk) | ✅ | Quiet mode; up to the request cap. |
 | CopyObject | ✅ | COPY/REPLACE metadata directive; same-key metadata change; versioned source. |

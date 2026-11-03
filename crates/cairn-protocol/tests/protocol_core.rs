@@ -1464,6 +1464,45 @@ async fn full_object_lifecycle() {
     assert_eq!(body, b"hello");
     assert_eq!(header(&hdrs, "content-range"), Some("bytes 0-4/11"));
 
+    // A single-part object has no multipart layout: part 1 is the whole object, part 2 is invalid.
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("my-bucket"),
+                Some("docs/a.txt"),
+                &[("partNumber", "1")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"hello world");
+    assert_eq!(header(&hdrs, "content-length"), Some("11"));
+    assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), None);
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("my-bucket"),
+                Some("docs/a.txt"),
+                &[("partNumber", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("InvalidPart"));
+
     // Conditional If-None-Match with the current ETag -> 304.
     let (st, _, _) = drain(
         send(
@@ -2603,7 +2642,7 @@ async fn multipart_lifecycle() {
                 Method::PUT,
                 Some("mpb"),
                 Some("big.bin"),
-                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[("uploadId", upload_id.as_str()), ("partNumber", "3")],
                 &[],
                 part2.clone(),
             ),
@@ -2611,12 +2650,12 @@ async fn multipart_lifecycle() {
         .await,
     )
     .await;
-    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+    let etag3 = header(&hdrs, "etag").unwrap().to_owned();
 
-    // Complete.
+    // Complete. Part numbers are deliberately non-contiguous (1 and 3), which S3 permits.
     let complete = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
-         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+         <Part><PartNumber>3</PartNumber><ETag>{etag3}</ETag></Part></CompleteMultipartUpload>"
     );
     let (st, _, body) = drain(
         send(
@@ -2653,6 +2692,112 @@ async fn multipart_lifecycle() {
     expected.extend_from_slice(&part2);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
+
+    // A completed multipart object retains its part layout and serves GET/HEAD ?partNumber.
+    let (st, hdrs, got_part) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("partNumber", "1")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got_part, part1);
+    assert_eq!(header(&hdrs, "content-length"), Some("5242880"));
+    assert_eq!(
+        header(&hdrs, "content-range"),
+        Some("bytes 0-5242879/5242888")
+    );
+    assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), Some("2"));
+
+    let (st, hdrs, got_part) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("partNumber", "3")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got_part, part2);
+    assert_eq!(header(&hdrs, "content-length"), Some("8"));
+    assert_eq!(
+        header(&hdrs, "content-range"),
+        Some("bytes 5242880-5242887/5242888")
+    );
+    assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), Some("2"));
+
+    let (st, hdrs, got_part) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("partNumber", "3")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert!(got_part.is_empty());
+    assert_eq!(header(&hdrs, "content-length"), Some("8"));
+    assert_eq!(
+        header(&hdrs, "content-range"),
+        Some("bytes 5242880-5242887/5242888")
+    );
+    assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), Some("2"));
+
+    for (query, headers, expected_code) in [
+        (&[("partNumber", "2")][..], &[][..], "InvalidPart"),
+        (&[("partNumber", "4")][..], &[][..], "InvalidPart"),
+        (&[("partNumber", "0")][..], &[][..], "InvalidArgument"),
+        (
+            &[("partNumber", "3")][..],
+            &[("range", "bytes=0-99")][..],
+            "InvalidArgument",
+        ),
+    ] {
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::GET,
+                    Some("mpb"),
+                    Some("big.bin"),
+                    query,
+                    headers,
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{expected_code}");
+        assert!(
+            String::from_utf8_lossy(&body).contains(expected_code),
+            "expected {expected_code} in {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     use sha2::{Digest, Sha256};
     let row = h
         .meta
@@ -2663,6 +2808,19 @@ async fn multipart_lifecycle() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        row.multipart_parts,
+        Some(vec![
+            cairn_types::object::MultipartPartRecord {
+                part_number: 1,
+                size: part1.len() as u64,
+            },
+            cairn_types::object::MultipartPartRecord {
+                part_number: 3,
+                size: part2.len() as u64,
+            },
+        ])
+    );
     assert_eq!(
         row.internal_sha256,
         Some(hex::encode(Sha256::digest(&expected)))

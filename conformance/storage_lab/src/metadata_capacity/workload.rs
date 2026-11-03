@@ -215,6 +215,7 @@ fn row(bucket: &BucketName, key: ObjectKey, version_id: VersionId) -> ObjectVers
         internal_sha256: None,
         replication_status: None,
         replicated_at: None,
+        multipart_parts: None,
         created_at: NOW,
         updated_at: NOW,
     }

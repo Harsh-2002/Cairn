@@ -16,14 +16,16 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   quiescence resolution, bounded intent recovery and leased cleanup. Validate the normalized
   path/upload/reservation index against each persisted plan; mirror SQL and typed outcomes across
   both metadata crates and the in-memory double.
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v38 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v41 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
   legacy-token sanitation v25; bounded multipart reservations/cleanup accounting v26; multipart
   initial tags/Object Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27;
   lifecycle row identity in the partial current-listing covering index v28; exact multipart
-  completion claim ownership tokens v29).
+  completion claim ownership tokens v29; multipart download filename metadata v39; object TTL
+  expiry and its indexes v40; multipart completed-object part layout for `GET`/`HEAD ?partNumber`
+  v41).
   Turso
   builders deliberately enable its experimental VACUUM support
   so a pending v25 sanitation marker can compact the local database before readers open.
