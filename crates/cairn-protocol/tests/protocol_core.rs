@@ -16958,6 +16958,34 @@ async fn multipart_sse_parts_are_ciphertext_and_object_roundtrips() {
         header(&hdrs, "x-amz-server-side-encryption"),
         Some("AES256")
     );
+
+    // A part read goes through the same decryption/range path as a whole-object read.
+    let (st, hdrs, got_part) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("msse"),
+                Some("big.bin"),
+                &[("partNumber", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got_part, part2);
+    assert_eq!(
+        header(&hdrs, "content-range"),
+        Some("bytes 6291456-6291463/6291464")
+    );
+    assert_eq!(header(&hdrs, "x-amz-mp-parts-count"), Some("2"));
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
 }
 
 /// The HIGH-finding regression: an SSE session mixing one UploadPart and one UploadPartCopy stages
