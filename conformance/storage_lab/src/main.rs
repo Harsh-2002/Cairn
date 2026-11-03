@@ -71,6 +71,7 @@ fn row(
         replication_status: None,
         internal_sha256: None,
         replicated_at: None,
+        multipart_part_sizes: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     }
