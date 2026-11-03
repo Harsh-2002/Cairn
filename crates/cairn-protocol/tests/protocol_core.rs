@@ -2892,6 +2892,18 @@ async fn multipart_lifecycle() {
         row.checksums.is_empty(),
         "internal digest must not become an S3 checksum"
     );
+
+    // A completed multipart object carries the same per-object metadata sidecar as an ordinary
+    // object, so a lost index can rebuild the row from the durable file.
+    let sidecar_path = h._dir.path().join(format!(
+        "{}.meta",
+        row.storage_path.as_ref().expect("assembled path").as_str()
+    ));
+    let sidecar = tokio::fs::read(&sidecar_path).await.unwrap();
+    let record = cairn_types::storage::ObjectMetadataRecord::decode(&sidecar).unwrap();
+    assert_eq!(record.row_id, row.id);
+    assert_eq!(record.etag, row.etag);
+    assert_eq!(record.size_logical, row.size_logical);
 }
 
 /// Audit 2026-07: an uploadId is scoped to its (bucket, key). Completing it against a different key

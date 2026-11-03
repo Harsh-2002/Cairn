@@ -1,6 +1,8 @@
 # Multipart follow-up decisions — 2026-11-03
 
-**Status:** accepted. Two fixes are merged or in review; the remaining work is phased.
+**Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, and the v1
+metadata sidecar for assembled objects are implemented; the part-layout record and performance
+work remain phased.
 
 Five parallel reviews covered the multipart upload path: replication layout, object-file authority,
 upload performance, benchmark methodology, and an independent architecture/security review. This
@@ -32,9 +34,11 @@ The docs now describe Cairn's behavior instead of claiming single-part parity.
 
 ## 2. Multipart object-file authority — phase 1, later
 
-**Decision:** extend protocol-3 file authority to new completed multipart objects, but as a
-separate storage-format increment after the replication fix. Until then, the part-number path fails
-closed when a composite ETag has no retained layout.
+**Decision:** extend protocol-3 file authority to new completed multipart objects in two stages.
+The first stage — a v1 `<uuid>.meta` sidecar on every assembled object, written from the completion
+plan and committed before the directory barrier — is implemented. It restores the object row after
+index loss but does not carry the part layout; `?partNumber` fails closed after such a rebuild. The
+second stage adds the part layout to a v2 record with a 1 MiB bound and restores it on rebuild.
 
 **Why:** a completed multipart object has no trailer and no `.meta` sidecar. `CompleteMultipartUpload`
 commits at `synchronous=FULL`, so a crash after ACK is safe; the exposure is a lost/corrupt SQLite
@@ -43,7 +47,7 @@ mandatory reconciliation scan treats the headerless object as unreferenced and e
 it. The object's durable file is therefore not the authority for this object class, contrary to the
 protocol-3 contract.
 
-**Design (phase 1):**
+**Design (phase 1b, after the shipped v1 sidecar):**
 
 - Plaintext assemblies get the inline `CRNI` trailer; compressed/encrypted assemblies get a
   `<uuid>.meta` sidecar because the container trailer must stay last.

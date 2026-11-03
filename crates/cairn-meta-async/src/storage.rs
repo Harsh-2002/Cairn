@@ -493,8 +493,10 @@ pub(crate) async fn resolve_paths(
     plan: &StorageWritePlan,
     index_spool: IndexSpoolState,
 ) -> R<()> {
-    let published_object = matches!(plan.target, StorageWriteTarget::Object { .. })
-        && referenced(db, plan.final_path()?).await?;
+    let published_object = matches!(
+        plan.target,
+        StorageWriteTarget::Object { .. } | StorageWriteTarget::Completion { .. }
+    ) && referenced(db, plan.final_path()?).await?;
     let owner = matches!(plan.target, StorageWriteTarget::Part { .. })
         .then(|| plan.final_path())
         .transpose()?;
