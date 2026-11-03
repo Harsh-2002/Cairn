@@ -148,6 +148,15 @@ blob stage (input, hash, sink, fsync) is. Assembly p50 was 340.5 ms and durabili
 same load. The single-post-stage publication therefore remains gated and is not pursued from this
 measurement; the body/sink work needs its own A/B.
 
+**Body/sink buffer A/B (2026-11-03, negative):** a 1 MiB part-staging buffer (parts only, so
+ordinary small writes keep 256 KiB) moved the direct p50 sink+finalize pair from 28–32 ms to
+20–25 ms across three runs, but client input wait varied 24–32 ms and the scored part body/throughput
+did not improve: body p50 stayed 59–76 ms and every run landed near 68 obj/s. The scored shape is
+client-paced, so the sink reduction was hidden by input scheduling; the change also reserves 1 MiB
+per in-flight part. Keep the 256 KiB buffer and do not carry the change. The remaining part cost is
+input wait (client), MD5 (~15 ms; the SIMD-backend experiment was already neutral), and the sink
+itself; there is no measured server-side win left in this shape.
+
 **Conditions if the single post-stage publication is built later:**
 
 - One durable publication after staging, still `synchronous=FULL`; never add it to the Writer's
