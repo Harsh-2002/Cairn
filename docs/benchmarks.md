@@ -692,7 +692,7 @@ durability-equivalence proof.
 | GET 4 KiB, c16 (3 pairs) | 14,781 obj/s | 13,299 obj/s | **1.11×** |
 | HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
 | Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
-| Multipart upload, 10×5 MiB (1 pair, after #158) | 48.9 obj/s | 71.1 obj/s | **0.69×** |
+| Multipart upload, 10×5 MiB (3 pairs, after #168) | 49.7 obj/s | 64.4 obj/s | **0.77×** |
 | DELETE 4 KiB, c16, batch 100 | 4,051 obj/s (20k objects) | 243 obj/s (6.4k objects) | **not comparable** |
 
 Notes:
@@ -704,7 +704,10 @@ Notes:
   comparison needs a prefill plus `--list-existing` with the same pool and a measured window of at
   least seven seconds; until then, this row is a diagnostic observation, not a score.
 - Multipart upload was 0.59× over three pairs before #158; the part-hash fix raised the
-  single-pair result to 0.69×. The measured split and remaining I/O/durability work are in
+  single-pair result to 0.69×. The assembly MD5 elision in #168 then measured 0.77× over three
+  pairs (49.7 vs 64.4 obj/s; per-pair ratios 0.74, 0.81 and 0.76). The host is noisy, so treat the
+  direction as the signal, not the third digit. The measured split and remaining I/O/durability
+  work are in
   [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
@@ -730,3 +733,12 @@ upload, metadata commits and the rest of the S3 request path. A permanent test
 (`assembly_with_an_explicit_etag_skips_the_unused_full_object_md5`) checks that the elided arm
 still returns the exact bytes, the composite ETag, the internal SHA-256 and a v2 sidecar carrying
 the same layout.
+
+On the scored 10×5 MiB multipart case, a three-pair run of the same strict harness measured
+Cairn at 49.7 obj/s and RustFS at 64.4 obj/s — **0.77×**, versus the earlier single-pair 0.69×
+after #158. That run used Cairn release binary SHA-256
+`8cc7c84cd344bbe5c705be3ce780091a4c7b0678f41e26817a05e1d183b36e05`, RustFS 1.0.0 executable
+SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`, and Warp v1.8.2
+SHA-256 `fc7661a6b952800fbc8422cf0f72ae82726f82aa80065d15f50125f8bf5ca5fa`; per-pair ratios were
+0.74, 0.81 and 0.76. The pair count and host load differ from the earlier row, so the ratio moved
+for more than one reason; the direction is consistent with the isolated A/B.
