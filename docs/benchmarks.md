@@ -693,14 +693,16 @@ durability-equivalence proof.
 | HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
 | Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
 | Multipart upload, 10×5 MiB (1 pair, after #158) | 48.9 obj/s | 71.1 obj/s | **0.69×** |
-| DELETE 4 KiB, c16, batch 100 | ~4,050 obj/s | ~243 obj/s | **>10×** (indicative) |
+| DELETE 4 KiB, c16, batch 100 | 4,051 obj/s (20k objects) | 243 obj/s (6.4k objects) | **not comparable** |
 
 Notes:
 
-- The DELETE result is indicative, not a scored pair: Warp requires at least 6,400 objects, but
-  Cairn deletes that set before Warp can collect enough samples. The Cairn figure is from a
-  20,000-object run and the RustFS figure from the 6,400 minimum; both use c16/batch 100 and
-  strict durability.
+- The DELETE row is **not a ratio**. Warp requires at least 6,400 objects for a bulk delete at
+  batch 100, but Cairn deletes that set before Warp can collect enough one-second samples. The
+  Cairn figure is from a 20,000-object run and the RustFS figure from the 6,400 minimum; the
+  object counts and measured windows differ, so the numbers are not comparable. A repeatable
+  comparison needs a prefill plus `--list-existing` with the same pool and a measured window of at
+  least seven seconds; until then, this row is a diagnostic observation, not a score.
 - Multipart upload was 0.59× over three pairs before #158; the part-hash fix raised the
   single-pair result to 0.69×. The measured split and remaining I/O/durability work are in
   [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
