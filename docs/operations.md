@@ -274,6 +274,29 @@ so a crash cannot combine a new main file with an old WAL. See
 [`backup-restore.md`](./backup-restore.md) for the procedure, consistency argument, and mandatory
 upgrade steps for legacy database paths nested more than one level below `CAIRN_DATA_DIR`.
 
+### Backfilling a missing sidecar
+
+Assembled multipart objects completed before the sidecar existed have no `<uuid>.meta`. Their rows
+are still served from SQLite, but a later index loss cannot rebuild them, and reconciliation may
+treat the headerless data as unreferenced. After stopping the server, run the offline backfill:
+
+```sh
+cairn backfill-sidecars --dry-run    # count candidates, write nothing
+cairn backfill-sidecars             # write every supported missing sidecar
+cairn backfill-sidecars --limit 10000
+```
+
+The command takes the node lock, so it refuses to run while `serve` or any other node-local command
+holds it. It pages every bucket's versions, selects composite-ETag versions whose data file exists,
+reads the row plus its tags and effective Object Lock state, and writes the sidecar through the
+same fsync → rename → directory-barrier sequence as a live write. It is idempotent and never
+overwrites an existing sidecar. A version with a recorded part layout gets a v2 record; a legacy
+layout-less assembly gets v1, which restores the row while keeping `?partNumber` fail-closed. Only
+flat `bucket/uuid` paths are supported; nested laboratory paths are counted as `nested` and
+skipped. `--limit` bounds candidates per run; rerun until `candidates=0`. The command never
+invents, changes, or deletes an index row, and it does not backfill ordinary pre-protocol-3
+objects.
+
 ## 7. Master-key rotation
 
 Secrets at rest — per-object data keys (SSE-S3, `aws:kms`, and transparent at-rest), users' SigV4

@@ -204,6 +204,14 @@ pub(crate) struct AnchoredPath {
 }
 
 impl AnchoredPath {
+    /// One sibling name in the same already-open directory.
+    pub(crate) fn sibling(&self, name: impl Into<String>) -> Self {
+        Self {
+            parent: self.parent.clone(),
+            name: name.into(),
+        }
+    }
+
     /// Must run inside a leased blocking operation. EXCL preserves unexpected existing artifacts.
     pub(crate) fn create_new(&self) -> std::io::Result<File> {
         let file = open_beneath(

@@ -49,7 +49,9 @@ completed by this version. Its record is `format_version=2`, which adds the orde
 plaintext sizes to the v1 fields; both generations are bounded by the same 1 MiB limit, and v2 is
 required to carry a layout while v1 is required not to, so a record cannot be silently downgraded.
 A v1 sidecar left by an earlier version still restores the row, but has no layout, so part-number
-reads fail closed rather than serve the wrong bytes. Startup rebuild walks the bucket directories, reads each trailer or sidecar,
+reads fail closed rather than serve the wrong bytes. Assembled objects written before the sidecar
+existed can be backfilled offline with `cairn backfill-sidecars` (see
+[`operations.md`](operations.md)). Startup rebuild walks the bucket directories, reads each trailer or sidecar,
 validates it against its data file, and inserts missing index rows before readiness; it never
 invents or deletes rows (Section 8.5). When the index already holds a row for the same version, the
 rebuild keeps the newer generation — commit time first, then the UUIDv7 row id — and republishes it,

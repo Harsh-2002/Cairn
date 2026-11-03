@@ -1,8 +1,8 @@
 # Multipart follow-up decisions — 2026-11-03
 
-**Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, and both stages
-of the multipart object-file authority (v1 sidecar, then the v2 part-layout record) are implemented;
-performance work and the sidecar backfill remain phased.
+**Status:** accepted. The replicated-layout fix, the fail-closed part-number guard, both stages of
+the multipart object-file authority (v1 sidecar, then the v2 part-layout record), and the offline
+sidecar backfill are implemented; performance work remains phased.
 
 Five parallel reviews covered the multipart upload path: replication layout, object-file authority,
 upload performance, benchmark methodology, and an independent architecture/security review. This
@@ -38,7 +38,8 @@ The docs now describe Cairn's behavior instead of claiming single-part parity.
 The first stage — a v1 `<uuid>.meta` sidecar on every assembled object, written from the completion
 plan and committed before the directory barrier — is implemented. The second stage — a v2 record
 that also carries the part layout under a 1 MiB bound, restored by startup rebuild — is implemented
-too. Existing assembled objects from before the first stage still need the sidecar-only backfill.
+too. Existing assembled objects from before the first stage are covered by the offline
+`cairn backfill-sidecars` command.
 
 **Why:** a completed multipart object has no trailer and no `.meta` sidecar. `CompleteMultipartUpload`
 commits at `synchronous=FULL`, so a crash after ACK is safe; the exposure is a lost/corrupt SQLite
@@ -70,15 +71,19 @@ protocol-3 contract.
 - No storage-protocol bump was made: the sidecar is additive and downgrade still serves data. An
   older binary cannot rebuild the layout, which is the same fail-closed outcome as a v1 sidecar,
   not a wrong answer.
-- Remaining: a rate-limited sidecar-only backfill for assembled objects completed before the
-  first stage; never append a trailer in place to a live plaintext object.
+- `cairn backfill-sidecars` backfills assembled objects completed before the first stage. It takes
+  the node lock, pages versions, writes v2 when a layout is recorded and v1 otherwise, and refuses
+  to overwrite an existing sidecar; `--dry-run` and `--limit` bound the pass. It never appends a
+  trailer in place to a live plaintext object.
 
 **Tests that landed:** v2 round-trip and v1/v2 mismatch rejection; over-cap encode/decode and
 inline-trailer skip; completion sidecar carries the same layout and composed checksum as the row;
 `rebuilt_row` restores it, a v1 record restores no layout, and an end-to-end in-memory rebuild
-restores the row, layout and checksums from the durable files. Still outstanding for a full restore
-drill: wiping a real SQLite database and asserting `?partNumber` through the S3 surface,
-backup/restore, and crash points around sidecar publication.
+restores the row, layout and checksums from the durable files. The backfill record reconstruction
+and sidecar write are unit-tested, and the command was exercised end to end on a three-part object
+with dry-run, write and idempotence. Still outstanding for a full restore drill: wiping a real
+SQLite database and asserting `?partNumber` through the S3 surface, backup/restore, and crash points
+around sidecar publication.
 
 ## 3. Multipart upload performance — measure before optimizing
 
@@ -134,8 +139,8 @@ not a score.
 ## Order
 
 1. Replicated multipart layout — done.
-2. Multipart file authority, v1 sidecar and v2 part layout — done, with the restore drill still
-   outstanding.
+2. Multipart file authority, v1 sidecar, v2 part layout and offline backfill — done, with the
+   restore drill still outstanding.
 3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
 4. Elide the unused assembly MD5 — implemented (31% of assembly); the remaining one-commit and
    body/sink work stays gated on a new measurement.
