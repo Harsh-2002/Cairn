@@ -302,6 +302,16 @@ impl LocalBlobStore {
                 "metadata record does not name the backfilled object".into(),
             ));
         }
+        match std::fs::symlink_metadata(self.data_root.join(data_path.as_str())) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && metadata.len() == record.size_physical => {}
+            Ok(_) => {
+                return Err(BlobError::Io(
+                    "data file length disagrees with the metadata record".into(),
+                ));
+            }
+            Err(error) => return Err(BlobError::Io(error.to_string())),
+        }
         let sidecar_path = object_metadata_path(data_path)
             .ok_or_else(|| BlobError::Io("object storage path has no sidecar name".into()))?;
         let sidecar_name = sidecar_path
