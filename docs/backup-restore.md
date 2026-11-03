@@ -29,7 +29,9 @@ The command:
 5. durably copies committed object blobs and active multipart-part files, excluding transient
    `.staging/*.tmp`, SQLite sidecars, and Cairn lock files. A `<uuid>.meta` sidecar is part of its
    object and is copied with its data file, and a plaintext object's metadata is inside the data
-   file; and
+   file. For a **completed multipart object** that companion is a v2 record carrying the exact part
+   layout; the data file holds only assembled bytes, so the sidecar is what keeps
+   `GET`/`HEAD ?partNumber` answerable after a rebuild; and
 6. streams every `object_versions.storage_path` and `multipart_parts.storage_path` from the
    snapshot and verifies that the corresponding regular file exists; then
 7. writes `manifest.json` last, after all earlier files and directories are synced.
@@ -141,9 +143,23 @@ snapshot/restore, verifies versioned reads and protection, and completes a resto
 It also rejects backup under a live node lock, sharded topology, a snapshot missing an authoritative
 part, and startup with the wrong master key. The failpoints `crash_multipoint.sh` gate additionally
 pauses Complete after durable assembly, kills the process with an exact completion claim persisted,
-and verifies that restoration/restart makes the upload retryable without leaking the assembled blob.
-These checks are distinct from the database-publication unit tests that pin the old/new generations
-on either side of the atomic rename.
+and verifies that restoration/restart makes the upload retryable without leaking the assembled blob;
+its `blob_after_assemble` arm also asserts the surviving durable pair is a data file plus a v2
+sidecar carrying that assembly's exact part layout. These checks are distinct from the
+database-publication unit tests that pin the old/new generations on either side of the atomic rename.
+
+The shell gate also exercises a completed **three-part multipart object** end to end: two 5 MiB parts
+and a smaller final part, with `GET ?partNumber=1/2/3` recording each part's bytes, `Content-Range`,
+`x-amz-mp-parts-count` and the composite ETag before the snapshot. It asserts `blobs/` pairs the
+object's v2 `<uuid>.meta` (`format_version` 2, exact part numbers/sizes, same ETag and logical size)
+with its data file, then restores into a fresh data directory and requires the sidecar to be
+byte-identical and the three part reads to concatenate to the original object. A final arm rewrites
+one restored sidecar as a layout-less v1 record and removes its index row (a simulated lost WAL
+tail): startup rebuild must re-create the row **without** parts, and `?partNumber=1` must fail closed
+with `400 InvalidPart` while a plain `GET` still returns the full object. Limits: this covers
+snapshot fidelity and the rebuild path, not payload integrity (that is `cairn integrity`), not a
+whole-database deletion (a rebuild creates no buckets or users), and not an older binary that cannot
+decode a v2 sidecar at all.
 
 Remote multipart journals preserve the exact destination identity and any upload ID received before
 the crash. On startup, the Writer invalidates abandoned delivery and cleanup ownership; existing

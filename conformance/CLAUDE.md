@@ -92,7 +92,14 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
   `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
-  layout and parses each synchronous CLI's stdout counts. Also runs stdlib `recovery_state.py`:
+  layout and parses each synchronous CLI's stdout counts. A completed THREE-PART multipart object
+  (two 5 MiB parts + a tail) is snapshotted too: `?partNumber=1/2/3` bytes/content-range/part-count
+  and the composite ETag are recorded, `blobs/` must pair a v2 `<uuid>.meta` (`format_version=2`,
+  exact layout) with its data file, and the restored sidecar must be byte-identical with the parts
+  concatenating to the original. A final arm downgrades one restored sidecar to a layout-less v1
+  record and removes its row (simulated lost WAL tail): rebuild re-creates the row WITHOUT parts and
+  `?partNumber` fails closed (`400 InvalidPart`) while a plain GET still returns the object. Also
+  runs stdlib `recovery_state.py`:
   encrypted history/delete markers, ACL/tags/retention/legal hold, active encrypted multipart parts,
   real interrupted replication claims, exact source-to-snapshot table/row fidelity, explicit
   fresh-generation restore transitions and independent quota/live-file/retired-alias checks,
