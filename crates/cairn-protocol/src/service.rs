@@ -6729,7 +6729,7 @@ fn precondition(req: &S3Request) -> Precondition {
 }
 
 /// One part selected by `?partNumber` from a completed multipart object.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ObjectPart {
     offset: u64,
     length: u64,
@@ -6741,10 +6741,32 @@ struct ObjectPart {
 /// byte range. A single-part object has no layout: part 1 is the whole object and every other part
 /// is `InvalidPart`, matching S3.
 fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Option<ObjectPart>> {
-    let Some(raw) = req.query("partNumber") else {
+    object_part_from(req.query("partNumber"), req.header("range").is_some(), row)
+}
+
+/// A composite ETag (`<32 hex>-<digits>`) marks an object completed by a multipart upload. If its
+/// retained layout is missing — a pre-v41 row, a rebuilt row without parts, or a lost metadata
+/// record — part 1 must not silently serve the whole object: that is the wrong byte range for a
+/// real multipart object. Fail closed instead.
+fn is_multipart_etag(etag: &ETag) -> bool {
+    let Some((digest, count)) = etag.as_str().rsplit_once('-') else {
+        return false;
+    };
+    digest.len() == 32
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !count.is_empty()
+        && count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn object_part_from(
+    raw: Option<&str>,
+    has_range: bool,
+    row: &ObjectVersionRow,
+) -> Result<Option<ObjectPart>> {
+    let Some(raw) = raw else {
         return Ok(None);
     };
-    if req.header("range").is_some() {
+    if has_range {
         return Err(Error::InvalidArgument(
             "range and partNumber cannot be combined".to_owned(),
         ));
@@ -6758,6 +6780,9 @@ fn selected_object_part(req: &S3Request, row: &ObjectVersionRow) -> Result<Optio
         ));
     }
     let Some(parts) = row.multipart_parts.as_deref() else {
+        if is_multipart_etag(&row.etag) {
+            return Err(Error::InvalidPart);
+        }
         return if number == 1 {
             Ok(None)
         } else {
@@ -7892,5 +7917,88 @@ mod expiration_header_tests {
     fn percent_encoding_leaves_unreserved_bytes_alone() {
         assert_eq!(percent_encode_rule_id("abcXYZ019-_.~"), "abcXYZ019-_.~");
         assert_eq!(percent_encode_rule_id("a b+c%"), "a%20b%2Bc%25");
+    }
+}
+
+#[cfg(test)]
+mod object_part_tests {
+    use super::{object_part_from, replica_marker_row};
+    use cairn_types::authz::OwnershipMode;
+    use cairn_types::bucket::{Bucket, VersioningState};
+    use cairn_types::error::Error;
+    use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
+    use cairn_types::object::{ETag, MultipartPartRecord, ObjectVersionRow};
+    use cairn_types::time::Timestamp;
+
+    fn row(
+        etag: &str,
+        size_logical: u64,
+        parts: Option<Vec<MultipartPartRecord>>,
+    ) -> ObjectVersionRow {
+        let bucket = Bucket {
+            name: BucketName::parse("bucket").unwrap(),
+            owner_id: UserId("owner".to_owned()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        };
+        let mut row = replica_marker_row(
+            &bucket,
+            &ObjectKey::parse("key").unwrap(),
+            &VersionId::null(),
+            Timestamp(1),
+        );
+        row.is_delete_marker = false;
+        row.etag = ETag::from_string(etag.to_owned());
+        row.size_logical = size_logical;
+        row.multipart_parts = parts;
+        row
+    }
+
+    #[test]
+    fn composite_etag_without_layout_fails_closed() {
+        let row = row("5eb63bbbe01eeed093cb22bb8f5acdc3-2", 10, None);
+        for part in ["1", "2"] {
+            let error = object_part_from(Some(part), false, &row).unwrap_err();
+            assert!(matches!(error, Error::InvalidPart), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn single_part_object_serves_part_one_whole() {
+        let row = row("5eb63bbbe01eeed093cb22bb8f5acdc3", 10, None);
+        assert!(object_part_from(Some("1"), false, &row).unwrap().is_none());
+        assert!(matches!(
+            object_part_from(Some("2"), false, &row).unwrap_err(),
+            Error::InvalidPart
+        ));
+    }
+
+    #[test]
+    fn layout_is_selected_by_part_number_not_position() {
+        let row = row(
+            "5eb63bbbe01eeed093cb22bb8f5acdc3-2",
+            12,
+            Some(vec![
+                MultipartPartRecord {
+                    part_number: 1,
+                    size: 5,
+                },
+                MultipartPartRecord {
+                    part_number: 3,
+                    size: 7,
+                },
+            ]),
+        );
+        let part = object_part_from(Some("3"), false, &row).unwrap().unwrap();
+        assert_eq!(part.offset, 5);
+        assert_eq!(part.length, 7);
+        assert_eq!(part.count, 2);
+        assert!(matches!(
+            object_part_from(Some("2"), false, &row).unwrap_err(),
+            Error::InvalidPart
+        ));
     }
 }
