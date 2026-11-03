@@ -42,6 +42,8 @@ CASES = (
                                            "--stat-distrib", "30", "--put-distrib", "15",
                                            "--delete-distrib", "10")),
     ("multipart_5m", "multipart", "5MiB", 16, ("--parts", "100", "--part.size", "5MiB")),
+    ("multipart_put_5m", "multipart-put", "5MiB", 4,
+     ("--parts", "10", "--part.size", "5MiB", "--part.concurrent", "4")),
 )
 BUCKET = "cairn-benchmark"
 ACCESS = "benchaccess"
@@ -404,6 +406,7 @@ def parse_warp(output, operation):
     target_name = (
         "TOTAL" if operation == "mixed"
         else "GET" if operation == "multipart"
+        else "PUTPART" if operation == "multipart-put"
         else operation.upper()
     )
     target = reports.get(target_name, {})
@@ -668,7 +671,7 @@ def run_arm(args, root, case, engine, index, deadline):
             "--no-color", "--benchdata", str(benchdata_base),
             *extras,
         ]
-        if operation != "multipart":
+        if operation not in ("multipart", "multipart-put"):
             warp_cmd.extend(("--obj.size", size))
         warp_env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("AWS_", "WARP_"))

@@ -60,3 +60,5 @@ protocol-3 design record and measurements).
 - The dated performance work queue and decisions start at
   [`performance-execution-2026-09.md`](performance-execution-2026-09.md); their retained raw JSON
   lives under [`performance-evidence/`](performance-evidence/README.md), not in the docs root.
+- The multipart-upload follow-up plan is
+  [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
