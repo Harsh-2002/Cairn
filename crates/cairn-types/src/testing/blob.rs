@@ -158,7 +158,12 @@ impl BlobStore for InMemoryBlobStore {
         // as the real store computes it pre-transform — so the ETag is identical with or without a
         // DEK (ARCH 21.1, SSE-S3).
         let md5 = md5_hex(&buf);
-        let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
+        let internal_blake3 = blake3::hash(&buf).to_hex().to_string();
+        let internal_sha256 = opts
+            .extra_checksums
+            .0
+            .contains(&crate::object::ChecksumAlgorithm::Sha256)
+            .then(|| hex::encode(sha2::Sha256::digest(&buf)));
         let path = plan
             .final_path()
             .map_err(|e| BlobError::Io(e.to_string()))?
@@ -181,6 +186,7 @@ impl BlobStore for InMemoryBlobStore {
             etag: ETag::from_md5_hex(md5.clone()),
             md5_hex: Some(md5),
             checksums: Vec::new(),
+            internal_blake3,
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
             index_spool: crate::blob::IndexSpoolState::NeverCreated,
@@ -355,7 +361,12 @@ impl BlobStore for InMemoryBlobStore {
             }
         }
         let md5 = md5_hex(&buf);
-        let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
+        let internal_blake3 = blake3::hash(&buf).to_hex().to_string();
+        let internal_sha256 = opts
+            .extra_checksums
+            .0
+            .contains(&crate::object::ChecksumAlgorithm::Sha256)
+            .then(|| hex::encode(sha2::Sha256::digest(&buf)));
         let path = plan
             .final_path()
             .map_err(|e| BlobError::Io(e.to_string()))?
@@ -391,6 +402,7 @@ impl BlobStore for InMemoryBlobStore {
             }),
             md5_hex,
             checksums: Vec::new(),
+            internal_blake3,
             internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
             index_spool: crate::blob::IndexSpoolState::NeverCreated,

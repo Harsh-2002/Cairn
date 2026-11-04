@@ -94,8 +94,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
   layout and parses each synchronous CLI's stdout counts. A completed THREE-PART multipart object
   (two 5 MiB parts + a tail) is snapshotted too: `?partNumber=1/2/3` bytes/content-range/part-count
-  and the composite ETag are recorded, `blobs/` must pair a v2 `<uuid>.meta` (`format_version=2`,
-  exact layout) with its data file, and the restored sidecar must be byte-identical with the parts
+  and the composite ETag are recorded, `blobs/` must pair a v3 `<uuid>.meta` (`format_version=3`,
+  exact layout and BLAKE3 baseline) with its data file, and the restored sidecar must be byte-identical with the parts
   concatenating to the original. A final arm downgrades one restored sidecar to a layout-less v1
   record and removes its row (simulated lost WAL tail): rebuild re-creates the row WITHOUT parts and
   `?partNumber` fails closed (`400 InvalidPart`) while a plain GET still returns the object. Also

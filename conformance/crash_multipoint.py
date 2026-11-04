@@ -247,12 +247,14 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
                           [len(Path(data_path).read_bytes()) - trailer["_suffix_len"]:])
             if record is not None:
                 relative = os.path.relpath(data_path, os.path.join(ROOT, "data"))
-                expected_version = 2 if seam == "blob_after_assemble" else 1
+                expected_version = 3
                 check(f"[{tag}] the record names its exact data path, object identity and format",
                       record.get("format_version") == expected_version
                       and record.get("bucket") == BUCKET
                       and record.get("key") == key
-                      and record.get("storage_path") == relative,
+                      and record.get("storage_path") == relative
+                      and isinstance(record.get("internal_blake3"), str)
+                      and len(record["internal_blake3"]) == 64,
                       f"record={record}")
                 if seam == "blob_after_assemble":
                     check(f"[{tag}] the completed-multipart sidecar carries the exact part layout",

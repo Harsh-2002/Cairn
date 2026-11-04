@@ -408,6 +408,7 @@ fn rebuilt_row(record: &ObjectMetadataRecord) -> ObjectVersionRow {
         // Replication intent is not part of the sidecar; a rebuilt row is not a replica, and the
         // pre-crash tail may need a replication rescan. Tracked as a known limitation.
         replication_status: None,
+        internal_blake3: record.internal_blake3.clone(),
         internal_sha256: record.internal_sha256.clone(),
         replicated_at: None,
         created_at: record.created_at,
@@ -442,7 +443,7 @@ mod tests {
             MultipartPartRecord, StorageClass,
         };
         use cairn_types::storage::{
-            OBJECT_METADATA_V2_FORMAT_VERSION, ObjectMetadataRecord, ObjectMetadataSeed,
+            OBJECT_METADATA_V3_FORMAT_VERSION, ObjectMetadataRecord, ObjectMetadataSeed,
         };
         use cairn_types::{BucketName, ObjectKey, StoragePath, UserId, VersionId};
 
@@ -490,21 +491,29 @@ mod tests {
             size_physical: 11,
             etag: ETag::from_md5_hex("0".repeat(32)),
             md5_hex: Some("0".repeat(32)),
-            internal_sha256: "0".repeat(64),
+            internal_blake3: "0".repeat(64),
+            internal_sha256: None,
             checksums: Vec::new(),
             compression: CompressionDescriptor::Uncompressed,
             index_spool: IndexSpoolState::NeverCreated,
         };
         let record = ObjectMetadataRecord::from_staged(&seed, &staged);
-        assert_eq!(record.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(record.format_version, OBJECT_METADATA_V3_FORMAT_VERSION);
 
         let row = rebuilt_row(&record);
         assert_eq!(row.multipart_parts.as_deref(), Some(parts.as_slice()));
+        assert_eq!(
+            row.internal_blake3.as_deref(),
+            Some("0".repeat(64).as_str())
+        );
+        assert_eq!(row.internal_sha256, None);
 
         // A v1 record has no layout; it restores the row without inventing parts.
         let mut legacy = record.clone();
         legacy.format_version = cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION;
         legacy.multipart_parts = None;
+        legacy.internal_blake3 = None;
+        legacy.internal_sha256 = Some("0".repeat(64));
         assert!(rebuilt_row(&legacy).multipart_parts.is_none());
     }
 
@@ -598,7 +607,8 @@ mod tests {
             size_physical: 11,
             etag: ETag::from_md5_hex("0".repeat(32)),
             md5_hex: Some("0".repeat(32)),
-            internal_sha256: "0".repeat(64),
+            internal_blake3: "0".repeat(64),
+            internal_sha256: None,
             checksums: Vec::new(),
             compression: CompressionDescriptor::Uncompressed,
             index_spool: IndexSpoolState::NeverCreated,

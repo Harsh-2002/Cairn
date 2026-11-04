@@ -529,14 +529,20 @@ impl StorageWritePlan {
 /// [`OBJECT_METADATA_MAX_BYTES`], and carries no secret plaintext: an SSE descriptor is the same
 /// sealed record SQLite stores, never a raw data-encryption key.
 ///
-/// v2 adds the optional completed-multipart part layout. v1 records remain readable; a v2 record
-/// must carry the layout and a v1 record must not, so a silently downgraded record cannot lose it.
+/// v2 adds the completed-multipart part layout. v3 adds the internal plaintext BLAKE3 baseline,
+/// replacing the legacy SHA-256 baseline for new objects. v1 and v2 records remain readable; a v2
+/// record must carry the layout and a v1 record must not. A v1/v2 record must not carry a BLAKE3
+/// baseline, and a v3 record must, so the baseline algorithm can never be ambiguous.
+pub const OBJECT_METADATA_V3_FORMAT_VERSION: u32 = 3;
+
+/// The completed-multipart part-layout generation, written for legacy objects without a BLAKE3
+/// baseline.
 pub const OBJECT_METADATA_V2_FORMAT_VERSION: u32 = 2;
 
 /// The latest record generation this binary understands.
-pub const OBJECT_METADATA_FORMAT_VERSION: u32 = OBJECT_METADATA_V2_FORMAT_VERSION;
+pub const OBJECT_METADATA_FORMAT_VERSION: u32 = OBJECT_METADATA_V3_FORMAT_VERSION;
 
-/// The original metadata record generation, still written for objects without a part layout.
+/// The original metadata record generation, still readable for objects without a part layout.
 pub const OBJECT_METADATA_V1_FORMAT_VERSION: u32 = 1;
 
 /// Hard bound on one encoded metadata record.
@@ -552,7 +558,7 @@ pub const OBJECT_METADATA_MAX_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectMetadataRecord {
-    /// Format generation: v1, or v2 when `multipart_parts` is present.
+    /// Format generation: v1, v2 when `multipart_parts` is present, or v3 for a BLAKE3 baseline.
     pub format_version: u32,
     /// The owning bucket.
     pub bucket: BucketName,
@@ -606,7 +612,10 @@ pub struct ObjectMetadataRecord {
     pub checksums: Vec<ChecksumValue>,
     /// The sealed SSE descriptor, when the data is server-side encrypted.
     pub sse_descriptor: Option<String>,
-    /// The internal plaintext SHA-256 baseline.
+    /// The internal plaintext BLAKE3 baseline (v3 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_blake3: Option<String>,
+    /// The legacy internal plaintext SHA-256 baseline, kept readable for v1/v2 records.
     pub internal_sha256: Option<String>,
     /// Creation time captured before staging.
     pub created_at: Timestamp,
@@ -722,13 +731,9 @@ impl ObjectMetadataRecord {
     /// Bind the pre-stage fields to the exact staged blob.
     #[must_use]
     pub fn from_staged(seed: &ObjectMetadataSeed, staged: &crate::blob::StagedBlob) -> Self {
-        // Only a record that actually carries a layout advertises v2, so v1 stays the common case
-        // and an older binary can still read every ordinary object's sidecar.
-        let format_version = if seed.multipart_parts.is_some() {
-            OBJECT_METADATA_V2_FORMAT_VERSION
-        } else {
-            OBJECT_METADATA_V1_FORMAT_VERSION
-        };
+        // Every newly staged or assembled object carries a BLAKE3 baseline, so its record is v3.
+        // The layout is optional in v3: an ordinary object simply omits it.
+        let format_version = OBJECT_METADATA_V3_FORMAT_VERSION;
         Self {
             format_version,
             bucket: seed.bucket.clone(),
@@ -762,7 +767,8 @@ impl ObjectMetadataRecord {
                     .collect()
             }),
             sse_descriptor: seed.sse_descriptor.clone(),
-            internal_sha256: Some(staged.internal_sha256.clone()),
+            internal_blake3: Some(staged.internal_blake3.clone()),
+            internal_sha256: None,
             created_at: seed.created_at,
             updated_at: seed.updated_at,
             tags: seed.tags.clone(),
@@ -774,9 +780,9 @@ impl ObjectMetadataRecord {
     ///
     /// The row is SQLite truth at the moment of the call; callers must hold the node lock so no
     /// live writer can supersede the version while the record is staged. Tags and Object Lock live
-    /// in side tables, so they are supplied separately. A version with a recorded part layout gets
-    /// a v2 record; a legacy assembled object without one gets v1 and keeps the fail-closed
-    /// part-number behavior.
+    /// in side tables, so they are supplied separately. A row with a BLAKE3 baseline gets a v3
+    /// record; a legacy row keeps v2 when it has a part layout and v1 otherwise, so an old binary
+    /// can still read every record whose baseline it understands.
     pub fn from_existing(
         row: &ObjectVersionRow,
         tags: Vec<(String, String)>,
@@ -789,7 +795,18 @@ impl ObjectMetadataRecord {
             .storage_path
             .clone()
             .ok_or_else(|| invalid("object version has no storage path"))?;
-        let format_version = if row.multipart_parts.is_some() {
+        let (internal_blake3, internal_sha256) =
+            match (row.internal_blake3.clone(), row.internal_sha256.clone()) {
+                (Some(blake3), None) => (Some(blake3), None),
+                (None, Some(sha256)) => (None, Some(sha256)),
+                (None, None) => (None, None),
+                (Some(_), Some(_)) => {
+                    return Err(invalid("object version carries two internal baselines"));
+                }
+            };
+        let format_version = if internal_blake3.is_some() {
+            OBJECT_METADATA_V3_FORMAT_VERSION
+        } else if row.multipart_parts.is_some() {
             OBJECT_METADATA_V2_FORMAT_VERSION
         } else {
             OBJECT_METADATA_V1_FORMAT_VERSION
@@ -820,7 +837,8 @@ impl ObjectMetadataRecord {
             acl: row.acl.clone(),
             checksums: row.checksums.clone(),
             sse_descriptor: row.sse_descriptor.clone(),
-            internal_sha256: row.internal_sha256.clone(),
+            internal_blake3,
+            internal_sha256,
             created_at: row.created_at,
             updated_at: row.updated_at,
             tags,
@@ -830,7 +848,7 @@ impl ObjectMetadataRecord {
 
     /// Whether both records name the same object version and its exact staged file.
     ///
-    /// The offline v1 → v2 sidecar upgrade compares the durable record against the record rebuilt
+    /// The offline sidecar upgrade compares the durable record against the record rebuilt
     /// from the index row before it replaces anything. A mismatch means the two disagree about the
     /// object and the existing sidecar must be left untouched.
     #[must_use]
@@ -875,6 +893,11 @@ impl ObjectMetadataRecord {
         }
         let record: Self =
             serde_json::from_slice(bytes).map_err(|error| MetaError::Engine(error.to_string()))?;
+        if record.internal_blake3.is_some() && record.internal_sha256.is_some() {
+            return Err(invalid(
+                "object metadata must not carry two internal baselines",
+            ));
+        }
         match record.format_version {
             OBJECT_METADATA_V1_FORMAT_VERSION if record.multipart_parts.is_some() => Err(invalid(
                 "object metadata v1 must not carry a multipart part layout",
@@ -882,7 +905,19 @@ impl ObjectMetadataRecord {
             OBJECT_METADATA_V2_FORMAT_VERSION if record.multipart_parts.is_none() => Err(invalid(
                 "object metadata v2 requires a multipart part layout",
             )),
-            OBJECT_METADATA_V1_FORMAT_VERSION | OBJECT_METADATA_V2_FORMAT_VERSION => Ok(record),
+            OBJECT_METADATA_V1_FORMAT_VERSION | OBJECT_METADATA_V2_FORMAT_VERSION
+                if record.internal_blake3.is_some() =>
+            {
+                Err(invalid(
+                    "object metadata v1/v2 must not carry a BLAKE3 baseline",
+                ))
+            }
+            OBJECT_METADATA_V3_FORMAT_VERSION if record.internal_blake3.is_none() => {
+                Err(invalid("object metadata v3 requires a BLAKE3 baseline"))
+            }
+            OBJECT_METADATA_V1_FORMAT_VERSION
+            | OBJECT_METADATA_V2_FORMAT_VERSION
+            | OBJECT_METADATA_V3_FORMAT_VERSION => Ok(record),
             _ => Err(invalid("unsupported object metadata format version")),
         }
     }
@@ -1175,7 +1210,8 @@ mod tests {
                 value: "AAAAAA==-2".to_owned(),
             }],
             sse_descriptor: Some("sealed".to_owned()),
-            internal_sha256: Some("00".repeat(32)),
+            internal_blake3: Some("00".repeat(32)),
+            internal_sha256: None,
             replication_status: None,
             replicated_at: None,
             multipart_parts: parts,
@@ -1212,12 +1248,13 @@ mod tests {
             intent,
         )
         .unwrap();
-        assert_eq!(record.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(record.format_version, OBJECT_METADATA_V3_FORMAT_VERSION);
         assert_eq!(record.multipart_parts.as_deref(), Some(parts.as_slice()));
         assert_eq!(record.storage_path, path);
         assert_eq!(record.etag.as_str(), "0123456789abcdef0123456789abcdef-2");
         assert_eq!(record.checksums.len(), 1);
-        assert_eq!(record.internal_sha256, Some("00".repeat(32)));
+        assert_eq!(record.internal_blake3, Some("00".repeat(32)));
+        assert_eq!(record.internal_sha256, None);
         assert_eq!(record.tags, tags);
         assert_eq!(record.lock_intent, intent);
         assert_eq!(record.expire_at, Some(Timestamp(99)));
@@ -1226,16 +1263,49 @@ mod tests {
             record
         );
 
-        // A legacy assembly without a recorded layout stays v1: the row is restorable, and
-        // part-number reads fail closed rather than inventing offsets.
+        // A legacy row keeps the SHA-256 generation: v2 when it recorded a part layout, v1
+        // otherwise. Part-number reads fail closed on the v1 form rather than inventing offsets.
+        let mut legacy_row = object_row(Some(parts.clone()), false, Some(path.clone()));
+        legacy_row.internal_blake3 = None;
+        legacy_row.internal_sha256 = Some("00".repeat(32));
         let legacy = ObjectMetadataRecord::from_existing(
-            &object_row(None, false, Some(path)),
+            &legacy_row,
+            Vec::new(),
+            ExplicitObjectLockIntent::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(legacy.internal_sha256, Some("00".repeat(32)));
+        assert!(legacy.internal_blake3.is_none());
+        assert_eq!(legacy.multipart_parts.as_deref(), Some(parts.as_slice()));
+        assert_eq!(
+            ObjectMetadataRecord::decode(&legacy.encode().unwrap()).unwrap(),
+            legacy
+        );
+
+        let mut legacy_row = object_row(None, false, Some(path.clone()));
+        legacy_row.internal_blake3 = None;
+        legacy_row.internal_sha256 = Some("00".repeat(32));
+        let legacy = ObjectMetadataRecord::from_existing(
+            &legacy_row,
             Vec::new(),
             ExplicitObjectLockIntent::default(),
         )
         .unwrap();
         assert_eq!(legacy.format_version, OBJECT_METADATA_V1_FORMAT_VERSION);
         assert!(legacy.multipart_parts.is_none());
+
+        // Exactly one baseline is representable on a durable record.
+        let mut both = object_row(None, false, Some(path));
+        both.internal_sha256 = Some("11".repeat(32));
+        assert!(
+            ObjectMetadataRecord::from_existing(
+                &both,
+                Vec::new(),
+                ExplicitObjectLockIntent::default()
+            )
+            .is_err()
+        );
 
         assert!(
             ObjectMetadataRecord::from_existing(
@@ -1309,7 +1379,8 @@ mod tests {
             size_physical: 11,
             etag: ETag::from_md5_hex("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned()),
             md5_hex: Some("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned()),
-            internal_sha256: "00".repeat(32),
+            internal_blake3: "00".repeat(32),
+            internal_sha256: None,
             checksums: Vec::new(),
             compression: CompressionDescriptor::Uncompressed,
             index_spool: crate::blob::IndexSpoolState::NeverCreated,
@@ -1317,9 +1388,11 @@ mod tests {
     }
 
     #[test]
-    fn v1_records_stay_plain_and_v2_records_carry_the_part_layout() {
+    fn v3_records_always_carry_blake3_and_optionally_the_part_layout() {
         let ordinary = ObjectMetadataRecord::from_staged(&metadata_seed(None), &staged_blob());
-        assert_eq!(ordinary.format_version, OBJECT_METADATA_V1_FORMAT_VERSION);
+        assert_eq!(ordinary.format_version, OBJECT_METADATA_V3_FORMAT_VERSION);
+        assert_eq!(ordinary.internal_blake3, Some("00".repeat(32)));
+        assert_eq!(ordinary.internal_sha256, None);
         let encoded = ordinary.encode().unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains("multipart_parts"));
         assert_eq!(ObjectMetadataRecord::decode(&encoded).unwrap(), ordinary);
@@ -1336,7 +1409,7 @@ mod tests {
         ];
         let assembled =
             ObjectMetadataRecord::from_staged(&metadata_seed(Some(parts.clone())), &staged_blob());
-        assert_eq!(assembled.format_version, OBJECT_METADATA_V2_FORMAT_VERSION);
+        assert_eq!(assembled.format_version, OBJECT_METADATA_V3_FORMAT_VERSION);
         assert_eq!(assembled.multipart_parts.as_deref(), Some(parts.as_slice()));
         let encoded = assembled.encode().unwrap();
         let decoded = ObjectMetadataRecord::decode(&encoded).unwrap();
@@ -1363,24 +1436,46 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_that_disagrees_with_its_layout_is_rejected() {
+    fn a_generation_that_disagrees_with_its_baseline_or_layout_is_rejected() {
         let ordinary = ObjectMetadataRecord::from_staged(&metadata_seed(None), &staged_blob());
-        let mut v1_with_parts: serde_json::Value =
-            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        let base: serde_json::Value = serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+
+        let mut v1_with_parts = base.clone();
+        v1_with_parts["format_version"] = serde_json::json!(OBJECT_METADATA_V1_FORMAT_VERSION);
+        v1_with_parts["internal_blake3"] = serde_json::Value::Null;
+        v1_with_parts["internal_sha256"] = serde_json::json!("00".repeat(32));
         v1_with_parts["multipart_parts"] = serde_json::json!([{"part_number": 1, "size": 11}]);
         assert!(
             ObjectMetadataRecord::decode(&serde_json::to_vec(&v1_with_parts).unwrap()).is_err()
         );
 
-        let mut v2_without_parts: serde_json::Value =
-            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        let mut v2_without_parts = base.clone();
         v2_without_parts["format_version"] = serde_json::json!(OBJECT_METADATA_V2_FORMAT_VERSION);
+        v2_without_parts["internal_blake3"] = serde_json::Value::Null;
+        v2_without_parts["internal_sha256"] = serde_json::json!("00".repeat(32));
         assert!(
             ObjectMetadataRecord::decode(&serde_json::to_vec(&v2_without_parts).unwrap()).is_err()
         );
 
-        let mut unknown: serde_json::Value =
-            serde_json::from_slice(&ordinary.encode().unwrap()).unwrap();
+        // A legacy generation must not smuggle in the new algorithm.
+        let mut v1_with_blake3 = base.clone();
+        v1_with_blake3["format_version"] = serde_json::json!(OBJECT_METADATA_V1_FORMAT_VERSION);
+        assert!(
+            ObjectMetadataRecord::decode(&serde_json::to_vec(&v1_with_blake3).unwrap()).is_err()
+        );
+
+        // v3 requires BLAKE3, and a record may never carry two baselines.
+        let mut v3_without_blake3 = base.clone();
+        v3_without_blake3["internal_blake3"] = serde_json::Value::Null;
+        v3_without_blake3["internal_sha256"] = serde_json::json!("00".repeat(32));
+        assert!(
+            ObjectMetadataRecord::decode(&serde_json::to_vec(&v3_without_blake3).unwrap()).is_err()
+        );
+        let mut v3_with_both = base.clone();
+        v3_with_both["internal_sha256"] = serde_json::json!("00".repeat(32));
+        assert!(ObjectMetadataRecord::decode(&serde_json::to_vec(&v3_with_both).unwrap()).is_err());
+
+        let mut unknown = base;
         unknown["format_version"] = serde_json::json!(99);
         assert!(ObjectMetadataRecord::decode(&serde_json::to_vec(&unknown).unwrap()).is_err());
     }

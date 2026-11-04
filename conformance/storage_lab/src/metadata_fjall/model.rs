@@ -54,11 +54,13 @@ pub struct Principal {
 pub struct Row {
     pub row: ObjectVersionRow,
     pub internal_sha256: Option<String>,
+    pub internal_blake3: Option<String>,
 }
 impl From<ObjectVersionRow> for Row {
     fn from(row: ObjectVersionRow) -> Self {
         Self {
             internal_sha256: row.internal_sha256.clone(),
+            internal_blake3: row.internal_blake3.clone(),
             row,
         }
     }
@@ -66,6 +68,7 @@ impl From<ObjectVersionRow> for Row {
 impl Row {
     pub fn into_row(mut self) -> ObjectVersionRow {
         self.row.internal_sha256 = self.internal_sha256;
+        self.row.internal_blake3 = self.internal_blake3;
         self.row
     }
 }

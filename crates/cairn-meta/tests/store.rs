@@ -50,6 +50,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp(1),
@@ -4439,6 +4440,20 @@ async fn vacuum_snapshot_runs_through_store_and_contains_committed_rows() {
         .await
         .unwrap();
 
+    let bucket = bucket("snapshot-bucket");
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket.clone())))
+        .await
+        .unwrap();
+    let mut version = row(&bucket.name, "key", VersionId::null(), "etag-2", true);
+    version.internal_blake3 =
+        Some("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85".to_owned());
+    let fixture = store.begin_fixture().await.unwrap();
+    store
+        .submit_fixture(&fixture, put(version, Precondition::default()))
+        .await
+        .unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     let snapshot = dir.path().join("snapshot.db");
     store.vacuum_into_snapshot(snapshot.clone()).await.unwrap();
@@ -4452,6 +4467,17 @@ async fn vacuum_snapshot_runs_through_store_and_contains_committed_rows() {
         )
         .unwrap();
     assert_eq!(count, 1);
+    let digest: Option<String> = conn
+        .query_row(
+            "SELECT internal_blake3 FROM object_versions WHERE key='key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        digest.as_deref(),
+        Some("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")
+    );
 }
 
 async fn claim_fixture_cleanup(
@@ -5694,7 +5720,7 @@ async fn multipart_replica_intent_survives_claim_recovery() {
 }
 
 #[tokio::test]
-async fn internal_integrity_digest_round_trips_through_writer() {
+async fn internal_integrity_digests_round_trip_through_writer() {
     let store = cairn_meta::open_in_memory().unwrap();
     let fixture = store.begin_fixture().await.unwrap();
     let b = BucketName::parse("digest-bucket").unwrap();
@@ -5710,12 +5736,20 @@ async fn internal_integrity_digest_round_trips_through_writer() {
         })))
         .await
         .unwrap();
-    for digest in [
-        None,
-        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+    for (blake3, sha256) in [
+        (None, None),
+        (
+            Some("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85".to_owned()),
+            None,
+        ),
+        (
+            None,
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+        ),
     ] {
         let mut version = row(&b, "key", VersionId::null(), "etag-2", true);
-        version.internal_sha256 = digest.clone();
+        version.internal_blake3 = blake3.clone();
+        version.internal_sha256 = sha256.clone();
         store
             .submit_fixture(&fixture, put(version, Precondition::default()))
             .await
@@ -5725,7 +5759,8 @@ async fn internal_integrity_digest_round_trips_through_writer() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.internal_sha256, digest);
+        assert_eq!(got.internal_blake3, blake3);
+        assert_eq!(got.internal_sha256, sha256);
         assert!(got.checksums.is_empty());
     }
 }

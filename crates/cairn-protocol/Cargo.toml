@@ -47,6 +47,7 @@ cairn-types = { workspace = true, features = ["testing"] }
 cairn-meta.workspace = true
 cairn-blob.workspace = true
 cairn-crypto.workspace = true
+blake3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 futures-util.workspace = true
 proptest.workspace = true

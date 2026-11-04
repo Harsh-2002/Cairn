@@ -170,7 +170,7 @@ def compare(baselines, candidates):
     return {'status': 'INCONCLUSIVE' if reasons else 'PASS', 'reasons': reasons,
             'cleanup_qualification': {'status': 'INCONCLUSIVE' if cleanup_reasons else 'PASS',
                                       'reasons': cleanup_reasons,
-                                      'scope': 'Committed protocol-2 intent/debt counts after final idle; no steady-state GC claim'},
+                                      'scope': 'Committed protocol-3 intent/debt counts after final idle; no steady-state GC claim'},
             'baseline': values[0], 'candidate': values[1],
             'median_paired_candidate_to_baseline': ratios, 'baseline_relative_spans': spans,
             'scope': 'Observed lifecycle cost only; no throughput adoption or journal-startup decision'}
@@ -178,7 +178,7 @@ def compare(baselines, candidates):
 
 def cleanup_drained(observation):
     if (not isinstance(observation, dict) or observation.get('status') != 'drained'
-            or observation.get('protocol') != {'minimum_reader': 2, 'minimum_writer': 2}
+            or observation.get('protocol') != {'minimum_reader': 3, 'minimum_writer': 3}
             or observation.get('boundary') != 'after_final_idle_before_server_stop'
             or observation.get('access') != 'sqlite_mode_ro'):
         return False

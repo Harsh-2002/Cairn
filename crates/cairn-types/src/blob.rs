@@ -142,8 +142,12 @@ pub struct StagedBlob {
     /// given an explicit ETag, so the store does not hash the whole object a second time for a
     /// value nothing consumes.
     pub md5_hex: Option<String>,
-    /// Always-computed internal plaintext SHA-256 (hex), independent of S3 checksums.
-    pub internal_sha256: String,
+    /// Always-computed internal plaintext BLAKE3 (hex), independent of S3 checksums. This is the
+    /// durable integrity baseline for every object written by this version.
+    pub internal_blake3: String,
+    /// The legacy internal plaintext SHA-256 (hex), computed only when the client requested
+    /// SHA-256. It is not the new-object baseline; the row and sidecar record BLAKE3 instead.
+    pub internal_sha256: Option<String>,
     /// The computed supplementary checksums.
     pub checksums: Vec<ChecksumValue>,
     /// How the blob was physically stored.

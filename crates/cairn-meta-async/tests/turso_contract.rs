@@ -62,6 +62,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp(1),
@@ -4193,12 +4194,20 @@ async fn internal_integrity_digest_round_trips_without_entering_s3_checksums() {
             })))
             .await
             .unwrap();
-        for digest in [
-            None,
-            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+        for (blake3, sha256) in [
+            (None, None),
+            (
+                Some("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85".to_owned()),
+                None,
+            ),
+            (
+                None,
+                Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+            ),
         ] {
             let mut version = row(&bk, "key", VersionId::null(), "etag-2", 3);
-            version.internal_sha256 = digest.clone();
+            version.internal_blake3 = blake3.clone();
+            version.internal_sha256 = sha256.clone();
             store
                 .submit_fixture(&fixture, put(version, Precondition::default()))
                 .await
@@ -4208,20 +4217,19 @@ async fn internal_integrity_digest_round_trips_without_entering_s3_checksums() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(current.internal_sha256, digest);
+            assert_eq!(current.internal_blake3, blake3);
+            assert_eq!(current.internal_sha256, sha256);
             let exact = store
                 .get_version(&bk, &current.key, &current.version_id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(exact.internal_sha256, digest);
+            assert_eq!(exact.internal_blake3, blake3);
+            assert_eq!(exact.internal_sha256, sha256);
             assert!(exact.checksums.is_empty());
-            assert!(
-                serde_json::to_value(&exact)
-                    .unwrap()
-                    .get("internal_sha256")
-                    .is_none()
-            );
+            let json = serde_json::to_value(&exact).unwrap();
+            assert!(json.get("internal_sha256").is_none());
+            assert!(json.get("internal_blake3").is_none());
         }
     }
 }

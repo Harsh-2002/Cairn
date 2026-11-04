@@ -521,9 +521,10 @@ def main():
                        and row["retain_until"] > int(time.time() * 1000)
                        for row in rows(source_db, "object_locks"))
             for row in rows(source_db, "object_versions"):
-                if "internal_sha256" in row and not row["is_delete_marker"]:
+                if not row["is_delete_marker"]:
                     expected_body = dict(versions)[row["version_id"]]
-                    assert row["internal_sha256"] == hashlib.sha256(expected_body).hexdigest()
+                    assert row["internal_sha256"] is None, "new objects must not record a SHA-256 baseline"
+                    assert isinstance(row["internal_blake3"], str) and len(row["internal_blake3"]) == 64, row["internal_blake3"]
             assert all(row["sse_descriptor"] for row in rows(source_db, "object_versions") if not row["is_delete_marker"])
             assert all(row["part_dek"] for row in rows(source_db, "multipart_parts"))
             for table in ("object_versions", "multipart_parts"):
@@ -604,8 +605,8 @@ def main():
             body, _ = request("GET", "/recovery/incomplete")
             assert body == part_body
             completed_row = next(row for row in rows(restored_db, "object_versions") if row["key"] == "incomplete")
-            if "internal_sha256" in completed_row:
-                assert completed_row["internal_sha256"] == hashlib.sha256(part_body).hexdigest()
+            assert completed_row["internal_sha256"] is None
+            assert isinstance(completed_row["internal_blake3"], str) and len(completed_row["internal_blake3"]) == 64
             request("DELETE", "/recovery/incomplete?" + urllib.parse.urlencode({"versionId": completed_row["version_id"]}), expected=403)
             tags, _ = request("GET", "/recovery/incomplete?tagging")
             assert b"multipart-recovery" in tags

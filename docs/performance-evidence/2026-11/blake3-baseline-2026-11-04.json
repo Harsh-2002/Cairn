@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "case": "blake3_completion_inclusive",
+  "method": "Same conformance/multipart_complete.py run_arm shape as section 12: fresh strict single-node store, one warm-up, 40 scored objects, 10 x 5 MiB parts at 4-way concurrency, 4 object workers; full-object and rotating ?partNumber read-back verification.",
+  "host_capacity": {
+    "memtotal_kib": 32659148,
+    "swaptotal_kib": 8388604,
+    "logical_cpus": 6
+  },
+  "metric": "client-visible completed-object rate and completion latency",
+  "arms": [
+    {
+      "engine": "cairn",
+      "variant": "paired-control-sha256",
+      "binary_sha256": "5cb8350a93d5fe350023b340f44ccef461edd486f3dc1bc78616c4c368b80b21",
+      "summary": {
+        "objects_per_second": 2.625102406278665,
+        "successful_completions": 40,
+        "errors": 0,
+        "completion": {
+          "count": 40,
+          "mean_ms": 689.286764121789,
+          "p50_ms": 692.170020978665,
+          "p90_ms": 746.3789230096154,
+          "p99_ms": 768.0697640171275,
+          "max_ms": 768.383418006124
+        },
+        "object_cycle": {
+          "count": 40,
+          "mean_ms": 1523.2693940459285,
+          "p50_ms": 1527.9184029786848,
+          "p90_ms": 1585.2243300178088,
+          "p99_ms": 1660.5028250196483,
+          "max_ms": 1661.9154149957467
+        },
+        "completion_share_of_object_time": 0.45250483388955043,
+        "multipart_stage_means": {
+          "permit_wait": {
+            "samples": 40.0,
+            "mean_ms": 0.0003406749999999999
+          },
+          "assembly": {
+            "samples": 40.0,
+            "mean_ms": 169.963908875
+          },
+          "durability": {
+            "samples": 40.0,
+            "mean_ms": 480.93256202500027
+          }
+        },
+        "wall_seconds": 15.237500793999061,
+        "client_cpu_seconds": 0.796860689,
+        "server_cpu_seconds": 22.48,
+        "server_peak_rss": 72650752,
+        "load_average_before": [
+          2.62,
+          2.47,
+          2.44
+        ],
+        "load_average_after": [
+          3.06,
+          2.59,
+          2.48
+        ]
+      }
+    },
+    {
+      "engine": "cairn",
+      "variant": "after-blake3",
+      "binary_sha256": "8b5d0f5080fa800b97be306703f93740f6f6093e6cbe42494c59e16e03405584",
+      "summary": {
+        "objects_per_second": 2.448661710573803,
+        "successful_completions": 40,
+        "errors": 0,
+        "completion": {
+          "count": 40,
+          "mean_ms": 588.9568177997717,
+          "p50_ms": 593.1268369895406,
+          "p90_ms": 726.659412990557,
+          "p99_ms": 854.7618390002754,
+          "max_ms": 919.5336110133212
+        },
+        "object_cycle": {
+          "count": 40,
+          "mean_ms": 1592.0579990990518,
+          "p50_ms": 1570.6666850019246,
+          "p90_ms": 1888.6023359955288,
+          "p99_ms": 1953.1977720034774,
+          "max_ms": 2124.3706579844
+        },
+        "completion_share_of_object_time": 0.36993427257867695,
+        "multipart_stage_means": {
+          "permit_wait": {
+            "samples": 40.0,
+            "mean_ms": 0.0004480250000000001
+          },
+          "assembly": {
+            "samples": 40.0,
+            "mean_ms": 35.01327415000001
+          },
+          "durability": {
+            "samples": 40.0,
+            "mean_ms": 492.421817
+          }
+        },
+        "wall_seconds": 16.33545369998319,
+        "client_cpu_seconds": 0.772207709,
+        "server_cpu_seconds": 16.89,
+        "server_peak_rss": 70422528,
+        "load_average_before": [
+          2.35,
+          2.23,
+          2.36
+        ],
+        "load_average_after": [
+          3.37,
+          2.59,
+          2.48
+        ]
+      }
+    }
+  ],
+  "notes": [
+    "Both arms passed 40/40 completions and 40/40 full-object, part-number, ETag and exact-listing verification.",
+    "Runs were sequential, not interleaved; the 480-492 ms durability barrier dominates the cycle and leaves the object rate within run-to-run noise.",
+    "The controlled stage signal is assembly: 170.0 ms control versus 35.0 ms BLAKE3."
+  ]
+}

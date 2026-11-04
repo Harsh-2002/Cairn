@@ -25,11 +25,12 @@ zeroize.workspace = true
 futures-util = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
 
 [features]
 # Canonical in-memory test doubles for every trait. Enabled by downstream crates
 # as a dev-dependency so the whole engine is unit-testable without disk or sqlite.
-testing = ["dep:futures-util", "dep:md-5", "dep:hex"]
+testing = ["dep:futures-util", "dep:md-5", "dep:hex", "dep:blake3"]
 
 [dev-dependencies]
 cairn-types = { path = ".", features = ["testing"] }

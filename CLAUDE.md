@@ -52,9 +52,9 @@ External-monitoring dashboard (OpenObserve, generated): [`dashboards/`](./dashbo
 ## Build, test, and the gate
 
 The binary is `cairn` (`cargo build --bin cairn`). The offline `cairn backfill-sidecars` command
-writes missing v1/v2 sidecars for assembled objects that predate them and, with `--upgrade-v1`,
-replaces an existing v1 record with the row's v2 part layout after an identity check; it requires
-the node lock. The following is the **full validation gate**
+writes missing sidecars for assembled objects that predate them and, with `--upgrade-v1`, replaces
+an existing v1 record with the row's current record (v3 with BLAKE3, or v2 for a legacy row) after an
+identity check; it requires the node lock. The following is the **full validation gate**
 for code, build, dependency, automation and mixed changes. CI uses `.github/workflows/validate.yml`
 and must be green before the change is finished. Ordinary documentation-only PRs use local-link,
 anchor, shell-example and workflow-policy checks instead (ARCH 31.7):
@@ -133,7 +133,7 @@ above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v41 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  is v42 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
   `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
   scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
   bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
@@ -145,7 +145,9 @@ above remain the source of truth.
   v38 offline baseline identity and legacy-accounting hold, v39 multipart download filename
   metadata, v40 object TTL expiry (`object_versions.expire_at`, due-sweep index, and the
   current-listing covering index), v41 multipart completed-object part layout
-  (`object_versions.multipart_parts`) for `GET`/`HEAD ?partNumber`.
+  (`object_versions.multipart_parts`) for `GET`/`HEAD ?partNumber`, v42 BLAKE3 internal integrity
+  baselines (`object_versions.internal_blake3`, legacy `internal_sha256` retained, sidecar v3, and
+  storage protocol floor 3).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is
@@ -157,7 +159,10 @@ above remain the source of truth.
   → commit the metadata transaction (the single linearization point) → reclaim superseded blobs.
   Don't reorder these steps. For a protocol-3 ordinary object the ACK follows the file barrier and
   the index fold is asynchronous; the metadata transaction is the linearization point for
-  control-plane and multipart writes.
+  control-plane and multipart writes. New objects record a BLAKE3 internal baseline; legacy objects
+  keep SHA-256. This is a one-way storage-format change (schema v42, sidecar v3, protocol floor 3):
+  never add a config selector or dual-write, and never reuse `internal_sha256` for another
+  algorithm.
 - Every fix lands with a regression test in the owning crate, and the applicable validation gate is green, before it
   is "done". Match the surrounding code's style, comment density, and idioms.
 
@@ -201,6 +206,7 @@ Storage protocol 3 keeps durable admission for multipart writes, fences ordinary
 single publication savepoint, rebuilds the object index from the object files at startup, and owes
 no cleanup debt for a consumed staging alias on a successful publication. A plaintext object is one
 file ending in its `CRNI` trailer; compressed and encrypted objects also keep `<uuid>.meta`. A
-completed multipart object keeps `<uuid>.meta` too: a `format_version=2` record with the ordered
-part layout, so startup rebuild restores `?partNumber`; v1 records (and pre-sidecar assemblies)
-restore the row but fail part-number reads closed.
+completed multipart object keeps `<uuid>.meta` too: a `format_version=3` record with the ordered
+part layout and BLAKE3 baseline, so startup rebuild restores `?partNumber` and the digest; v1/v2
+records (and pre-sidecar assemblies) restore the row and their legacy SHA-256 baseline, with v1
+failing part-number reads closed.

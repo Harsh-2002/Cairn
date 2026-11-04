@@ -918,6 +918,17 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
 ALTER TABLE object_versions ADD COLUMN multipart_parts TEXT;
 "#,
     },
+    Migration {
+        version: 42,
+        name: "BLAKE3 internal integrity baseline",
+        sql: r#"
+-- New objects record a BLAKE3 plaintext baseline; legacy rows keep their SHA-256 value and leave
+-- this column NULL. Downgrade is unsupported: raise the protocol floor so an older binary refuses
+-- the state instead of silently dropping the new baseline.
+ALTER TABLE object_versions ADD COLUMN internal_blake3 TEXT;
+UPDATE storage_protocol SET minimum_reader=3, minimum_writer=3;
+"#,
+    },
 ];
 
 /// Read-only compatibility preflight, before PRAGMAs, migrations, sanitation or the Writer.
@@ -987,7 +998,14 @@ pub(crate) async fn validate_compatibility(driver: &dyn AsyncSqlDriver) -> Resul
             "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol WHERE singleton=1", vec![]
         ).await?;
         if !rows.first().is_some_and(|row| {
-            row.value(0) == &Value::Int(if applied >= 36 { 2 } else { 1 })
+            let expected = if applied >= 42 {
+                3
+            } else if applied >= 36 {
+                2
+            } else {
+                1
+            };
+            row.value(0) == &Value::Int(expected)
                 && row.value(1) == row.value(0)
                 && row.value(2).as_str() == Some("flat")
                 && row.value(3).as_str() == Some("full-scan")
@@ -1138,8 +1156,8 @@ mod tests {
     async fn assert_startup_compatibility(turso: bool) {
         for change in [
             "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
-            "UPDATE storage_protocol SET minimum_reader=3",
-            "UPDATE storage_protocol SET minimum_writer=3",
+            "UPDATE storage_protocol SET minimum_reader=4",
+            "UPDATE storage_protocol SET minimum_writer=4",
             "UPDATE storage_protocol SET minimum_reader=1,minimum_writer=1",
             "DROP TABLE storage_intent_paths",
             "DROP TABLE storage_cleanups",
@@ -1160,7 +1178,7 @@ mod tests {
             let driver = db.driver();
             run_migrations(driver.as_ref()).await.unwrap();
             run_migrations(driver.as_ref()).await.unwrap();
-            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 41);
+            assert_eq!(validate_compatibility(driver.as_ref()).await.unwrap(), 42);
             driver.execute_batch(change).await.unwrap();
             driver
                 .execute_batch("INSERT INTO share_capability_sanitation VALUES (1)")
@@ -1498,6 +1516,21 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn migration_v42_adds_blake3_without_backfilling_legacy_rows() {
+        let driver = migrated_driver().await;
+        assert!(column_exists(driver.as_ref(), "object_versions", "internal_blake3").await);
+        let protocol = driver
+            .query(
+                "SELECT minimum_reader, minimum_writer FROM storage_protocol",
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(protocol.first().unwrap().get_i64(0), 3);
+        assert_eq!(protocol.first().unwrap().get_i64(1), 3);
     }
 
     #[tokio::test]

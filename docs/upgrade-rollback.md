@@ -25,14 +25,21 @@ decision that is **fixed at first init** and cannot be changed later.
   declared length from the index and finds a mismatch instead of serving the trailer as payload.
   That is a refusal, not a migration, so rollback still requires the pre-upgrade snapshot.
 
-### Multipart sidecars across versions
+### Multipart sidecars and the BLAKE3 baseline across versions
 
-Assembled multipart objects keep `<uuid>.meta` beside their data file: a v2 record carries the
-ordered part layout, so startup rebuild can restore both the row and `GET`/`HEAD ?partNumber`
-after index loss. A binary that predates the v2 record still serves the object from SQLite, but it
-cannot decode the sidecar, so a later index loss cannot rebuild that row. A v2 binary reads both
-generations. An object whose sidecar is still v1 restores the row but not its part layout, so
-part-number reads fail closed.
+Assembled multipart objects keep `<uuid>.meta` beside their data file. The current record is v3: it
+carries the ordered part layout and the internal plaintext BLAKE3 baseline, so startup rebuild can
+restore both the row and `GET`/`HEAD ?partNumber` after index loss. v1 (no layout, legacy SHA-256)
+and v2 (layout, legacy SHA-256) records remain readable. A binary that predates the v3 record still
+serves the object from SQLite, but it cannot decode the sidecar, so a later index loss cannot rebuild
+that row — and, because it also predates schema v42, it refuses to start against the upgraded
+database. Downgrade is therefore unsupported: restore the pre-upgrade snapshot.
+
+New objects write `object_versions.internal_blake3` and leave `internal_sha256` NULL; rows created
+before schema v42 keep their SHA-256 value and are still scrubbed with SHA-256. There is no
+`CAIRN_*` selector and no dual-write: the migration is one-way. A pre-v42 binary refuses the state
+through the `storage_protocol` floor (raised to reader/writer 3 by migration v42) instead of starting
+and comparing a BLAKE3 digest as if it were SHA-256.
 
 Objects completed before the multipart sidecar existed, and objects whose sidecar is still v1 even
 though the row records the part layout (assembled between the v1 and v2 stages), can be repaired
@@ -46,11 +53,10 @@ cairn backfill-sidecars --upgrade-v1
 
 The command takes the node lock, writes only missing sidecars unless `--upgrade-v1` is given, and is
 safe to rerun. Without the flag it never overwrites an existing sidecar. `--upgrade-v1` replaces an
-existing v1 record with the row's v2 record only when the record identity (`row_id`, bucket, key,
-version id, storage path, ETag and both sizes) matches the index row; it never rewrites a v2 record,
-and reports a conflict instead of guessing. Rerun until the summary reports `candidates=0`. An
-object whose sidecar is still v1 because its row has no recorded layout restores the row but not
-its part layout, so part-number reads fail closed.
+existing v1 record only when the record identity (`row_id`, bucket, key, version id, storage path,
+ETag and both sizes) matches the index row; it never rewrites a v2 or v3 record, and reports a
+conflict instead of guessing. It writes v3 when the row has a BLAKE3 baseline and preserves v1/v2
+for legacy rows. Rerun until the summary reports `candidates=0`.
 
 ## 2. Forward upgrade (newer binary, same data)
 
@@ -72,8 +78,9 @@ Snapshot validation also checks compatibility before staging target data.
 **Already released older binaries may open and mutate newer data.** The new guard cannot retrofit
 protection into them. Use a verified pre-upgrade snapshot for downgrade; do not try the previous
 binary against upgraded data to see whether it refuses. Schema v35 records minimum reader/writer
-protocol 1, flat writes and full-scan recovery. Missing, malformed or unsupported state fails closed.
-It does not activate a recovery journal or change object placement.
+protocol 1, flat writes and full-scan recovery; v36 raises the floor to 2; schema v42 raises it to 3
+when it adds the BLAKE3 baseline. Missing, malformed or unsupported state fails closed. The floor
+does not activate a recovery journal or change object placement.
 
 ### Zero-downtime upgrades
 

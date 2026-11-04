@@ -170,7 +170,7 @@ read ahead, so pacing is not a physical IOPS limit. A full pass remains I/O- and
   The `conformance/backup_restore.sh` harness exercises the full backup → corrupt → restore →
   `integrity --repair` → byte-identical-verify loop, plus encrypted history, protected versions,
   interrupted replication claims, resumable multipart state, and a completed multipart object whose
-  v2 sidecar and `?partNumber` reads must survive into a fresh tree.
+  v3 sidecar and `?partNumber` reads must survive into a fresh tree.
 - **Monitor replication lag and `unreplicated`** to assess the current delivery backlog and loss window.
 - For irreplaceable data, enable **versioning + Object Lock** so an accidental or malicious delete is
   recoverable even within a single node.

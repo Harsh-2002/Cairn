@@ -35,23 +35,28 @@ First, the object's bytes are streamed to a staging file in the staging director
 The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash may instead leave a durable object file with no index row; startup rebuild inserts the missing row before readiness, so no acknowledged object is lost. A crash between step four and step six leaves a durable blob without a visible object row, whose admitted intent is resolved into exact cleanup during recovery; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
 
 Protocol 3 moves that metadata into the object's own durable file. A plaintext (uncompressed,
-unencrypted) object is one file: the payload at offset 0, then the `format_version=1` record as
+unencrypted) object is one file: the payload at offset 0, then the `format_version=3` record as
 JSON, a `u32` metadata length, a `u64` payload length and the `CRNI` magic. The record carries the
 object identity, sizes, ETag, content fields, storage path, compression and storage class, owner,
-user metadata, ACL, persisted checksums, the sealed SSE descriptor, the internal plaintext SHA-256,
-timestamps, tags and explicit Object Lock intent; it never carries key material. Compressed and
-encrypted objects keep a `<uuid>.meta` sidecar beside the data file, because the CRNB container
-trailer must stay last; the sidecar is written, fsynced and renamed with the data file and covered
-by the same coalesced destination-directory barrier. Multipart parts keep neither. A completed
-multipart object writes the same `<uuid>.meta` sidecar for every encoding, so startup rebuild can
-restore its row and its part layout; `?partNumber` therefore survives index loss for objects
-completed by this version. Its record is `format_version=2`, which adds the ordered part numbers and
-plaintext sizes to the v1 fields; both generations are bounded by the same 1 MiB limit, and v2 is
-required to carry a layout while v1 is required not to, so a record cannot be silently downgraded.
-A v1 sidecar left by an earlier version still restores the row, but has no layout, so part-number
-reads fail closed rather than serve the wrong bytes. Assembled objects written before the sidecar
-existed can be backfilled offline with `cairn backfill-sidecars` (see
-[`operations.md`](operations.md)). Startup rebuild walks the bucket directories, reads each trailer or sidecar,
+user metadata, ACL, persisted checksums, the sealed SSE descriptor, the internal plaintext BLAKE3
+baseline, timestamps, tags and explicit Object Lock intent; it never carries key material.
+Compressed and encrypted objects keep a `<uuid>.meta` sidecar beside the data file, because the CRNB
+container trailer must stay last; the sidecar is written, fsynced and renamed with the data file and
+covered by the same coalesced destination-directory barrier. Multipart parts keep neither. A
+completed multipart object writes the same `<uuid>.meta` sidecar for every encoding, so startup
+rebuild can restore its row, its BLAKE3 baseline and its part layout; `?partNumber` therefore
+survives index loss for objects completed by this version. Its record is also `format_version=3`,
+which requires the BLAKE3 baseline and makes the ordered part numbers and plaintext sizes optional
+(absent for an ordinary object). Both generations are bounded by the same 1 MiB limit. The decode
+rules are generation-specific: v1 forbids a layout and a BLAKE3 baseline, v2 requires a layout and
+forbids a BLAKE3 baseline, and v3 requires a BLAKE3 baseline; no record may carry two baselines. A
+silently downgraded record therefore cannot lose its layout or have its digest algorithm
+misinterpreted. A v1 or v2 sidecar left by an earlier version still restores the row (and, for v2,
+the layout), but it carries the legacy SHA-256 baseline, so scrub and rebuild keep verifying it with
+SHA-256. Assembled objects written before the sidecar existed can be backfilled offline with
+`cairn backfill-sidecars` (see [`operations.md`](operations.md)); that pass writes v3 for a row with
+a BLAKE3 baseline and keeps v1/v2 for legacy rows. Startup rebuild walks the bucket directories, reads each trailer or
+sidecar,
 validates it against its data file, and inserts missing index rows before readiness; it never
 invents or deletes rows (Section 8.5). When the index already holds a row for the same version, the
 rebuild keeps the newer generation — commit time first, then the UUIDv7 row id — and republishes it,
@@ -212,7 +217,7 @@ the Phase 3C performance evaluation did not qualify journal-only startup for act
 
 ### 8.6 Single-node durability guidance for operators
 
-Because Cairn does not implement drive redundancy, its single-node durability is exactly the durability of the storage beneath it. The guidance, stated in the operations section, is to place the data filesystem on redundant storage: a checksumming, redundant filesystem such as ZFS gives both redundancy and silent-corruption detection, software or hardware RAID gives redundancy, and a cloud block volume gives provider-level redundancy. Cairn's contribution is that it never lies about durability: it acknowledges a write only when the kernel has acknowledged the underlying writes per the configured synchronous settings, so whatever guarantee the storage layer provides is faithfully reflected to the client. Cairn also detects silent bit-rot of its own stored bytes. Two mechanisms, and they are not interchangeable. On the **read** path, encrypted and compressed blobs are integrity-checked on every read (per-block AES-GCM authentication and the self-describing CRNB format both fail closed on a tampered or rotted block) — but that only ever covers bytes somebody actually GETs. Cold data is exactly what a scrub is for, so the **opt-in background scrub** (`CAIRN_SCRUB_INTERVAL_SECS`, **off by default**) re-reads *every* stored blob on its schedule and verifies it against the internal plaintext SHA-256 recorded at ingest, or for legacy rows a stored full-object supplementary checksum or single-part ETag: plaintext, compressed, **and encrypted** — an encrypted version is re-read through its own unsealed DEK, so a node running `CAIRN_ENCRYPT_AT_REST` (where every version carries an SSE descriptor) is fully covered, and the ETag comparison holds because the ETag is the plaintext MD5 under encryption too (Section 27). A detected mismatch is logged and counted as `cairn_scrub_corruption_total` rather than served to a client. Six residues are counted rather than verified, and reported as `cairn_scrub_skipped_total{reason}` so coverage is never overstated: a version whose key is temporarily off the master ring (`key_unavailable` — a rotation window, retried, not alarmed); a legacy multipart object lacking both an internal digest and a full-object supplementary checksum, whose composite `{md5}-{n}` ETag cannot be hash-compared (`composite_etag`, Section 26.4); a transient filesystem read failure (`io_error` — the blob is left untouched and retried on the next scrub, never counted as corruption); a version referencing no blob (`no_blob`); a delete marker (`delete_marker`); and a version whose metadata could not be loaded (`metadata_unavailable`). A checksumming, redundant filesystem such as ZFS remains the recommended defense-in-depth (it also repairs, which Cairn does not).
+Because Cairn does not implement drive redundancy, its single-node durability is exactly the durability of the storage beneath it. The guidance, stated in the operations section, is to place the data filesystem on redundant storage: a checksumming, redundant filesystem such as ZFS gives both redundancy and silent-corruption detection, software or hardware RAID gives redundancy, and a cloud block volume gives provider-level redundancy. Cairn's contribution is that it never lies about durability: it acknowledges a write only when the kernel has acknowledged the underlying writes per the configured synchronous settings, so whatever guarantee the storage layer provides is faithfully reflected to the client. Cairn also detects silent bit-rot of its own stored bytes. Two mechanisms, and they are not interchangeable. On the **read** path, encrypted and compressed blobs are integrity-checked on every read (per-block AES-GCM authentication and the self-describing CRNB format both fail closed on a tampered or rotted block) — but that only ever covers bytes somebody actually GETs. Cold data is exactly what a scrub is for, so the **opt-in background scrub** (`CAIRN_SCRUB_INTERVAL_SECS`, **off by default**) re-reads *every* stored blob on its schedule and verifies it against the internal plaintext BLAKE3 baseline recorded at ingest (SHA-256 for legacy rows), or for legacy rows a stored full-object supplementary checksum or single-part ETag: plaintext, compressed, **and encrypted** — an encrypted version is re-read through its own unsealed DEK, so a node running `CAIRN_ENCRYPT_AT_REST` (where every version carries an SSE descriptor) is fully covered, and the ETag comparison holds because the ETag is the plaintext MD5 under encryption too (Section 27). A detected mismatch is logged and counted as `cairn_scrub_corruption_total` rather than served to a client. Six residues are counted rather than verified, and reported as `cairn_scrub_skipped_total{reason}` so coverage is never overstated: a version whose key is temporarily off the master ring (`key_unavailable` — a rotation window, retried, not alarmed); a legacy multipart object lacking both an internal digest and a full-object supplementary checksum, whose composite `{md5}-{n}` ETag cannot be hash-compared (`composite_etag`, Section 26.4); a transient filesystem read failure (`io_error` — the blob is left untouched and retried on the next scrub, never counted as corruption); a version referencing no blob (`no_blob`); a delete marker (`delete_marker`); and a version whose metadata could not be loaded (`metadata_unavailable`). A checksumming, redundant filesystem such as ZFS remains the recommended defense-in-depth (it also repairs, which Cairn does not).
 
 ---
 
@@ -380,12 +385,21 @@ open, before producing plaintext.
 
 ### 10.8 Internal content integrity baseline
 
-Every newly staged or assembled object computes a plaintext SHA-256 in the existing streaming
-hash pass, alongside MD5 and requested S3 checksums. The internal digest is committed on the
-object-version row with the durable blob reference. PUT, copy, multipart completion, import and
-replica ingest all use that path, including compressed and encrypted objects. It is independent
-of the S3 ETag and checksum headers; requesting SHA-256 reuses the same hash state.
+Every newly staged or assembled object computes a plaintext **BLAKE3** digest in the existing
+streaming hash pass, alongside MD5 and requested S3 checksums. BLAKE3 is the durable baseline for
+new objects because it removes the SHA-256 cost from the synchronous multipart-completion tail
+(measured at roughly 3 GiB/s on the reference host versus ~330 MiB/s for the AVX-class SHA-256
+path). The internal digest is committed on the object-version row
+(`object_versions.internal_blake3`, schema v42) with the durable blob reference. PUT, copy,
+multipart completion, import and replica ingest all use that path, including compressed and
+encrypted objects. It is independent of the S3 ETag and checksum headers. SHA-256 is still computed
+when a client requests a SHA-256 checksum or when SigV4 signed a concrete payload hash; that value
+is a client checksum, not the new-object baseline.
 
-Existing rows retain a null internal digest after migration. Scrubbing must not populate it from
-existing bytes: those bytes may already be damaged. A rewrite creates a new baseline but cannot
-prove the old content was correct. Backup and restore preserve the digest through SQLite snapshots.
+Objects written before the v42 migration keep their `internal_sha256` value and leave the BLAKE3
+column NULL; scrub and startup rebuild select the algorithm by column, never by inspecting the
+digest. A row that carries both is handled explicitly: BLAKE3 wins. A malformed digest of either
+algorithm fails closed as corruption. Scrubbing must not populate a baseline from existing bytes:
+those bytes may already be damaged. A rewrite creates a new BLAKE3 baseline but cannot prove the old
+content was correct. Backup and restore preserve both columns through SQLite snapshots, and the
+per-object metadata sidecar carries the baseline for startup rebuild.

@@ -69,6 +69,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         multipart_parts: None,

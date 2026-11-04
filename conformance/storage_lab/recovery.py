@@ -40,8 +40,12 @@ def read_state(database, objects, expected_hash):
             raise RuntimeError("unexpected authoritative object count")
         for record in records:
             row = dict(zip(columns, record))
+            has_blake3 = isinstance(row.get("internal_blake3"), str) and len(row["internal_blake3"]) == 64
+            has_sha256 = row["internal_sha256"] == expected_hash
             if (row["size_logical"] != 4096 or row["size_physical"] != 4096
-                    or row["sse_descriptor"] is not None or row["internal_sha256"] != expected_hash
+                    or row["sse_descriptor"] is not None
+                    or not (has_blake3 or has_sha256)
+                    or (has_blake3 and row["internal_sha256"] is not None)
                     or row["is_delete_marker"] or not row["storage_path"]):
                 raise RuntimeError("unexpected authoritative object metadata")
         recovery = conn.execute("SELECT coverage_state,legacy_accounting_hold,legacy_release_authorized "

@@ -31,7 +31,7 @@ pub const OBJECT_VERSION_COLS: &str = "id, bucket_name, key, version_id, is_late
      compression, storage_class, cold_locator, owner_id, user_metadata, acl, checksums, \
      sse_descriptor, replication_status, created_at, updated_at, content_encoding, cache_control, \
      content_disposition, content_language, expires, replicated_at, internal_sha256, expire_at, \
-     multipart_parts";
+     multipart_parts, internal_blake3";
 
 /// `buckets` columns in mapper order.
 pub const BUCKET_COLS: &str =
@@ -269,6 +269,7 @@ pub fn object_version_from_row(row: &Row) -> Result<ObjectVersionRow, MetaError>
             Some(s) => Some(json_col(&s)?),
             None => None,
         },
+        internal_blake3: row.get_opt_text(31),
         created_at: Timestamp(row.get_i64(20)),
         updated_at: Timestamp(row.get_i64(21)),
     })
