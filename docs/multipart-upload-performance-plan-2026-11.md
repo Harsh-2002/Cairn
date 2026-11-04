@@ -5,6 +5,9 @@ single pair). Items 3-5 remain open. The measurement harness, the `multipart_put
 sampled part/commit timings are in place. Phase 3 (completion) is implemented and measured:
 assembly hashes on a blocking reader concurrently with the sink write, and CRC-64/NVME slices by
 eight, cutting a real completion from a 246 ms median to 210 ms (see `benchmarks.md` section 11).
+A later part-body pipeline screen measured a real stage win but no repeatable score win and was
+reverted; it also isolated the per-upload completion tail as the then-dominant scored cost — see
+"Where the scored multipart-put ratio actually goes".
 
 Goal: close the strict multipart-upload gap against RustFS without weakening the UploadPart
 acknowledgement. Ordinary PUT/GET/LIST results must not regress.
@@ -163,6 +166,34 @@ its own `MultipartStage` timings; do not conflate assembly with part upload.
   `CompleteMultipartUpload` probe measured a median 246 ms before and 210 ms after. Chunk size
   (256 KiB vs 512 KiB vs 1 MiB) and the io_uring sink were measured and rejected. Details and
   tables are in [`benchmarks.md`](benchmarks.md) section 11. The part path is untouched.
+- 2026-11-04: **pipelined part body (measured stage win, no repeatable score win — reverted).**
+  Measured against `433438f`, before the completion pipeline above.
+  Candidate: drive the raw part body reader/hasher and the staging sink as two halves of one
+  task (`try_join`), with a bounded read-ahead (tried 4 chunks, 32 chunks, and a 1 MiB byte
+  budget), so the mandatory MD5 and the next body frames overlap the blocking part write. The
+  sink kept its single owner, chunk order, and the caller's one flush/fdatasync barrier; the
+  UploadPart ACK still followed the durable part record, and no reservation/publication rule
+  changed.
+  - Part-focused screen (16 concurrent one-part uploads, 5 MiB, 10 s arms, alternating on this
+    host): `body` p50 96.5 and 64.3 ms in two baseline arms vs 59.6 and 58.0 ms with the 1 MiB
+    read-ahead; a 32-chunk variant measured 63.8 and 43.9 ms. `finalize` moved the other way
+    (the write lands closer to the fsync), so `body`+`finalize` together improved ~10–20%.
+    The stage effect is real in that shape.
+  - Scored harness (`multipart_put_5m`, Warp 10×5 MiB, c4, 12 s, RustFS 1.0.4 normalizer,
+    alternating baseline/candidate pairs in four batches). Per-pair Cairn/RustFS ratios:
+    baseline 0.773/0.737/0.734 vs 4-chunk pipeline 0.966/0.864/0.655; baseline 0.749/0.742/0.787
+    vs 32-chunk 0.918/0.781/0.742; baseline 0.772/0.509/0.726 vs 1 MiB budget 0.713/0.490/0.533;
+    a final batch with arms spanning load 0.9–9.4 measured 0.710/0.511/0.832 vs
+    0.645/0.448/0.448. Mean body p50 fell from 92.3 to 72.2 ms in the 32-chunk batch, but the
+    score moved in both directions and never reproducibly: the host was shared, and the same arms
+    ranged 13–52 obj/s.
+  - A simultaneous two-server A/B (identical wall-clock conditions, both builds on fresh volumes,
+    same Warp load) measured the candidate at +5.0%, -0.8%, +14.8% and +2.7% (median +3.9%),
+    with absolute rates halved by mutual contention. Not a repeatable score win.
+  - Conclusion: reverted; the code change is not merged. The part body is not the scored
+    bottleneck. See the completion-tail measurement below. Raw arms, ratios, stage p50s and
+    binary hashes are retained in
+    [`performance-evidence/2026-11/multipart-part-pipeline-ab-2026-11-04.json`](performance-evidence/2026-11/multipart-part-pipeline-ab-2026-11-04.json).
 
 ## Remaining gap
 
@@ -174,9 +205,41 @@ RustFS strict mode and client-side input pacing, not a server micro-optimization
 data barrier, Cairn's stricter acknowledgement is the remaining difference and should be
 documented rather than removed.
 
-Completion is no longer part of the gap: assembly is hash-bound (the mandatory internal SHA-256
-alone is ~150 ms for 50 MiB on a core without SHA-NI) and now overlaps the reads and writes; the
-remaining ~45 ms is the data fsync, which is the same durability barrier the part path pays.
+Completion is no longer the dominant part of the gap: assembly is hash-bound (the mandatory
+internal SHA-256 alone is ~150 ms for 50 MiB on a core without SHA-NI) and now overlaps the reads
+and writes; the remaining ~45 ms is the data fsync, which is the same durability barrier the part
+path pays.
+
+### Where the scored multipart-put ratio actually goes
+
+The scored `multipart_put_5m` throughput is not limited by the part handler. Warp's
+`multipart-put` worker is strictly **create multipart upload → upload 10 parts at 4-way
+concurrency → synchronous CompleteMultipartUpload → next upload**, four workers in parallel. An
+upload therefore pays `ceil(10/4) = 3` part waves plus a serial completion tail, and the next
+upload cannot start during that tail.
+
+In the quiet three-pair batch on 2026-11-04 the per-part p50 was **Cairn 171.4 ms vs RustFS
+179.9 ms** (Cairn 155.1 vs RustFS 189.9 in another pair, and Cairn's PUTPART TTFB p50 was 98 ms
+vs 122 ms), yet Cairn measured 51.4 vs 66.4 obj/s. Cairn's part service was already faster; the
+missing throughput was the completion tail. A 50 MiB assembly measured p50 ≈ 340 ms before the
+completion pipeline above, so Cairn's per-worker loop was ≈ 3 × 171 + 340 = 853 ms, which at four
+workers predicts ≈ 47 obj/s (measured 51.4). Fitting RustFS's measured 66.4 obj/s to the same loop
+implies ≈ 3 × 180 + ≈ 60 ms of completion, i.e. a much smaller tail. This is why part-path changes
+of 10–20 ms per part (≈ 30–60 ms per upload, ~5%) were measured at or below the host noise even
+when the part stage clearly improved.
+
+The completion pipeline in `benchmarks.md` section 11 then cut that real completion from a 246 ms
+median to 210 ms on the same host, which validates the accounting: the same four-worker loop now
+predicts ≈ 3 × 171 + 210 = 723 ms → ≈ 55 obj/s. The remaining completion tail is still ≈ 150 ms
+larger than RustFS's, so the part path is ~70% of the loop and its per-part service is already
+faster than the comparison; further part micro-optimizations can recover only a few percent of
+the score even when they win their own stage.
+
+**Consequence for this workstream:** the part path's remaining durable barrier (write + fdatasync)
+and hashing are not the scored lever. The scored ratio needs the residual completion tail closed
+and/or a benchmark shape that measures parts without the per-upload completion tail. Do not merge
+part-path micro-optimizations on the strength of a stage reduction alone; require a repeatable
+scored-ratio improvement.
 
 ## Acceptance
 

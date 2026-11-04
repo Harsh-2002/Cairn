@@ -1,0 +1,779 @@
+{
+  "schema": 1,
+  "date": "2026-11-04",
+  "subject": "Pipelined plaintext multipart part body: measured stage win, no repeatable scored-throughput win",
+  "host": "local i5-9400T / NVMe, shared with other workstreams",
+  "harness": {
+    "scored": "conformance/rustfs_compare.py --case multipart_put_5m --pairs 1 --duration 12 --metrics-drain-seconds 16 --allow-ballooning; alternating baseline/candidate rounds",
+    "warp": "v1.8.2 (warp-rdma_linux_amd64)",
+    "rustfs": "1.0.4 (strict durability env from the harness)",
+    "part_screen": "16 concurrent one-part uploads (parts=1, part.concurrent=1), 10 s arms, alternating",
+    "simultaneous": "both builds, fresh volumes, identical Warp load at the same wall-clock time; absolute rates halved by mutual contention"
+  },
+  "binaries": {
+    "baseline": {
+      "sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620"
+    },
+    "4_chunk_pipeline": {
+      "sha256": "c4064a0953a75cf791574a0e4fc337af8968cdd11e150436a762a4bfbaf3e4af"
+    },
+    "32_chunk_pipeline": {
+      "sha256": "9795eaa844e9835be4508241580d034ea191dff8ddb09544e962cf288000d7df"
+    },
+    "1mib_budget_pipeline": {
+      "sha256": "e0a101dd612522e8558c29c35618fecb522db4e44e293260b5dd29bc6af97dd5"
+    },
+    "1mib_budget_yield": {
+      "sha256": "2f6f92d48f0ef78421bade72958b600add9668530df67f03056b1e97a54a757e"
+    }
+  },
+  "scored_batches": {
+    "baseline_vs_4_chunk": [
+      {
+        "arm": "mpu-ab-1-baseline",
+        "cairn_obj_s": 51.37,
+        "rustfs_obj_s": 66.42,
+        "ratio": 0.773,
+        "unrelated_cpu_s": 8.920000000000002,
+        "cairn": {
+          "total_p50_ms": 163.28,
+          "blob_p50_ms": 121.08,
+          "body_p50_ms": 86.49,
+          "input_wait_p50_ms": 26.74,
+          "hash_p50_ms": 15.67,
+          "sink_p50_ms": 33.52,
+          "finalize_p50_ms": 21.69,
+          "admission_p50_ms": 6.72,
+          "publication_p50_ms": 10.79
+        }
+      },
+      {
+        "arm": "mpu-ab-2-pipeline",
+        "cairn_obj_s": 52.66,
+        "rustfs_obj_s": 54.54,
+        "ratio": 0.966,
+        "unrelated_cpu_s": 6.7299999999999995,
+        "cairn": {
+          "total_p50_ms": 137.83,
+          "blob_p50_ms": 115.04,
+          "body_p50_ms": 80.56,
+          "input_wait_p50_ms": 27.55,
+          "hash_p50_ms": 13.85,
+          "sink_p50_ms": 35.36,
+          "finalize_p50_ms": 36.62,
+          "admission_p50_ms": 6.2,
+          "publication_p50_ms": 7.29
+        }
+      },
+      {
+        "arm": "mpu-ab-3-pipeline",
+        "cairn_obj_s": 40.0,
+        "rustfs_obj_s": 46.32,
+        "ratio": 0.864,
+        "unrelated_cpu_s": 6.739999999999999,
+        "cairn": {
+          "total_p50_ms": 129.86,
+          "blob_p50_ms": 107.71,
+          "body_p50_ms": 74.76,
+          "input_wait_p50_ms": 24.36,
+          "hash_p50_ms": 17.4,
+          "sink_p50_ms": 34.26,
+          "finalize_p50_ms": 23.79,
+          "admission_p50_ms": 7.19,
+          "publication_p50_ms": 5.12
+        }
+      },
+      {
+        "arm": "mpu-ab-4-baseline",
+        "cairn_obj_s": 36.04,
+        "rustfs_obj_s": 48.91,
+        "ratio": 0.737,
+        "unrelated_cpu_s": 6.91,
+        "cairn": {
+          "total_p50_ms": 183.18,
+          "blob_p50_ms": 137.12,
+          "body_p50_ms": 84.83,
+          "input_wait_p50_ms": 26.42,
+          "hash_p50_ms": 13.73,
+          "sink_p50_ms": 40.18,
+          "finalize_p50_ms": 30.79,
+          "admission_p50_ms": 8.24,
+          "publication_p50_ms": 13.11
+        }
+      },
+      {
+        "arm": "mpu-ab-5-baseline",
+        "cairn_obj_s": 37.78,
+        "rustfs_obj_s": 51.44,
+        "ratio": 0.734,
+        "unrelated_cpu_s": 7.82,
+        "cairn": {
+          "total_p50_ms": 128.67,
+          "blob_p50_ms": 110.66,
+          "body_p50_ms": 68.98,
+          "input_wait_p50_ms": 24.6,
+          "hash_p50_ms": 14.19,
+          "sink_p50_ms": 26.59,
+          "finalize_p50_ms": 35.26,
+          "admission_p50_ms": 6.68,
+          "publication_p50_ms": 5.9
+        }
+      },
+      {
+        "arm": "mpu-ab-6-pipeline",
+        "cairn_obj_s": 33.26,
+        "rustfs_obj_s": 50.8,
+        "ratio": 0.655,
+        "unrelated_cpu_s": 6.33,
+        "cairn": {
+          "total_p50_ms": 182.77,
+          "blob_p50_ms": 141.35,
+          "body_p50_ms": 73.78,
+          "input_wait_p50_ms": 33.73,
+          "hash_p50_ms": 13.18,
+          "sink_p50_ms": 37.66,
+          "finalize_p50_ms": 47.69,
+          "admission_p50_ms": 8.47,
+          "publication_p50_ms": 7.22
+        }
+      }
+    ],
+    "baseline_vs_32_chunk": [
+      {
+        "arm": "mpu-ab32-1-baseline",
+        "cairn_obj_s": 50.94,
+        "rustfs_obj_s": 68.05,
+        "ratio": 0.749,
+        "unrelated_cpu_s": 13.7,
+        "cairn": {
+          "total_p50_ms": 151.51,
+          "blob_p50_ms": 135.84,
+          "body_p50_ms": 104.42,
+          "input_wait_p50_ms": 35.95,
+          "hash_p50_ms": 15.91,
+          "sink_p50_ms": 48.76,
+          "finalize_p50_ms": 20.11,
+          "admission_p50_ms": 7.65,
+          "publication_p50_ms": 7.83
+        }
+      },
+      {
+        "arm": "mpu-ab32-2-pipe32",
+        "cairn_obj_s": 47.01,
+        "rustfs_obj_s": 51.22,
+        "ratio": 0.918,
+        "unrelated_cpu_s": 4.180000000000001,
+        "cairn": {
+          "total_p50_ms": 135.81,
+          "blob_p50_ms": 99.77,
+          "body_p50_ms": 61.4,
+          "input_wait_p50_ms": 40.73,
+          "hash_p50_ms": 12.71,
+          "sink_p50_ms": 39.37,
+          "finalize_p50_ms": 26.8,
+          "admission_p50_ms": 7.46,
+          "publication_p50_ms": 9.43
+        }
+      },
+      {
+        "arm": "mpu-ab32-3-pipe32",
+        "cairn_obj_s": 39.14,
+        "rustfs_obj_s": 50.13,
+        "ratio": 0.781,
+        "unrelated_cpu_s": 5.11,
+        "cairn": {
+          "total_p50_ms": 171.41,
+          "blob_p50_ms": 117.13,
+          "body_p50_ms": 85.85,
+          "input_wait_p50_ms": 52.31,
+          "hash_p50_ms": 22.35,
+          "sink_p50_ms": 74.47,
+          "finalize_p50_ms": 33.89,
+          "admission_p50_ms": 14.16,
+          "publication_p50_ms": 8.38
+        }
+      },
+      {
+        "arm": "mpu-ab32-4-baseline",
+        "cairn_obj_s": 37.05,
+        "rustfs_obj_s": 49.92,
+        "ratio": 0.742,
+        "unrelated_cpu_s": 7.23,
+        "cairn": {
+          "total_p50_ms": 181.68,
+          "blob_p50_ms": 151.94,
+          "body_p50_ms": 94.45,
+          "input_wait_p50_ms": 34.04,
+          "hash_p50_ms": 15.66,
+          "sink_p50_ms": 32.68,
+          "finalize_p50_ms": 44.83,
+          "admission_p50_ms": 9.95,
+          "publication_p50_ms": 9.41
+        }
+      },
+      {
+        "arm": "mpu-ab32-5-baseline",
+        "cairn_obj_s": 38.0,
+        "rustfs_obj_s": 48.27,
+        "ratio": 0.787,
+        "unrelated_cpu_s": 5.31,
+        "cairn": {
+          "total_p50_ms": 155.44,
+          "blob_p50_ms": 137.48,
+          "body_p50_ms": 78.17,
+          "input_wait_p50_ms": 31.52,
+          "hash_p50_ms": 15.19,
+          "sink_p50_ms": 25.21,
+          "finalize_p50_ms": 34.25,
+          "admission_p50_ms": 10.81,
+          "publication_p50_ms": 8.33
+        }
+      },
+      {
+        "arm": "mpu-ab32-6-pipe32",
+        "cairn_obj_s": 37.61,
+        "rustfs_obj_s": 50.68,
+        "ratio": 0.742,
+        "unrelated_cpu_s": 9.960000000000003,
+        "cairn": {
+          "total_p50_ms": 141.92,
+          "blob_p50_ms": 113.8,
+          "body_p50_ms": 69.16,
+          "input_wait_p50_ms": 38.75,
+          "hash_p50_ms": 17.98,
+          "sink_p50_ms": 47.07,
+          "finalize_p50_ms": 23.56,
+          "admission_p50_ms": 8.05,
+          "publication_p50_ms": 7.69
+        }
+      }
+    ],
+    "baseline_vs_1mib_budget": [
+      {
+        "arm": "mpu-final-1-baseline",
+        "cairn_obj_s": 52.46,
+        "rustfs_obj_s": 67.97,
+        "ratio": 0.772,
+        "unrelated_cpu_s": 8.329999999999998,
+        "cairn": {
+          "total_p50_ms": 158.96,
+          "blob_p50_ms": 131.4,
+          "body_p50_ms": 96.96,
+          "input_wait_p50_ms": 29.4,
+          "hash_p50_ms": 14.93,
+          "sink_p50_ms": 39.12,
+          "finalize_p50_ms": 32.05,
+          "admission_p50_ms": 7.32,
+          "publication_p50_ms": 8.95
+        }
+      },
+      {
+        "arm": "mpu-final-2-final",
+        "cairn_obj_s": 41.37,
+        "rustfs_obj_s": 58.02,
+        "ratio": 0.713,
+        "unrelated_cpu_s": 6.77,
+        "cairn": {
+          "total_p50_ms": 120.02,
+          "blob_p50_ms": 89.64,
+          "body_p50_ms": 64.4,
+          "input_wait_p50_ms": 38.72,
+          "hash_p50_ms": 14.55,
+          "sink_p50_ms": 45.93,
+          "finalize_p50_ms": 24.2,
+          "admission_p50_ms": 10.51,
+          "publication_p50_ms": 7.39
+        }
+      },
+      {
+        "arm": "mpu-final-3-final",
+        "cairn_obj_s": 24.57,
+        "rustfs_obj_s": 50.1,
+        "ratio": 0.49,
+        "unrelated_cpu_s": 6.83,
+        "cairn": {
+          "total_p50_ms": 195.05,
+          "blob_p50_ms": 158.99,
+          "body_p50_ms": 70.9,
+          "input_wait_p50_ms": 40.67,
+          "hash_p50_ms": 19.4,
+          "sink_p50_ms": 58.96,
+          "finalize_p50_ms": 58.9,
+          "admission_p50_ms": 14.98,
+          "publication_p50_ms": 14.29
+        }
+      },
+      {
+        "arm": "mpu-final-4-baseline",
+        "cairn_obj_s": 24.0,
+        "rustfs_obj_s": 47.11,
+        "ratio": 0.509,
+        "unrelated_cpu_s": 6.449999999999999,
+        "cairn": {
+          "total_p50_ms": 367.84,
+          "blob_p50_ms": 281.82,
+          "body_p50_ms": 82.03,
+          "input_wait_p50_ms": 30.32,
+          "hash_p50_ms": 16.4,
+          "sink_p50_ms": 31.36,
+          "finalize_p50_ms": 195.09,
+          "admission_p50_ms": 13.84,
+          "publication_p50_ms": 18.41
+        }
+      },
+      {
+        "arm": "mpu-final-5-baseline",
+        "cairn_obj_s": 34.7,
+        "rustfs_obj_s": 47.79,
+        "ratio": 0.726,
+        "unrelated_cpu_s": 9.290000000000003,
+        "cairn": {
+          "total_p50_ms": 163.02,
+          "blob_p50_ms": 140.06,
+          "body_p50_ms": 88.06,
+          "input_wait_p50_ms": 32.7,
+          "hash_p50_ms": 15.13,
+          "sink_p50_ms": 37.28,
+          "finalize_p50_ms": 35.64,
+          "admission_p50_ms": 6.76,
+          "publication_p50_ms": 14.08
+        }
+      },
+      {
+        "arm": "mpu-final-6-final",
+        "cairn_obj_s": 26.67,
+        "rustfs_obj_s": 50.04,
+        "ratio": 0.533,
+        "unrelated_cpu_s": 6.22,
+        "cairn": {
+          "total_p50_ms": 223.02,
+          "blob_p50_ms": 159.06,
+          "body_p50_ms": 74.41,
+          "input_wait_p50_ms": 47.87,
+          "hash_p50_ms": 15.31,
+          "sink_p50_ms": 50.44,
+          "finalize_p50_ms": 90.42,
+          "admission_p50_ms": 8.59,
+          "publication_p50_ms": 16.08
+        }
+      }
+    ],
+    "baseline_vs_1mib_budget_yield": [
+      {
+        "arm": "mpu-yield-1-baseline",
+        "cairn_obj_s": 27.22,
+        "rustfs_obj_s": 38.33,
+        "ratio": 0.71,
+        "unrelated_cpu_s": 7.169999999999999,
+        "cairn": {
+          "total_p50_ms": 328.01,
+          "blob_p50_ms": 198.04,
+          "body_p50_ms": 66.54,
+          "input_wait_p50_ms": 26.97,
+          "hash_p50_ms": 14.48,
+          "sink_p50_ms": 22.35,
+          "finalize_p50_ms": 127.03,
+          "admission_p50_ms": 8.93,
+          "publication_p50_ms": 11.9
+        }
+      },
+      {
+        "arm": "mpu-yield-2-yield",
+        "cairn_obj_s": 18.13,
+        "rustfs_obj_s": 28.11,
+        "ratio": 0.645,
+        "unrelated_cpu_s": 5.780000000000001,
+        "cairn": {
+          "total_p50_ms": 334.51,
+          "blob_p50_ms": 290.81,
+          "body_p50_ms": 100.03,
+          "input_wait_p50_ms": 27.73,
+          "hash_p50_ms": 17.44,
+          "sink_p50_ms": 20.61,
+          "finalize_p50_ms": 177.12,
+          "admission_p50_ms": 13.78,
+          "publication_p50_ms": 16.53
+        }
+      },
+      {
+        "arm": "mpu-yield-3-yield",
+        "cairn_obj_s": 13.52,
+        "rustfs_obj_s": 30.15,
+        "ratio": 0.448,
+        "unrelated_cpu_s": 15.84,
+        "cairn": {
+          "total_p50_ms": 384.0,
+          "blob_p50_ms": 330.19,
+          "body_p50_ms": 110.35,
+          "input_wait_p50_ms": 24.68,
+          "hash_p50_ms": 17.81,
+          "sink_p50_ms": 28.86,
+          "finalize_p50_ms": 210.37,
+          "admission_p50_ms": 16.49,
+          "publication_p50_ms": 16.85
+        }
+      },
+      {
+        "arm": "mpu-yield-4-baseline",
+        "cairn_obj_s": 14.4,
+        "rustfs_obj_s": 28.19,
+        "ratio": 0.511,
+        "unrelated_cpu_s": 5.71,
+        "cairn": {
+          "total_p50_ms": 353.28,
+          "blob_p50_ms": 277.01,
+          "body_p50_ms": 72.64,
+          "input_wait_p50_ms": 24.67,
+          "hash_p50_ms": 15.32,
+          "sink_p50_ms": 31.0,
+          "finalize_p50_ms": 211.04,
+          "admission_p50_ms": 18.39,
+          "publication_p50_ms": 26.89
+        }
+      },
+      {
+        "arm": "mpu-yield-5-baseline",
+        "cairn_obj_s": 19.56,
+        "rustfs_obj_s": 23.5,
+        "ratio": 0.832,
+        "unrelated_cpu_s": 5.89,
+        "cairn": {
+          "total_p50_ms": 405.64,
+          "blob_p50_ms": 365.93,
+          "body_p50_ms": 93.58,
+          "input_wait_p50_ms": 26.51,
+          "hash_p50_ms": 17.67,
+          "sink_p50_ms": 38.89,
+          "finalize_p50_ms": 214.19,
+          "admission_p50_ms": 16.56,
+          "publication_p50_ms": 19.84
+        }
+      },
+      {
+        "arm": "mpu-yield-6-yield",
+        "cairn_obj_s": 13.07,
+        "rustfs_obj_s": 29.16,
+        "ratio": 0.448,
+        "unrelated_cpu_s": 4.46,
+        "cairn": {
+          "total_p50_ms": 487.48,
+          "blob_p50_ms": 319.47,
+          "body_p50_ms": 112.29,
+          "input_wait_p50_ms": 20.59,
+          "hash_p50_ms": 17.81,
+          "sink_p50_ms": 28.67,
+          "finalize_p50_ms": 201.76,
+          "admission_p50_ms": 15.15,
+          "publication_p50_ms": 18.39
+        }
+      }
+    ]
+  },
+  "part_screen": [
+    {
+      "label": "b1",
+      "objects_per_second": 42.84,
+      "load": "2.99",
+      "body_p50_ms": 115.73,
+      "input_wait_p50_ms": 40.88,
+      "hash_p50_ms": 20.33,
+      "sink_p50_ms": 43.22,
+      "finalize_p50_ms": 22.54,
+      "total_p50_ms": 162.24
+    },
+    {
+      "label": "b4",
+      "objects_per_second": 38.55,
+      "load": "4.57",
+      "body_p50_ms": 61.92,
+      "input_wait_p50_ms": 21.6,
+      "hash_p50_ms": 13.12,
+      "sink_p50_ms": 24.0,
+      "finalize_p50_ms": 55.73,
+      "total_p50_ms": 155.47
+    },
+    {
+      "label": "b7",
+      "objects_per_second": 31.74,
+      "load": "4.87",
+      "body_p50_ms": 69.23,
+      "input_wait_p50_ms": 24.4,
+      "hash_p50_ms": 14.15,
+      "sink_p50_ms": 21.08,
+      "finalize_p50_ms": 54.3,
+      "total_p50_ms": 166.31
+    },
+    {
+      "label": "p32-3",
+      "objects_per_second": 46.97,
+      "load": "4.75",
+      "body_p50_ms": 47.07,
+      "input_wait_p50_ms": 28.69,
+      "hash_p50_ms": 12.5,
+      "sink_p50_ms": 42.19,
+      "finalize_p50_ms": 43.95,
+      "total_p50_ms": 134.92
+    },
+    {
+      "label": "p32-6",
+      "objects_per_second": 34.22,
+      "load": "4.75",
+      "body_p50_ms": 51.83,
+      "input_wait_p50_ms": 31.51,
+      "hash_p50_ms": 13.74,
+      "sink_p50_ms": 45.9,
+      "finalize_p50_ms": 37.48,
+      "total_p50_ms": 170.42
+    },
+    {
+      "label": "p32-9",
+      "objects_per_second": 33.33,
+      "load": "4.63",
+      "body_p50_ms": 42.02,
+      "input_wait_p50_ms": 22.03,
+      "hash_p50_ms": 12.82,
+      "sink_p50_ms": 37.81,
+      "finalize_p50_ms": 45.72,
+      "total_p50_ms": 171.2
+    },
+    {
+      "label": "p4-2",
+      "objects_per_second": 48.54,
+      "load": "4.11",
+      "body_p50_ms": 77.9,
+      "input_wait_p50_ms": 28.62,
+      "hash_p50_ms": 13.22,
+      "sink_p50_ms": 33.78,
+      "finalize_p50_ms": 45.87,
+      "total_p50_ms": 147.8
+    },
+    {
+      "label": "p4-5",
+      "objects_per_second": 40.7,
+      "load": "5.15",
+      "body_p50_ms": 95.32,
+      "input_wait_p50_ms": 27.75,
+      "hash_p50_ms": 15.42,
+      "sink_p50_ms": 45.22,
+      "finalize_p50_ms": 75.13,
+      "total_p50_ms": 195.99
+    },
+    {
+      "label": "p4-8",
+      "objects_per_second": 31.0,
+      "load": "5.24",
+      "body_p50_ms": 89.13,
+      "input_wait_p50_ms": 21.44,
+      "hash_p50_ms": 14.36,
+      "sink_p50_ms": 43.55,
+      "finalize_p50_ms": 50.86,
+      "total_p50_ms": 182.59
+    },
+    {
+      "label": "z-b1",
+      "objects_per_second": 49.25,
+      "load": "2.64",
+      "body_p50_ms": 96.47,
+      "input_wait_p50_ms": 32.57,
+      "hash_p50_ms": 15.96,
+      "sink_p50_ms": 41.97,
+      "finalize_p50_ms": 37.65,
+      "total_p50_ms": 168.89
+    },
+    {
+      "label": "z-b4",
+      "objects_per_second": 37.87,
+      "load": "5.13",
+      "body_p50_ms": 64.25,
+      "input_wait_p50_ms": 25.47,
+      "hash_p50_ms": 13.84,
+      "sink_p50_ms": 25.98,
+      "finalize_p50_ms": 37.81,
+      "total_p50_ms": 144.87
+    },
+    {
+      "label": "z-bud-3",
+      "objects_per_second": 42.34,
+      "load": "3.78",
+      "body_p50_ms": 59.65,
+      "input_wait_p50_ms": 29.69,
+      "hash_p50_ms": 13.94,
+      "sink_p50_ms": 51.46,
+      "finalize_p50_ms": 45.85,
+      "total_p50_ms": 154.85
+    },
+    {
+      "label": "z-bud-6",
+      "objects_per_second": 33.24,
+      "load": "5.55",
+      "body_p50_ms": 57.95,
+      "input_wait_p50_ms": 29.22,
+      "hash_p50_ms": 15.62,
+      "sink_p50_ms": 49.67,
+      "finalize_p50_ms": 21.94,
+      "total_p50_ms": 131.77
+    },
+    {
+      "label": "z-p32-2",
+      "objects_per_second": 49.07,
+      "load": "3.75",
+      "body_p50_ms": 63.79,
+      "input_wait_p50_ms": 38.36,
+      "hash_p50_ms": 14.29,
+      "sink_p50_ms": 50.97,
+      "finalize_p50_ms": 32.51,
+      "total_p50_ms": 141.52
+    },
+    {
+      "label": "z-p32-5",
+      "objects_per_second": 32.67,
+      "load": "5.28",
+      "body_p50_ms": 43.88,
+      "input_wait_p50_ms": 25.86,
+      "hash_p50_ms": 12.29,
+      "sink_p50_ms": 39.65,
+      "finalize_p50_ms": 53.53,
+      "total_p50_ms": 119.78
+    }
+  ],
+  "simultaneous_ab": [
+    {
+      "round": 0,
+      "load_before": "1.09 2.97 3.81 1/2522 4013714",
+      "load_after": "4.93 3.83 4.08 1/2534 4015059",
+      "elapsed": 15.4,
+      "left": {
+        "binary": "/tmp/cairn-mpu-baseline",
+        "obj_s": 28.97,
+        "stages": {
+          "total": 228.7,
+          "body": 156.6,
+          "input": 43.7,
+          "hash": 30.7,
+          "sink": 78.0,
+          "finalize": 37.4,
+          "admission": 17.9,
+          "publication": 11.8
+        }
+      },
+      "right": {
+        "binary": "/tmp/cairn-mpu-final",
+        "obj_s": 30.44,
+        "stages": {
+          "total": 312.0,
+          "body": 145.3,
+          "input": 95.6,
+          "hash": 37.2,
+          "sink": 117.8,
+          "finalize": 36.0,
+          "admission": 12.3,
+          "publication": 18.9
+        }
+      }
+    },
+    {
+      "round": 1,
+      "load_before": "4.93 3.83 4.08 1/2517 4015235",
+      "load_after": "6.25 4.34 4.24 2/2568 4016721",
+      "elapsed": 18.1,
+      "left": {
+        "binary": "/tmp/cairn-mpu-final",
+        "obj_s": 22.98,
+        "stages": {
+          "total": 227.4,
+          "body": 112.2,
+          "input": 53.8,
+          "hash": 35.6,
+          "sink": 91.1,
+          "finalize": 41.7,
+          "admission": 14.3,
+          "publication": 26.6
+        }
+      },
+      "right": {
+        "binary": "/tmp/cairn-mpu-baseline",
+        "obj_s": 23.16,
+        "stages": {
+          "total": 334.4,
+          "body": 186.9,
+          "input": 56.6,
+          "hash": 30.3,
+          "sink": 69.2,
+          "finalize": 38.9,
+          "admission": 19.4,
+          "publication": 10.6
+        }
+      }
+    },
+    {
+      "round": 2,
+      "load_before": "5.75 4.27 4.22 2/2519 4016874",
+      "load_after": "6.25 4.63 4.35 1/2532 4018189",
+      "elapsed": 15.3,
+      "left": {
+        "binary": "/tmp/cairn-mpu-baseline",
+        "obj_s": 13.33,
+        "stages": {
+          "total": 437.2,
+          "body": 129.1,
+          "input": 45.2,
+          "hash": 16.8,
+          "sink": 56.7,
+          "finalize": 99.6,
+          "admission": 12.9,
+          "publication": 19.1
+        }
+      },
+      "right": {
+        "binary": "/tmp/cairn-mpu-final",
+        "obj_s": 15.3,
+        "stages": {
+          "total": 454.9,
+          "body": 145.8,
+          "input": 91.4,
+          "hash": 27.3,
+          "sink": 73.2,
+          "finalize": 152.8,
+          "admission": 13.6,
+          "publication": 51.7
+        }
+      }
+    },
+    {
+      "round": 3,
+      "load_before": "5.75 4.56 4.32 1/2520 4018375",
+      "load_after": "6.70 5.00 4.48 1/2536 4019741",
+      "elapsed": 15.3,
+      "left": {
+        "binary": "/tmp/cairn-mpu-final",
+        "obj_s": 19.52,
+        "stages": {
+          "total": 608.4,
+          "body": 124.5,
+          "input": 63.8,
+          "hash": 34.1,
+          "sink": 116.7,
+          "finalize": 83.2,
+          "admission": 9.3,
+          "publication": 12.7
+        }
+      },
+      "right": {
+        "binary": "/tmp/cairn-mpu-baseline",
+        "obj_s": 19.0,
+        "stages": {
+          "total": 572.5,
+          "body": 206.9,
+          "input": 62.5,
+          "hash": 25.5,
+          "sink": 98.5,
+          "finalize": 248.1,
+          "admission": 13.4,
+          "publication": 11.9
+        }
+      }
+    }
+  ],
+  "conclusion": "The pipeline reduced the body stage consistently (part screen: body p50 96.5/64.3 ms baseline vs 59.6/58.0 ms with 1 MiB read-ahead) but never produced a repeatable scored throughput win across four alternating batches or a simultaneous two-server A/B. Measured against 433438f, the per-part p50 was already lower than RustFS's while throughput was lower, because Warp pays a synchronous CompleteMultipartUpload tail per 10-part upload. The code was reverted and not merged; the completion tail (later cut by the section-11 assembly pipeline) was the scored lever.",
+  "base_commit": "433438f (main before the section-11 completion pipeline)"
+}
