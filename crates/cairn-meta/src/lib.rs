@@ -150,7 +150,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // `apply.rs` with headroom so the LRU never evicts a hot statement mid-batch (ARCH 30.3).
     write_conn.set_prepared_statement_cache_capacity(64);
     schema::run_migrations(&write_conn).map_err(map)?;
-    let writer = Writer::spawn(write_conn, opts.group_commit_linger);
+    let writer = Writer::spawn(write_conn, opts.group_commit_linger, opts.synchronous_full);
 
     // The read pool: WAL snapshot readers, query-only.
     let opts_for_init = opts.clone();
@@ -190,7 +190,7 @@ pub fn open_in_memory() -> Result<SqliteMetadataStore, MetaError> {
         .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
         .map_err(map)?;
     schema::run_migrations(&write_conn).map_err(map)?;
-    let writer = Writer::spawn(write_conn, None);
+    let writer = Writer::spawn(write_conn, None, true);
 
     let manager = SqliteConnectionManager::file(&name)
         .with_flags(flags)

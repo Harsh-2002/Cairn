@@ -175,7 +175,7 @@ pub struct Writer {
 impl Writer {
     /// Spawn the writer on a dedicated OS thread owning `conn`. `linger` optionally waits a
     /// short window to enlarge batches under bursty load (group-commit linger).
-    pub fn spawn(conn: Connection, linger: Option<Duration>) -> Writer {
+    pub fn spawn(conn: Connection, linger: Option<Duration>, synchronous_full: bool) -> Writer {
         let (tx, rx) = mpsc::channel::<Job>(4096);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let loop_depth = queue_depth.clone();
@@ -185,7 +185,17 @@ impl Writer {
         let loop_stages = stage_samples.clone();
         std::thread::Builder::new()
             .name("cairn-meta-writer".to_owned())
-            .spawn(move || writer_loop(conn, rx, linger, &loop_depth, &loop_samples, &loop_stages))
+            .spawn(move || {
+                writer_loop(
+                    conn,
+                    rx,
+                    linger,
+                    synchronous_full,
+                    &loop_depth,
+                    &loop_samples,
+                    &loop_stages,
+                )
+            })
             .expect("spawn writer thread");
         Writer {
             tx,
@@ -326,6 +336,7 @@ fn writer_loop(
     conn: Connection,
     mut rx: mpsc::Receiver<Job>,
     linger: Option<Duration>,
+    synchronous_full: bool,
     queue_depth: &AtomicUsize,
     commit_samples: &Mutex<VecDeque<CommitSample>>,
     stage_samples: &StageSamples,
@@ -371,7 +382,13 @@ fn writer_loop(
             }
         }
 
-        commit_batch(&conn, batch, commit_samples, stage_samples);
+        commit_batch(
+            &conn,
+            batch,
+            commit_samples,
+            stage_samples,
+            synchronous_full,
+        );
         for ctl in deferred {
             match ctl {
                 Control::CheckpointAndShutdown(reply) => {
@@ -477,6 +494,7 @@ fn commit_batch(
     batch: Vec<WriteRequest>,
     commit_samples: &Mutex<VecDeque<CommitSample>>,
     stage_samples: &StageSamples,
+    synchronous_full: bool,
 ) {
     // The number of mutations coalesced into this batch — the `cairn_writer_batch_size` observation,
     // captured before `batch` is consumed below.
@@ -488,17 +506,22 @@ fn commit_batch(
     // index tail, and startup rebuild restores it from those files. A batch made only of such
     // publications therefore does not need a per-commit WAL fsync; control-plane and every mixed
     // batch keep the full barrier. (Prototype: measure before making this permanent.)
-    let relaxed = batch.iter().all(|(mutation, _, _)| {
-        matches!(
-            mutation,
-            cairn_types::meta::Mutation::PublishObjectWrite { .. }
+    // `synchronous=normal` is an opt-in whole-writer mode: every batch uses NORMAL. With the
+    // default `full`, only a batch made entirely of overlay-backed publications may use NORMAL;
+    // every control-plane or mixed batch keeps the full barrier. This is the documented config
+    // contract, and the previous unconditional FULL for non-relaxed batches silently ignored it.
+    let relaxed = !synchronous_full
+        || batch.iter().all(|(mutation, _, _)| {
+            matches!(
+                mutation,
+                cairn_types::meta::Mutation::PublishObjectWrite { .. }
                 | cairn_types::meta::Mutation::AbandonObjectWrite { .. }
                 // The storage journal and its cleanup debt are recovered by the mandatory full
                 // scan; losing their WAL tail never loses an acknowledged object.
                 | cairn_types::meta::Mutation::Storage { .. }
                 | cairn_types::meta::Mutation::ClaimStorageCleanup { .. }
-        )
-    });
+            )
+        });
     let _ = conn.execute_batch(if relaxed {
         "PRAGMA synchronous=NORMAL"
     } else {
@@ -656,7 +679,7 @@ mod tests {
         }
         let commits = Mutex::new(VecDeque::new());
         let stages = Mutex::new(StageBuffer::default());
-        commit_batch(&conn, batch, &commits, &stages);
+        commit_batch(&conn, batch, &commits, &stages, true);
         for reply in replies {
             assert!(matches!(reply.await.unwrap(), Err(MetaError::OutOfSpace)));
         }
@@ -686,6 +709,7 @@ mod tests {
             )],
             &commits,
             &stages,
+            true,
         );
         assert!(reply.await.unwrap().is_ok());
         assert_eq!(
@@ -703,7 +727,7 @@ mod tests {
         for delay_ms in [0, 50] {
             let conn = Connection::open_in_memory().unwrap();
             crate::schema::run_migrations(&conn).unwrap();
-            let writer = Writer::spawn(conn, None);
+            let writer = Writer::spawn(conn, None, true);
             let (entered_tx, entered_rx) = oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let blocker = writer.clone();
@@ -846,6 +870,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synchronous_normal_mode_applies_to_non_relaxed_batches() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::run_migrations(&conn).unwrap();
+        let stages = Mutex::new(StageBuffer::default());
+        let commits = Mutex::new(VecDeque::new());
+        let delete = || Mutation::DeleteBucket(cairn_types::BucketName::parse("absent").unwrap());
+
+        let (ack, result) = oneshot::channel();
+        commit_batch(
+            &conn,
+            vec![(delete(), ack, Instant::now())],
+            &commits,
+            &stages,
+            false,
+        );
+        let _ = result.await;
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "CAIRN_META_SYNCHRONOUS=normal must use NORMAL even for a non-relaxed batch"
+        );
+
+        let (ack, result) = oneshot::channel();
+        commit_batch(
+            &conn,
+            vec![(delete(), ack, Instant::now())],
+            &commits,
+            &stages,
+            true,
+        );
+        let _ = result.await;
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "the default full mode keeps the full barrier for a non-relaxed batch"
+        );
+    }
+
+    #[tokio::test]
     async fn queued_delay_is_separate_from_transaction_stages_and_failed_mutations() {
         let conn = Connection::open_in_memory().unwrap();
         crate::schema::run_migrations(&conn).unwrap();
@@ -865,6 +930,7 @@ mod tests {
             )],
             &commits,
             &stages,
+            true,
         );
         assert!(result.await.unwrap().is_err());
         let guard = stages.lock().unwrap();
