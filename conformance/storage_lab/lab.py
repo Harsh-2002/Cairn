@@ -144,8 +144,8 @@ def observe_storage_cleanup(database, work_deadline, server_alive):
         if protocol == (1, 1):
             result.update(status="unsupported", reason="protocol 1 has no lifecycle journal")
             return result
-        if protocol != (2, 2):
-            result["reason"] = "observation supports only protocol 2 journals"
+        if protocol[0] != protocol[1] or protocol[0] < 2:
+            result["reason"] = "observation requires a supported journal protocol"
             return result
         while time.monotonic() < deadline:
             if not server_alive():

@@ -19,7 +19,7 @@ class CleanupObservation(unittest.TestCase):
         self.writer.execute('PRAGMA journal_mode=WAL')
         self.writer.executescript('''
             CREATE TABLE storage_protocol(singleton,minimum_reader,minimum_writer);
-            INSERT INTO storage_protocol VALUES(1,2,2);
+            INSERT INTO storage_protocol VALUES(1,3,3);
             CREATE TABLE storage_write_intents(id);
             CREATE TABLE storage_cleanups(id);
         ''')
