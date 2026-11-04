@@ -4086,3 +4086,179 @@ async fn internal_integrity_digest_round_trips_without_entering_s3_checksums() {
         }
     }
 }
+
+fn delete_activity_entry(id: &str, bucket: &str, key: &str) -> ActivityEntry {
+    ActivityEntry {
+        id: id.to_owned(),
+        action: "DeleteObject".to_owned(),
+        bucket: Some(bucket.to_owned()),
+        key: Some(key.to_owned()),
+        size: None,
+        etag: None,
+        actor: Some("auditor".to_owned()),
+        at: Timestamp(7),
+    }
+}
+
+#[tokio::test]
+async fn delete_with_activity_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let fixture = s.begin_fixture().await.unwrap();
+        let bucket_name = BucketName::parse("delete-activity").unwrap();
+        s.submit(Mutation::CreateBucket(Box::new(bucket(
+            "delete-activity",
+            VersioningState::Unversioned,
+        ))))
+        .await
+        .unwrap();
+        let key = ObjectKey::parse("object").unwrap();
+        let version = VersionId::null();
+        s.submit_fixture(
+            &fixture,
+            put(
+                row(&bucket_name, key.as_str(), version.clone(), "etag", 3),
+                Precondition::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let entry = delete_activity_entry("delete-activity-1", "delete-activity", "object");
+        let outcome = s
+            .submit(Mutation::DeleteWithActivity {
+                operation: Box::new(Mutation::DeleteVersion {
+                    bucket: bucket_name.clone(),
+                    key: key.clone(),
+                    version_id: version.clone(),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(7),
+                    bypass: GovernanceBypass::Denied,
+                }),
+                activity: Box::new(entry.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MutationOutcome::Deleted { .. }));
+        assert!(
+            s.get_version(&bucket_name, &key, &version)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(s.list_activity(10).await.unwrap(), vec![entry.clone()]);
+
+        // A retried duplicate id is already satisfied and must not fail a later delete.
+        s.submit_fixture(
+            &fixture,
+            put(
+                row(&bucket_name, key.as_str(), version.clone(), "etag", 3),
+                Precondition::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let retried = s
+            .submit(Mutation::DeleteWithActivity {
+                operation: Box::new(Mutation::DeleteVersion {
+                    bucket: bucket_name.clone(),
+                    key: key.clone(),
+                    version_id: version.clone(),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(8),
+                    bypass: GovernanceBypass::Denied,
+                }),
+                activity: Box::new(entry.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(retried, MutationOutcome::Deleted { .. }));
+        assert_eq!(s.list_activity(10).await.unwrap(), vec![entry]);
+
+        // Only the delete family may carry a co-committed activity row.
+        let rejected = s
+            .submit(Mutation::DeleteWithActivity {
+                operation: Box::new(Mutation::SetVersioning {
+                    bucket: bucket_name.clone(),
+                    state: VersioningState::Enabled,
+                }),
+                activity: Box::new(delete_activity_entry(
+                    "delete-activity-shape",
+                    "delete-activity",
+                    "object",
+                )),
+            })
+            .await;
+        assert!(
+            matches!(rejected, Err(MetaError::Engine(ref message)) if message.contains("DeleteVersion")),
+            "non-delete inner operation must be rejected, got {rejected:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_with_activity_protected_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let fixture = s.begin_fixture().await.unwrap();
+        let locked = bucket("delete-activity-worm", VersioningState::Enabled);
+        let bucket_name = locked.name.clone();
+        s.submit(Mutation::CreateObjectLockBucket(Box::new(locked)))
+            .await
+            .unwrap();
+        let key = ObjectKey::parse("locked").unwrap();
+        let version = VersionId::from_string("locked-v1".into());
+        let mut object = row(&bucket_name, key.as_str(), version.clone(), "etag", 3);
+        object.created_at = Timestamp(10);
+        s.submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: None,
+                        legal_hold: Some(true),
+                    },
+                },
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcome = s
+            .submit(Mutation::DeleteWithActivity {
+                operation: Box::new(Mutation::DeleteVersion {
+                    bucket: bucket_name.clone(),
+                    key: key.clone(),
+                    version_id: version.clone(),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(100),
+                    bypass: GovernanceBypass::Denied,
+                }),
+                activity: Box::new(delete_activity_entry(
+                    "delete-activity-protected",
+                    "delete-activity-worm",
+                    "locked",
+                )),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::DeleteProtected);
+        assert!(s.list_activity(10).await.unwrap().is_empty());
+        assert!(
+            s.get_version(&bucket_name, &key, &version)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}

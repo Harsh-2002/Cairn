@@ -637,3 +637,146 @@ async fn remote_cleanup_and_delivery_use_independent_fairness_cursors() {
         "alternating callers must not pin one parity of shards"
     );
 }
+
+fn delete_activity_entry(id: &str, bucket: &str, key: &str) -> ActivityEntry {
+    ActivityEntry {
+        id: id.to_owned(),
+        action: "DeleteObject".to_owned(),
+        bucket: Some(bucket.to_owned()),
+        key: Some(key.to_owned()),
+        size: None,
+        etag: None,
+        actor: Some("owner".to_owned()),
+        at: Timestamp(7),
+    }
+}
+
+#[tokio::test]
+async fn n3_delete_with_activity_deletes_on_bucket_shard_and_audits_globally() {
+    let n = 3;
+    let (store, inner) = shards(n);
+    let fixture = store.begin_fixture().await.unwrap();
+    // Force a bucket that does not map to shard 0, so the two destinations are distinguishable.
+    let name = (0..64)
+        .map(|i| format!("activity-route-{i}"))
+        .find(|name| cairn_meta::shard_for_bucket(name, n) != 0)
+        .expect("a 3-shard layout must route some bucket away from shard 0");
+    store.submit(bucket(&name)).await.unwrap();
+    let b = BucketName::parse(&name).unwrap();
+    let key = ObjectKey::parse("k").unwrap();
+    store
+        .submit_fixture(&fixture, put(row(&name, "k", 5)))
+        .await
+        .unwrap();
+
+    let entry = delete_activity_entry("activity-route-1", &name, "k");
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: b.clone(),
+                key: key.clone(),
+                version_id: VersionId::null(),
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Deleted { .. }));
+
+    let owner = cairn_meta::shard_for_bucket(&name, n);
+    assert_ne!(owner, 0, "test precondition");
+    assert!(
+        inner[owner]
+            .current_version(&b, &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the delete must apply on the bucket's own shard"
+    );
+    assert!(
+        inner[owner].list_activity(10).await.unwrap().is_empty(),
+        "the activity row must not be written into a bucket shard nobody reads"
+    );
+    assert_eq!(
+        store.list_activity(10).await.unwrap(),
+        vec![entry],
+        "the activity row must be visible from the global shard"
+    );
+}
+
+#[tokio::test]
+async fn n2_delete_with_activity_records_nothing_for_a_protected_delete() {
+    let (store, _) = shards(2);
+    let fixture = store.begin_fixture().await.unwrap();
+    let name = "activity-protected";
+    store
+        .submit(Mutation::CreateObjectLockBucket(Box::new(Bucket {
+            name: BucketName::parse(name).unwrap(),
+            owner_id: UserId("owner".to_owned()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        })))
+        .await
+        .unwrap();
+    let b = BucketName::parse(name).unwrap();
+    let key = ObjectKey::parse("locked").unwrap();
+    let version = VersionId::from_string("locked-v1".into());
+    let mut object = row(name, "locked", 0);
+    object.version_id = version.clone();
+    store
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(object),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: None,
+                        legal_hold: Some(true),
+                    },
+                },
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: b.clone(),
+                key: key.clone(),
+                version_id: version.clone(),
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(100),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(delete_activity_entry(
+                "activity-protected-1",
+                name,
+                "locked",
+            )),
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, MutationOutcome::DeleteProtected);
+    assert!(store.list_activity(10).await.unwrap().is_empty());
+    assert!(
+        store
+            .get_version(&b, &key, &version)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

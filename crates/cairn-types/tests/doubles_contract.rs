@@ -1597,3 +1597,144 @@ async fn requeue_replication_versions_double_skips_unshippable_non_current_versi
     ids.sort_unstable();
     assert_eq!(ids, vec!["kept:1", "kept:2", "pruned:2"]);
 }
+
+fn activity_row(bucket: &BucketName, key: &ObjectKey, version: VersionId) -> ObjectVersionRow {
+    ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version,
+        is_latest: true,
+        is_delete_marker: false,
+        size_logical: 3,
+        size_physical: 3,
+        etag: ETag::from_string("etag".to_owned()),
+        content_type: "text/plain".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        expire_at: None,
+        storage_path: None,
+        compression: CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: UserId::generate(),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        sse_descriptor: None,
+        replication_status: None,
+        internal_sha256: None,
+        replicated_at: None,
+        created_at: Timestamp::EPOCH,
+        updated_at: Timestamp::EPOCH,
+        multipart_parts: None,
+    }
+}
+
+#[tokio::test]
+async fn delete_with_activity_double_commits_once_and_dedupes() {
+    let meta = InMemoryMetadataStore::new();
+    let fixture = meta.begin_fixture().await.unwrap();
+    let bucket = BucketName::parse("activity-bucket").unwrap();
+    create_bucket_fixture(&meta, &bucket).await;
+    let key = ObjectKey::parse("k").unwrap();
+    let version = VersionId::null();
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(activity_row(&bucket, &key, version.clone())),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let entry = ActivityEntry {
+        id: "activity-1".to_owned(),
+        action: "DeleteObject".to_owned(),
+        bucket: Some(bucket.as_str().to_owned()),
+        key: Some(key.as_str().to_owned()),
+        size: None,
+        etag: None,
+        actor: Some("actor".to_owned()),
+        at: Timestamp(7),
+    };
+    let outcome = meta
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version,
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Deleted { .. }));
+    assert!(meta.current_version(&bucket, &key).await.unwrap().is_none());
+    assert_eq!(meta.list_activity(10).await.unwrap(), vec![entry.clone()]);
+
+    // A retried duplicate id is already satisfied.
+    meta.submit_fixture(
+        &fixture,
+        Mutation::PutObjectVersion {
+            row: Box::new(activity_row(&bucket, &key, VersionId::null())),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let retried = meta
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::null(),
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(8),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(retried, MutationOutcome::Deleted { .. }));
+    assert_eq!(meta.list_activity(10).await.unwrap(), vec![entry]);
+
+    let rejected = meta
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::SetVersioning {
+                bucket: bucket.clone(),
+                state: VersioningState::Enabled,
+            }),
+            activity: Box::new(ActivityEntry {
+                id: "activity-shape".to_owned(),
+                action: "DeleteObject".to_owned(),
+                bucket: Some(bucket.as_str().to_owned()),
+                key: None,
+                size: None,
+                etag: None,
+                actor: None,
+                at: Timestamp(9),
+            }),
+        })
+        .await;
+    assert!(
+        matches!(rejected, Err(MetaError::Engine(ref message)) if message.contains("DeleteVersion")),
+        "non-delete inner operation must be rejected, got {rejected:?}"
+    );
+}

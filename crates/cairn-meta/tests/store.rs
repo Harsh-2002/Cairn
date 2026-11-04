@@ -5898,3 +5898,306 @@ async fn listing_visible_at_omits_expired_versions() {
         .unwrap();
     assert!(hidden.items.is_empty());
 }
+
+fn delete_audit_entry(id: &str, action: &str, bucket: &str, key: &str) -> ActivityEntry {
+    ActivityEntry {
+        id: id.to_owned(),
+        action: action.to_owned(),
+        bucket: Some(bucket.to_owned()),
+        key: Some(key.to_owned()),
+        size: None,
+        etag: None,
+        actor: Some("auditor".to_owned()),
+        at: Timestamp(7),
+    }
+}
+
+#[tokio::test]
+async fn delete_with_activity_commits_the_audit_row_with_the_delete() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let b = BucketName::parse("audit-delete").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("audit-delete"))))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("doc").unwrap();
+    let v = VersionId::from_string("v1".into());
+    store
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "doc", v.clone(), "e", false),
+                Precondition::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let entry = delete_audit_entry("audit-delete-1", "DeleteObject", "audit-delete", "doc");
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: b.clone(),
+                key: k.clone(),
+                version_id: v,
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::Deleted { .. }));
+    assert!(
+        store.current_version(&b, &k).await.unwrap().is_none(),
+        "the delete and its audit row must commit together"
+    );
+    assert_eq!(store.list_activity(10).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn delete_with_activity_audits_an_idempotent_not_applied_delete() {
+    // The single-object handler answers 204 for a version that was already gone, so the audit
+    // intent still holds and the co-committed row must be written.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("audit-not-applied").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket(
+            "audit-not-applied",
+        ))))
+        .await
+        .unwrap();
+    let entry = delete_audit_entry(
+        "audit-not-applied-1",
+        "DeleteObject",
+        "audit-not-applied",
+        "missing",
+    );
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: b.clone(),
+                key: ObjectKey::parse("missing").unwrap(),
+                version_id: VersionId::null(),
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, MutationOutcome::DeleteNotApplied);
+    assert_eq!(store.list_activity(10).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn delete_with_activity_ignores_a_duplicate_activity_id() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let b = BucketName::parse("audit-duplicate").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("audit-duplicate"))))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("doc").unwrap();
+    let v = VersionId::from_string("v1".into());
+    store
+        .submit_fixture(
+            &fixture,
+            put(
+                row(&b, "doc", v.clone(), "e", false),
+                Precondition::default(),
+            ),
+        )
+        .await
+        .unwrap();
+    let entry = delete_audit_entry(
+        "audit-duplicate-1",
+        "DeleteObject",
+        "audit-duplicate",
+        "doc",
+    );
+    store
+        .submit(Mutation::RecordActivity(Box::new(entry.clone())))
+        .await
+        .unwrap();
+
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: b.clone(),
+                key: k.clone(),
+                version_id: v,
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, MutationOutcome::Deleted { .. }),
+        "a duplicate audit id is already satisfied and must not fail the delete"
+    );
+    assert_eq!(store.list_activity(10).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn delete_with_activity_records_nothing_for_a_protected_delete() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let b = bucket("audit-protected");
+    let bucket_name = b.name.clone();
+    store
+        .submit(Mutation::CreateObjectLockBucket(Box::new(b)))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("locked").unwrap();
+    let v = VersionId::from_string("locked-v1".into());
+    let mut locked = row(&bucket_name, "locked", v.clone(), "e", false);
+    locked.created_at = Timestamp(10);
+    store
+        .submit_fixture(
+            &fixture,
+            Mutation::PutObjectVersion {
+                row: Box::new(locked),
+                precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent {
+                        retention: None,
+                        legal_hold: Some(true),
+                    },
+                },
+                replication: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let entry = delete_audit_entry(
+        "audit-protected-1",
+        "DeleteObject",
+        "audit-protected",
+        "locked",
+    );
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::DeleteVersion {
+                bucket: bucket_name.clone(),
+                key: k,
+                version_id: v,
+                expected_row_id: None,
+                expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(100),
+                bypass: GovernanceBypass::Denied,
+            }),
+            activity: Box::new(entry),
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, MutationOutcome::DeleteProtected);
+    assert!(
+        store.list_activity(10).await.unwrap().is_empty(),
+        "a failed protected delete must not write an audit row"
+    );
+}
+
+#[tokio::test]
+async fn delete_with_activity_rejects_a_non_delete_inner_operation() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("audit-shape").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("audit-shape"))))
+        .await
+        .unwrap();
+    let result = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::SetVersioning {
+                bucket: b,
+                state: VersioningState::Enabled,
+            }),
+            activity: Box::new(delete_audit_entry(
+                "audit-shape-1",
+                "DeleteObject",
+                "audit-shape",
+                "k",
+            )),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(MetaError::Engine(ref message)) if message.contains("DeleteVersion")),
+        "only delete-family operations may carry a co-committed activity row, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_with_activity_commits_a_delete_marker_and_its_audit_row() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let fixture = store.begin_fixture().await.unwrap();
+    let b = bucket("audit-marker");
+    let owner = b.owner_id.clone();
+    let bucket_name = b.name.clone();
+    store
+        .submit(Mutation::CreateBucket(Box::new(b)))
+        .await
+        .unwrap();
+    store
+        .submit_fixture(
+            &fixture,
+            put(
+                row(
+                    &bucket_name,
+                    "doc",
+                    VersionId::from_string("v1".into()),
+                    "e",
+                    false,
+                ),
+                Precondition::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let marker_id = VersionId::from_string("marker-1".into());
+    let entry = delete_audit_entry("audit-marker-1", "DeleteObject", "audit-marker", "doc");
+    let outcome = store
+        .submit(Mutation::DeleteWithActivity {
+            operation: Box::new(Mutation::CreateDeleteMarker {
+                bucket: bucket_name.clone(),
+                key: ObjectKey::parse("doc").unwrap(),
+                version_id: marker_id.clone(),
+                owner_id: owner,
+                now: Timestamp(7),
+                bypass: GovernanceBypass::Denied,
+                expected_current: None,
+                replication: Vec::new(),
+            }),
+            activity: Box::new(entry.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        MutationOutcome::DeleteMarker { version_id, .. } if version_id == marker_id
+    ));
+    let current = store
+        .current_version(&bucket_name, &ObjectKey::parse("doc").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id, marker_id);
+    assert!(current.is_delete_marker);
+    assert_eq!(store.list_activity(10).await.unwrap(), vec![entry]);
+}

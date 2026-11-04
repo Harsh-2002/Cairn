@@ -145,6 +145,37 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             Ok(outcome)
         }
+        Mutation::DeleteWithActivity {
+            operation,
+            activity,
+        } => {
+            // The inner operation is restricted by construction so the audit outcome set below
+            // cannot silently accept a non-delete that happens to have a similar result.
+            if !matches!(
+                operation.as_ref(),
+                Mutation::DeleteVersion { .. } | Mutation::CreateDeleteMarker { .. }
+            ) {
+                return Err(MetaError::Engine(
+                    "delete-with-activity requires DeleteVersion or CreateDeleteMarker".into(),
+                ));
+            }
+            let outcome = apply_inner(driver, *operation).await?;
+            // A protected delete fails the request, so it must not record an audit row. Every
+            // other applied outcome is exactly what the single-object handler answers 204 for.
+            if matches!(
+                &outcome,
+                MutationOutcome::Deleted { .. }
+                    | MutationOutcome::DeleteNotApplied
+                    | MutationOutcome::DeleteMarker { .. }
+            ) {
+                // A retried or duplicate activity id is the only failure that leaves the delete
+                // intact: the row already exists, so the audit intent is satisfied. Any other
+                // error must fail the delete rather than acknowledge a transaction whose state is
+                // no longer trustworthy. Mirror `PublishStorageWrite`'s activity handling.
+                insert_activity_best_effort(driver, &activity).await?;
+            }
+            Ok(outcome)
+        }
         other => {
             cairn_types::storage::validate_unadmitted_mutation(&other)?;
             apply_inner(driver, other).await
@@ -224,6 +255,9 @@ async fn apply_inner(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutc
         | Mutation::PublishObjectWrite { .. }
         | Mutation::AbandonObjectWrite { .. } => {
             Err(MetaError::Engine("nested storage operation".into()))
+        }
+        Mutation::DeleteWithActivity { .. } => {
+            Err(MetaError::Engine("nested delete operation".into()))
         }
         Mutation::BeginStorageGeneration { generation } => {
             crate::storage::begin(driver, &generation).await

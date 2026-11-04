@@ -444,6 +444,7 @@ impl CachedMetadataStore {
             | Mutation::ResolveObjectWrite { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
+            | Mutation::DeleteWithActivity { .. }
             | Mutation::CreateMultipart { .. }
             | Mutation::ReserveMultipartPart { .. }
             | Mutation::ReleaseMultipartReservation { .. }
