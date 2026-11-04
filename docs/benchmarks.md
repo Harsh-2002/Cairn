@@ -813,7 +813,79 @@ Caveats:
   SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd` (publisher ZIP
   `2d5059501745682664c3d345b22274b66079c952fbec7e1ce66980ef4515cd42`). Warp is not involved in
   this measurement. Method and offline checks live in `conformance/delete_single_key.py` and
-  `conformance/test_delete_single_key.py`.
+  `conformance/test_delete_single_key.py`; the writer attribution below uses
+  `conformance/delete_single_key_cairn.py` and `conformance/test_delete_single_key_cairn.py`.
+
+#### Writer attribution for the single-key shape (2026-11-04)
+
+`conformance/delete_single_key_cairn.py` is the diagnostic companion to that harness. It imports
+`delete_single_key.py`'s client unchanged — the same exact 12,000-key 4 KiB pool and the same one
+signed `DELETE` per key at bounded concurrency — and additionally scrapes `/metrics` one full
+15-second store-metrics tick apart on both sides of the scored delete window. The writer's
+per-stage sample rings (admission, queue, begin, apply, commit, checkpoint), its per-commit ring
+(commit seconds and batch size), the per-process I/O counters and the host load average therefore
+describe that window and not the prefill. It measures Cairn only and is not an engine ratio. Arms
+were run exclusively — no other benchmark ran while a batch was in flight — and the host was
+otherwise shared with unrelated builds, so only within-batch comparisons are drawn.
+
+Control binary `c81ff690…` (commit `433438f`), one arm per row. Across the session the same c16 arm
+of that binary ranged 1,176–1,613 obj/s as host load moved, while the commit share stayed 77–84%,
+so the absolute rate is not comparable across batches but the split is:
+
+| Concurrency | obj/s | Batch | Commits | COMMIT mean | COMMIT share of arm wall | apply mean/batch | Process write bytes per object |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 949 | 3.98 | 3,126 | 3.400 ms | 84% | 0.583 ms | 70 KiB |
+| 16 | 1,548 | 7.03 | 1,768 | 3.536 ms | 81% | 0.951 ms | 63 KiB |
+| 32 | 2,257 | 10.78 | 1,154 | 3.545 ms | 77% | 1.417 ms | 58 KiB |
+
+Three properties explain the shape:
+
+- **The durability barrier dominates.** The single `COMMIT` that covers a whole group-commit batch
+  is 77–84% of the arm's wall time; the per-batch `apply` of the savepointed mutations accounts for
+  most of what is left. At c16 the writer spends 6.25 s of a 7.75 s arm inside `COMMIT` and 0.95 ms
+  per ~7-mutation batch applying them.
+- **It is barrier latency, not bytes written.** From c8 to c32 the mean batch grew 2.7× while
+  `COMMIT` mean moved 3.400 → 3.545 ms (+4%). A `synchronous=FULL` commit on this host costs a
+  ~3.5 ms fixed barrier, so writing fewer pages per delete would not make the barrier shorter.
+- **Throughput follows the batch, and the batch follows the client.** The batch is roughly the
+  requests that arrive while the previous commit is in flight (≈ 1 + rate × commit), so the same
+  server delivers 949 / 1,548 / 2,257 obj/s at c8 / c16 / c32. At the harness's fixed c16 that is
+  ~7 deletes per commit, i.e. ≈ 3.5/7 + 0.14 ≈ 0.64 ms of writer time per object. The handler's own
+  duration says the same thing from the request side: 12,000 DELETEs at 9.301 ms mean in the
+  quiet-host arm, of which 8.2 ms is the measured assembly queue plus apply plus commit barrier,
+  against 0.44 ms of process CPU per object.
+
+**Rejected: fewer statements per delete.** A candidate derived the `bucket_stats.objects` delta from
+the row a delete already reads (its `is_latest`/`is_delete_marker` flags and the successor it
+promotes) instead of two `current_visibility` probes, folded that delta into the existing roll-up
+upsert, and inserted each storage-cleanup debt row before reading it back. That removes five of
+roughly sixteen statements from an unversioned delete, and both SQL backends were mirrored. A
+three-pair alternating A/B on the same c16 shape measured 1,513 / 1,571 / 1,613 obj/s for the
+control and 1,290 / 1,559 / 1,507 obj/s for the candidate (mean **0.93×**), with `apply` per
+object 0.148 ms for the control and 0.144 ms for the candidate — no change beyond noise — so the
+change is not merged. The reason is visible in the stage split: `apply` time tracks the statements
+that modify a page, not the index probes that read one, and the merged upsert writes the same page
+the separate update wrote. Removing read probes changed neither `apply` nor `COMMIT`.
+
+**Rejected: a group-commit linger.** The candidate experiment set
+`CAIRN_META_GROUP_COMMIT_LINGER_MICROS=1000` for two diagnostic arms (the official comparison pins
+it at 0). The mean batch rose 7.06 → 8.5, but the two pairs measured 1,163 → 1,037 and 1,105 →
+1,325 obj/s — no repeatable gain — while p50 rose in one pair (10.7 → 12.4 ms). A wait before the
+commit pays back exactly what it amortizes at this arrival rate, so the batcher should not add one
+implicitly.
+
+The remaining levers are therefore the host's barrier latency, the number of deletes a commit
+covers (client concurrency or a multi-key request — the bulk `delete_4k` row above amortizes one
+barrier over up to 100 keys), and the ~0.14 ms/object `apply`. Within `apply`, the two
+`storage_cleanups` rows a delete enqueues are a third of the page-modifying statements but about
+half of the pages it dirties; the `.meta` absence-barrier row (`P2` in the DELETE review) is still
+gated on proving no legacy or partial sidecar can exist, and this attribution shows skipping it
+would cut WAL bytes and `apply` time but not the barrier latency, so it is not a throughput win on
+this host. None of this contradicts the versioned arm below, which is the durability-equivalent
+comparison and measures Cairn ahead there: this section only explains why the *unversioned*
+as-configured number is what it is. Raw arms, host load and the rejected candidate's binary are
+recorded in
+[`performance-evidence/2026-11/delete-single-key-attribution-2026-11-04.json`](performance-evidence/2026-11/delete-single-key-attribution-2026-11-04.json).
 
 ### Versioned single-key DELETE — the durability-equivalent arm
 
