@@ -67,11 +67,16 @@ use std::sync::Arc;
 const STAGING: &str = ".staging";
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Plaintext multipart assembly reads one part per blocking job. A 256-KiB job amortises the
-/// blocking-pool hand-off over four times the bytes of a single [`READ_CHUNK`] while keeping the
-/// retained buffer small and the yield granularity sub-millisecond. Encrypted parts keep their
-/// block-sized decoder frames.
+/// Plaintext multipart assembly reads a part in 256-KiB chunks: four times the bytes of a single
+/// [`READ_CHUNK`] while keeping each retained buffer small. Encrypted parts keep their block-sized
+/// decoder frames.
 const ASSEMBLY_READ_CHUNK: usize = 4 * READ_CHUNK;
+
+/// How many assembly chunks the leased reader may run ahead of the staging sink. Assembly is
+/// dominated by the mandatory internal SHA-256 (measured ~330 MiB/s on a reference core without
+/// SHA-NI), while the part reads and the sink writes are a fraction of that; hashing one chunk
+/// ahead of the write keeps both busy without retaining more than a few 256-KiB buffers.
+const ASSEMBLY_PIPELINE_DEPTH: usize = 2;
 /// The logical block size for an encrypted-but-uncompressed object (no bucket policy supplies a
 /// block size in that case). 64 KiB keeps the per-block GCM-tag overhead negligible (16 bytes per
 /// 65536) while bounding the amount decrypted for a small ranged read.
@@ -853,28 +858,6 @@ fn stream_input(
     Ok(())
 }
 
-/// Multipart inputs have no GET probe. Validate and stream this already anchored descriptor in
-/// the same leased blocking operation, preserving the metadata-pinned CRNB declaration.
-fn stream_part(
-    file: std::fs::File,
-    cipher: BlobCipher,
-    expected_logical_len: u64,
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
-) -> Result<(), BlobError> {
-    let reader = CompressedReader::open_with_dek(
-        file,
-        cipher,
-        &CompressionDescriptor::Uncompressed,
-        expected_logical_len,
-    )?;
-    stream_input(
-        StreamInput::Container(Box::new(reader)),
-        0,
-        expected_logical_len,
-        tx,
-    )
-}
-
 /// The prepared input and reservations stay together through queued blocking work, including
 /// cancellation before the body is first polled or before the blocking task starts.
 enum StreamSrc {
@@ -914,15 +897,21 @@ fn read_stream(
     }))
 }
 
-/// Feed one plaintext chunk of an assembled part through the shared downstream: enforce the running
-/// size ceiling, hash the plaintext (the ETag/checksum basis), then write it through the optional
-/// object block encoder/encrypter into the staging sink. Both the plaintext-part (raw-read) and the
-/// encrypted-part (decrypt-on-read) branches of `assemble_into` converge here so the ceiling/hash/
-/// encode logic is written once (ARCH 27).
-async fn feed_assembled_chunk(
+/// One assembly chunk in flight from the leased reader to the staging sink: `len` valid bytes at
+/// the start of `buf`. The buffer travels with the chunk so the reader can recycle it instead of
+/// allocating (a fresh 256-KiB allocation is mmap-backed and faults its pages every time).
+struct AssemblyChunk {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+/// Write one already-hashed plaintext chunk through the optional object block encoder/encrypter
+/// into the staging sink, enforcing the running size ceiling on the bytes that actually reach it.
+/// Both the plaintext-part and the encrypted-part branches of the assembly reader converge here so
+/// the ceiling/encode logic is written once (ARCH 27).
+async fn write_assembled_chunk(
     sink: &mut Staging,
     chunk: &[u8],
-    hashers: &mut Hashers,
     enc: &mut Option<StagedEncoder>,
     logical: &mut u64,
     physical: &mut u64,
@@ -936,7 +925,6 @@ async fn feed_assembled_chunk(
     if *logical > size_ceiling {
         return Err(BlobError::SizeExceeded);
     }
-    hashers.update(chunk);
     match enc {
         Some(e) => {
             *physical += e.feed(chunk, sink).await?;
@@ -949,122 +937,158 @@ async fn feed_assembled_chunk(
     Ok(())
 }
 
+/// The blocking half of assembly: read each part in order, hash the plaintext, and hand the chunk
+/// to the staging sink through a bounded channel (ARCH 27).
+///
+/// Hashing is deliberately on this side rather than on the reactor: the internal SHA-256 is
+/// mandatory and costs more than the reads and writes together, so the sink's write hop runs on
+/// the reactor while this job hashes the next chunk. A part staged encrypted
+/// (`PartRef.cipher != KnownPlaintext`) is decrypted here through the same metadata-version-pinned
+/// CRNB reader GET uses, so `assemble` always sees plaintext before it re-encodes under the object
+/// DEK. Order is preserved (one producer, one channel), so the hash covers exactly the assembled
+/// byte stream.
+fn pump_assembly_parts(
+    root: &std::path::Path,
+    parts: &[PartRef],
+    mut hashers: Hashers,
+    size_ceiling: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<AssemblyChunk, BlobError>>,
+    recycle: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<Hashers, BlobError> {
+    let mut logical = 0u64;
+    let mut send = |chunk: AssemblyChunk| -> Result<bool, BlobError> {
+        logical = logical
+            .checked_add(chunk.len as u64)
+            .ok_or(BlobError::SizeExceeded)?;
+        if logical > size_ceiling {
+            return Err(BlobError::SizeExceeded);
+        }
+        hashers.update(&chunk.buf[..chunk.len]);
+        // A closed channel means the sink side returned an error or the future was cancelled;
+        // stop reading and let the caller surface the original failure.
+        Ok(tx.blocking_send(Ok(chunk)).is_ok())
+    };
+    for part in parts {
+        let file = namespace::read_file(root, &part.storage_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BlobError::NotFound
+            } else {
+                io_err(error)
+            }
+        })?;
+        match &part.cipher {
+            // Plaintext / pre-v21 part: raw positional reads into a recycled chunk buffer.
+            BlobCipher::KnownPlaintext => {
+                if file.metadata().map_err(io_err)?.len() != part.size {
+                    return Err(BlobError::Corruption(
+                        "part length does not match metadata".into(),
+                    ));
+                }
+                let mut offset = 0u64;
+                while offset != part.size {
+                    let mut buf = recycle
+                        .try_recv()
+                        .unwrap_or_else(|_| vec![0u8; ASSEMBLY_READ_CHUNK]);
+                    let want = (part.size - offset).min(ASSEMBLY_READ_CHUNK as u64) as usize;
+                    let n = read_at(&file, &mut buf[..want], offset).map_err(io_err)?;
+                    if n == 0 {
+                        return Err(BlobError::Corruption(
+                            "part truncated during assembly".into(),
+                        ));
+                    }
+                    if !send(AssemblyChunk { buf, len: n })? {
+                        return Ok(hashers);
+                    }
+                    offset += n as u64;
+                }
+            }
+            // Encrypted part: decrypt-on-read through the same CRNB reader GET uses. A
+            // wrong/tampered/truncated part fails per-block GCM auth here and surfaces as
+            // `BlobError::Corruption`, which `assemble` turns into a `sink.abort()` — no orphan, no
+            // plaintext, no partial object.
+            cipher => {
+                if part.size == 0 {
+                    continue;
+                }
+                let mut reader = CompressedReader::open_with_dek(
+                    file,
+                    cipher.clone(),
+                    &CompressionDescriptor::Uncompressed,
+                    part.size,
+                )?;
+                let block_size = reader.block_size();
+                let last = (part.size - 1) / block_size;
+                for block in 0..=last {
+                    let start = block * block_size;
+                    let len = part.size.min(start + block_size) - start;
+                    let data = reader.read_range(start, len)?;
+                    if data.len() as u64 != len {
+                        return Err(BlobError::Corruption(
+                            "part truncated during assembly".into(),
+                        ));
+                    }
+                    let chunk = AssemblyChunk {
+                        len: data.len(),
+                        buf: data,
+                    };
+                    if !send(chunk)? {
+                        return Ok(hashers);
+                    }
+                }
+            }
+        }
+    }
+    Ok(hashers)
+}
+
 impl LocalBlobStore {
-    /// Read each part in order, hashing the plaintext, applying the (optional) block
-    /// encoder/encrypter, and streaming the physical bytes into the staging sink. A part staged
-    /// encrypted (`PartRef.cipher != KnownPlaintext`, ARCH 27) is decrypted on read through the same
-    /// metadata-version-pinned CRNB reader GET uses, so `assemble` always sees plaintext before it
-    /// re-encodes under the object DEK.
-    /// Factored out of `assemble` so the caller can `abort` the sink on any error without duplicating
-    /// the unlink.
+    /// Drive the assembly pipeline: one leased blocking job reads and hashes every part in order
+    /// while this task applies the (optional) block encoder/encrypter and streams the physical
+    /// bytes into the staging sink. Returns the finalized-over hashers and the written logical
+    /// length.
+    ///
+    /// Factored out of `assemble` so the caller can `abort` the sink on any error without
+    /// duplicating the unlink.
     #[allow(clippy::too_many_arguments)]
     async fn assemble_into(
         &self,
         sink: &mut Staging,
         parts: &[PartRef],
-        hashers: &mut Hashers,
+        hashers: Hashers,
         enc: &mut Option<StagedEncoder>,
-        logical: &mut u64,
         physical: &mut u64,
         size_ceiling: u64,
         lease: &cairn_types::storage::io::StorageIoLease,
-    ) -> Result<(), BlobError> {
-        // Allocate only for the first plaintext part, then reuse across part boundaries. An
-        // entirely encrypted upload keeps its existing bounded decoder buffers without this one.
-        let mut plaintext_buf = None;
-        for part in parts {
-            let part_path = part.storage_path.clone();
-            let root = self.data_root.clone();
-            match part.cipher.clone() {
-                // Plaintext / pre-v21 part: raw read, unchanged.
-                BlobCipher::KnownPlaintext => {
-                    let read_lease = lease.try_child()?;
-                    let expected = part.size;
-                    let file = tokio::task::spawn_blocking(move || {
-                        let file = namespace::read_file(&root, &part_path).map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::NotFound {
-                                BlobError::NotFound
-                            } else {
-                                io_err(error)
-                            }
-                        })?;
-                        if file.metadata().map_err(io_err)?.len() != expected {
-                            return Err(BlobError::Corruption(
-                                "part length does not match metadata".into(),
-                            ));
-                        }
-                        Ok::<_, BlobError>(owned_file::FileOwner::new(file, read_lease))
-                    })
-                    .await
-                    .map_err(|error| BlobError::Io(error.to_string()))??;
-                    let mut remaining = part.size;
-                    while remaining != 0 {
-                        let mut buf = plaintext_buf
-                            .take()
-                            .unwrap_or_else(|| vec![0u8; ASSEMBLY_READ_CHUNK]);
-                        let want = remaining.min(ASSEMBLY_READ_CHUNK as u64) as usize;
-                        let (buf, n) = file
-                            .run(move |mut file| {
-                                use std::io::Read;
-                                let n = file.read(&mut buf[..want])?;
-                                Ok((buf, n))
-                            })
-                            .await
-                            .map_err(io_err)?;
-                        if n == 0 {
-                            return Err(BlobError::Corruption(
-                                "part truncated during assembly".into(),
-                            ));
-                        }
-                        feed_assembled_chunk(
-                            sink,
-                            &buf[..n],
-                            hashers,
-                            enc,
-                            logical,
-                            physical,
-                            size_ceiling,
-                        )
-                        .await?;
-                        remaining -= n as u64;
-                        plaintext_buf = Some(buf);
-                    }
-                }
-                // Encrypted part: decrypt-on-read through the same CRNB reader GET uses, off the
-                // reactor via `spawn_blocking` feeding a bounded channel (mirrors `read_stream`). A
-                // wrong/tampered/truncated part fails per-block GCM auth inside `stream_blob` and
-                // surfaces here as `BlobError::Corruption`, which `assemble` turns into a `sink.abort()`
-                // — no orphan, no plaintext, no partial object.
-                cipher => {
-                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
-                    let size = part.size;
-                    let read_lease = lease.try_child()?;
-                    tokio::task::spawn_blocking(move || {
-                        let _read_lease = read_lease;
-                        let result = namespace::read_file(&root, &part_path)
-                            .map_err(io_err)
-                            .and_then(|file| stream_part(file, cipher, size, &tx));
-                        if let Err(error) = result {
-                            let _ = tx.blocking_send(Err(error));
-                        }
-                    });
-                    while let Some(item) = rx.recv().await {
-                        let chunk = item?;
-                        feed_assembled_chunk(
-                            sink,
-                            &chunk,
-                            hashers,
-                            enc,
-                            logical,
-                            physical,
-                            size_ceiling,
-                        )
-                        .await?;
-                    }
-                }
-            }
+    ) -> Result<(Hashers, u64), BlobError> {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<AssemblyChunk, BlobError>>(ASSEMBLY_PIPELINE_DEPTH);
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel(ASSEMBLY_PIPELINE_DEPTH);
+        let read_lease = lease.try_child()?;
+        let root = self.data_root.clone();
+        let parts = parts.to_vec();
+        let reader = tokio::task::spawn_blocking(move || {
+            let _read_lease = read_lease;
+            pump_assembly_parts(&root, &parts, hashers, size_ceiling, &tx, &recycle_rx)
+        });
+        let mut logical = 0u64;
+        while let Some(item) = rx.recv().await {
+            let chunk = item?;
+            write_assembled_chunk(
+                sink,
+                &chunk.buf[..chunk.len],
+                enc,
+                &mut logical,
+                physical,
+                size_ceiling,
+            )
+            .await?;
+            // Best effort: a full recycle channel only costs one allocation, never a stall.
+            let _ = recycle_tx.try_send(chunk.buf);
         }
-        Ok(())
+        let hashers = reader
+            .await
+            .map_err(|error| BlobError::Io(error.to_string()))??;
+        Ok((hashers, logical))
     }
 }
 
@@ -1828,7 +1852,6 @@ impl BlobStore for LocalBlobStore {
             .as_ref()
             .is_none_or(|seed| seed.etag.is_none());
         let mut hashers = Hashers::new_for_assembly(&opts.extra_checksums, compute_md5);
-        let mut logical: u64 = 0;
         let mut physical: u64 = 0;
         let mut enc = block_pol
             .map(|policy| {
@@ -1848,18 +1871,23 @@ impl BlobStore for LocalBlobStore {
             .assemble_into(
                 &mut sink,
                 parts,
-                &mut hashers,
+                hashers,
                 &mut enc,
-                &mut logical,
                 &mut physical,
                 opts.size_ceiling,
                 &paths.lease,
             )
             .await;
-        if let Err(e) = assembled {
-            sink.abort().await;
-            return Err(e);
-        }
+        let logical = match assembled {
+            Ok((finalized, logical)) => {
+                hashers = finalized;
+                logical
+            }
+            Err(e) => {
+                sink.abort().await;
+                return Err(e);
+            }
+        };
         let mut index_spool = IndexSpoolState::NeverCreated;
         let descriptor = if let Some(e) = enc {
             match e.finish(&mut sink).await {

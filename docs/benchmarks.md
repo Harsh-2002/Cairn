@@ -1002,3 +1002,87 @@ SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`, and 
 SHA-256 `fc7661a6b952800fbc8422cf0f72ae82726f82aa80065d15f50125f8bf5ca5fa`; per-pair ratios were
 0.74, 0.81 and 0.76. The pair count and host load differ from the earlier row, so the ratio moved
 for more than one reason; the direction is consistent with the isolated A/B.
+
+## 11. Multipart assembly hash/I/O pipeline and CRC64 slicing (2026-11-04)
+
+Profiling the completion assembly showed that the mandatory internal SHA-256 was not only the
+largest cost, it was serialized with every part read and every sink write: one 256-KiB blocking
+read hop, the hash, then one 256-KiB blocking write hop, 200 times for 50 MiB. A micro-probe on
+this host measured SHA-256 (aws-lc-rs, no SHA-NI on the i5-9400T) at **333 MiB/s = 150 ms per
+50 MiB**, MD5 at 455 MiB/s, 50 MiB of 256-KiB page-cache reads through `spawn_blocking` at 14 ms,
+a 256-KiB copy pass at 5 ms, and the exact read+hash+write shape at 184–190 ms wall / 160–180 ms
+CPU. The hash dominates and the I/O has nothing to overlap with.
+
+Assembly now runs one leased blocking job that reads and hashes every part in order and hands each
+chunk to the staging sink through a bounded channel (depth 2, recycled 256-KiB buffers), while the
+reactor applies the block encoder/encrypter and writes the previous chunk. Order is preserved by
+the single producer, so the internal SHA-256 still covers exactly the assembled plaintext. The
+bytes, composite ETag, requested checksums, encryption/compression framing and the v2 sidecar are
+unchanged; only the scheduling of the same work changed. The encrypted-part branch decrypts in the
+same reader job instead of in a separate channel-fed job.
+
+CRC-64/NVME now updates eight bytes per iteration (slice-by-8) instead of one. The byte-at-a-time
+table cost 135 ms of CPU per 50 MiB, which is significant next to the SHA-256 a completion already
+computes over the same bytes; the eight slice tables are derived from the same polynomial, so the
+digest is identical. A permanent test compares every input length and streaming split against the
+byte recurrence.
+
+Measured with `crates/cairn-blob/examples/bench_assembly.rs`: ten 5 MiB parts staged once, eight
+timed assemblies per arm after one warm-up, interleaved arms, release profile, Rust 1.97.1, data
+directory on the XFS NVMe root filesystem, `LocalBlobStore` directly (no server, network or
+metadata database), under a host-wide benchmark lock. Each arm reports the whole `assemble()` call,
+the `Assembly` stage and the `Durability` stage separately. Host load varied (3–17) because other
+workstreams were building on the same host, so pairs are read only against each other.
+
+Plaintext parts, two interleaved pairs:
+
+| Arm | Mean ms | Median ms | Min–max ms | Assembly mean | Durability mean | CPU mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before | 237.8 / 231.7 | 236.4 / 231.6 | 225.6–252.2 | 189.4 / 188.5 | 48.4 / 43.2 | 175.0 / 177.5 |
+| Pipeline | 206.3 / 207.7 | 206.3 / 207.9 | 200.2–216.9 | 161.9 / 162.6 | 44.3 / 45.0 | 180.0 / 181.3 |
+
+The pipeline removes 26–31 ms of the ~232–238 ms completion (11–13 %): the assembly stage drops
+27.5 ms while the durability stage is unchanged. Total CPU is unchanged within tick granularity —
+the win is overlap, not less work. A second pair on a quieter host measured 223.1/230.9 ms before
+and 202.0/204.6 ms after.
+
+Other shapes, one interleaved pair each (total mean ms / assembly mean ms):
+
+| Shape | Before | Pipeline | Pipeline + CRC64 slice |
+| --- | --- | --- | --- |
+| Encrypted parts (AES-256-GCM containers) | 291.8 / 247.0 | 279.8 / 233.1 | — |
+| zstd-compressed object | 264.5 / 217.7 | 198.4 / 154.4 | — |
+| `CRC64NVME` requested | 359.0 / 311.7 | 334.8 / 290.6 | **229.8 / 185.7** |
+
+Every shape improves; none regresses. With CRC64NVME requested, the slice-by-8 update removes
+another ~103 ms: the requested checksum now adds ~24 ms to the 207 ms plain pipeline, where it
+added ~130 ms before.
+
+Two candidates were measured and rejected:
+
+- **Chunk size.** 256 KiB, 512 KiB and 1 MiB chunks measured 212.5/213.7, 225.9/212.4 and
+  217.3/226.4 ms across interleaved runs — indistinguishable. 256 KiB stays: it is the smallest
+  retained footprint (depth 2, under 1 MiB per in-flight assembly including the sink buffer).
+- **io_uring sink.** With the same pipeline binary and `--features io-uring`, the default and io_uring
+  staging backends measured 206.0/203.8 and 203.3/213.8 ms. Once the sink write runs concurrently
+  with the hash it is no longer on the critical path, so the write backend does not matter.
+
+End-to-end, through a strict server (`CAIRN_META_SYNCHRONOUS=full`, one shard, no linger), twelve
+sequential `CompleteMultipartUpload` calls of ten 5 MiB parts each, interleaved pairs:
+
+| Arm | Median ms | Mean ms | Min–max ms |
+| --- | ---: | ---: | ---: |
+| Before | 246.8 / 245.9 | 246.2 / 259.4 | 236.7–374.8 |
+| Pipeline + CRC64 slice | 210.2 / 210.9 | 210.4 / 222.7 | 198.3–344.7 |
+
+That is ~36 ms (14.6 %) off a real completion. The scored `warp multipart-put` case reports
+`PUTPART` throughput and is dominated by the part-upload path (one completion per ten parts), so
+it is not a usable signal for this change; its arms moved within host-load noise (41.8–54.4 obj/s).
+
+Tests: `assembly_pipeline_preserves_hash_and_byte_order_across_unaligned_parts` checks the exact
+bytes, the composite ETag and the internal SHA-256 against the same bytes staged in one pass for
+parts straddling the 256-KiB read chunk; `assembly_mid_stream_reader_failure_aborts_without_publishing`
+checks that a reader failure after earlier chunks reached the sink fails closed;
+`crc64nvme::tests::slice_by_eight_matches_the_byte_recurrence` covers every length and split
+against the byte-at-a-time recurrence. The existing mixed plaintext/encrypted, wrong-DEK,
+checksum-over-plaintext and preallocation assembly tests all run through the new pipeline.
