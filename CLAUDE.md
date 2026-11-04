@@ -91,7 +91,10 @@ above remain the source of truth.
   pool + a read-through cache. Schema/migrations in `schema.rs`; mutation SQL in `apply.rs`.
 - `cairn-meta-async` — libSQL/Turso async backend (beta, glibc-only); mirrors `cairn-meta`'s SQL.
 - `cairn-blob` — local-filesystem `BlobStore`: durable commit, block compression, reconciliation.
-  The only crate doing filesystem syscalls.
+  The only crate doing general filesystem syscalls; the isolated `cairn-reflink` wrapper owns the
+  single copy-on-write cloning `ioctl`.
+- `cairn-reflink` — the only `unsafe` seam: one `FICLONERANGE` wrapper with copy-on-write
+  isolation tests. Cloning is an optimization and every error falls back to a byte copy.
 - `cairn-crypto` — `Crypto` (AES-256-GCM envelope + zeroize), `Clock`, `PublicUrl`.
 - `cairn-auth` / `cairn-authz` — SigV4 + Bearer authenticator chain; pure policy/ACL/BPA/ownership engine.
 - `cairn-net` — the SSRF guard: `validate_endpoint` (validate-time) + `GuardedResolver`/
