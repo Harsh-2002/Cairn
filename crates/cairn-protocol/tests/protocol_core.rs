@@ -2861,7 +2861,6 @@ async fn multipart_lifecycle() {
         "{xml}"
     );
     assert!(!xml.contains("<NextPartNumberMarker>"), "{xml}");
-    use sha2::{Digest, Sha256};
     let row = h
         .meta
         .current_version(
@@ -2885,12 +2884,47 @@ async fn multipart_lifecycle() {
         ])
     );
     assert_eq!(
-        row.internal_sha256,
-        Some(hex::encode(Sha256::digest(&expected)))
+        row.internal_blake3,
+        Some(blake3::hash(&expected).to_hex().to_string())
     );
+    assert_eq!(row.internal_sha256, None);
     assert!(
         row.checksums.is_empty(),
         "internal digest must not become an S3 checksum"
+    );
+
+    // The same concatenated plaintext staged in one PUT must produce the identical BLAKE3
+    // baseline: the digest is path-independent, not an artifact of multipart assembly.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb"),
+                Some("single-equivalent.bin"),
+                &[],
+                &[],
+                expected.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let single = h
+        .meta
+        .current_version(
+            &BucketName::parse("mpb").unwrap(),
+            &ObjectKey::parse("single-equivalent.bin").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(single.internal_blake3, row.internal_blake3);
+    assert_eq!(single.internal_sha256, None);
+    assert_ne!(
+        single.etag, row.etag,
+        "single PUT and multipart ETags differ"
     );
 
     // A completed multipart object carries the same per-object metadata sidecar as an ordinary
@@ -18879,7 +18913,6 @@ async fn multipart_replica_intent_is_authorized_persisted_and_idempotent() {
 
 #[tokio::test]
 async fn put_and_copy_persist_internal_plaintext_digest_without_checksum_headers() {
-    use sha2::{Digest, Sha256};
     let h = harness().await;
     drain(
         send(
@@ -18890,7 +18923,7 @@ async fn put_and_copy_persist_internal_plaintext_digest_without_checksum_headers
     )
     .await;
     let content = b"plaintext digest for put and copy";
-    let expected = hex::encode(Sha256::digest(content));
+    let expected = blake3::hash(content).to_hex().to_string();
     let (status, headers, _) = drain(
         send(
             &h.svc,
@@ -18934,7 +18967,8 @@ async fn put_and_copy_persist_internal_plaintext_digest_without_checksum_headers
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.internal_sha256, Some(expected.clone()));
+        assert_eq!(row.internal_blake3, Some(expected.clone()));
+        assert_eq!(row.internal_sha256, None);
         assert!(row.checksums.is_empty());
         let (status, headers, _) = drain(
             send(

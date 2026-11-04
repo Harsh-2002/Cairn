@@ -399,6 +399,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: None,
             replication_status: None,
+            internal_blake3: None,
             internal_sha256: Some("00".repeat(32)),
             replicated_at: None,
             created_at: Timestamp(0),
@@ -696,7 +697,7 @@ mod tests {
             row.size_logical = staged.size_logical;
             row.size_physical = staged.size_physical;
             row.etag = staged.etag;
-            row.internal_sha256 = Some(staged.internal_sha256);
+            row.internal_blake3 = Some(staged.internal_blake3);
             if lose_ack {
                 meta.fail_next_object_put_ack();
             }
@@ -979,7 +980,7 @@ mod tests {
         row.size_logical = staged.size_logical;
         row.size_physical = staged.size_physical;
         row.etag = staged.etag;
-        row.internal_sha256 = Some(staged.internal_sha256);
+        row.internal_blake3 = Some(staged.internal_blake3);
         let StorageWriteTarget::Completion { claim_token, .. } = &record.plan.target else {
             panic!("completion target")
         };

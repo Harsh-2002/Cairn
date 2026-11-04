@@ -7,7 +7,8 @@ use crate::{config::Config, node_lock, stack};
 use cairn_types::object::{ObjectLockState, ObjectVersionRow};
 use cairn_types::storage::io::StorageIoWatch;
 use cairn_types::storage::{
-    OBJECT_METADATA_V1_FORMAT_VERSION, ObjectMetadataRecord, PlannedStorageWrite, StorageToken,
+    OBJECT_METADATA_V1_FORMAT_VERSION, OBJECT_METADATA_V2_FORMAT_VERSION,
+    OBJECT_METADATA_V3_FORMAT_VERSION, ObjectMetadataRecord, PlannedStorageWrite, StorageToken,
     StorageWriteTarget, object_metadata_path,
 };
 use cairn_types::traits::Clock;
@@ -49,17 +50,35 @@ fn classify_existing_sidecar(
     if !existing.matches_row_identity(row) {
         return ExistingSidecar::Conflict;
     }
-    if existing.format_version == OBJECT_METADATA_V1_FORMAT_VERSION {
-        if row.multipart_parts.is_some() {
-            ExistingSidecar::Upgrade
-        } else {
-            ExistingSidecar::SkipV1
+    match existing.format_version {
+        OBJECT_METADATA_V1_FORMAT_VERSION => {
+            if row.multipart_parts.is_some() || row.internal_blake3.is_some() {
+                ExistingSidecar::Upgrade
+            } else {
+                ExistingSidecar::SkipV1
+            }
         }
-    } else if existing.multipart_parts == row.multipart_parts {
-        ExistingSidecar::Keep
-    } else {
-        // A v2 record whose layout disagrees with the row is not ours to rewrite.
-        ExistingSidecar::Conflict
+        OBJECT_METADATA_V2_FORMAT_VERSION => {
+            // A v2 record for a row that now carries the BLAKE3 baseline is upgraded to v3; the
+            // row's layout must still match, or the record is not ours to rewrite.
+            if existing.multipart_parts != row.multipart_parts {
+                ExistingSidecar::Conflict
+            } else if row.internal_blake3.is_some() {
+                ExistingSidecar::Upgrade
+            } else {
+                ExistingSidecar::Keep
+            }
+        }
+        OBJECT_METADATA_V3_FORMAT_VERSION => {
+            if existing.multipart_parts == row.multipart_parts
+                && existing.internal_blake3 == row.internal_blake3
+            {
+                ExistingSidecar::Keep
+            } else {
+                ExistingSidecar::Conflict
+            }
+        }
+        _ => ExistingSidecar::Conflict,
     }
 }
 
@@ -458,6 +477,7 @@ mod tests {
             acl: None,
             checksums: Vec::new(),
             sse_descriptor: None,
+            internal_blake3: None,
             internal_sha256: None,
             replication_status: None,
             replicated_at: None,
@@ -529,6 +549,32 @@ mod tests {
         }]);
         assert_eq!(
             classify_existing_sidecar(&different_layout, &row),
+            ExistingSidecar::Conflict
+        );
+
+        // A row with the BLAKE3 baseline classifies against the v3 generation. The same v2 record
+        // becomes an upgrade target, and a v3 record with a stale baseline is a conflict.
+        let mut blake3_row = row.clone();
+        blake3_row.internal_blake3 = Some("ab".repeat(32));
+        blake3_row.internal_sha256 = None;
+        let v3 = ObjectMetadataRecord::from_existing(
+            &blake3_row,
+            Vec::new(),
+            ExplicitObjectLockIntent::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_existing_sidecar(&v3, &blake3_row),
+            ExistingSidecar::Keep
+        );
+        assert_eq!(
+            classify_existing_sidecar(&v2, &blake3_row),
+            ExistingSidecar::Upgrade
+        );
+        let mut stale = v3.clone();
+        stale.internal_blake3 = Some("cd".repeat(32));
+        assert_eq!(
+            classify_existing_sidecar(&stale, &blake3_row),
             ExistingSidecar::Conflict
         );
     }

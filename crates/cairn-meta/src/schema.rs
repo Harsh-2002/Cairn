@@ -985,6 +985,19 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
 ALTER TABLE object_versions ADD COLUMN multipart_parts TEXT;
 "#,
     },
+    Migration {
+        version: 42,
+        name: "BLAKE3 internal integrity baseline",
+        sql: r#"
+-- New objects record a BLAKE3 plaintext baseline; legacy rows keep their SHA-256 value and leave
+-- this column NULL. The algorithm is never inferred from column contents, so both columns stay
+-- explicitly named. Downgrade is unsupported: raise the protocol floor so an older binary refuses
+-- the state instead of silently dropping the new baseline (or, worse, comparing a BLAKE3 value as
+-- SHA-256).
+ALTER TABLE object_versions ADD COLUMN internal_blake3 TEXT;
+UPDATE storage_protocol SET minimum_reader=3, minimum_writer=3;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1064,10 +1077,14 @@ pub(crate) fn validate_compatibility(conn: &Connection) -> rusqlite::Result<i64>
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
         ).optional()?;
         if !state.is_some_and(|(reader, writer, layout, recovery)| {
-            reader == if applied >= 36 { 2 } else { 1 }
-                && writer == reader
-                && layout == "flat"
-                && recovery == "full-scan"
+            let expected = if applied >= 42 {
+                3
+            } else if applied >= 36 {
+                2
+            } else {
+                1
+            };
+            reader == expected && writer == expected && layout == "flat" && recovery == "full-scan"
         }) {
             return Err(incompatible(
                 "unsupported or missing storage protocol state",
@@ -1153,8 +1170,8 @@ mod tests {
     fn startup_rejects_future_schema_or_protocol_before_maintenance() {
         for change in [
             "INSERT INTO schema_migrations VALUES (9999, 'future', 0)",
-            "UPDATE storage_protocol SET minimum_reader=3",
-            "UPDATE storage_protocol SET minimum_writer=3",
+            "UPDATE storage_protocol SET minimum_reader=4",
+            "UPDATE storage_protocol SET minimum_writer=4",
             "UPDATE storage_protocol SET minimum_reader=1,minimum_writer=1",
             "DROP TABLE storage_intent_paths",
             "DROP TABLE storage_cleanups",
@@ -1269,7 +1286,7 @@ mod tests {
             "SELECT minimum_reader, minimum_writer, write_layout, recovery_mode FROM storage_protocol",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         ).unwrap();
-        assert_eq!(state, (2, 2, "flat".into(), "full-scan".into()));
+        assert_eq!(state, (3, 3, "flat".into(), "full-scan".into()));
     }
 
     #[test]
@@ -2160,6 +2177,52 @@ mod tests {
         migrate_fixture_through(&conn, 40);
         run_migrations(&conn).unwrap();
         assert!(column_exists(&conn, "object_versions", "multipart_parts"));
+    }
+
+    #[test]
+    fn migration_v42_adds_blake3_without_backfilling_legacy_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 41);
+        conn.execute_batch(
+            r#"
+            INSERT INTO object_versions
+            (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+             etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,
+             created_at,updated_at,internal_sha256)
+            VALUES ('legacy','b','k','1',1,0,3,3,'etag','text/plain','"Uncompressed"','Standard',
+                    'owner','[]','[]',0,0,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "object_versions", "internal_blake3"));
+        let (sha, blake3): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT internal_sha256, internal_blake3 FROM object_versions WHERE id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(sha.is_some(), "the legacy SHA-256 baseline is preserved");
+        assert!(
+            blake3.is_none(),
+            "a migration must never invent a BLAKE3 baseline from existing bytes"
+        );
+        let protocol: (i64, i64) = conn
+            .query_row(
+                "SELECT minimum_reader, minimum_writer FROM storage_protocol",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(protocol, (3, 3));
+
+        // The fence is load-bearing: a database at v42 with the old protocol floor is refused,
+        // so a pre-BLAKE3 binary cannot start and compare a BLAKE3 digest as SHA-256.
+        conn.execute_batch("UPDATE storage_protocol SET minimum_reader=2, minimum_writer=2;")
+            .unwrap();
+        assert!(validate_compatibility(&conn).is_err());
     }
 
     #[test]

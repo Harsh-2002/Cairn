@@ -62,6 +62,7 @@ fn row_from(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: Some(staged.internal_blake3.clone()),
         internal_sha256: None,
         replicated_at: None,
         created_at: now,
@@ -231,6 +232,11 @@ async fn put_get_list_delete_roundtrip() {
         .unwrap();
     assert_eq!(read_all(handle).await, b"hello");
     assert_eq!(current.etag.as_str(), "5d41402abc4b2a76b9719d911017c592"); // md5("hello")
+    assert_eq!(
+        current.internal_blake3.as_deref(),
+        Some(blake3::hash(b"hello").to_hex().to_string().as_str())
+    );
+    assert_eq!(current.internal_sha256, None);
 
     // LIST with a prefix returns both, sorted.
     let page = meta
@@ -673,6 +679,7 @@ async fn plant_outbox_entry_at(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp::EPOCH,
@@ -1626,6 +1633,7 @@ fn activity_row(bucket: &BucketName, key: &ObjectKey, version: VersionId) -> Obj
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp::EPOCH,

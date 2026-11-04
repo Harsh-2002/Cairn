@@ -613,6 +613,7 @@ pub(super) fn object_row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: Some("00".repeat(32)),
         replicated_at: None,
         created_at: Timestamp(0),

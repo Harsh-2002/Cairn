@@ -13,7 +13,7 @@
 #
 # The same snapshot also carries a completed THREE-PART multipart object (two >=5 MiB parts and a
 # small tail). Its v2 `<uuid>.meta` sidecar is the object's durability authority: the harness proves
-# the snapshot pairs it with its data file, decodes it (format_version=2 plus the exact part layout),
+# the snapshot pairs it with its data file, decodes it (format_version=3 plus the exact part layout),
 # and re-reads `?partNumber=1/2/3` after restore into a fresh tree, concatenating byte-exactly. A
 # final arm downgrades that restored sidecar to a layout-less v1 record and deletes the index row
 # (a simulated lost WAL tail), so startup rebuild must re-create the row WITHOUT parts and fail
@@ -135,9 +135,9 @@ check_mp_parts() { # label
     || fail "$label: concatenated part reads are not $MP_TOTAL bytes"
 }
 
-# Decode the v2 sidecar and assert the exact durability record: one `<uuid>.meta` paired with its
-# data file, format_version=2, the recorded composite ETag and the whole part layout. Prints the
-# sidecar filename so the caller can compare snapshot and restored copies.
+# Decode the v3 sidecar and assert the exact durability record: one `<uuid>.meta` paired with its
+# data file, format_version=3, the BLAKE3 baseline, the recorded composite ETag and the whole part
+# layout. Prints the sidecar filename so the caller can compare snapshot and restored copies.
 assert_mp_sidecar() { # bucket-dir total etag-without-quotes
   "$PYBIN" - "$1" "$2" "$3" "$MP_S1" "$MP_S2" "$MP_S3" <<'PY'
 import json
@@ -156,14 +156,16 @@ data = [path for path in directory.iterdir()
         if path.is_file() and not path.name.endswith((".meta", ".tmp"))]
 assert [path.name for path in data] == [sidecar.name[:-5]], f"sidecar/data pairing: {data}"
 record = json.loads(sidecar.read_text())
-assert record["format_version"] == 2, record.get("format_version")
+assert record["format_version"] == 3, record.get("format_version")
+assert isinstance(record.get("internal_blake3"), str) and len(record["internal_blake3"]) == 64, record.get("internal_blake3")
+assert record.get("internal_sha256") is None, record.get("internal_sha256")
 assert record["bucket"] == "bkmp" and record["key"] == "multi.bin", record
 assert record["storage_path"] == f"bkmp/{sidecar.name[:-5]}", record.get("storage_path")
 assert record["size_logical"] == total, record.get("size_logical")
 assert record["size_physical"] == total, record.get("size_physical")
 assert record["etag"] == etag, (record.get("etag"), etag)
 layout = record.get("multipart_parts")
-assert layout is not None, "a v2 sidecar must carry its part layout"
+assert layout is not None, "a v3 sidecar for a completed multipart object must carry its part layout"
 assert [(part["part_number"], part["size"]) for part in layout] == \
     [(number, size) for number, size in enumerate(sizes, start=1)], layout
 payload = data[0].read_bytes()
@@ -281,7 +283,7 @@ MP_SIDECAR="$(assert_mp_sidecar "$BK/blobs/$MP_BUCKET" "$MP_TOTAL" "$MP_ETAG")" 
   || fail "the snapshot's multipart sidecar is not a valid v2 part-layout record"
 [ -f "$BK/blobs/$MP_BUCKET/${MP_SIDECAR%.meta}" ] \
   || fail "the snapshot's multipart sidecar has no data file"
-ok "snapshot carries $MP_BUCKET/$MP_SIDECAR (format_version=2, parts $MP_S1/$MP_S2/$MP_S3, ETag $MP_ETAG) with its data file"
+ok "snapshot carries $MP_BUCKET/$MP_SIDECAR (format_version=3, parts $MP_S1/$MP_S2/$MP_S3, ETag $MP_ETAG) with its data file"
 
 # --- 3) corrupt the primary's largest blob AFTER the snapshot ---------------------------------
 # Scoped to the ordinary bucket: the multipart object lives in its own bucket and must stay intact
@@ -387,9 +389,12 @@ import sys
 
 sidecar, database = sys.argv[1], sys.argv[2]
 record = json.loads(open(sidecar).read())
-# Exactly what an older writer's v1 record can express: the object's identity and bytes, no layout.
+# Exactly what an older writer's v1 record can express: the object's identity and bytes, no layout,
+# and only the legacy SHA-256 baseline.
 record["format_version"] = 1
 record.pop("multipart_parts", None)
+record.pop("internal_blake3", None)
+record["internal_sha256"] = None
 with open(sidecar, "w") as file:
     json.dump(record, file, separators=(",", ":"))
 

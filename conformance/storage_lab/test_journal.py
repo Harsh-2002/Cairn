@@ -9,7 +9,7 @@ from summarize import summarize_run
 
 
 def drained():
-    return {'status': 'drained', 'protocol': {'minimum_reader': 2, 'minimum_writer': 2},
+    return {'status': 'drained', 'protocol': {'minimum_reader': 3, 'minimum_writer': 3},
             'boundary': 'after_final_idle_before_server_stop', 'access': 'sqlite_mode_ro',
             'wait_budget_seconds': 5, 'elapsed_seconds': .25,
             'samples': [{'elapsed_seconds': .2, 'write_intents': 0, 'cleanups': 0}]}

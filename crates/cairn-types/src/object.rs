@@ -244,8 +244,15 @@ pub struct ObjectVersionRow {
     /// (sealed) under the master key, and the wrapping nonce. `None` for unencrypted objects
     /// (ARCH 27, SSE-S3). The raw DEK is never stored; only its sealed form lives here.
     pub sse_descriptor: Option<String>,
-    /// Internal plaintext SHA-256 recorded at ingest. None means no trusted legacy baseline.
-    /// Not an S3 checksum and never emitted through serialized object responses.
+    /// Internal plaintext digest recorded at ingest: BLAKE3 (hex) for objects written by this
+    /// version, `None` for legacy rows and delete markers. Not an S3 checksum and never emitted
+    /// through serialized object responses. Exactly one of `internal_blake3`/`internal_sha256` is
+    /// set on a row with a baseline.
+    #[serde(skip)]
+    pub internal_blake3: Option<String>,
+    /// Legacy internal plaintext SHA-256 recorded at ingest by older releases. Kept readable for
+    /// scrubbing and rebuild; new writes leave it `None`. Not an S3 checksum and never emitted
+    /// through serialized object responses.
     #[serde(skip)]
     pub internal_sha256: Option<String>,
     /// Replication status for replication-enabled buckets.

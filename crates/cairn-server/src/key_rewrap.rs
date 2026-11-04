@@ -1125,6 +1125,7 @@ mod tests {
                         checksums: Vec::new(),
                         sse_descriptor: Some(descriptor),
                         replication_status: None,
+                        internal_blake3: None,
                         internal_sha256: None,
                         replicated_at: None,
                         created_at: Timestamp(1),

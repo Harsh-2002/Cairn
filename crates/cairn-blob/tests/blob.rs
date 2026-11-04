@@ -726,7 +726,6 @@ async fn compression_is_transparent_and_etag_invariant() {
 #[tokio::test]
 async fn preallocated_containers_release_tail_blocks_and_preserve_full_content() {
     use futures_util::StreamExt;
-    use sha2::{Digest, Sha256};
     use std::os::unix::fs::MetadataExt;
 
     for algorithm in [
@@ -784,7 +783,11 @@ async fn preallocated_containers_release_tail_blocks_and_preserve_full_content()
                     std::fs::metadata(dir.path().join(staged.storage_path.as_str())).unwrap();
                 assert_eq!(metadata.len(), staged.size_physical);
                 assert_eq!(staged.size_logical, data.len() as u64);
-                assert_eq!(staged.internal_sha256, hex::encode(Sha256::digest(&data)));
+                assert_eq!(
+                    staged.internal_blake3,
+                    blake3::hash(&data).to_hex().to_string()
+                );
+                assert_eq!(staged.internal_sha256, None);
                 if algorithm != CompressionAlgorithm::None {
                     assert!(metadata.len() < data.len() as u64 / 4);
                     assert!(
@@ -1887,12 +1890,13 @@ async fn assemble_honors_extra_checksums_whole_object() {
         .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
         .expect("crc64nvme present");
     assert_eq!(assembled_crc.value, single_crc.value);
-    use sha2::{Digest, Sha256};
     assert_eq!(
-        assembled.internal_sha256,
-        hex::encode(Sha256::digest(b"part-one-part-two"))
+        assembled.internal_blake3,
+        blake3::hash(b"part-one-part-two").to_hex().to_string()
     );
-    assert_eq!(assembled.internal_sha256, single.internal_sha256);
+    assert_eq!(assembled.internal_blake3, single.internal_blake3);
+    assert_eq!(assembled.internal_sha256, None);
+    assert_eq!(single.internal_sha256, None);
     assert_eq!(
         single.checksums.len(),
         1,
@@ -2952,12 +2956,14 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         enc_asm.md5_hex, plain_asm.md5_hex,
         "whole-object MD5 over plaintext"
     );
-    assert_eq!(enc_asm.internal_sha256, plain_asm.internal_sha256);
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
+    assert_eq!(enc_asm.internal_blake3, plain_asm.internal_blake3);
+    let mut digest = blake3::Hasher::new();
     digest.update(&plain1);
     digest.update(&plain2);
-    assert_eq!(enc_asm.internal_sha256, hex::encode(digest.finalize()));
+    assert_eq!(
+        enc_asm.internal_blake3,
+        digest.finalize().to_hex().to_string()
+    );
 }
 
 #[tokio::test]
@@ -3248,7 +3254,7 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
             .unwrap();
         assert_eq!(assembled.size_logical, expected.len() as u64);
         assert_eq!(assembled.md5_hex, single.md5_hex);
-        assert_eq!(assembled.internal_sha256, single.internal_sha256);
+        assert_eq!(assembled.internal_blake3, single.internal_blake3);
         assert_eq!(assembled.checksums, single.checksums);
         let cipher = if encrypted {
             BlobCipher::AuthenticatedV3(object_key.into())
@@ -3527,8 +3533,7 @@ async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
     assert_eq!(payload_len, staged.size_logical);
     assert_eq!(
         record.format_version,
-        cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION,
-        "an ordinary object keeps the v1 record so older binaries can read it"
+        cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION
     );
     assert_eq!(record.bucket, bucket);
     assert_eq!(record.key, key);
@@ -3538,7 +3543,8 @@ async fn plaintext_object_carries_its_record_in_an_inline_trailer() {
     assert_eq!(record.size_logical, staged.size_logical);
     assert_eq!(record.size_physical, staged.size_physical);
     assert_eq!(record.etag, staged.etag);
-    assert_eq!(record.internal_sha256, Some(staged.internal_sha256.clone()));
+    assert_eq!(record.internal_blake3, Some(staged.internal_blake3.clone()));
+    assert_eq!(record.internal_sha256, None);
     assert_eq!(record.cache_control.as_deref(), Some("max-age=60"));
     assert_eq!(record.user_metadata, seed.user_metadata);
     assert_eq!(record.tags, seed.tags);
@@ -3639,7 +3645,7 @@ async fn assembly_with_an_explicit_etag_skips_the_unused_full_object_md5() {
     assert_eq!(record.etag.as_str(), composite);
     assert_eq!(
         record.format_version,
-        cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
+        cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION
     );
     assert!(record.multipart_parts.is_some());
 }
@@ -3899,8 +3905,17 @@ async fn replacing_a_v1_sidecar_writes_v2_without_touching_the_data_file() {
         .stage_fixture(&bucket, body(b"data".to_vec()), opts(None, "text/plain"))
         .await
         .unwrap();
-    let v1 = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
-    let v2 = cairn_types::storage::ObjectMetadataRecord::from_staged(&v2_seed, &staged);
+    let mut v1 = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
+    let mut v2 = cairn_types::storage::ObjectMetadataRecord::from_staged(&v2_seed, &staged);
+    // Construct the legacy generations explicitly: the two production rows that need this
+    // offline upgrade were written before BLAKE3 and carry only SHA-256.
+    for record in [&mut v1, &mut v2] {
+        record.internal_blake3 = None;
+        record.internal_sha256 = Some("00".repeat(32));
+    }
+    v1.format_version = cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION;
+    v1.multipart_parts = None;
+    v2.format_version = cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION;
     assert_eq!(
         v1.format_version,
         cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION
@@ -3966,6 +3981,60 @@ async fn replacing_a_v1_sidecar_writes_v2_without_touching_the_data_file() {
         decoded.encode().unwrap(),
         "the durable v2 record is unchanged by the refused second pass"
     );
+}
+
+#[tokio::test]
+async fn replacing_a_legacy_v1_sidecar_accepts_the_v3_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("upgrade-v3-bucket").unwrap();
+    let key = ObjectKey::parse("assembled.bin").unwrap();
+    let version = VersionId::null();
+    let mut seed = metadata_seed(&bucket, &key, &version, &"d".repeat(32));
+    seed.multipart_parts = Some(vec![cairn_types::object::MultipartPartRecord {
+        part_number: 1,
+        size: 4,
+    }]);
+    let staged = store
+        .stage_fixture(&bucket, body(b"data".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let mut v3 = cairn_types::storage::ObjectMetadataRecord::from_staged(&seed, &staged);
+    assert_eq!(
+        v3.format_version,
+        cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION
+    );
+    assert!(v3.internal_blake3.is_some());
+    assert!(v3.internal_sha256.is_none());
+    let mut v1 = v3.clone();
+    v1.format_version = cairn_types::storage::OBJECT_METADATA_V1_FORMAT_VERSION;
+    v1.multipart_parts = None;
+    v1.internal_blake3 = None;
+    v1.internal_sha256 = Some("00".repeat(32));
+    v3.internal_sha256 = None;
+    let sidecar = cairn_types::storage::object_metadata_path(&staged.storage_path).unwrap();
+    std::fs::write(dir.path().join(sidecar.as_str()), v1.encode().unwrap()).unwrap();
+
+    store
+        .replace_metadata_sidecar(
+            object_permit(&bucket, &key, &version),
+            &staged.storage_path,
+            &v3,
+        )
+        .await
+        .unwrap();
+    let decoded = cairn_types::storage::ObjectMetadataRecord::decode(
+        &std::fs::read(dir.path().join(sidecar.as_str())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.format_version,
+        cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION
+    );
+    assert_eq!(decoded.internal_blake3, v3.internal_blake3);
+    assert_eq!(decoded.multipart_parts, v3.multipart_parts);
 }
 
 #[tokio::test]

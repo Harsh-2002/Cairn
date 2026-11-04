@@ -74,7 +74,8 @@ The decisive tests run real S3 clients against a running Cairn. The boto3 AWS SD
 The live `conformance/scrub.sh` gate isolates plaintext, at-rest encryption, client SSE-S3,
 compression and multipart content on separate nodes. Its multipart arm disables optional SDK
 checksums, verifies the intact assembled object first, and then proves byte corruption is detected
-through the internal SHA-256 without a composite-ETag coverage skip. Legacy rows without a content
+through the internal BLAKE3 baseline without a composite-ETag coverage skip. Legacy rows without a
+content
 baseline retain their explicit skip coverage in the server unit suite.
 
 ### 29.6 Benchmarks and load

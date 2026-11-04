@@ -33,6 +33,7 @@ fn object_row(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId) -> O
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_blake3: None,
         internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp(10),

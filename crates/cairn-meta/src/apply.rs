@@ -330,6 +330,7 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 checksums: Vec::new(),
                 sse_descriptor: None,
                 replication_status: None,
+                internal_blake3: None,
                 internal_sha256: None,
                 replicated_at: None,
                 created_at: now,
@@ -2439,8 +2440,8 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
           etag, content_type, content_encoding, cache_control, content_disposition, content_language,
           expires, storage_path, compression, storage_class, cold_locator, owner_id,
-          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256, expire_at, multipart_parts)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at, internal_sha256, internal_blake3, expire_at, multipart_parts)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
     )
     .map_err(engine_err)?
     .execute(params![
@@ -2472,6 +2473,7 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.created_at.0,
             row.updated_at.0,
             row.internal_sha256,
+            row.internal_blake3,
             row.expire_at.map(|expires| expires.0),
             row.multipart_parts.as_ref().map(to_json),
         ])
@@ -3459,6 +3461,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: None,
             replication_status: None,
+            internal_blake3: None,
             internal_sha256: None,
             replicated_at: None,
             created_at: Timestamp(1),

@@ -168,7 +168,7 @@ plan every temporary, final and optional spool path without I/O. A guard owns th
 before the Writer admission await. Only an acknowledged typed admission for the current generation
 becomes a move-only creation permit; a lost acknowledgement creates no file and queues resolution.
 
-The blob store streams bytes through MD5, internal plaintext SHA-256, requested checksum hashers,
+The blob store streams bytes through MD5, internal plaintext BLAKE3, requested checksum hashers,
 and compression/encryption, then preserves file sync → rename → directory sync. The handler
 verifies the hashes and captures the version creation timestamp after staging. Publication wraps
 the ordinary put in `PublishStorageWrite`. Its one savepoint validates the exact admitted plan,

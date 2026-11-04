@@ -2980,6 +2980,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: None,
             replication_status: None,
+            internal_blake3: None,
             internal_sha256: None,
             replicated_at: None,
             created_at: now,
@@ -3257,7 +3258,7 @@ mod tests {
         let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
-            .execute("UPDATE storage_protocol SET minimum_writer=3", [])
+            .execute("UPDATE storage_protocol SET minimum_writer=4", [])
             .unwrap();
         drop(connection);
         // Rebind the deliberately incompatible bytes: rejection must come from the protocol

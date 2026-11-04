@@ -349,7 +349,8 @@ bounded release; restore and fresh generations invalidate release authorization 
 | user_metadata | text | The user-defined metadata entries. |
 | acl | text | Nullable; the object ACL where ownership keeps ACLs in force. |
 | checksums | text | Nullable; any client-supplied checksums. |
-| internal_sha256 | text | Nullable; internal hex SHA-256 of the logical plaintext, recorded during new ingest/assembly. Legacy NULL is never backfilled by scrub. Independent of S3 checksums; native snapshots preserve it. |
+| internal_blake3 | text | Nullable; internal hex BLAKE3 of the logical plaintext for every object written by schema v42 and later. New rows leave `internal_sha256` NULL. Independent of S3 checksums; native snapshots and v3 sidecars preserve it. |
+| internal_sha256 | text | Nullable; legacy internal hex SHA-256 recorded by pre-v42 ingest/assembly. Read and scrubbed with SHA-256; never backfilled by scrub and never populated on new rows. |
 | replication_status | text | Nullable; pending, completed, failed, or replica, for replication-enabled buckets. |
 | replicated_at | integer | Nullable; unix seconds MarkReplicationDone last stamped this version completed (migration v23); NULL = never shipped from this node or shipped pre-v23 (treated as suspect by the encrypted-replica audit). |
 | multipart_parts | text | Nullable; JSON array of `{part_number,size}` records for an object completed by a multipart upload (migration v41). Part numbers may be non-contiguous; the offset is the sum of the sizes that precede the selected number, and `GET`/`HEAD ?partNumber=N` serves that part. NULL for single-part PUTs, copies, and objects completed before v41. |

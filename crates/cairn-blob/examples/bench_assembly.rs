@@ -266,7 +266,7 @@ async fn main() {
         }
         assembled_paths.push((
             assembled.storage_path.clone(),
-            assembled.internal_sha256.clone(),
+            assembled.internal_blake3.clone(),
             assembled.compression.clone(),
         ));
         if !keep {
@@ -330,26 +330,25 @@ async fn main() {
             bytes.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(bytes, expected, "assembled bytes must match the parts");
-        let sha = {
-            use aws_lc_rs::digest::{Context, SHA256};
-            let mut ctx = Context::new(&SHA256);
-            ctx.update(&bytes);
-            hex::encode(ctx.finish().as_ref())
+        let blake3_hex = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&bytes);
+            hasher.finalize().to_hex().to_string()
         };
         assert_eq!(
-            assembled.internal_sha256, sha,
-            "internal SHA-256 must cover the exact assembled plaintext"
+            assembled.internal_blake3, blake3_hex,
+            "internal BLAKE3 must cover the exact assembled plaintext"
         );
         let meta = cairn_types::storage::object_metadata_path(&assembled.storage_path).unwrap();
         let record = cairn_types::storage::ObjectMetadataRecord::decode(
             &std::fs::read(dir.join(meta.as_str())).unwrap(),
         )
         .unwrap();
-        assert_eq!(record.format_version, 2);
+        assert_eq!(record.format_version, 3);
         assert_eq!(record.multipart_parts.as_ref().map(Vec::len), Some(parts));
-        assert_eq!(record.internal_sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(record.internal_blake3.as_deref(), Some(blake3_hex.as_str()));
         println!(
-            "verify: {} bytes exact, internal sha256 ok, v2 sidecar ok ({})",
+            "verify: {} bytes exact, internal blake3 ok, v3 sidecar ok ({})",
             bytes.len(),
             assembled.etag.as_str()
         );

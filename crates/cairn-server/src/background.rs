@@ -2220,15 +2220,19 @@ async fn scrub_version_paced(
         Err(_) => return ScrubOutcome::Corrupt("open_failed"),
     };
     // Internal ingest digests take precedence. A malformed baseline is damage, never absence.
-    if row
-        .internal_sha256
-        .as_ref()
-        .is_some_and(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    // BLAKE3 is authoritative when both columns are populated (the v42 migration never writes
+    // both; this explicit precedence only resolves a hand-edited row). New objects carry BLAKE3;
+    // legacy rows keep SHA-256.
+    let invalid_digest =
+        |digest: &String| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit());
+    if row.internal_blake3.as_ref().is_some_and(invalid_digest)
+        || row.internal_sha256.as_ref().is_some_and(invalid_digest)
     {
         return ScrubOutcome::Corrupt("invalid_digest");
     }
+    let has_baseline = row.internal_blake3.is_some() || row.internal_sha256.is_some();
     let mut full_checksums = Vec::new();
-    if row.internal_sha256.is_none() {
+    if !has_baseline {
         for checksum in &row.checksums {
             let expected_len = match checksum.algorithm {
                 ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => 4,
@@ -2259,7 +2263,8 @@ async fn scrub_version_paced(
         }
     }
     let set = ChecksumSet(full_checksums.iter().map(|c| c.algorithm).collect());
-    let mut hasher = cairn_blob::hash::Hashers::new(&set);
+    let legacy_sha256 = row.internal_blake3.is_none() && row.internal_sha256.is_some();
+    let mut hasher = cairn_blob::hash::Hashers::new_for_scrub(&set, legacy_sha256);
     let mut logical_bytes = 0u64;
     let mut body = handle.body;
     while let Some(chunk) = body.next().await {
@@ -2287,10 +2292,25 @@ async fn scrub_version_paced(
     if logical_bytes != row.size_logical {
         return ScrubOutcome::Corrupt("length_mismatch");
     }
-    let (md5, checksums, internal_sha256) = hasher.finalize();
-    let md5 = md5.expect("the scrub hasher always computes the MD5");
+    let finalized = hasher.finalize();
+    let md5 = finalized
+        .md5_hex
+        .expect("the scrub hasher always computes the MD5");
+    if let Some(expected) = &row.internal_blake3 {
+        let actual = finalized
+            .internal_blake3
+            .expect("a BLAKE3 baseline always computes BLAKE3");
+        return if actual.eq_ignore_ascii_case(expected) {
+            ScrubOutcome::Verified
+        } else {
+            ScrubOutcome::Corrupt("hash_mismatch")
+        };
+    }
     if let Some(expected) = &row.internal_sha256 {
-        return if internal_sha256.eq_ignore_ascii_case(expected) {
+        let actual = finalized
+            .internal_sha256
+            .expect("a legacy SHA-256 baseline always computes SHA-256");
+        return if actual.eq_ignore_ascii_case(expected) {
             ScrubOutcome::Verified
         } else {
             ScrubOutcome::Corrupt("hash_mismatch")
@@ -2299,7 +2319,7 @@ async fn scrub_version_paced(
     if !full_checksums.is_empty() {
         return if full_checksums
             .iter()
-            .all(|expected| checksums.contains(expected))
+            .all(|expected| finalized.checksums.contains(expected))
         {
             ScrubOutcome::Verified
         } else {
@@ -2734,7 +2754,8 @@ mod tests {
                 checksums: Vec::new(),
                 sse_descriptor: None,
                 replication_status: None,
-                internal_sha256: Some(staged.internal_sha256),
+                internal_blake3: Some(staged.internal_blake3),
+                internal_sha256: None,
                 replicated_at: None,
                 created_at: Timestamp(1),
                 updated_at: Timestamp(1),
@@ -3311,6 +3332,7 @@ mod tests {
                 checksums: Vec::new(),
                 sse_descriptor,
                 replication_status: None,
+                internal_blake3: None,
                 internal_sha256: None,
                 replicated_at: None,
                 created_at: Timestamp(0),
@@ -3356,7 +3378,7 @@ mod tests {
                 staged.compression,
                 descriptor,
             );
-            row.internal_sha256 = Some(staged.internal_sha256);
+            row.internal_blake3 = Some(staged.internal_blake3);
             row
         }
 
@@ -3520,6 +3542,7 @@ mod tests {
                 ScrubOutcome::Verified
             );
             // The pre-migration single-part MD5 fallback remains covered independently.
+            row.internal_blake3 = None;
             row.internal_sha256 = None;
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
@@ -3544,6 +3567,7 @@ mod tests {
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
             row.etag = ETag::from_md5_hex(format!("{}-2", "0".repeat(32)));
+            row.internal_blake3 = None;
             row.internal_sha256 = None;
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
@@ -3589,10 +3613,11 @@ mod tests {
                         ScrubOutcome::Verified
                     );
                     // Legacy rows may carry a FULL_OBJECT checksum but have no internal baseline.
+                    row.internal_blake3 = None;
                     row.internal_sha256 = None;
                     let mut hashes = cairn_blob::hash::Hashers::new(&ChecksumSet(vec![algorithm]));
                     hashes.update(&body);
-                    row.checksums = hashes.finalize().1;
+                    row.checksums = hashes.finalize().checksums;
                     assert_eq!(
                         scrub_version(&blobs, &crypto, &row).await,
                         ScrubOutcome::Verified
@@ -3616,17 +3641,60 @@ mod tests {
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"multipart plaintext", None, None, None).await;
             row.etag = ETag::multipart("0".repeat(32), 2);
-            let digest = row.internal_sha256.clone();
-            row.internal_sha256 = Some("not a digest".to_owned());
+            let digest = row.internal_blake3.clone();
+            row.internal_blake3 = Some("not a digest".to_owned());
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
                 ScrubOutcome::Corrupt("invalid_digest")
             );
-            row.internal_sha256 = digest;
+            row.internal_blake3 = digest;
             flip_a_byte(dir.path(), &row);
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
                 ScrubOutcome::Corrupt("hash_mismatch")
+            );
+        }
+
+        /// A legacy SHA-256 row still scrubs with the old algorithm after the BLAKE3 migration.
+        #[tokio::test]
+        async fn a_legacy_sha256_baseline_still_verifies() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let body = b"legacy sha256 baseline";
+            let mut row = staged_row(&blobs, body, None, None, None).await;
+            row.internal_blake3 = None;
+            row.internal_sha256 = Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body)));
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+            row.internal_sha256 = Some("0".repeat(64));
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("hash_mismatch")
+            );
+        }
+
+        /// A row carrying both columns is handled explicitly: BLAKE3 is the stronger, current
+        /// baseline and wins; a stale SHA-256 value cannot turn a healthy object into "corrupt".
+        #[tokio::test]
+        async fn both_baselines_present_prefers_blake3() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs =
+                LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+                    .await
+                    .unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let mut row = staged_row(&blobs, b"both baselines", None, None, None).await;
+            assert!(row.internal_blake3.is_some());
+            row.internal_sha256 = Some("0".repeat(64));
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
             );
         }
 
@@ -3640,6 +3708,7 @@ mod tests {
                     .unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
+            row.internal_blake3 = None;
             row.internal_sha256 = None;
             row.etag = ETag::multipart("0".repeat(32), 2);
             row.checksums = vec![ChecksumValue {

@@ -196,6 +196,7 @@ fn marker(
         acl: None,
         checksums: vec![],
         sse_descriptor: None,
+        internal_blake3: None,
         internal_sha256: None,
         replication_status: None,
         replicated_at: None,

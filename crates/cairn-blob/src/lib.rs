@@ -355,16 +355,17 @@ impl LocalBlobStore {
         Ok(true)
     }
 
-    /// Replace an existing v1 metadata sidecar with a v2 record during offline maintenance.
+    /// Replace an existing v1 metadata sidecar with a current record during offline maintenance.
     ///
-    /// This is the opt-in `backfill-sidecars --upgrade-v1` path: an object assembled between the
-    /// v1 sidecar stage and the v2 part-layout stage has a v1 record even though its index row
-    /// carries the part layout. The caller must hold the node lock. The data file is never touched
-    /// or created; only the sidecar is rewritten.
+    /// This is the opt-in `backfill-sidecars --upgrade-v1` path: an object written or assembled
+    /// before the current sidecar generation has a v1 record even though its index row may carry a
+    /// part layout and/or a BLAKE3 baseline. The caller must hold the node lock. The data file is
+    /// never touched or created; only the sidecar is rewritten.
     ///
-    /// Fail-closed preconditions: the new record must be v2 with a part layout, the data file must
-    /// still be exactly the size the record describes, the destination must be an existing regular
-    /// v1 sidecar, and its identity must agree with the replacement. The new JSON is staged under
+    /// Fail-closed preconditions: the new record must be a consistent v2 (part layout, legacy
+    /// SHA-256) or v3 (BLAKE3, optional layout) generation, the data file must still be exactly the
+    /// size the record describes, the destination must be an existing regular v1 sidecar, and its
+    /// identity must agree with the replacement. The new JSON is staged under
     /// the permit's fresh attempt alias, fsynced, atomically renamed **over** the destination, and
     /// the bucket directory is synced; a failed write or rename leaves the old sidecar intact.
     pub async fn replace_metadata_sidecar(
@@ -373,11 +374,19 @@ impl LocalBlobStore {
         data_path: &StoragePath,
         record: &ObjectMetadataRecord,
     ) -> Result<(), BlobError> {
-        if record.format_version != cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION
-            || record.multipart_parts.is_none()
-        {
+        let is_generation = match record.format_version {
+            cairn_types::storage::OBJECT_METADATA_V2_FORMAT_VERSION => {
+                record.multipart_parts.is_some() && record.internal_blake3.is_none()
+            }
+            cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION => {
+                record.internal_blake3.is_some() && record.internal_sha256.is_none()
+            }
+            _ => false,
+        };
+        if !is_generation {
             return Err(BlobError::Io(
-                "metadata replacement requires a v2 record with a part layout".into(),
+                "metadata replacement requires a consistent v2 (parts) or v3 (BLAKE3) record"
+                    .into(),
             ));
         }
         let mut components = data_path.as_str().split('/');
@@ -611,7 +620,8 @@ struct StagedWrite {
     md5: String,
     checksums: Vec<cairn_types::object::ChecksumValue>,
     compression: CompressionDescriptor,
-    internal_sha256: String,
+    internal_blake3: Option<String>,
+    internal_sha256: Option<String>,
     index_spool: IndexSpoolState,
 }
 
@@ -691,8 +701,10 @@ async fn write_staged(
         }
         let (tail_bytes, index_spool) = enc.finish(file).await?;
         physical += tail_bytes;
-        let (md5, checks, internal_sha256) = hashers.finalize();
-        let md5 = md5.expect("a single-pass write always computes the MD5");
+        let finalized = hashers.finalize();
+        let md5 = finalized
+            .md5_hex
+            .expect("a single-pass write always computes the MD5");
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
         // still `Uncompressed` to readers that only care about the compression algorithm.
@@ -707,9 +719,10 @@ async fn write_staged(
             logical,
             physical,
             md5,
-            checksums: checks,
+            checksums: finalized.checksums,
             compression: descriptor,
-            internal_sha256,
+            internal_blake3: finalized.internal_blake3,
+            internal_sha256: finalized.internal_sha256,
             index_spool,
         })
     } else {
@@ -747,8 +760,10 @@ async fn write_staged(
         if let Some(detail) = raw_body_breakdown.as_mut() {
             detail.begin(timing::RawBodyPhase::Hash);
         }
-        let (md5, checks, internal_sha256) = hashers.finalize();
-        let md5 = md5.expect("a single-pass write always computes the MD5");
+        let finalized = hashers.finalize();
+        let md5 = finalized
+            .md5_hex
+            .expect("a single-pass write always computes the MD5");
         if let Some(detail) = raw_body_breakdown.as_mut() {
             detail.end(true);
         }
@@ -756,9 +771,10 @@ async fn write_staged(
             logical,
             physical,
             md5,
-            checksums: checks,
+            checksums: finalized.checksums,
             compression: CompressionDescriptor::Uncompressed,
-            internal_sha256,
+            internal_blake3: finalized.internal_blake3,
+            internal_sha256: finalized.internal_sha256,
             index_spool: IndexSpoolState::NeverCreated,
         })
     }
@@ -1475,6 +1491,9 @@ impl BlobStore for LocalBlobStore {
             etag: ETag::from_md5_hex(write.md5.clone()),
             md5_hex: Some(write.md5),
             checksums: write.checksums,
+            internal_blake3: write
+                .internal_blake3
+                .expect("a whole-object write always computes the BLAKE3 baseline"),
             internal_sha256: write.internal_sha256,
             compression: write.compression,
             index_spool: write.index_spool,
@@ -1914,7 +1933,8 @@ impl BlobStore for LocalBlobStore {
             CompressionDescriptor::Uncompressed
         };
 
-        let (md5_hex, checksums, internal_sha256) = hashers.finalize();
+        let finalized = hashers.finalize();
+        let md5_hex = finalized.md5_hex;
         let etag = metadata_seed
             .as_ref()
             .and_then(|seed| seed.etag.clone())
@@ -1931,8 +1951,11 @@ impl BlobStore for LocalBlobStore {
             size_physical: physical,
             etag,
             md5_hex,
-            checksums,
-            internal_sha256,
+            checksums: finalized.checksums,
+            internal_blake3: finalized
+                .internal_blake3
+                .expect("an assembly always computes the BLAKE3 baseline"),
+            internal_sha256: finalized.internal_sha256,
             compression: descriptor,
             index_spool,
         };
