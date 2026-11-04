@@ -318,6 +318,254 @@ pub async fn assert_storage_journal(meta: &dyn MetadataStore) {
     assert_storage_multipart_quota(meta).await;
     assert_storage_completion(meta).await;
     assert_object_publication_without_admission(meta).await;
+    // Last: it begins new storage generations, which invalidate every earlier cleanup claim.
+    assert_storage_cleanup_batch(meta).await;
+}
+
+/// Record exact cleanup debt for every planned alias of one abandoned object attempt. The attempt
+/// is admitted, then resolved only after its I/O quiescence proof, which is the same durable point
+/// a restarting cleanup consumer resumes from.
+async fn abandon_object_plan(
+    meta: &dyn MetadataStore,
+    bucket: &BucketName,
+    generation: &StorageToken,
+) {
+    let planned = plan(bucket, generation);
+    let MutationOutcome::StorageAdmission(receipt) = meta
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: StorageMutation::Reserve {
+                plan: Box::new(planned.plan().clone()),
+                now: Timestamp(0),
+            },
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("object admission expected");
+    };
+    let attempt = planned.plan().attempt.clone();
+    let (mut watch, lease) = StorageIoWatch::new(attempt, generation.clone(), Arc::new(()));
+    let permit = planned.admit(receipt, lease).unwrap();
+    drop(permit);
+    update(
+        meta,
+        bucket,
+        StorageMutation::Resolve {
+            quiescence: watch.quiescent().await,
+        },
+        true,
+    )
+    .await;
+}
+
+async fn retire_batch(
+    meta: &dyn MetadataStore,
+    bucket: &BucketName,
+    cleanups: Vec<StorageCleanup>,
+    now: i64,
+) -> Result<usize, crate::MetaError> {
+    match meta
+        .submit(Mutation::Storage {
+            bucket: bucket.clone(),
+            operation: StorageMutation::FinishCleanupBatch {
+                cleanups,
+                now: Timestamp(now),
+            },
+        })
+        .await?
+    {
+        MutationOutcome::StorageCleanupRetired { retired } => Ok(retired),
+        other => panic!("batched cleanup retirement outcome expected, got {other:?}"),
+    }
+}
+
+/// Claim only `bucket`'s debt. Earlier contract sections run on the same store and share the
+/// global claim page, so unrelated rows are settled under their own bucket instead of leaking
+/// into the counts this section asserts.
+async fn claim_bucket(
+    meta: &dyn MetadataStore,
+    bucket: &BucketName,
+    generation: &StorageToken,
+    now: i64,
+) -> Vec<StorageCleanup> {
+    let mut mine = Vec::new();
+    for row in claim(meta, generation, 100, now).await {
+        if &row.bucket == bucket {
+            mine.push(row);
+        } else {
+            let foreign = row.bucket.clone();
+            retire_batch(meta, &foreign, vec![row], now).await.unwrap();
+        }
+    }
+    mine
+}
+
+/// One submission retires an exact set of already-reclaimed rows; a stale, expired or re-claimed
+/// row is skipped without failing the rest; a foreign bucket is rejected before anything settles;
+/// a generation change retires nothing but leaves every row re-claimable; and a linked quota charge
+/// is refunded exactly once.
+pub async fn assert_storage_cleanup_batch(meta: &dyn MetadataStore) {
+    let bucket = BucketName::parse("storage-cleanup-batch-contract").unwrap();
+    create_bucket(meta, &bucket).await;
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        abandon_object_plan(meta, &bucket, &generation).await;
+    }
+    let mut rows = claim_bucket(meta, &bucket, &generation, 0).await;
+    let total = rows.len();
+    assert!(
+        total >= 4,
+        "two abandoned object plans own several exact aliases"
+    );
+    // A duplicate entry settles once: the second copy is already gone inside the same savepoint.
+    let last = rows.pop().unwrap();
+    assert_eq!(
+        retire_batch(meta, &bucket, rows, 1).await.unwrap(),
+        total - 1
+    );
+    assert_eq!(
+        retire_batch(meta, &bucket, vec![last.clone(), last], 2)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(claim_bucket(meta, &bucket, &generation, 3).await.is_empty());
+
+    // A stale generation retires nothing. The rows stay durable debt and are re-claimed under the
+    // next generation, which is also the state a crash between physical unlink and retirement
+    // leaves behind: nothing here has been settled, so a retry re-does the (idempotent) unlink.
+    abandon_object_plan(meta, &bucket, &generation).await;
+    let stale = claim_bucket(meta, &bucket, &generation, 4).await;
+    assert!(!stale.is_empty());
+    let next = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: next.clone(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        retire_batch(meta, &bucket, stale.clone(), 5).await.unwrap(),
+        0
+    );
+    let mut reclaimed = claim_bucket(meta, &bucket, &next, 6).await;
+    assert_eq!(reclaimed.len(), stale.len());
+    let exact = reclaimed.pop().unwrap();
+    let mut wrong = exact.clone();
+    wrong.claim_token = StorageToken::generate();
+    assert_eq!(
+        retire_batch(meta, &bucket, vec![wrong], 7).await.unwrap(),
+        0,
+        "a re-claimed token settles nothing"
+    );
+    let expired_at = exact.lease_until.0 + 1;
+    assert_eq!(
+        retire_batch(meta, &bucket, vec![exact.clone()], expired_at)
+            .await
+            .unwrap(),
+        0,
+        "an acknowledgement past its lease settles nothing"
+    );
+    assert_eq!(
+        retire_batch(meta, &bucket, vec![exact], 7).await.unwrap(),
+        1
+    );
+    let remaining = reclaimed.len();
+    assert_eq!(
+        retire_batch(meta, &bucket, reclaimed, 7).await.unwrap(),
+        remaining
+    );
+
+    // A batch whose rows belong to another bucket is a caller defect, rejected before any row
+    // settles; the rejected claim stays exact and can still settle afterwards.
+    let other = BucketName::parse("storage-cleanup-batch-other").unwrap();
+    create_bucket(meta, &other).await;
+    abandon_object_plan(meta, &other, &next).await;
+    let mut foreign = claim_bucket(meta, &other, &next, 8).await;
+    assert!(!foreign.is_empty());
+    let foreign_total = foreign.len();
+    let row = foreign.remove(0);
+    assert!(
+        retire_batch(meta, &bucket, vec![row.clone()], 9)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        retire_batch(meta, &other, vec![row], 9).await.unwrap(),
+        1,
+        "the rejected row kept its exact claim and debt"
+    );
+    assert_eq!(
+        retire_batch(meta, &other, foreign, 9).await.unwrap(),
+        foreign_total - 1,
+        "the rest of the foreign page settles under its own bucket"
+    );
+
+    // Quota debit refunds exactly once across one batch: the charge-bearing row is retired with
+    // its siblings, the restored quota admits a replacement, and a stale resubmission refunds
+    // nothing because it settles no row.
+    let quota_bucket = BucketName::parse("storage-cleanup-batch-quota").unwrap();
+    create_bucket(meta, &quota_bucket).await;
+    meta.submit(Mutation::SetBucketQuota {
+        bucket: quota_bucket.clone(),
+        quota_bytes: Some(20),
+    })
+    .await
+    .unwrap();
+    let generation = StorageToken::generate();
+    meta.submit(Mutation::BeginStorageGeneration {
+        generation: generation.clone(),
+    })
+    .await
+    .unwrap();
+    let upload = create_upload(meta, &quota_bucket).await;
+    let first = part_plan(&quota_bucket, &generation, &upload);
+    assert!(matches!(
+        meta.submit(reserve_part(&first)).await.unwrap(),
+        MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+    ));
+    assert!(matches!(
+        meta.submit(publish_part(&first)).await.unwrap(),
+        MutationOutcome::PartRecorded { .. }
+    ));
+    let aliases = claim_bucket(meta, &quota_bucket, &generation, 0).await;
+    assert_eq!(aliases.len(), 1);
+    let second = part_plan(&quota_bucket, &generation, &upload);
+    assert!(matches!(
+        meta.submit(reserve_part(&second)).await.unwrap(),
+        MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+    ));
+    assert!(matches!(
+        meta.submit(publish_part(&second)).await.unwrap(),
+        MutationOutcome::PartRecorded { .. }
+    ));
+    let debts = claim_bucket(meta, &quota_bucket, &generation, 2).await;
+    assert_eq!(debts.len(), 3);
+    assert!(debts.iter().any(|row| row.quota_debt_id.is_some()));
+    assert_eq!(
+        retire_batch(meta, &quota_bucket, debts.clone(), 3)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        retire_batch(meta, &quota_bucket, debts, 4).await.unwrap(),
+        0,
+        "a stale resubmission must not refund the charge a second time"
+    );
+    let third = part_plan(&quota_bucket, &generation, &upload);
+    assert!(
+        matches!(
+            meta.submit(reserve_part(&third)).await.unwrap(),
+            MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
+        ),
+        "retiring the charge-bearing row restores exactly its quota"
+    );
 }
 
 pub(super) fn object_row(

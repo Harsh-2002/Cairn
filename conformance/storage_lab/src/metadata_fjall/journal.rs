@@ -546,6 +546,192 @@ pub fn apply(
             }
         }
         StorageMutation::FinishCleanup { cleanup, now } => finish(view, bucket, cleanup, now)?,
+        StorageMutation::FinishCleanupBatch { cleanups, now } => {
+            return Ok(MutationOutcome::StorageCleanupRetired {
+                retired: finish_batch(view, bucket, cleanups, now)?,
+            });
+        }
     };
     Ok(MutationOutcome::StorageUpdated { applied })
+}
+
+/// Validate batch membership once, then settle each row under its own exact claim. A stale
+/// generation retires nothing; a mixed bucket or generation is a caller defect, rejected before
+/// any row changes.
+fn finish_batch(
+    view: &mut Overlay<'_>,
+    bucket: &BucketName,
+    cleanups: Vec<StorageCleanup>,
+    now: Timestamp,
+) -> Result<usize, MetaError> {
+    let Some(first) = cleanups.first() else {
+        return Ok(0);
+    };
+    if cleanups.iter().any(|cleanup| &cleanup.bucket != bucket) {
+        return Err(kv::error("cleanup batch mixes buckets"));
+    }
+    if cleanups
+        .iter()
+        .any(|cleanup| cleanup.generation != first.generation)
+    {
+        return Err(kv::error("cleanup batch mixes storage generations"));
+    }
+    if generation(view)?.as_ref() != Some(&first.generation) {
+        return Ok(0);
+    }
+    let mut retired = 0;
+    for cleanup in cleanups {
+        retired += usize::from(finish(view, bucket, cleanup, now)?);
+    }
+    Ok(retired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kv::Native;
+    use super::*;
+    use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
+
+    fn path(bucket: &BucketName) -> StoragePath {
+        StoragePath::from_string(format!(
+            "{}/{}",
+            bucket.as_str(),
+            StorageToken::generate().as_str()
+        ))
+    }
+
+    fn claim(view: &mut Overlay<'_>, generation: &StorageToken, now: i64) -> Vec<StorageCleanup> {
+        let MutationOutcome::StorageCleanupBatch(rows) =
+            super::claim(view, generation.clone(), 10, Timestamp(now), 60).unwrap()
+        else {
+            panic!("cleanup page expected")
+        };
+        rows
+    }
+
+    #[test]
+    fn cleanup_batch_retires_exact_claims_only() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SingleWriterTxDatabase::builder(root.path()).open().unwrap();
+        let tree = db.keyspace("rows", KeyspaceCreateOptions::default).unwrap();
+        let tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        let native = Native {
+            transaction: &tx,
+            tree: &tree,
+        };
+        let mut view = Overlay::new(&native);
+
+        let generation = StorageToken::generate();
+        begin(&mut view, generation.clone()).unwrap();
+        let bucket = BucketName::parse("lab-cleanup-batch").unwrap();
+        let other = BucketName::parse("lab-cleanup-other").unwrap();
+        let first = path(&bucket);
+        let second = path(&bucket);
+        let foreign = path(&other);
+        for (owner, row) in [(&bucket, &first), (&bucket, &second), (&other, &foreign)] {
+            enqueue(&mut view, owner, row, None, None).unwrap();
+        }
+        let rows = claim(&mut view, &generation, 1);
+        assert_eq!(rows.len(), 3);
+
+        // A batch may only settle rows of its outer bucket, and the rejection changes nothing.
+        assert!(
+            apply(
+                &mut view,
+                &bucket,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: rows.clone(),
+                    now: Timestamp(2),
+                }
+            )
+            .is_err()
+        );
+
+        // One submission retires both rows of this bucket; the foreign row keeps its claim.
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|row| row.bucket == bucket)
+            .cloned()
+            .collect();
+        let theirs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.bucket == other)
+            .cloned()
+            .collect();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(
+            apply(
+                &mut view,
+                &bucket,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: mine,
+                    now: Timestamp(2),
+                }
+            )
+            .unwrap(),
+            MutationOutcome::StorageCleanupRetired { retired: 2 }
+        );
+
+        // A re-claimed token settles nothing, even alongside a live claim of the same page.
+        let mut stale = theirs[0].clone();
+        stale.claim_token = StorageToken::generate();
+        assert_eq!(
+            apply(
+                &mut view,
+                &other,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: vec![stale.clone(), stale],
+                    now: Timestamp(2),
+                }
+            )
+            .unwrap(),
+            MutationOutcome::StorageCleanupRetired { retired: 0 }
+        );
+        assert_eq!(
+            apply(
+                &mut view,
+                &other,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: theirs,
+                    now: Timestamp(2),
+                }
+            )
+            .unwrap(),
+            MutationOutcome::StorageCleanupRetired { retired: 1 }
+        );
+
+        // A generation change retires nothing and leaves the debt claimable.
+        enqueue(&mut view, &bucket, &path(&bucket), None, None).unwrap();
+        let rows = claim(&mut view, &generation, 3);
+        assert_eq!(rows.len(), 1);
+        let next = StorageToken::generate();
+        begin(&mut view, next.clone()).unwrap();
+        assert_eq!(
+            apply(
+                &mut view,
+                &bucket,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: rows,
+                    now: Timestamp(4),
+                }
+            )
+            .unwrap(),
+            MutationOutcome::StorageCleanupRetired { retired: 0 }
+        );
+        let rows = claim(&mut view, &next, 4);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            apply(
+                &mut view,
+                &bucket,
+                StorageMutation::FinishCleanupBatch {
+                    cleanups: rows,
+                    now: Timestamp(4),
+                }
+            )
+            .unwrap(),
+            MutationOutcome::StorageCleanupRetired { retired: 1 }
+        );
+        assert!(claim(&mut view, &next, 5).is_empty());
+    }
 }

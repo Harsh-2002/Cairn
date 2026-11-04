@@ -938,6 +938,17 @@ pub enum StorageMutation {
         cleanup: StorageCleanup,
         now: Timestamp,
     },
+    /// Retire a bounded set of rows whose physical reclamation already succeeded, in one Writer
+    /// submission. Every row must belong to the outer [`Mutation::Storage`] bucket and share the
+    /// same storage generation; the applier rejects a mixed batch as a caller defect rather than
+    /// silently discarding debt. Each row still passes the exact claim check of
+    /// [`Self::FinishCleanup`] on its own, so a stale, re-claimed or expired row retires nothing
+    /// while the remaining rows still settle. A batch therefore never overcounts and never
+    /// refunds a quota charge twice.
+    FinishCleanupBatch {
+        cleanups: Vec<StorageCleanup>,
+        now: Timestamp,
+    },
 }
 
 /// Exact immutable physical cleanup work. No reference to a deletable bucket/session row.

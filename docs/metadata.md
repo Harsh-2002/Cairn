@@ -201,10 +201,17 @@ charge those bytes twice. Legacy cleanup release mutations cannot retire protoco
 
 `ClaimStorageCleanup` is bounded and excludes every path referenced by an object, part or
 outstanding intent. A worker deletes only its exact claimed path and establishes the directory
-absence barrier before `FinishCleanup`. Settlement verifies the cleanup id, bucket, path, current
-generation, claim token, unexpired exact lease and quota-debt identity inside the Writer. The last
-linked cleanup may retire its sole quota charge only when no outstanding intent protects the
-charged path. A stale claim or failed deletion preserves retryable debt.
+absence barrier before settlement. Settlement verifies the cleanup id, bucket, path, current
+generation, claim token, unexpired exact lease and quota-debt identity inside the Writer. Rows
+whose physical reclamation already succeeded are then retired in bounded `FinishCleanupBatch`
+submissions of at most 64 claims, one submission per bucket chunk rather than one per file: the
+batch validates its bucket and storage generation once (a mixed batch is rejected as a caller
+defect, and a stale generation retires nothing), while every row is still checked against its own
+exact claim, so a stale, re-claimed or expired row retires nothing and its siblings still settle.
+The last linked cleanup may retire its sole quota charge only when no outstanding intent protects
+the charged path; because that check runs per settled row, a batched refund happens exactly once
+and a repeated submission of an already-retired row refunds nothing. A stale claim or failed
+deletion preserves retryable debt.
 
 Startup advances the process generation only under exclusive node ownership after prior backend
 I/O has drained, invalidating old cleanup claims. Prior-generation intents are enumerated in
