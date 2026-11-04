@@ -28,6 +28,8 @@ mod baseline;
 mod raw_io;
 #[cfg(unix)]
 mod reconcile;
+#[cfg(unix)]
+mod reflink_assembly;
 #[cfg(feature = "io-uring")]
 mod uring;
 // The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
@@ -1112,7 +1114,7 @@ impl LocalBlobStore {
 /// Read at an absolute position without mutating a shared file cursor. The descriptor is shared
 /// with the optional zero-copy hint, so a cursor-based read could race the kernel transfer.
 #[cfg(unix)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     let mut filled = 0;
     while filled < buf.len() {
@@ -1129,7 +1131,7 @@ fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result
 /// Portable fallback: the anchored descriptor is not shared with a concurrent transfer off Unix,
 /// so a cursor read is safe there.
 #[cfg(not(unix))]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = file;
     file.seek(SeekFrom::Start(offset))?;
@@ -1887,17 +1889,67 @@ impl BlobStore for LocalBlobStore {
         // The assemble write path mirrors `stage`: on any error before commit, unlink the staged
         // tmp via the same backend that created it, then propagate. A small closure keeps the
         // sink's `abort` reachable from each fallible step without a flag dance.
-        let assembled = self
-            .assemble_into(
+        //
+        // Known-plaintext parts with no compression/encryption are the concatenation of the part
+        // files, so a reflink-capable filesystem can share their extents instead of rewriting the
+        // assembled bytes. A 4 KiB probe decides support before writing anything; when it fails,
+        // the streaming pipeline below runs unchanged. Once supported, unaligned ranges and
+        // refused clones are copied. The io_uring backend does not expose its descriptor, so it
+        // keeps the streaming pipeline.
+        #[cfg(unix)]
+        let reflink_placement =
+            !self.use_uring && reflink_assembly::eligible(parts, block_pol.is_some());
+        #[cfg(not(unix))]
+        let reflink_placement = false;
+
+        let mut pending_hashers = Some(hashers);
+        let mut placed_with_reflink = false;
+        let assembled = if reflink_placement {
+            let root = self.data_root.clone();
+            let owned_parts = parts.to_vec();
+            let hashers = pending_hashers
+                .take()
+                .expect("the assembly hashers are consumed once");
+            match sink
+                .run_file_op(move |file| {
+                    reflink_assembly::place(&root, &owned_parts, file, hashers, opts.size_ceiling)
+                })
+                .await
+            {
+                Ok(reflink_assembly::Placement::Placed { hashers, logical }) => {
+                    placed_with_reflink = true;
+                    Ok((hashers, logical))
+                }
+                // The probe proved the filesystem cannot reflink and wrote nothing, so the
+                // original streaming pipeline runs on the same, still-empty staging file.
+                Ok(reflink_assembly::Placement::Unsupported(hashers)) => {
+                    self.assemble_into(
+                        &mut sink,
+                        parts,
+                        hashers,
+                        &mut enc,
+                        &mut physical,
+                        opts.size_ceiling,
+                        &paths.lease,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.assemble_into(
                 &mut sink,
                 parts,
-                hashers,
+                pending_hashers
+                    .take()
+                    .expect("the assembly hashers are consumed once"),
                 &mut enc,
                 &mut physical,
                 opts.size_ceiling,
                 &paths.lease,
             )
-            .await;
+            .await
+        };
         let logical = match assembled {
             Ok((finalized, logical)) => {
                 hashers = finalized;
@@ -1908,6 +1960,9 @@ impl BlobStore for LocalBlobStore {
                 return Err(e);
             }
         };
+        if placed_with_reflink {
+            physical = logical;
+        }
         let mut index_spool = IndexSpoolState::NeverCreated;
         let descriptor = if let Some(e) = enc {
             match e.finish(&mut sink).await {
@@ -1977,12 +2032,25 @@ impl BlobStore for LocalBlobStore {
 
         drop(assembly_timing);
         let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
-        sink.commit(&paths.final_file).await?;
+        // Overlap the data file's barrier with the sidecar's, exactly as the single-PUT path does.
+        // The data rename still completes first and the metadata rename second, under one
+        // destination-directory barrier; a failure in either barrier prevents publication.
+        let data_commit = sink.commit(&paths.final_file);
+        let sidecar = match sidecar {
+            Some(sidecar) => {
+                let ((), sidecar) = tokio::try_join!(data_commit, sidecar.fsync_retained())?;
+                Some(sidecar)
+            }
+            None => {
+                data_commit.await?;
+                None
+            }
+        };
         if let Some(sidecar) = sidecar {
             let destination = paths.metadata_file.clone().ok_or_else(|| {
                 BlobError::Io("storage plan lacks a multipart metadata sidecar path".into())
             })?;
-            sidecar.commit(&destination).await?;
+            sidecar.rename_retained(&destination).await?;
         }
         // Release the copy permit before parking on the coalesced directory-fsync barrier.
         drop(copy_permit);

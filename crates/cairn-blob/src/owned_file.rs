@@ -87,6 +87,12 @@ impl OwnedFile {
         Ok(self.owner)
     }
 
+    /// Whether a physical write is still queued. A caller that needs the descriptor for an
+    /// independent operation must wait for the queue to drain first.
+    pub(crate) fn has_pending_write(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(crate) async fn read_chunk(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if self.pending.is_some() || len > WRITE_BATCH {
             return Err(io::Error::other("invalid storage scratch read"));

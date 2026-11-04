@@ -162,7 +162,9 @@ above remain the source of truth.
   control-plane and multipart writes. New objects record a BLAKE3 internal baseline; legacy objects
   keep SHA-256. This is a one-way storage-format change (schema v42, sidecar v3, protocol floor 3):
   never add a config selector or dual-write, and never reuse `internal_sha256` for another
-  algorithm.
+  algorithm. A completed plaintext multipart object may share extents with its parts (reflink);
+  parts stay immutable until completion cleanup unlinks them, and no path may truncate or punch
+  holes in a part while the completed object references it.
 - Every fix lands with a regression test in the owning crate, and the applicable validation gate is green, before it
   is "done". Match the surrounding code's style, comment density, and idioms.
 

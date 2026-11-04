@@ -78,6 +78,39 @@ impl Staging {
         }
     }
 
+    /// Run one retained blocking operation against the staging file's descriptor.
+    ///
+    /// Plaintext reflink placement needs the destination descriptor so the filesystem can share
+    /// part extents into it. Only the default `tokio` backend exposes one; the io_uring backend and
+    /// a writer with a queued physical write are rejected, so the caller falls back to the
+    /// streaming pipeline. The operation owns a child lease through actual completion, exactly
+    /// like every other queued blocking file job.
+    pub(crate) async fn run_file_op<T, F>(&self, operation: F) -> Result<T, BlobError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&std::fs::File) -> Result<T, BlobError> + Send + 'static,
+    {
+        match self {
+            Self::Tokio { writer, .. } => {
+                if writer.get_ref().has_pending_write() {
+                    return Err(BlobError::Io(
+                        "staging file still has a queued physical write".into(),
+                    ));
+                }
+                writer
+                    .get_ref()
+                    .owner
+                    .run(move |file| Ok::<_, std::io::Error>(operation(file)))
+                    .await
+                    .map_err(io_err)?
+            }
+            #[cfg(feature = "io-uring")]
+            Self::Uring(_) => Err(BlobError::Io(
+                "reflink placement requires the default staging backend".into(),
+            )),
+        }
+    }
+
     /// File sync precedes the exclusive rename. The caller then synchronizes the exact destination
     /// directory through the shared coalescer before reporting the blob durable (ARCH 8.2).
     pub(crate) async fn commit(self, destination: &AnchoredPath) -> Result<(), BlobError> {
