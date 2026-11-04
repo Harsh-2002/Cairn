@@ -2,7 +2,9 @@
 
 **Status:** research complete; phase 2 item 1 implemented and measured (0.64× -> ~0.69× on a
 single pair). Items 3-5 remain open. The measurement harness, the `multipart_put_5m` case, and
-sampled part/commit timings are in place.
+sampled part/commit timings are in place. Phase 3 (completion) is implemented and measured:
+assembly hashes on a blocking reader concurrently with the sink write, and CRC-64/NVME slices by
+eight, cutting a real completion from a 246 ms median to 210 ms (see `benchmarks.md` section 11).
 
 Goal: close the strict multipart-upload gap against RustFS without weakening the UploadPart
 acknowledgement. Ordinary PUT/GET/LIST results must not regress.
@@ -153,6 +155,15 @@ its own `MultipartStage` timings; do not conflate assembly with part upload.
   obj/s because client input wait varied 24–32 ms. The 256 KiB buffer stays; the change was
   reverted. Remaining part cost is client input wait (~27 ms), MD5 (~15 ms) and sink (~27 ms).
 
+- 2026-11-04: completion assembly hashes on a leased blocking reader while the reactor writes the
+  previous chunk (bounded depth 2, recycled 256-KiB buffers), and CRC-64/NVME updates eight bytes
+  per iteration. A 10×5 MiB isolated A/B under a host-wide lock measured 232–238 ms before and
+  206–208 ms after (assembly 189 -> 162 ms, durability unchanged); encrypted, compressed and
+  checksum-requesting shapes all improve, and CRC64NVME drops from 334 to 231 ms. A real
+  `CompleteMultipartUpload` probe measured a median 246 ms before and 210 ms after. Chunk size
+  (256 KiB vs 512 KiB vs 1 MiB) and the io_uring sink were measured and rejected. Details and
+  tables are in [`benchmarks.md`](benchmarks.md) section 11. The part path is untouched.
+
 ## Remaining gap
 
 The measured residual is not a single missing micro-optimization. Hashing is now ~15 ms; the
@@ -162,6 +173,10 @@ not worth their durability/memory cost. The remaining candidates are the part fs
 RustFS strict mode and client-side input pacing, not a server micro-optimization. If RustFS defers the per-part
 data barrier, Cairn's stricter acknowledgement is the remaining difference and should be
 documented rather than removed.
+
+Completion is no longer part of the gap: assembly is hash-bound (the mandatory internal SHA-256
+alone is ~150 ms for 50 MiB on a core without SHA-NI) and now overlaps the reads and writes; the
+remaining ~45 ms is the data fsync, which is the same durability barrier the part path pays.
 
 ## Acceptance
 

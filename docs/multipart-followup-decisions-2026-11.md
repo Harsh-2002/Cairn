@@ -139,6 +139,19 @@ explicit ETag, while an assembly without one still computes it. `StagedBlob.md5_
 optional, and the assembly's `etag` is the authoritative value. This does not change the part
 commits, the durability barriers or `synchronous=FULL`.
 
+**Measured (2026-11-04):** assembly was serialized around the mandatory internal SHA-256: one
+256-KiB blocking read, the hash, then one 256-KiB blocking write, 200 times for 50 MiB. It now runs
+one leased blocking reader that hashes every part in order while the reactor writes the previous
+chunk through a bounded channel (depth 2, recycled buffers), and CRC-64/NVME updates eight bytes per
+iteration. A 10×5 MiB isolated A/B measured 232–238 ms before and 206–208 ms after (assembly
+189 → 162 ms; durability unchanged); encrypted, compressed and checksum-requesting shapes all
+improve, CRC64NVME from 334 to 231 ms, and a real `CompleteMultipartUpload` probe improved from a
+246 ms median to 210 ms. The part path, its two commits and every durability barrier are untouched;
+tables are in [`benchmarks.md`](benchmarks.md) section 11. Note the earlier "durability 0.77 ms"
+figure was taken while a loaded host let writeback finish during a 340 ms assembly; when assembly
+is faster the fsync absorbs the remaining dirty pages, so the honest completion baseline is
+assembly + durability.
+
 **Idle-host part-path split (2026-11-03):** release binary
 `7104dcf3af5b188b18dbfab716ddb56d0edf4f3c3d4400edb4dcc9fc083c6694`; 15 s
 `warp multipart-put` (10×5 MiB parts, 4 objects, part concurrency 4); p50 total **78.5 ms**,

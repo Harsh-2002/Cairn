@@ -3644,6 +3644,154 @@ async fn assembly_with_an_explicit_etag_skips_the_unused_full_object_md5() {
     assert!(record.multipart_parts.is_some());
 }
 
+/// The assembly reader hashes on its own blocking job while the staging sink writes on the
+/// reactor, and recycles 256-KiB buffers across chunk and part boundaries. Unequal, unaligned part
+/// sizes must still produce the exact concatenated bytes and the same internal SHA-256 a single
+/// staged object records — the hash has to cover every assembled byte once, in order.
+#[tokio::test]
+async fn assembly_pipeline_preserves_hash_and_byte_order_across_unaligned_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("assembly-pipeline").unwrap();
+    let upload = UploadId::generate();
+    // One byte short of, exactly, and one byte past the 256-KiB assembly read chunk, then a tiny
+    // final part: every read job and the final short send cross a buffer/part boundary.
+    let sizes = [262_143usize, 262_144, 262_181, 1];
+    let mut expected = Vec::new();
+    let mut refs = Vec::new();
+    for (index, len) in sizes.into_iter().enumerate() {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ (index as u8)).collect();
+        expected.extend_from_slice(&bytes);
+        let number = u16::try_from(index + 1).unwrap();
+        let part = store
+            .stage_part_fixture(
+                &upload,
+                number,
+                &format!("pipeline-{index}"),
+                body(bytes),
+                ChecksumSet::none(),
+                8 << 20,
+                None,
+            )
+            .await
+            .unwrap();
+        refs.push(part_ref(number, &part, None));
+    }
+    let mut seed = metadata_seed(
+        &bucket,
+        &ObjectKey::parse("pipeline").unwrap(),
+        &VersionId::null(),
+        &"a".repeat(32),
+    );
+    seed.etag = Some(ETag::from_string(
+        "0123456789abcdef0123456789abcdef-4".to_owned(),
+    ));
+    seed.multipart_parts = Some(
+        refs.iter()
+            .map(|part| cairn_types::object::MultipartPartRecord {
+                part_number: part.part_number,
+                size: part.size,
+            })
+            .collect(),
+    );
+    let assembled = store
+        .assemble_fixture(
+            &bucket,
+            &refs,
+            StageOptions {
+                metadata_seed: Some(seed),
+                ..opts(None, "application/octet-stream")
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.size_logical, expected.len() as u64);
+    assert_eq!(assembled.md5_hex, None);
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression,
+            assembled.size_logical,
+        )
+        .await,
+        expected
+    );
+    // The same bytes staged in one pass give the authoritative plaintext SHA-256 baseline.
+    let single = store
+        .stage_fixture(
+            &bucket,
+            body(expected.clone()),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.internal_sha256, single.internal_sha256);
+    assert_eq!(
+        assembled.etag.as_str(),
+        "0123456789abcdef0123456789abcdef-4"
+    );
+}
+
+/// A reader failure after some chunks already reached the staging sink (here the second part's file
+/// disappears) must fail the whole assembly closed: no object is published, and the admitted
+/// staging artifact is retained for its journal owner exactly like any other pre-commit failure.
+#[tokio::test]
+async fn assembly_mid_stream_reader_failure_aborts_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path(), cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("assembly-mid-stream").unwrap();
+    let upload = UploadId::generate();
+    let first = store
+        .stage_part_fixture(
+            &upload,
+            1,
+            "mid-stream-1",
+            body(vec![b'1'; 300 * 1024]),
+            ChecksumSet::none(),
+            8 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .stage_part_fixture(
+            &upload,
+            2,
+            "mid-stream-2",
+            body(vec![b'2'; 300 * 1024]),
+            ChecksumSet::none(),
+            8 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(dir.path().join(second.storage_path.as_str())).unwrap();
+    let refs = vec![part_ref(1, &first, None), part_ref(2, &second, None)];
+    let error = store
+        .assemble_fixture(&bucket, &refs, opts(None, "application/octet-stream"))
+        .await;
+    assert!(
+        matches!(error, Err(BlobError::NotFound)),
+        "a mid-stream missing part must fail the assembly: {error:?}"
+    );
+    let leaked: Vec<_> = std::fs::read_dir(dir.path().join(".staging"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert_eq!(
+        leaked.len(),
+        1,
+        "a failed assembly retains its admitted artifact for the cleanup owner"
+    );
+}
+
 #[tokio::test]
 async fn backfill_writes_a_missing_sidecar_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
