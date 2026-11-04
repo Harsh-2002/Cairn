@@ -1892,9 +1892,10 @@ impl BlobStore for LocalBlobStore {
         //
         // Known-plaintext parts with no compression/encryption are the concatenation of the part
         // files, so a reflink-capable filesystem can share their extents instead of rewriting the
-        // assembled bytes; the copy path in `reflink_assembly` covers every other filesystem and
-        // every unaligned range. The io_uring backend does not expose its descriptor, so it keeps
-        // the streaming pipeline.
+        // assembled bytes. A 4 KiB probe decides support before writing anything; when it fails,
+        // the streaming pipeline below runs unchanged. Once supported, unaligned ranges and
+        // refused clones are copied. The io_uring backend does not expose its descriptor, so it
+        // keeps the streaming pipeline.
         #[cfg(unix)]
         let reflink_placement =
             !self.use_uring && reflink_assembly::eligible(parts, block_pol.is_some());

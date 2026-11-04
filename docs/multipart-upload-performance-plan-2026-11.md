@@ -247,6 +247,13 @@ and/or a benchmark shape that measures parts without the per-upload completion t
 part-path micro-optimizations on the strength of a stage reduction alone; require a repeatable
 scored-ratio improvement.
 
+**Closure (2026-11-04):** the completion tail is closed. BLAKE3 removed 133 ms of assembly
+(158.1 → 24.6 ms) and the scoped reflink fast path replaced the 50 MiB rewrite with metadata-only
+extent sharing, taking the isolated completion to 30.8 ms median. The scored Warp
+`multipart_put_5m` row is 1.078× RustFS (25.48 vs 23.65 obj/s) and the completion-inclusive ratio is
+~1.02× across ten pairs (0.668× before). See `benchmarks.md` sections 13–14; no part-path change was
+needed for that result.
+
 ## Acceptance
 
 - `multipart_put_5m` reaches at least **0.95×** RustFS on the local harness with three pairs,

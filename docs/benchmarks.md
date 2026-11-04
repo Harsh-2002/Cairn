@@ -1261,3 +1261,72 @@ The stage split is the controlled signal: assembly shrinks by 79 %, while durabi
 wave are unchanged. Every completion in both arms passed the full-object, `?partNumber`, composite
 ETag and exact-listing verification. Raw summary:
 [`blake3-baseline-2026-11-04.json`](performance-evidence/2026-11/blake3-baseline-2026-11-04.json).
+
+## 14. Reflink multipart completion (2026-11-04)
+
+A multipart completion whose parts are all known-plaintext, with no compression or encryption, is
+exactly the concatenation of the part files. On a reflink-capable filesystem, `cairn-blob` now
+shares each aligned part's extents into the assembled file and hashes each source part once,
+instead of rewriting the assembled bytes. A 4 KiB `FICLONERANGE` probe runs before any placement;
+if the filesystem refuses it, the staging file is untouched and the original streaming pipeline
+runs, so ext4/tmpfs stores keep the previous path. Once the probe succeeds, an unaligned range or a
+refused clone is copied. No storage format, metadata, or configuration changes; the data fsync,
+data rename, sidecar rename and directory barrier are unchanged.
+
+### 14.1 Isolated completion
+
+`crates/cairn-blob/examples/bench_assembly.rs` (10 x 5 MiB, 8 timed assemblies, XFS, host-wide
+benchmark lock):
+
+| Arm | Assembly mean | Durability mean | Total median |
+| --- | ---: | ---: | ---: |
+| BLAKE3 baseline (section 13) | 24.6 ms | ~276 ms | 300.9 ms |
+| BLAKE3 + reflink (load ~1.6) | 21.2 ms | 11.8 ms | 33.1 ms |
+| BLAKE3 + reflink + overlapping sidecar barrier (final) | 23.6 ms | 8.9 ms | 30.8 ms |
+
+The final run verified the exact 50 MiB bytes, the BLAKE3 baseline and the v3 sidecar. The assembly
+stage is the mandatory BLAKE3 read of the parts; the durability stage is now metadata-only clone
+commit plus the sidecar/data barriers. A second final run under load 3.4 measured 42.1 ms median
+(25.6 ms assembly / 17.4 ms durability), so the idle 30.8 ms is the clean floor.
+
+### 14.2 Completion-inclusive
+
+`conformance/multipart_complete.py`, 5 interleaved strict pairs, 40 x 10 x 5 MiB, 4 object workers
+x 4-way part concurrency, host-wide lock. Final binary
+`784b5d0f8b002de20249a50dcf8897840d9185133f887e8d1298457861d086a2`; RustFS 1.0.0
+`a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`:
+
+| Metric | Cairn | RustFS |
+| --- | ---: | ---: |
+| Completed objects/s, per pair | 2.50 / 2.74 / 2.74 / 2.58 / 2.94 | 2.26 / 2.62 / 2.66 / 2.85 / 3.27 |
+| Completion p50, per pair | 137.4 / 81.6 / 147.8 / 78.6 / 76.1 ms | 31.1 / 36.8 / 35.9 / 31.9 / 28.3 ms |
+| Completion share of object cycle | 13.0 / 5.8 / 16.1 / 8.7 / 6.2 % | 3.5 / 3.8 / 5.8 / 3.5 / 3.1 % |
+| Assembly stage mean | 28.0 / 26.0 / 26.1 / 25.8 / 25.3 ms | n/a |
+| Durability stage mean | 89.6 / 23.2 / 92.2 / 49.9 / 26.6 ms | n/a |
+
+Per-pair completed-object ratios: 1.108, 1.045, 1.031, 0.904 and 0.900 (mean **0.998x**). An
+earlier 5-pair run of the same code before the sidecar-barrier overlap (binary
+`ecf28fbdb5fa8a4a9dcdf265c93337dbc3510d6de1e8067abe773d26084ecfab`) measured 1.073, 0.925, 0.799,
+1.265 and 1.180 (mean **1.048x**); across the ten pairs the mean is **~1.02x**. The pre-change
+section 12 control was **0.668x**. The remaining spread is the shared XFS log and the part wave,
+not a fixed completion tail: the completion share of the object cycle fell from 43.2 % to 4-16 %.
+Every arm passed 40/40 completions, full-object GET, one rotating `?partNumber`, the locally
+derived composite ETag and an exact bounded listing.
+
+### 14.3 Warp scoreboard
+
+`conformance/rustfs_compare.py --case multipart_put_5m --pairs 3 --duration 12` with the same final
+binary and Warp 1.8.2 (`fc7661a6b952800fbc8422cf0f72ae82726f82aa80065d15f50125f8bf5ca5fa`):
+
+| Arm | Cairn | RustFS | Ratio |
+| --- | ---: | ---: | ---: |
+| pair 1 | 24.35 obj/s | 22.60 obj/s | 1.077x |
+| pair 2 | 26.51 obj/s | 23.58 obj/s | 1.124x |
+| pair 3 | 25.58 obj/s | 24.77 obj/s | 1.033x |
+| mean | **25.48 obj/s** | **23.65 obj/s** | **1.078x** |
+
+This is the scored `multipart_put_5m` row that previously read 0.77x. Raw evidence:
+[`reflink-warp-multipart-2026-11-04.json`](performance-evidence/2026-11/reflink-warp-multipart-2026-11-04.json),
+[`reflink-completion-2026-11-04.json`](performance-evidence/2026-11/reflink-completion-2026-11-04.json)
+and
+[`reflink-completion-pre-overlap-2026-11-04.json`](performance-evidence/2026-11/reflink-completion-pre-overlap-2026-11-04.json).

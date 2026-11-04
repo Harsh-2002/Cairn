@@ -320,9 +320,38 @@ keeps FULL for every delete/mixed batch.
 
 **Not changed:** the plaintext `<uuid>.meta` absence barrier remains. It costs one guaranteed-ENOENT
 cleanup row per plaintext delete, but the index row alone cannot prove that no stale sidecar exists
-across legacy/partial states, and batching already removed its per-row retirement commits. A versioned
-DELETE-marker benchmark (RustFS strict syncs `xl.meta`) is the fair next comparison; the current
-unversioned ratios are as-configured, not equal-durability.
+across legacy/partial states, and batching already removed its per-row retirement commits. The
+versioned DELETE-marker benchmark is now implemented and measured at **3.55×** (see the
+durability-equivalent section above); the current unversioned ratios are as-configured, not
+equal-durability.
+
+## 5. Multipart completion side — implemented (BLAKE3 + reflink)
+
+The completion-inclusive run in §3 put the durable 50 MiB rewrite at 527–859 ms of a ~1.0 s
+completion under four-worker load. Two approved changes close it.
+
+- **BLAKE3 baseline** replaces the new-object whole-object SHA-256 baseline (schema v42, sidecar v3,
+  protocol floor 3; PR #191). The isolated assembly stage fell 158.1 → 24.6 ms and the paired
+  completion p50 fell 692 → 593 ms. The object rate did not move because the rewrite barrier still
+  dominated.
+- **Reflink completion** shares the extents of known-plaintext, uncompressed, unencrypted parts
+  instead of rewriting them. A 4 KiB `FICLONERANGE` probe runs before any placement; if the
+  filesystem refuses it, the staging file is untouched and the streaming pipeline runs. Once the
+  probe succeeds, an unaligned range or a refused clone is copied. The isolated completion is now
+  **30.8 ms median** (23.6 ms assembly / 8.9 ms durability), and the sidecar barrier overlaps the
+  data barrier.
+
+The completion-inclusive ratio is **0.998×** over 5 final pairs (1.048× on the pre-overlap run;
+**~1.02× across ten pairs**); the scored Warp `multipart_put_5m` row is **1.078×** (25.48 vs 23.65
+obj/s), up from 0.77×. Durability is unchanged: the data file is still one regular file, the file
+fsync → data rename → sidecar rename → directory barrier order is preserved, and part cleanup
+unlinks (never truncates or punches holes) because the completed object shares those extents. No
+configuration selector, format generation beyond v42/v3, or background work was added.
+
+**Not pursued:** a part-body pipeline (measured negative), precomputing the whole-object hash during
+part upload (cross-request state and a format change), and a per-part Merkle baseline
+(path-dependent, more schema/state). The part handler is already faster than RustFS; the completion
+tail was the scored lever.
 
 ## Order
 
@@ -332,7 +361,8 @@ unversioned ratios are as-configured, not equal-durability.
 3. Measure multipart completion/assembly and CPU per part — measured (the isolated completion is
    assembly-dominated). The completion-inclusive measurement then showed that under the scored
    four-worker pipeline the completed object's durability is the dominant tail (43 % of the object
-   cycle), so the next step is a completion-side design decision, not another part micro-optimization.
+   cycle), so the next step was a completion-side design decision, not another part
+   micro-optimization. That decision is implemented in section 5.
 4. Elide the unused assembly MD5 — implemented (31% of assembly). The idle part-path split puts the
    two commits at ~3% of a part, so the one-commit change is not pursued; the body/sink work remains
    gated on its own A/B.
@@ -342,3 +372,6 @@ unversioned ratios are as-configured, not equal-durability.
    run measured 0.83× as-configured. It is not pooled with the bulk ratio. The versioned
    durability-equivalent arm is now measured at **3.55×** (Cairn 2,457.3 vs RustFS 691.7 obj/s);
    that is the fair DELETE number, while the unversioned 0.49× and 0.83× remain as-configured.
+6. Multipart completion side — done: BLAKE3 (#191) plus the reflink fast path and overlapping
+   sidecar barrier. The scored Warp row is 1.078× and the completion-inclusive ratio is ~1.02×
+   across ten pairs; see section 5.
