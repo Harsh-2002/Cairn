@@ -693,10 +693,19 @@ durability-equivalence proof.
 | HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
 | Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
 | Multipart upload, 10×5 MiB (3 pairs, after #168) | 49.7 obj/s | 64.4 obj/s | **0.77×** |
-| DELETE 4 KiB, c16, batch 100 (3 pairs, 100k prefill) | 3,444 obj/s | 2,415 obj/s | **1.43×** |
+| DELETE 4 KiB, c16, batch 100† (3 pairs, 100k prefill) | 3,444 obj/s | 2,415 obj/s | **1.43×** |
 
 Notes:
 
+- † **The DELETE rows are not equal-durability comparisons.** RustFS 1.0.0 (commit `d47f54bf`) `strict` mode covers
+  PUT/part/container/rename commit points, but its unversioned DELETE path
+  (`crates/ecstore/src/disk/local.rs`: `delete_version_inner` →
+  `delete_file_with_namespace_owner`/`move_to_trash_with_namespace_owner`) does not consult
+  `effective_durability` and performs unsynced unlinks/renames. Cairn ACKs after a durable tombstone
+  plus its co-committed audit row. Both the bulk 1.43× and the single-key ratio are therefore
+  **as-configured throughput**, not a capacity comparison at equal durability. A fair comparison
+  needs a versioned DELETE-marker arm (RustFS strict syncs `xl.meta`) or a RustFS build that fsyncs
+  the unversioned delete path.
 - DELETE now uses an exact pool: 100,000 × 4 KiB objects created by signed S3 PUTs at 32-way
   concurrency, then `warp delete --list-existing --objects 100000 --batch 100 --concurrent 16
   --duration 12s --noclear`. Both engines started from the same pool; the scored delete excluded
@@ -721,11 +730,13 @@ separately. For each arm it starts a fresh single-node store, creates exactly 12
 4 KiB keys through signed S3 PUTs, then issues exactly one signed `DELETE /bucket/key` per key at
 16-way client concurrency. The scored interval is the full pool depletion; prefill is timed but
 excluded. An arm passes only when all 12,000 DELETEs return 200/204, the driver records no error,
-HEAD of the first/middle/last key returns 404, and (for RustFS) the bucket-durability readback is
-`strict`. Cairn pins `CAIRN_META_SYNCHRONOUS=full`, `CAIRN_META_SHARDS=1` and
+HEAD of the first/middle/last key returns 404, a bounded `list-type=2` request proves the bucket is
+empty, and (for RustFS) the bucket-durability readback is `strict`. The driver records client CPU
+and the exact pool count. Cairn pins `CAIRN_META_SYNCHRONOUS=full`, `CAIRN_META_SHARDS=1` and
 `CAIRN_META_GROUP_COMMIT_LINGER_MICROS=0`; RustFS uses `RUSTFS_DURABILITY_MODE=strict`,
 `RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict` and `RUSTFS_DRIVE_SYNC_ENABLE=true`, the same settings
-as `rustfs_compare.py`.
+as `rustfs_compare.py`. As the note above explains, that RustFS mode does **not** fsync the
+unversioned delete path; the single-key ratio is as-configured, not equal-durability.
 
 Two independent five-pair batches were run with the pair order reversed on every other pair; the
 second used the same command with `--root /var/tmp/cairn-performance-delete-single-key-12k-b`:
@@ -739,6 +750,8 @@ python3 conformance/delete_single_key.py \
 ```
 
 The client is Python 3 standard library only (minimal SigV4, one reused connection per worker).
+
+**Before #179/#180 (10 pairs, 20 arms, 120,000 deletes per engine):**
 
 | Metric (10 pairs, 20 arms, 120,000 deletes per engine) | Cairn | RustFS |
 |---|---:|---:|
@@ -754,22 +767,48 @@ The ten per-pair Cairn/RustFS ratios were 0.646, 0.504, 0.440, 0.415, 0.439, 0.6
 ten pairs. Every arm deleted 12,000/12,000 keys with zero driver errors, all sampled keys returned
 404, and RustFS's strict readback held after each arm.
 
+**After #179/#180 (3 hardened pairs, 2026-11-04):** #179 co-commits the audit row with the delete
+savepoint (one `synchronous=FULL` commit instead of delete-then-audit); #180 batches cleanup-debt
+retirement after the physical unlink/namespace phase. The hardened driver adds the exact
+bucket-empty LIST check and records client CPU.
+
+```sh
+python3 conformance/delete_single_key.py --root /var/tmp/cairn-performance-delete-single-key-post2   --cairn target/release/cairn --rustfs /tmp/cairn-delete-post/rustfs   --pairs 3 --objects 12000 --concurrency 16
+```
+
+| Metric (3 pairs, 6 arms) | Cairn | RustFS |
+|---|---:|---:|
+| Throughput, mean of arm rates | 1,370.2 obj/s | 1,655.9 obj/s |
+| Per-pair rates | 1,612.5 / 1,339.4 / 1,158.8 | 1,627.4 / 1,704.9 / 1,635.3 |
+| p50 / p90 / p99 latency, median arm | 9.35 / 23.07 / 47.54 ms | 8.90 / 13.94 / 23.41 ms |
+| Client CPU per object, mean | 0.322 ms | 0.371 ms |
+| Bucket empty after every arm | yes | yes |
+
+The three per-pair ratios were 0.991, 0.786 and 0.709; mean **0.83×**. This is not a controlled
+capacity comparison: the host was loaded (load average ~12), Cairn fell across the three pairs while
+RustFS stayed near 1.65k obj/s, and the pre-change 0.49× came from a quieter, larger 10-pair run.
+The paired before/after diagnostic for #179 is the controlled evidence: 5,000 × 4 KiB, c16,
+13.5 → 7.4 ms p50 and 1,154 → 2,003 obj/s (+74%). #180's cleanup diagnostic removed 24,000 retire
+mutations and ~4,300 commits from a 12k-delete arm, but that work was already outside the scored
+critical path; the scored gain is the delete+audit co-commit. Raw evidence:
+[`performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json`](performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json).
+
 Caveats:
 
 - This is a **single-key** measurement and is **not** a replacement for, or an input to, the
   `delete_4k` **1.43×** bulk ratio. The two shapes measure different server work — one request per
   key here, one request carrying up to 100 keys there — and must not be pooled. The single-key
   shape favors RustFS while the bulk shape favors Cairn; that disagreement is the reason to report
-  both, not evidence of a regression in either.
+  both, not evidence of a regression in either. Neither ratio is equal-durability: RustFS's strict
+  mode does not fsync the unversioned delete path (see the † note above).
 - The 12,000-key pool was chosen after a 3,000-key screening (943 Cairn / 656 RustFS obj/s): it puts
   the slower Cairn arm at ~15 s and the faster RustFS arm near 7 s; a larger pool only lengthens the
   Cairn arm. Two earlier 10,000-key batches measured 0.65× and 0.70× while RustFS ranged
   699–1,776 obj/s, and a 3-pair pilot measured 1.25×; those host-load-affected pilots are not
   pooled. The two 12,000-key batches agreed at 0.489× and 0.484×, with RustFS inside
   1,550–1,739 obj/s across all ten arms.
-- Binaries: Cairn was built from this worktree with `cargo build --release --bin cairn` (Rust
-  1.97.1), local release SHA-256
-  `7175e2ba77a9060335298b6c4667310b6b465e2875842d0efa855babc483ee1a`; RustFS 1.0.0 executable
+- Binaries: the pre-change Cairn build was `7175e2ba…`; the post-change build in the hardened run
+  was `f1896419f6c58aeded63a7832917b8ca05c3411d26cde981158ff7f4a5810292`. RustFS 1.0.0 executable
   SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd` (publisher ZIP
   `2d5059501745682664c3d345b22274b66079c952fbec7e1ce66980ef4515cd42`). Warp is not involved in
   this measurement. Method and offline checks live in `conformance/delete_single_key.py` and

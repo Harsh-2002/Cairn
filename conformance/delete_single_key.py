@@ -204,6 +204,19 @@ def verify_absent(port, secret, count):
     return checks
 
 
+def verify_empty(port, secret):
+    """A sampled HEAD cannot prove a whole pool; one bounded LIST can see any survivor."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        status, payload = signed_request(
+            connection, secret, "GET", f"/{BUCKET}",
+            query=(("list-type", "2"), ("max-keys", "1")))
+    finally:
+        connection.close()
+    empty = status == 200 and b"<Contents>" not in payload and b"<Key>" not in payload
+    return {"status": status, "empty": empty, "body_prefix": payload[:200].decode(errors="replace")}
+
+
 def run_arm(args, root, engine, pair, ordinal, deadline):
     capacity_before = common.host_capacity()
     if time.monotonic() + args.arm_timeout + 10 >= deadline:
@@ -274,12 +287,15 @@ def run_arm(args, root, engine, pair, ordinal, deadline):
         peak["peak_bytes"] = max(peak["peak_bytes"], used)
         peak["peak_inodes"] = max(peak["peak_inodes"], inodes)
 
+        client_cpu_start = time.process_time()
         delete_start = time.monotonic()
         latencies, errors = delete_pool(port, secret, args.objects, args.concurrency,
                                         delete_start + args.arm_timeout)
         wall_seconds = time.monotonic() - delete_start
+        client_cpu_seconds = time.process_time() - client_cpu_start
         checks = verify_absent(port, secret, args.objects)
-        absent = all(check["status"] == 404 for check in checks)
+        empty = verify_empty(port, secret)
+        absent = all(check["status"] == 404 for check in checks) and empty["empty"]
 
         after = common.cpu_rss(proc.pid)
         final_bytes, final_inodes = common.arm_usage(base_bytes, base_inodes, arm)
@@ -302,6 +318,10 @@ def run_arm(args, root, engine, pair, ordinal, deadline):
             "latency": latency_summary(latencies),
             "durability": durability,
             "deletion_spot_check": checks,
+            "bucket_empty": empty,
+            "client_cpu_seconds": client_cpu_seconds,
+            "client_cpu_per_object": (client_cpu_seconds / len(latencies)
+                                      if latencies else None),
             "server_cpu_seconds": (after[0] - before[0] if before and after else None),
             "host_capacity_before": capacity_before,
             "host_capacity_after": capacity_after,
@@ -312,6 +332,7 @@ def run_arm(args, root, engine, pair, ordinal, deadline):
         result["status"] = "PASS" if (
             not stop.is_set() and absent and not errors
             and len(latencies) == args.objects
+            and empty["status"] == 200
             and common.capacity_compatible(capacity_before, capacity_after)
         ) else "INCONCLUSIVE"
         return result
