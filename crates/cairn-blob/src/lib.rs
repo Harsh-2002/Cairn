@@ -1977,12 +1977,25 @@ impl BlobStore for LocalBlobStore {
 
         drop(assembly_timing);
         let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
-        sink.commit(&paths.final_file).await?;
+        // Overlap the data file's barrier with the sidecar's, exactly as the single-PUT path does.
+        // The data rename still completes first and the metadata rename second, under one
+        // destination-directory barrier; a failure in either barrier prevents publication.
+        let data_commit = sink.commit(&paths.final_file);
+        let sidecar = match sidecar {
+            Some(sidecar) => {
+                let ((), sidecar) = tokio::try_join!(data_commit, sidecar.fsync_retained())?;
+                Some(sidecar)
+            }
+            None => {
+                data_commit.await?;
+                None
+            }
+        };
         if let Some(sidecar) = sidecar {
             let destination = paths.metadata_file.clone().ok_or_else(|| {
                 BlobError::Io("storage plan lacks a multipart metadata sidecar path".into())
             })?;
-            sidecar.commit(&destination).await?;
+            sidecar.rename_retained(&destination).await?;
         }
         // Release the copy permit before parking on the coalesced directory-fsync barrier.
         drop(copy_permit);
