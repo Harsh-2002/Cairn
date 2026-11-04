@@ -136,24 +136,73 @@ pub(super) fn apply(
             };
             MutationOutcome::StorageUpdated { applied }
         }
-        StorageMutation::FinishCleanup { cleanup, now } => {
-            let applied = journal.baseline.generation.as_ref() == Some(&cleanup.generation)
-                && &cleanup.bucket == bucket
-                && cleanup.lease_until >= now
-                && journal.cleanups.get(&cleanup.id).is_some_and(|row| {
-                    row.claim.as_ref() == Some(&cleanup) && row.quota == cleanup.quota_debt_id
-                });
-            if applied {
-                journal.cleanups.remove(&cleanup.id);
-                if let Some(debt) = &cleanup.quota_debt_id {
-                    retire_quota(st, &mut journal, debt);
-                }
+        StorageMutation::FinishCleanup { cleanup, now } => MutationOutcome::StorageUpdated {
+            applied: finish_cleanup(st, &mut journal, bucket, &cleanup, now),
+        },
+        StorageMutation::FinishCleanupBatch { cleanups, now } => {
+            MutationOutcome::StorageCleanupRetired {
+                retired: finish_cleanup_batch(st, &mut journal, bucket, &cleanups, now)?,
             }
-            MutationOutcome::StorageUpdated { applied }
         }
     };
     st.storage = journal;
     Ok(outcome)
+}
+
+/// Settle one exact claim in the in-memory journal, refunding its quota charge only when that row
+/// was actually removed. A stale, re-claimed or expired claim changes nothing.
+fn finish_cleanup(
+    st: &mut State,
+    journal: &mut Journal,
+    bucket: &BucketName,
+    cleanup: &StorageCleanup,
+    now: Timestamp,
+) -> bool {
+    let applied = journal.baseline.generation.as_ref() == Some(&cleanup.generation)
+        && &cleanup.bucket == bucket
+        && cleanup.lease_until >= now
+        && journal.cleanups.get(&cleanup.id).is_some_and(|row| {
+            row.claim.as_ref() == Some(cleanup) && row.quota == cleanup.quota_debt_id
+        });
+    if applied {
+        journal.cleanups.remove(&cleanup.id);
+        if let Some(debt) = &cleanup.quota_debt_id {
+            retire_quota(st, journal, debt);
+        }
+    }
+    applied
+}
+
+/// Validate batch membership once, then settle each row under its own exact claim. A stale
+/// generation retires nothing; a mixed bucket or generation is a caller defect, rejected before
+/// any row changes.
+fn finish_cleanup_batch(
+    st: &mut State,
+    journal: &mut Journal,
+    bucket: &BucketName,
+    cleanups: &[StorageCleanup],
+    now: Timestamp,
+) -> R<usize> {
+    let Some(first) = cleanups.first() else {
+        return Ok(0);
+    };
+    if cleanups.iter().any(|cleanup| &cleanup.bucket != bucket) {
+        return Err(invalid("cleanup batch mixes buckets"));
+    }
+    if cleanups
+        .iter()
+        .any(|cleanup| cleanup.generation != first.generation)
+    {
+        return Err(invalid("cleanup batch mixes storage generations"));
+    }
+    if journal.baseline.generation.as_ref() != Some(&first.generation) {
+        return Ok(0);
+    }
+    let mut retired = 0;
+    for cleanup in cleanups {
+        retired += usize::from(finish_cleanup(st, journal, bucket, cleanup, now));
+    }
+    Ok(retired)
 }
 
 pub(super) fn reserve_joint(

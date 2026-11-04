@@ -6,7 +6,7 @@
 use cairn_protocol::{StorageRecoveryAdmission, StorageRecoveryPermit, StorageWriteRecovery};
 use cairn_types::meta::{ClaimReleaseOutcome, Mutation, MutationOutcome};
 use cairn_types::storage::io::StorageIoWatch;
-use cairn_types::storage::{StorageMutation, StorageToken, StorageWriteTarget};
+use cairn_types::storage::{StorageCleanup, StorageMutation, StorageToken, StorageWriteTarget};
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,8 +206,19 @@ pub(crate) struct StorageCleanupDrain {
     pub retired: usize,
 }
 
+/// Rows retired by one Writer submission. Each row still carries its own exact claim, and the
+/// whole batch runs in the mutation's savepoint, so the bound keeps a single transaction's SQL
+/// small without weakening any per-row validation. 64 rows turn a full 1,000-row page into at
+/// most 16 retire submissions instead of 1,000.
+const RETIRE_BATCH: usize = 64;
+
 /// Drain one bounded batch through exact Writer claims. Errors and stale/expired acknowledgements
 /// retain debt and quota; a physical ENOENT still passes through the blob's namespace sync barrier.
+///
+/// Physical reclamation stays concurrent and completes first; only then are the reclaimed rows
+/// retired, grouped by bucket and submitted as bounded [`StorageMutation::FinishCleanupBatch`]
+/// batches. The ordering is therefore unchanged — unlink, namespace barrier, durable retirement —
+/// while the durable bookkeeping no longer costs one Writer submission per file.
 pub(crate) async fn drain_storage_cleanup(
     meta: &dyn MetadataStore,
     blob: &dyn BlobStore,
@@ -229,33 +240,64 @@ pub(crate) async fn drain_storage_cleanup(
         return Err("unexpected storage cleanup claim outcome".into());
     };
     let claimed = batch.len();
-    // Keep each physical cleanup and its Writer acknowledgement in the same bounded future.
-    // Concurrent acknowledgements can group-commit; no detached task or extra executor is needed.
+    // Reclaim first. A failed unlink keeps its claim until the lease expires, so it is simply not
+    // retired here; no detached task owns the retry.
     let mut operations = futures_util::stream::iter(batch)
         .map(|cleanup| {
             let node_lifetime = node_lifetime.clone();
-            let clock = &clock;
             async move {
                 let (_watch, lease) = StorageIoWatch::new(
                     cleanup.id.clone(), cleanup.generation.clone(), node_lifetime,
                 );
-                if let Err(error) = blob.cleanup_storage(&cleanup, lease).await {
-                    tracing::warn!(%error, cleanup_id = %cleanup.id.as_str(), "storage cleanup remains pending");
-                    return Ok::<bool, String>(false);
-                }
-                match meta.submit(Mutation::Storage {
-                    bucket: cleanup.bucket.clone(),
-                    operation: StorageMutation::FinishCleanup { cleanup, now: clock.now() },
-                }).await.map_err(|error| error.to_string())? {
-                    MutationOutcome::StorageUpdated { applied } => Ok(applied),
-                    _ => Err("unexpected storage cleanup retirement outcome".into()),
+                match blob.cleanup_storage(&cleanup, lease).await {
+                    Ok(()) => Ok::<Option<StorageCleanup>, String>(Some(cleanup)),
+                    Err(error) => {
+                        tracing::warn!(%error, cleanup_id = %cleanup.id.as_str(), "storage cleanup remains pending");
+                        Ok(None)
+                    }
                 }
             }
         })
         .buffer_unordered(8);
-    let mut retired = 0;
+    let mut reclaimed: Vec<StorageCleanup> = Vec::with_capacity(claimed);
     while let Some(result) = operations.next().await {
-        retired += usize::from(result?);
+        if let Some(cleanup) = result? {
+            reclaimed.push(cleanup);
+        }
+    }
+    // `Mutation::Storage` carries one bucket, so group the reclaimed rows by their retained bucket
+    // and keep claim order inside each group. Grouping is also what keeps the sharded router
+    // correct: the whole mutation is routed to its bucket's shard, where every row lives. A page
+    // is normally single-bucket; a mixed page only costs one submission per bucket.
+    let mut groups: Vec<(cairn_types::id::BucketName, Vec<StorageCleanup>)> = Vec::new();
+    for cleanup in reclaimed {
+        match groups
+            .iter_mut()
+            .find(|(bucket, _)| *bucket == cleanup.bucket)
+        {
+            Some((_, rows)) => rows.push(cleanup),
+            None => groups.push((cleanup.bucket.clone(), vec![cleanup])),
+        }
+    }
+    let now = clock.now();
+    let mut retired = 0;
+    for (bucket, rows) in &groups {
+        for chunk in rows.chunks(RETIRE_BATCH) {
+            let outcome = meta
+                .submit(Mutation::Storage {
+                    bucket: bucket.clone(),
+                    operation: StorageMutation::FinishCleanupBatch {
+                        cleanups: chunk.to_vec(),
+                        now,
+                    },
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            match outcome {
+                MutationOutcome::StorageCleanupRetired { retired: count } => retired += count,
+                _ => return Err("unexpected storage cleanup retirement outcome".into()),
+            }
+        }
     }
     Ok(StorageCleanupDrain { claimed, retired })
 }

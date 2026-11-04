@@ -157,26 +157,78 @@ pub async fn apply(
             if &cleanup.bucket != bucket || !current(db, &cleanup.generation).await? {
                 false
             } else {
-                let deleted = x(
-                    db,
-                    "DELETE FROM storage_cleanups WHERE id=?1 AND bucket_name=?2 AND storage_path=?3 AND claim_token=?4 AND claim_generation=?5 AND lease_until=?6 AND lease_until>=?7 AND quota_debt_id IS ?8",
-                    vec![
-                        text(cleanup.id.as_str()),
-                        text(bucket.as_str()),
-                        text(cleanup.path.as_str()),
-                        text(cleanup.claim_token.as_str()),
-                        text(cleanup.generation.as_str()),
-                        Cell::Int(cleanup.lease_until.0),
-                        Cell::Int(now.0),
-                        cleanup.quota_debt_id.as_deref().map_or(Cell::Null, text),
-                    ],
-                ).await? != 0;
-                if deleted && let Some(debt) = &cleanup.quota_debt_id { retire_quota(db, debt).await?; }
-                deleted
+                retire_cleanup(db, bucket, &cleanup, now).await?
             }
+        }
+        StorageMutation::FinishCleanupBatch { cleanups, now } => {
+            let retired = retire_cleanup_batch(db, bucket, cleanups, now).await?;
+            return Ok(MutationOutcome::StorageCleanupRetired { retired });
         }
     };
     Ok(MutationOutcome::StorageUpdated { applied })
+}
+
+/// Delete exactly one claimed debt row and retire its quota charge only when that row was removed.
+/// A stale, re-claimed or expired claim deletes nothing, leaving both physical debt and the charge
+/// intact for a later retry.
+async fn retire_cleanup(
+    db: &DB<'_>,
+    bucket: &BucketName,
+    cleanup: &StorageCleanup,
+    now: Timestamp,
+) -> R<bool> {
+    let deleted = x(
+        db,
+        "DELETE FROM storage_cleanups WHERE id=?1 AND bucket_name=?2 AND storage_path=?3 AND claim_token=?4 AND claim_generation=?5 AND lease_until=?6 AND lease_until>=?7 AND quota_debt_id IS ?8",
+        vec![
+            text(cleanup.id.as_str()),
+            text(bucket.as_str()),
+            text(cleanup.path.as_str()),
+            text(cleanup.claim_token.as_str()),
+            text(cleanup.generation.as_str()),
+            Cell::Int(cleanup.lease_until.0),
+            Cell::Int(now.0),
+            cleanup.quota_debt_id.as_deref().map_or(Cell::Null, text),
+        ],
+    )
+    .await?
+        != 0;
+    if deleted && let Some(debt) = &cleanup.quota_debt_id {
+        retire_quota(db, debt).await?;
+    }
+    Ok(deleted)
+}
+
+/// Apply one bounded batch of already-reclaimed rows. Bucket and generation membership are
+/// validated once, before any row settles: a mixed batch is a caller defect, while a stale
+/// generation retires nothing at all. Each remaining row is then settled by its own exact claim,
+/// so a concurrent re-claim of one path cannot settle another and the count is exact.
+async fn retire_cleanup_batch(
+    db: &DB<'_>,
+    bucket: &BucketName,
+    cleanups: Vec<StorageCleanup>,
+    now: Timestamp,
+) -> R<usize> {
+    let Some(first) = cleanups.first() else {
+        return Ok(0);
+    };
+    if cleanups.iter().any(|cleanup| &cleanup.bucket != bucket) {
+        return Err(invalid("cleanup batch mixes buckets"));
+    }
+    if cleanups
+        .iter()
+        .any(|cleanup| cleanup.generation != first.generation)
+    {
+        return Err(invalid("cleanup batch mixes storage generations"));
+    }
+    if !current(db, &first.generation).await? {
+        return Ok(0);
+    }
+    let mut retired = 0;
+    for cleanup in &cleanups {
+        retired += usize::from(retire_cleanup(db, bucket, cleanup, now).await?);
+    }
+    Ok(retired)
 }
 
 fn multipart_identity(plan: &StorageWritePlan) -> (Option<&str>, Option<&str>) {

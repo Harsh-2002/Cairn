@@ -910,6 +910,12 @@ pub enum MutationOutcome {
     StorageUpdated {
         applied: bool,
     },
+    /// Rows retired by one [`crate::storage::StorageMutation::FinishCleanupBatch`] submission.
+    /// Stale, re-claimed or expired rows are skipped, so this never exceeds the batch length and
+    /// `0` means every submitted claim had already been lost.
+    StorageCleanupRetired {
+        retired: usize,
+    },
     /// A bounded page of prior-generation plans requiring actual backend quiescence checks.
     StorageIntentBatch(Vec<crate::storage::StorageWritePlan>),
     /// Independently claimed physical debt, with retained routing and exact lease ownership.
