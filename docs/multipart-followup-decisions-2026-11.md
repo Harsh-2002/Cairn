@@ -207,15 +207,34 @@ python3 conformance/delete_single_key.py --root /var/tmp/cairn-performance-delet
 
 The repeat used the same arguments with `--root /var/tmp/cairn-performance-delete-single-key-12k-b`.
 
-Measured 2026-11-03: Cairn **813.4 obj/s** mean vs RustFS **1,680.3 obj/s**; mean per-pair ratio
-**0.49×** (median 0.45×; ratio of arm means 0.48×; per-pair 0.415–0.646; RustFS faster in 10/10).
-Every arm deleted 12,000/12,000 keys with zero errors, and the two batches agreed at 0.489× and
-0.484×. Cairn release binary SHA-256
+Measured before #179 (2026-11-03): Cairn **813.4 obj/s** mean vs RustFS **1,680.3 obj/s**; mean
+per-pair ratio **0.49×** (median 0.45×; ratio of arm means 0.48×; per-pair 0.415–0.646; RustFS
+faster in 10/10). Every arm deleted 12,000/12,000 keys with zero errors, and the two batches agreed
+at 0.489× and 0.484×. Cairn release binary SHA-256
 `7175e2ba77a9060335298b6c4667310b6b465e2875842d0efa855babc483ee1a`; RustFS 1.0.0 executable
 SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`. This result is **not**
 pooled with the bulk 1.43×: the bulk row is Warp `--batch 100`, the single-key row is one request
 per key. Earlier 10,000-key pilots (0.65× and 0.70×) and a three-pair pilot (1.25×) were
 host-load-affected and are not pooled. See `docs/benchmarks.md` §9.
+
+**Corrective changes (2026-11-04):** two independent reviews found the single-key path paid an
+avoidable second durable commit per request (delete then audit) and two separate cleanup-debt
+retirement mutations per object. #179 co-commits the audit row in the delete savepoint; #180
+batches cleanup retirement after the physical unlink/namespace barrier. A paired diagnostic for
+#179 measured 1,154 → 2,003 obj/s and p50 13.5 → 7.4 ms at 5,000 × 4 KiB/c16. The #180 diagnostic
+removed 24,000 retire mutations and ~4,300 commits from a 12k-delete arm, but that work was already
+outside the scored critical path. A hardened three-pair run then measured Cairn **1,370.2 obj/s** vs
+RustFS **1,655.9 obj/s** (mean **0.83×**; per-pair 0.991, 0.786, 0.709; host load ~12, Cairn fell
+across pairs while RustFS stayed ~1.65k). Raw evidence:
+[`performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json`](performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json).
+
+**Durability fairness:** the ratio is **as-configured, not equal-durability**. RustFS 1.0.0's
+`strict` mode does not cover its unversioned DELETE path: `delete_version_inner` →
+`delete_file_with_namespace_owner`/`move_to_trash_with_namespace_owner` performs unsynced unlinks and
+renames and does not consult `effective_durability`. Cairn ACKs after a durable tombstone plus the
+co-committed audit. The bulk 1.43× has the same caveat. A durability-equivalent comparison needs a
+versioned delete-marker arm (RustFS strict syncs `xl.meta`) or a RustFS build that fsyncs the
+unversioned delete path.
 
 ## Order
 
@@ -227,5 +246,7 @@ host-load-affected and are not pooled. See `docs/benchmarks.md` §9.
    two commits at ~3% of a part, so the one-commit change is not pursued; the body/sink work remains
    gated on its own A/B.
 5. Implement the paired DELETE methodology and re-run the scoreboard gaps — done; the bulk mean
-   ratio is 1.43× with the variance noted above. The separate single-key comparison is also
-   implemented and measured at 0.49×; it is not pooled with the bulk ratio.
+   ratio is 1.43× with the variance noted above. The separate single-key comparison is implemented,
+   its avoidable audit/cleanup commit amplification is fixed (#179/#180), and a hardened post-change
+   run measured 0.83× as-configured. It is not pooled with the bulk ratio, and neither DELETE ratio
+   is durability-equivalent until a versioned-delete arm is measured.

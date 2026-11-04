@@ -335,8 +335,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   MEASURED op, not warp's prepare-PUT.
 - `delete_single_key.py` — **exact single-key DELETE comparison vs RustFS**, separate from the Warp
   `delete_4k` bulk ratio: a fresh store per arm, an exact 12,000 × 4 KiB pool, exactly one signed S3
-  DELETE per key at 16-way concurrency, strict durability, and exact 200/204 + 404 spot checks.
-  Reports obj/s, wall time, p50/p90/p99, errors and per-pair ratios. **NOT a gate.**
+  DELETE per key at 16-way concurrency, exact 200/204 + 404 spot checks, and a bounded `list-type=2`
+  assertion that the bucket is empty. Records client CPU and per-pair ratios. Cairn pins FULL
+  metadata durability; RustFS `strict` is **write-path only** — its unversioned DELETE path is not
+  fsynced — so the ratio is as-configured, not equal-durability. **NOT a gate.**
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
