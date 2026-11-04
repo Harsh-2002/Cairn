@@ -692,7 +692,7 @@ durability-equivalence proof.
 | GET 4 KiB, c16 (3 pairs) | 14,781 obj/s | 13,299 obj/s | **1.11×** |
 | HEAD 4 KiB, c16 (3 pairs) | 20,573 obj/s | 17,511 obj/s | **1.18×** |
 | Multipart part GET, 10×5 MiB (3 pairs) | 1,059 obj/s | 388 obj/s | **2.73×** |
-| Multipart upload, 10×5 MiB (3 pairs, after #168) | 49.7 obj/s | 64.4 obj/s | **0.77×** |
+| Multipart upload, 10×5 MiB (3 pairs, after §14) | 25.5 obj/s | 23.7 obj/s | **1.08×** |
 | DELETE 4 KiB, c16, batch 100† (3 pairs, 100k prefill) | 3,444 obj/s | 2,415 obj/s | **1.43×** |
 
 Notes:
@@ -729,7 +729,9 @@ Notes:
   has ten parts, but the absolute object rate is one tenth of the displayed figure and the summary
   gives the completion tail no line of its own. Section 12 measures that tail directly with an
   exact completed-object count; see also
-  [`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md).
+  [`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md). The
+  current section 14 row is 25.48 vs 23.65 `PUTPART` ops/s = **2.55 vs 2.37 completed objects/s**,
+  consistent with section 14.2's completed-object rates.
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
 
@@ -1012,7 +1014,9 @@ after #158. That run used Cairn release binary SHA-256
 SHA-256 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`, and Warp v1.8.2
 SHA-256 `fc7661a6b952800fbc8422cf0f72ae82726f82aa80065d15f50125f8bf5ca5fa`; per-pair ratios were
 0.74, 0.81 and 0.76. The pair count and host load differ from the earlier row, so the ratio moved
-for more than one reason; the direction is consistent with the isolated A/B.
+for more than one reason; the direction is consistent with the isolated A/B. Section 14 supersedes
+this row: the same scored case now measures 25.48 vs 23.65 obj/s (**1.078×**) after the BLAKE3
+baseline and the reflink completion fast path.
 
 ## 11. Multipart assembly hash/I/O pipeline and CRC64 slicing (2026-11-04)
 
