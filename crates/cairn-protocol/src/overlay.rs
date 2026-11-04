@@ -369,3 +369,95 @@ async fn settle(
         "object index fold failed after retries; retaining the overlay entry"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::object::{CompressionDescriptor, ETag, MultipartPartRecord, StorageClass};
+    use cairn_types::testing::InMemoryMetadataStore;
+    use cairn_types::{
+        Bucket, ObjectVersionRow, OwnershipMode, Timestamp, UserId, VersionId, VersioningState,
+    };
+
+    fn bucket() -> Bucket {
+        Bucket {
+            name: BucketName::parse("overlay-bucket").unwrap(),
+            owner_id: UserId("owner".to_owned()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Unversioned,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        }
+    }
+
+    fn row(bucket: &Bucket, key: &ObjectKey) -> ObjectVersionRow {
+        ObjectVersionRow {
+            id: "a".repeat(32),
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: VersionId::null(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: 1,
+            size_physical: 1,
+            etag: ETag::from_string("etag".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            expire_at: None,
+            storage_path: None,
+            compression: CompressionDescriptor::Uncompressed,
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: bucket.owner_id.clone(),
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            sse_descriptor: None,
+            internal_sha256: None,
+            replication_status: None,
+            replicated_at: None,
+            multipart_parts: None::<Vec<MultipartPartRecord>>,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_for_one_key_does_not_wait_for_an_unrelated_pending_key() {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let overlay = Overlay::start(meta, 8);
+        let bucket = bucket();
+        let key_a = ObjectKey::parse("a").unwrap();
+        let key_b = ObjectKey::parse("b").unwrap();
+        overlay.latest.write().unwrap().insert(
+            (bucket.name.clone(), key_b.clone()),
+            Latest {
+                created_at: bucket.created_at,
+                row: Arc::new(row(&bucket, &key_b)),
+            },
+        );
+
+        // Key A has no pending row even though key B does; the per-key barrier returns.
+        tokio::time::timeout(Duration::from_secs(1), overlay.wait_key(&bucket, &key_a))
+            .await
+            .expect("unrelated pending key must not block")
+            .unwrap();
+        // Key B itself still blocks until its row is gone.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), overlay.wait_key(&bucket, &key_b))
+                .await
+                .is_err()
+        );
+        overlay
+            .latest
+            .write()
+            .unwrap()
+            .remove(&(bucket.name.clone(), key_b.clone()));
+        overlay.wait_key(&bucket, &key_b).await.unwrap();
+    }
+}
