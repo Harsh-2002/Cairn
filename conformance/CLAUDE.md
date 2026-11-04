@@ -352,6 +352,17 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (admission/queue/begin/apply/commit/checkpoint), commit seconds, batch size, process I/O and load
   average describe the delete window only. Reports the stage split; never an engine ratio.
   **NOT a gate.** Offline checks: `test_delete_single_key_cairn.py`.
+- `multipart_complete.py` — **completion-inclusive multipart comparison vs RustFS**, separate from
+  the Warp `multipart_put_5m` `PUTPART` row (which counts 5 MiB part operations, one tenth of the
+  completed-object rate). A fresh strict store per arm, one unscored warm-up, an exact scored
+  object count (40 × 10 × 5 MiB by default), four object workers with 4-way part concurrency and no
+  cross-object pipelining beyond them: `CreateMultipartUpload` → parts → synchronous
+  `CompleteMultipartUpload` per object. Records completed objects/s, parts/s, object-cycle and
+  completion p50/p90/p99, per-part p50, completion share, client CPU and (Cairn) the block
+  multipart stage means. Gates on an exact completion count, the locally derived composite ETag,
+  a full-object GET plus one rotating `?partNumber` byte check on **every** completed object, an
+  exact bounded listing, and RustFS's strict readback. **NOT a gate.** Offline checks:
+  `test_multipart_complete.py`.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
@@ -401,8 +412,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   through the management API (SSRF-guarded), unlike `soak`'s config-endpoint path. The remaining
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
   `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`,
-  `delete_versioned_single_key.py`, `delete_single_key_cairn.py`) whose gating signal is already
-  covered by the CI correctness jobs; run them by hand for numbers.
+  `delete_versioned_single_key.py`, `delete_single_key_cairn.py`, `multipart_complete.py`) whose
+  gating signal is already covered by the CI correctness jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
 

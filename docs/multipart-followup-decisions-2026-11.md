@@ -152,6 +152,38 @@ figure was taken while a loaded host let writeback finish during a 340 ms assemb
 is faster the fsync absorbs the remaining dirty pages, so the honest completion baseline is
 assembly + durability.
 
+**Completion-inclusive, measured (2026-11-04):** the Warp `multipart-put` row reports `PUTPART`
+operation throughput, so its 49.7 `obj/s` is 4.97 completed objects/s (ten 5 MiB parts each) and the
+summary has no line for the per-upload completion. `conformance/multipart_complete.py` measures the
+object rate directly: a fresh strict store per arm, one unscored warm-up, exactly 40 objects of
+10 × 5 MiB, four object workers × four part slots, `CreateMultipartUpload` → parts → synchronous
+`CompleteMultipartUpload` per object with nothing else pipelined, then every object re-read in full
+and by one rotating `?partNumber`, with composite-ETag and exact-listing gates. Three interleaved
+pairs measured Cairn **1.88 objects/s** vs RustFS **2.89 objects/s** (per-pair 0.557, 0.534 and
+0.914; mean **0.668×**). Completion p50 was **1,026 ms** on Cairn vs **32 ms** on RustFS and took
+**43 %** vs **5 %** of the object cycle. The server stage means attribute Cairn's tail to
+**durability, not assembly**: assembly stayed 173–197 ms while durability measured 527–859 ms under
+the 4×4 pipeline; a sequential control with the same payloads measured completion p50 321 ms,
+assembly 164 ms and durability 211 ms. The isolated 246 → 210 ms result therefore still holds for a
+sequential completion, but under the scored pipeline the completion is 0.70–1.09 s p50, so the
+14.6 % isolated win does not become a 14.6 % object-rate win. The completed-object ratio is below
+the Warp row's 0.77×; with ten parts per object the two rates are proportional when every object
+completes inside the window, so the difference is conditions (tail share and part p50s), not a
+hidden scaling, and the two methods are never pooled. Raw evidence:
+[`performance-evidence/2026-11/multipart-complete-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-2026-11-04.json)
+and
+[`performance-evidence/2026-11/multipart-complete-tail-control-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-tail-control-2026-11-04.json);
+tables in [`benchmarks.md`](benchmarks.md) section 12.
+
+**Implication (2026-11-04):** under the scored four-worker shape the completion is the largest
+single non-part component of the object cycle (43 % on Cairn), and its cost is the durable rewrite
+of the assembled 50 MiB file contending with the part pipeline's fsyncs. RustFS's measured
+completion is 25–76 ms with strict durability; its parts are already durable and the tail is
+consistent with a metadata-only publish, though this comparison did not instrument RustFS's internal
+stages. Part-path micro-optimization cannot remove that tail; the next multipart step needs either a
+completion-side design (overlap the assembled write/fsync with the part pipeline without weakening
+the completion ACK) or an explicit decision to accept the rewrite cost. Neither is implemented here.
+
 **Idle-host part-path split (2026-11-03):** release binary
 `7104dcf3af5b188b18dbfab716ddb56d0edf4f3c3d4400edb4dcc9fc083c6694`; 15 s
 `warp multipart-put` (10×5 MiB parts, 4 objects, part concurrency 4); p50 total **78.5 ms**,
@@ -297,7 +329,10 @@ unversioned ratios are as-configured, not equal-durability.
 1. Replicated multipart layout — done.
 2. Multipart file authority, v1 sidecar, v2 part layout and offline backfill — done; the
    row-loss restore drill passed (above).
-3. Measure multipart completion/assembly and CPU per part — measured (assembly dominates).
+3. Measure multipart completion/assembly and CPU per part — measured (the isolated completion is
+   assembly-dominated). The completion-inclusive measurement then showed that under the scored
+   four-worker pipeline the completed object's durability is the dominant tail (43 % of the object
+   cycle), so the next step is a completion-side design decision, not another part micro-optimization.
 4. Elide the unused assembly MD5 — implemented (31% of assembly). The idle part-path split puts the
    two commits at ~3% of a part, so the one-commit change is not pursued; the body/sink work remains
    gated on its own A/B.
