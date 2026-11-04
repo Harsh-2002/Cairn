@@ -1091,8 +1091,8 @@ That is ~36 ms (14.6 %) off a real completion. The scored `warp multipart-put` c
 it is not a usable signal for this change; its arms moved within host-load noise (41.8–54.4 obj/s).
 
 Tests: `assembly_pipeline_preserves_hash_and_byte_order_across_unaligned_parts` checks the exact
-bytes, the composite ETag and the internal SHA-256 against the same bytes staged in one pass for
-parts straddling the 256-KiB read chunk; `assembly_mid_stream_reader_failure_aborts_without_publishing`
+bytes, the composite ETag and the internal BLAKE3 baseline against the same bytes staged in one pass
+for parts straddling the 256-KiB read chunk; `assembly_mid_stream_reader_failure_aborts_without_publishing`
 checks that a reader failure after earlier chunks reached the sink fails closed;
 `crc64nvme::tests::slice_by_eight_matches_the_byte_recurrence` covers every length and split
 against the byte-at-a-time recurrence. The existing mixed plaintext/encrypted, wrong-DEK,
@@ -1219,3 +1219,28 @@ Raw evidence:
 [`multipart-complete-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-2026-11-04.json)
 and
 [`multipart-complete-tail-control-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-tail-control-2026-11-04.json).
+
+## 13. BLAKE3 internal baseline (2026-11-04)
+
+The completion tail hashed every 50 MiB of assembled plaintext with SHA-256 at this host's
+AVX-class ceiling. Schema v42 changes that baseline for new objects to BLAKE3; legacy rows keep
+SHA-256. Isolated hash throughput on the same host and payload:
+
+| Algorithm | Median | Min | Throughput |
+| --- | ---: | ---: | ---: |
+| BLAKE3 | 16.8 ms | 16.4 ms | ~3.0 GiB/s |
+| SHA-256 (aws-lc-rs, no SHA-NI) | 147.1 ms | 144.0 ms | ~340 MiB/s |
+
+`bench_assembly` (ten 5 MiB parts, eight timed assemblies, release, same XFS data directory,
+host-wide benchmark lock) isolates the completion assembly stage:
+
+| Arm | Assembly mean | Assembly range | Total mean (fsync-noisy) |
+| --- | ---: | ---: | ---: |
+| SHA-256 baseline | 158.1 ms | 151.4–174.9 ms | 313.8 ms |
+| BLAKE3 baseline | 24.6 ms | 23.1–27.5 ms | 300.9 ms |
+
+The assembly stage drops by ~133 ms (84 %) and process CPU falls from ~174 ms to ~39 ms per
+completion. The total includes this host's durability barrier, which was heavily contended during
+the run (25–822 ms per arm); under the 44 ms durability measured in the section above the same
+133 ms saving puts a completion at ~77 ms. The final verification pass re-read the assembled bytes
+and checked the BLAKE3 baseline and v3 sidecar in both arms.

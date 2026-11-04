@@ -6,8 +6,8 @@
 //! Each run is reported individually plus mean/median/min/max, together with the process CPU
 //! (utime + stime) consumed while assembling, so a wall-time change can be attributed. The
 //! drained `MultipartStage` samples split assembly from durability. One run at the end reads the
-//! assembled object back and compares it byte-for-byte, and checks the internal SHA-256 and the
-//! v2 sidecar, so an arm that is faster because it is wrong cannot be reported as a win.
+//! assembled object back and compares it byte-for-byte, and checks the internal BLAKE3 baseline and
+//! the v3 sidecar, so an arm that is faster because it is wrong cannot be reported as a win.
 //!
 //! Run: `cargo run --release --example bench_assembly -p cairn-blob`
 //!

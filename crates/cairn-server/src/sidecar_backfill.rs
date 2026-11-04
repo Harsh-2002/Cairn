@@ -59,12 +59,10 @@ fn classify_existing_sidecar(
             }
         }
         OBJECT_METADATA_V2_FORMAT_VERSION => {
-            // A v2 record for a row that now carries the BLAKE3 baseline is upgraded to v3; the
-            // row's layout must still match, or the record is not ours to rewrite.
-            if existing.multipart_parts != row.multipart_parts {
+            // A v2 record is never rewritten. If the row now carries the BLAKE3 baseline, the
+            // durable record is older than the index truth and an operator must resolve it.
+            if existing.multipart_parts != row.multipart_parts || row.internal_blake3.is_some() {
                 ExistingSidecar::Conflict
-            } else if row.internal_blake3.is_some() {
-                ExistingSidecar::Upgrade
             } else {
                 ExistingSidecar::Keep
             }
@@ -569,7 +567,7 @@ mod tests {
         );
         assert_eq!(
             classify_existing_sidecar(&v2, &blake3_row),
-            ExistingSidecar::Upgrade
+            ExistingSidecar::Conflict
         );
         let mut stale = v3.clone();
         stale.internal_blake3 = Some("cd".repeat(32));

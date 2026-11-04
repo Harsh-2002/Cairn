@@ -3726,7 +3726,7 @@ async fn assembly_pipeline_preserves_hash_and_byte_order_across_unaligned_parts(
         .await,
         expected
     );
-    // The same bytes staged in one pass give the authoritative plaintext SHA-256 baseline.
+    // The same bytes staged in one pass give the authoritative plaintext BLAKE3 baseline.
     let single = store
         .stage_fixture(
             &bucket,
@@ -3735,7 +3735,8 @@ async fn assembly_pipeline_preserves_hash_and_byte_order_across_unaligned_parts(
         )
         .await
         .unwrap();
-    assert_eq!(assembled.internal_sha256, single.internal_sha256);
+    assert_eq!(assembled.internal_blake3, single.internal_blake3);
+    assert_eq!(assembled.internal_sha256, None);
     assert_eq!(
         assembled.etag.as_str(),
         "0123456789abcdef0123456789abcdef-4"
