@@ -447,6 +447,7 @@ dependencies = [
  "base64",
  "blake3",
  "bytes",
+ "cairn-reflink",
  "cairn-types",
  "crc32c",
  "crc32fast",

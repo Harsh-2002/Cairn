@@ -51,8 +51,13 @@ SQLite index remains `cairn-meta`'s.
 - `encode.rs` — bounded CRNB staging adapter; 64-KiB index buffer spills to the admitted index alias,
   unlinks its newly created inode, and streams through a leased file owner into the final blob.
   The alias still requires exact cleanup/namespace synchronization before its debt can retire.
-- `hash.rs` — `Hashers`: the always-on MD5 (→ ETag) and internal SHA-256 plus requested supplementary checksums, over
-  plaintext, in one streaming pass.
+- `hash.rs` — `Hashers`: the always-on MD5 (→ ETag), the internal BLAKE3 baseline for new objects,
+  the legacy SHA-256 (legacy scrub or a requested SHA-256 checksum) and requested supplementary
+  checksums, over plaintext in one streaming pass.
+- `reflink_assembly.rs` — plaintext multipart placement: a 4 KiB `FICLONERANGE` support probe, then
+  aligned part ranges are cloned into the staging file and each source part is hashed exactly once.
+  Unaligned ranges and clone failures are copied. When the probe fails, nothing has been written and
+  `assemble` runs the streaming pipeline instead.
 - `raw_io.rs` — safe `fallocate`/`fadvise` placement hints (ARCH 7.5) via `rustix` (keeps `forbid(unsafe_code)`).
 - `uring.rs` — the optional `io-uring`-feature staging backend (EXPERIMENTAL, Linux-only, off by default).
 
@@ -64,6 +69,13 @@ SQLite index remains `cairn-meta`'s.
   its CRNB container and also keeps a `<uuid>.meta` sidecar. `stage` returns *before*
   an authoritative object row references it; a crash here leaves admitted paths (or a durable file
   for the startup rebuild) rather than a half-visible object.
+- **A completed plaintext multipart object may share extents with its parts.** `reflink_assembly`
+  clones only known-plaintext, uncompressed, unencrypted parts on the same filesystem, after a
+  4-KiB support probe; otherwise `assemble` runs the streaming pipeline (the probe returns before
+  writing anything). Parts stay immutable until completion cleanup, and cleanup must `unlink` them
+  — never punch holes or truncate a part in place — because the completed object shares those
+  extents. The completed object is still one regular file, and the data fsync → data rename →
+  sidecar rename → directory barrier is unchanged.
 - **Every physical write requires a committed permit.** `stage_part` and `assemble` consume a
   `StorageCreationPermit` for the exact Writer-admitted plan and its `StorageIoLease`; `stage`
   consumes a move-only `ObjectCreationPermit` that the publication savepoint fences.
