@@ -723,6 +723,13 @@ Notes:
   handler itself already faster than RustFS's (p50 171 vs 180 ms) and attributed the remaining
   ratio to the per-upload `CompleteMultipartUpload` tail; see that plan's "Where the scored
   multipart-put ratio actually goes".
+- **The multipart `obj/s` figures above are Warp `PUTPART` operation rates, not completed
+  objects.** Each `PUTPART` is one 5 MiB part, so 49.7 parts/s = 248 MiB/s = **4.97 completed
+  objects/s** (RustFS 64.4 parts/s = 6.44 objects/s). The ratio is unchanged while every object
+  has ten parts, but the absolute object rate is one tenth of the displayed figure and the summary
+  gives the completion tail no line of its own. Section 12 measures that tail directly with an
+  exact completed-object count; see also
+  [`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md).
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
 
@@ -1090,3 +1097,125 @@ checks that a reader failure after earlier chunks reached the sink fails closed;
 `crc64nvme::tests::slice_by_eight_matches_the_byte_recurrence` covers every length and split
 against the byte-at-a-time recurrence. The existing mixed plaintext/encrypted, wrong-DEK,
 checksum-over-plaintext and preallocation assembly tests all run through the new pipeline.
+
+## 12. Completion-inclusive multipart comparison (2026-11-04)
+
+Section 11 measured the completion in isolation. This section measures the whole object under the
+same four-worker shape the scored `multipart_put_5m` case uses, so the completion is on the
+critical path: every object is `CreateMultipartUpload` → ten 5 MiB `UploadPart`s at 4-way
+concurrency → one synchronous `CompleteMultipartUpload` → the next object, with four object
+workers and nothing else pipelined. The output is **completed objects per second**, not Warp's
+`PUTPART` operation rate.
+
+**Why the existing row is not an object rate.** Warp's `multipart-put` report block is `PUTPART`,
+and its `obj/s` field counts those part operations: 49.7 parts/s × 5 MiB = 248 MiB/s (and RustFS
+64.4 × 5 MiB = 318 MiB/s), which is the bandwidth the plan recorded. The completed-object rate in
+that run was therefore 4.97 Cairn / 6.44 RustFS objects per second, and the summary gives the
+per-upload completion no line of its own.
+
+**Method.** `conformance/multipart_complete.py` starts a fresh strict single-node store per arm
+through `rustfs_compare.py`'s helpers, creates one unscored warm-up object, then scores exactly 40
+objects (10 × 5 MiB = 50 MiB per object). Each part position has its own deterministic 5 MiB buffer,
+generated once, so a reordered or duplicated part fails the byte checks rather than passing on
+identical payloads. After the scored window the driver fetches **every** completed object in full
+and one rotating `?partNumber` (each part number is checked four times over 40 objects), asserts
+the exact SHA-256 and length of both responses, asserts the completion ETag equals the composite
+`MD5(concat(part MD5s))-10`, and asserts a bounded `list-type=2` page contains exactly the 40
+keys. An arm passes only on 40/40 completions, 40/40 of each verification, an exact listing, zero
+driver errors, and (RustFS) a strict bucket-durability readback. Both engines wait the same 16 s
+settle window before and after the scored interval; the wait exists because Cairn's multipart stage
+histograms are drained by a 15 s background tick, and waiting only on Cairn's arm would give it a
+quieter start.
+
+```sh
+flock -x /tmp/cairn-deep-perf.lock python3 conformance/multipart_complete.py \
+  --root /var/tmp/cairn-performance-mpu-complete \
+  --cairn target/release/cairn \
+  --rustfs /var/tmp/cairn-perf-tools/rustfs \
+  --pairs 3 --objects 40
+```
+
+Three interleaved pairs, pair order reversed on even pairs, on the local 6-core i5-9400T / NVMe
+host under `flock /tmp/cairn-deep-perf.lock`; the 1-minute load average was 1.22 before and 7.72
+after the campaign (the latter is the campaign's own server plus client). Cairn release SHA-256
+`c4957da821f948193bc0f1f963ebf2b55eb9bffc39bd1065ef67598ac50efd1e` (0.1.0-dev+g53513027, main
+`5351302`), RustFS 1.0.0 `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd`.
+
+| Metric (3 pairs, 6 arms, 120 completed objects per engine) | Cairn | RustFS |
+|---|---:|---:|
+| Completed objects/s, mean of arm rates | 1.88 | 2.89 |
+| Arm range | 1.59–2.31 | 2.52–3.16 |
+| Parts/s, mean | 18.9 | 28.8 |
+| Completed-object MiB/s, mean | 94.2 | 144.3 |
+| Wall time per arm, mean | 21.7 s | 14.0 s |
+| Object-cycle p50, median arm | 2,277 ms | 1,275 ms |
+| Completion p50 / p90 / p99, median arm | **1,026 / 1,478 / 1,634 ms** | **32 / 132 / 204 ms** |
+| Part p50, median arm | 345 ms | 397 ms |
+| Completion share of object time, mean | **43.2 %** | **4.8 %** |
+| Client CPU per object, mean | 19.5 ms | 17.6 ms |
+| Server CPU, mean | 22.7 s (≈1.0 core) | 34.6 s (≈2.5 cores) |
+| Server peak RSS, mean | 61.7 MiB | 318.2 MiB |
+| Verified full object / part / ETag / listing | 40/40 each, every arm | 40/40 each, every arm |
+
+Per-pair Cairn/RustFS completed-object ratios were **0.557, 0.534 and 0.914** (mean **0.668×**;
+ratio of arm means 0.653×). The third pair is the outlier: Cairn improved to 2.31 obj/s while
+RustFS fell to 2.52, and the pair-3 RustFS completion p50 rose to 75 ms.
+
+The loop arithmetic checks out exactly. Cairn's per-object p50 cycle was 2,277 ms and four workers
+give `4 / 2.277 = 1.76` obj/s against 1.76 measured; RustFS `4 / 1.275 = 3.14` against 3.16. The
+rate is the worker count divided by the object cycle, so the completion tail is not a rounding
+error — at 43 % of Cairn's cycle it is the second-largest component after the three part waves.
+
+### Where the completion tail goes under load
+
+A separate diagnostic (`multipart-complete-tail-control-2026-11-04.json`) ran eight complete
+objects per shape on one fresh Cairn store with the same payloads and the same `upload_object`
+path: sequentially (one object at a time, four part slots) and then under the scored 4×4 pipeline.
+It reports the server-side `cairn_blob_multipart_stage_seconds` stages for each window:
+
+| Shape | Completion p50 | Assembly mean | Durability mean | Part p50 |
+|---|---:|---:|---:|---:|
+| Sequential, one object at a time | 321 ms | 164 ms | 211 ms | 117 ms |
+| Four object workers × four part slots | 704 ms | 179 ms | 744 ms | 697 ms |
+
+The scored arms agree with the pipelined control on the stage means: assembly stayed at 173–197 ms
+in all three arms, while durability measured 527–859 ms and permit wait was under 0.001 ms.
+**The load-dependent tail is the completed object's durability, not assembly.** The completion
+writes a new 50 MiB object file and must fsync it (plus the rename and directory sync) while up to
+sixteen part streams are staging and fsyncing their own 5 MiB files, so the completion's fsync
+waits behind the part pipeline's dirty data. RustFS completes in 25–76 ms; with strict durability its
+parts are already durable, and the measured tail is consistent with a metadata-only completion that
+does not rewrite the 50 MiB object. That is a real architectural difference, not a mode mismatch,
+since both engines ran strict; this comparison did not instrument RustFS's internal stages, so the
+mechanism is inferred from the measured tail, not measured directly.
+
+Section 11's isolated probe measured a 246 → 210 ms completion (assembly 189 → 162 ms, durability
+~44 ms) with sequential completions on an otherwise idle host. Those numbers reproduce here for
+the sequential shape (321 ms p50, assembly 164 ms, durability 211 ms — the faster assembly now
+absorbs the writeback in the fsync, as section 11 notes). Under the four-worker pipeline the tail
+is **0.70–1.09 s p50 and 39–47 % of the object cycle**, so the 14.6 % isolated improvement does not
+translate into a 14.6 % object-rate improvement; the durable rewrite dominates instead.
+
+### Reading and limits
+
+- **The completed-object ratio is 0.67×**, not the Warp row's 0.77×. With ten parts per object,
+  `PUTPART` throughput and completed-object throughput are proportional when every object completes
+  inside the window, so the ratio difference is not a unit trick: it comes from conditions. Here
+  Cairn's tail share is 43 % (Warp's loop implied ~40 %) while RustFS's is 5 % (Warp's implied
+  ~10 %), and the part p50s are 345/397 ms versus Warp's 171/180 ms on the same host. This campaign
+  did not isolate why the part wave is slower under this driver; client CPU was only ~19 ms/object,
+  so the Python client's own CPU is not the explanation, and the host load plus device writeback
+  state were not held equal to the Warp runs.
+- The absolute rates are **method-specific** and must not be pooled with the Warp scoreboard. The
+  stable signals are the tail share, the stage split, and the completed-object count/verification.
+- Every completion is verified before the arm passes, so a throughput number is never reported for
+  an object whose bytes, part layout or composite ETag were not checked. `?partNumber` coverage is
+  part of the gate, not a sample.
+- The Python driver is standard-library only and reuses `delete_single_key.py`'s SigV4 client and
+  `rustfs_compare.py`'s strict environment, health, bucket and durability helpers. Offline checks:
+  `conformance/test_multipart_complete.py`.
+
+Raw evidence:
+[`multipart-complete-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-2026-11-04.json)
+and
+[`multipart-complete-tail-control-2026-11-04.json`](performance-evidence/2026-11/multipart-complete-tail-control-2026-11-04.json).

@@ -1,0 +1,90 @@
+{
+  "case": "multipart_complete_completion_tail_control",
+  "note": "diagnostic control only; eight complete objects per shape on one fresh strict Cairn store, same payloads and upload_object path as the scored harness; sequential means one object at a time with four part slots",
+  "cairn_sha256": "c4957da821f948193bc0f1f963ebf2b55eb9bffc39bd1065ef67598ac50efd1e",
+  "objects_per_shape": 8,
+  "part_bytes": 5242880,
+  "parts_per_object": 10,
+  "sequential": {
+    "objects": 8,
+    "cycles": {
+      "count": 8,
+      "mean_ms": 796.2944600039918,
+      "p50_ms": 755.4867650032975,
+      "p90_ms": 908.1089299870655,
+      "p99_ms": 908.1089299870655,
+      "max_ms": 1125.704547011992
+    },
+    "completions": {
+      "count": 8,
+      "mean_ms": 392.4146308709169,
+      "p50_ms": 321.39686300070025,
+      "p90_ms": 564.0999829920474,
+      "p99_ms": 564.0999829920474,
+      "max_ms": 589.6672520029824
+    },
+    "part": {
+      "count": 80,
+      "mean_ms": 141.21333432885876,
+      "p50_ms": 117.34947800869122,
+      "p90_ms": 162.3083169979509,
+      "p99_ms": 589.8006400093436,
+      "max_ms": 589.817376981955
+    },
+    "stages": {
+      "permit_wait": {
+        "samples": 8.0,
+        "mean_ms": 0.0006601250000000001
+      },
+      "assembly": {
+        "samples": 8.0,
+        "mean_ms": 163.65865574999998
+      },
+      "durability": {
+        "samples": 8.0,
+        "mean_ms": 210.6385955
+      }
+    }
+  },
+  "pipelined_4x4": {
+    "objects": 8,
+    "cycles": {
+      "count": 8,
+      "mean_ms": 2864.207390375668,
+      "p50_ms": 2788.3317719970364,
+      "p90_ms": 3161.9411350111477,
+      "p99_ms": 3161.9411350111477,
+      "max_ms": 3213.3908020041417
+    },
+    "completions": {
+      "count": 8,
+      "mean_ms": 1000.3756065016205,
+      "p50_ms": 703.6765940138139,
+      "p90_ms": 1421.1863079981413,
+      "p99_ms": 1421.1863079981413,
+      "max_ms": 1472.209270024905
+    },
+    "part": {
+      "count": 80,
+      "mean_ms": 664.4341862229339,
+      "p50_ms": 697.4560360249598,
+      "p90_ms": 1055.1899790007155,
+      "p99_ms": 1064.7253469796851,
+      "max_ms": 1066.410386993084
+    },
+    "stages": {
+      "permit_wait": {
+        "samples": 8.0,
+        "mean_ms": 0.0004053749999999997
+      },
+      "assembly": {
+        "samples": 8.0,
+        "mean_ms": 178.84080687499997
+      },
+      "durability": {
+        "samples": 8.0,
+        "mean_ms": 743.7357448749998
+      }
+    }
+  }
+}

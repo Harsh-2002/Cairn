@@ -22,6 +22,10 @@ Cairn/RustFS pairs:
 |---|---:|---:|---:|
 | Multipart upload, 5 MiB parts | 37.4 obj/s (187 MiB/s) | 63.6 obj/s (318 MiB/s) | **0.59×** |
 
+Warp's `multipart-put` report is `PUTPART`, so the rate above counts 5 MiB part operations:
+37.4 × 5 MiB = 187 MiB/s, i.e. **3.74 completed objects/s** for Cairn. The completion-inclusive
+object rate is measured separately in [`benchmarks.md`](benchmarks.md) section 12.
+
 An earlier unpaired screen measured 218 MiB/s vs 343 MiB/s (0.64×), so the gap is consistent.
 
 Cairn sampled part-stage medians (18 samples, 1-in-32 sampling, 12-second arm):
@@ -46,8 +50,8 @@ with a median batch of 3. The dominant costs are hashing and the staging write/f
 Writer.
 
 A 64-in-flight screen (8 uploads × 8 part concurrency) shows the limit is per-part service rate,
-not client concurrency: Cairn 47.5 obj/s vs RustFS 75.0, with similar ~0.57 s request latency.
-Cairn barely improved from 44.6 obj/s at 16 in-flight; RustFS improved from 69.6.
+not client concurrency: Cairn 47.5 PUTPART ops/s vs RustFS 75.0, with similar ~0.57 s request
+latency. Cairn barely improved from 44.6 ops/s at 16 in-flight; RustFS improved from 69.6.
 
 ## Code path
 
@@ -220,20 +224,22 @@ upload cannot start during that tail.
 
 In the quiet three-pair batch on 2026-11-04 the per-part p50 was **Cairn 171.4 ms vs RustFS
 179.9 ms** (Cairn 155.1 vs RustFS 189.9 in another pair, and Cairn's PUTPART TTFB p50 was 98 ms
-vs 122 ms), yet Cairn measured 51.4 vs 66.4 obj/s. Cairn's part service was already faster; the
-missing throughput was the completion tail. A 50 MiB assembly measured p50 ≈ 340 ms before the
+vs 122 ms), yet Cairn measured 51.4 vs 66.4 PUTPART ops/s. Cairn's part service was already faster;
+the missing throughput was the completion tail. A 50 MiB assembly measured p50 ≈ 340 ms before the
 completion pipeline above, so Cairn's per-worker loop was ≈ 3 × 171 + 340 = 853 ms, which at four
-workers predicts ≈ 47 obj/s (measured 51.4). Fitting RustFS's measured 66.4 obj/s to the same loop
-implies ≈ 3 × 180 + ≈ 60 ms of completion, i.e. a much smaller tail. This is why part-path changes
-of 10–20 ms per part (≈ 30–60 ms per upload, ~5%) were measured at or below the host noise even
-when the part stage clearly improved.
+workers predicts ≈ 4.7 completed objects/s (≈ 47 PUTPART ops/s; measured 51.4). Fitting RustFS's
+measured 66.4 PUTPART ops/s to the same loop implies ≈ 3 × 180 + ≈ 60 ms of completion, i.e. a much
+smaller tail. This is why part-path changes of 10–20 ms per part (≈ 30–60 ms per upload, ~5%) were
+measured at or below the host noise even when the part stage clearly improved.
 
 The completion pipeline in `benchmarks.md` section 11 then cut that real completion from a 246 ms
 median to 210 ms on the same host, which validates the accounting: the same four-worker loop now
-predicts ≈ 3 × 171 + 210 = 723 ms → ≈ 55 obj/s. The remaining completion tail is still ≈ 150 ms
-larger than RustFS's, so the part path is ~70% of the loop and its per-part service is already
-faster than the comparison; further part micro-optimizations can recover only a few percent of
-the score even when they win their own stage.
+predicts ≈ 3 × 171 + 210 = 723 ms → ≈ 5.5 completed objects/s (≈ 55 PUTPART ops/s). The remaining
+completion tail is still ≈ 150 ms larger than RustFS's, so the part path is ~70% of the loop and
+its per-part service is already faster than the comparison; further part micro-optimizations can
+recover only a few percent of the score even when they win their own stage. That 210 ms is a
+sequential/isolated completion: the completion-inclusive run in `benchmarks.md` section 12 measured a
+tail of ~1.0 s under the four-worker pipeline, dominated by the assembled object's fsync.
 
 **Consequence for this workstream:** the part path's remaining durable barrier (write + fdatasync)
 and hashing are not the scored lever. The scored ratio needs the residual completion tail closed
