@@ -1,5 +1,6 @@
-//! `cairn-blob` — the local-filesystem [`BlobStore`]. This is the ONLY crate that performs
-//! filesystem syscalls, and it owns the durable commit sequence (ARCH 8.2): stream to a
+//! `cairn-blob` — the local-filesystem [`BlobStore`]. This is the ONLY crate that performs general
+//! filesystem syscalls (the isolated `cairn-reflink` wrapper owns one copy-on-write cloning
+//! `ioctl`), and it owns the durable commit sequence (ARCH 8.2): stream to a
 //! staging file, fsync the file, rename it into the per-bucket directory, fsync that
 //! directory (the F-1 fix), and only then return — so a committed blob is durable before any
 //! metadata references it. Object bytes live under opaque identifiers, never under the key, so

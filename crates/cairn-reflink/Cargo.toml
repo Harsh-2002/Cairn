@@ -1,0 +1,16 @@
+[package]
+name = "cairn-reflink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Isolated FICLONERANGE seam for copy-on-write range cloning on reflink-capable filesystems."
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

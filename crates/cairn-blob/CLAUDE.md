@@ -9,7 +9,8 @@ leases through completion. Do not remove a shared parent merely because it is cu
 an admitted multipart completion may already hold its final directory descriptor.
 
 The local-filesystem `BlobStore` (`LocalBlobStore`) — **the only crate in the workspace that performs
-filesystem syscalls**. It owns the durable commit sequence, the self-describing CRNB block format
+general filesystem syscalls** (the isolated `cairn-reflink` wrapper owns the single copy-on-write
+cloning `ioctl`). It owns the durable commit sequence, the self-describing CRNB block format
 (compression + SSE-S3 encryption at rest), and the reconcile (orphan-reclaim) path. Object bytes are
 plain files under opaque IDs, and the blob layer writes the durable per-object metadata record into
 that file's `CRNI` trailer (or a `<uuid>.meta` sidecar when the CRNB container must stay last); the

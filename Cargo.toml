@@ -17,6 +17,7 @@ cairn-types = { path = "crates/cairn-types" }
 cairn-meta = { path = "crates/cairn-meta" }
 cairn-meta-async = { path = "crates/cairn-meta-async" }
 cairn-blob = { path = "crates/cairn-blob" }
+cairn-reflink = { path = "crates/cairn-reflink" }
 cairn-crypto = { path = "crates/cairn-crypto" }
 cairn-net = { path = "crates/cairn-net" }
 cairn-auth = { path = "crates/cairn-auth" }
