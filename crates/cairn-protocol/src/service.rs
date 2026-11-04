@@ -1596,15 +1596,26 @@ impl S3Service {
             let event_version = version_id.clone();
             let outcome = self
                 .meta
-                .submit(Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id,
-                    expected_row_id: None,
-                    expected_updated_at: None,
-                    require_sole_key_version: false,
-                    now,
-                    bypass,
+                .submit(Mutation::DeleteWithActivity {
+                    operation: Box::new(Mutation::DeleteVersion {
+                        bucket: bucket.name.clone(),
+                        key,
+                        version_id,
+                        expected_row_id: None,
+                        expected_updated_at: None,
+                        require_sole_key_version: false,
+                        now,
+                        bypass,
+                    }),
+                    activity: Box::new(self.activity_entry(
+                        "DeleteObject",
+                        bucket.name.as_str(),
+                        Some(event_key.as_str()),
+                        None,
+                        None,
+                        req.principal.as_ref(),
+                        now,
+                    )),
                 })
                 .await;
             match outcome {
@@ -1625,15 +1636,6 @@ impl S3Service {
                 None,
                 None,
                 now,
-            )
-            .await;
-            self.audit(
-                "DeleteObject",
-                bucket.name.as_str(),
-                Some(event_key.as_str()),
-                None,
-                None,
-                req.principal.as_ref(),
             )
             .await;
             // Mirror the delete-marker-CREATING branch below: name the version acted on, and say
@@ -1674,15 +1676,26 @@ impl S3Service {
                         .await?;
                     let enqueued_repl = !replication.is_empty();
                     self.meta
-                        .submit(Mutation::CreateDeleteMarker {
-                            bucket: bucket.name.clone(),
-                            key,
-                            version_id: marker_id.clone(),
-                            owner_id: bucket.owner_id.clone(),
-                            now,
-                            bypass: GovernanceBypass::Denied,
-                            expected_current: None,
-                            replication,
+                        .submit(Mutation::DeleteWithActivity {
+                            operation: Box::new(Mutation::CreateDeleteMarker {
+                                bucket: bucket.name.clone(),
+                                key,
+                                version_id: marker_id.clone(),
+                                owner_id: bucket.owner_id.clone(),
+                                now,
+                                bypass: GovernanceBypass::Denied,
+                                expected_current: None,
+                                replication,
+                            }),
+                            activity: Box::new(self.activity_entry(
+                                "DeleteObject",
+                                bucket.name.as_str(),
+                                Some(event_key.as_str()),
+                                None,
+                                None,
+                                req.principal.as_ref(),
+                                now,
+                            )),
                         })
                         .await?;
                     if enqueued_repl {
@@ -1699,15 +1712,20 @@ impl S3Service {
                     now,
                 )
                 .await;
-                self.audit(
-                    "DeleteObject",
-                    bucket.name.as_str(),
-                    Some(event_key.as_str()),
-                    None,
-                    None,
-                    req.principal.as_ref(),
-                )
-                .await;
+                if is_replica {
+                    // An inbound replica marker is applied through the version-preserving
+                    // `PutObjectVersion` upsert, which has no co-committed activity field: keep
+                    // the separate best-effort audit row on that path only.
+                    self.audit(
+                        "DeleteObject",
+                        bucket.name.as_str(),
+                        Some(event_key.as_str()),
+                        None,
+                        None,
+                        req.principal.as_ref(),
+                    )
+                    .await;
+                }
                 // Signal the newly-created delete marker's identity to the client (Medium #4).
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
@@ -1731,15 +1749,26 @@ impl S3Service {
                     .await?;
                 let outcome = self
                     .meta
-                    .submit(Mutation::CreateDeleteMarker {
-                        bucket: bucket.name.clone(),
-                        key,
-                        version_id: VersionId::null(),
-                        owner_id: bucket.owner_id.clone(),
-                        now,
-                        bypass,
-                        expected_current: None,
-                        replication,
+                    .submit(Mutation::DeleteWithActivity {
+                        operation: Box::new(Mutation::CreateDeleteMarker {
+                            bucket: bucket.name.clone(),
+                            key,
+                            version_id: VersionId::null(),
+                            owner_id: bucket.owner_id.clone(),
+                            now,
+                            bypass,
+                            expected_current: None,
+                            replication,
+                        }),
+                        activity: Box::new(self.activity_entry(
+                            "DeleteObject",
+                            bucket.name.as_str(),
+                            Some(event_key.as_str()),
+                            None,
+                            None,
+                            req.principal.as_ref(),
+                            now,
+                        )),
                     })
                     .await;
                 match outcome {
@@ -1762,15 +1791,6 @@ impl S3Service {
                     now,
                 )
                 .await;
-                self.audit(
-                    "DeleteObject",
-                    bucket.name.as_str(),
-                    Some(event_key.as_str()),
-                    None,
-                    None,
-                    req.principal.as_ref(),
-                )
-                .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
                     .with_header("x-amz-request-id", &req.request_id))
@@ -1781,15 +1801,26 @@ impl S3Service {
                     .await?;
                 let outcome = self
                     .meta
-                    .submit(Mutation::DeleteVersion {
-                        bucket: bucket.name.clone(),
-                        key,
-                        version_id: VersionId::null(),
-                        expected_row_id: None,
-                        expected_updated_at: None,
-                        require_sole_key_version: false,
-                        now,
-                        bypass,
+                    .submit(Mutation::DeleteWithActivity {
+                        operation: Box::new(Mutation::DeleteVersion {
+                            bucket: bucket.name.clone(),
+                            key,
+                            version_id: VersionId::null(),
+                            expected_row_id: None,
+                            expected_updated_at: None,
+                            require_sole_key_version: false,
+                            now,
+                            bypass,
+                        }),
+                        activity: Box::new(self.activity_entry(
+                            "DeleteObject",
+                            bucket.name.as_str(),
+                            Some(event_key.as_str()),
+                            None,
+                            None,
+                            req.principal.as_ref(),
+                            now,
+                        )),
                     })
                     .await;
                 match outcome {
@@ -1811,15 +1842,6 @@ impl S3Service {
                     None,
                     None,
                     now,
-                )
-                .await;
-                self.audit(
-                    "DeleteObject",
-                    bucket.name.as_str(),
-                    Some(event_key.as_str()),
-                    None,
-                    None,
-                    req.principal.as_ref(),
                 )
                 .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
@@ -5261,15 +5283,20 @@ impl S3Service {
     }
 
     /// Best-effort per-event audit entry for a MUTATING S3 op (ARCH 26.3: both the S3 and
-    /// management surfaces are audited — the S3 data plane was the missing half). Fire-and-forget
-    /// through the single writer, exactly like `emit_events`: a failed audit write must never fail
-    /// the request, and the group-commit writer amortizes these across concurrent mutations. Reads
-    /// are NOT audited (the request-metrics aggregate covers read volume); only mutating handlers
-    /// call this. `principal` is `None` for an anonymous requester a public bucket policy allowed to
-    /// mutate — still audited, with a `None` actor (the write DID happen; ARCH 26.3 records "the
-    /// actor", which may legitimately be anonymous). Never bind the principal via a fallible
-    /// `require_principal(..)?` around this: an anonymous-permitted mutation carries no principal,
-    /// and failing the request for a missing actor would break the very write policy just allowed.
+    /// management surfaces are audited — the S3 data plane was the missing half). Submits through
+    /// the single writer exactly like `emit_events`: a failed audit write must never fail the
+    /// request, and the group-commit writer amortizes these across concurrent mutations. The
+    /// submit is awaited so the row is queued before the handler returns, but its result is
+    /// discarded. Single-object DELETE does NOT call this: it co-commits its audit row in the
+    /// delete savepoint via `Mutation::DeleteWithActivity`, so a successful delete waits for one
+    /// durable commit and never acknowledges from a transaction whose activity insert failed.
+    /// Reads are NOT audited (the request-metrics aggregate covers read volume); only mutating
+    /// handlers call this. `principal` is `None` for an anonymous requester a public bucket policy
+    /// allowed to mutate — still audited, with a `None` actor (the write DID happen; ARCH 26.3
+    /// records "the actor", which may legitimately be anonymous). Never bind the principal via a
+    /// fallible `require_principal(..)?` around this: an anonymous-permitted mutation carries no
+    /// principal, and failing the request for a missing actor would break the very write policy
+    /// just allowed.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors the audit identity fields it shares with audit()"

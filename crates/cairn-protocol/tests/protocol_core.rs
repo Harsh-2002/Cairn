@@ -15709,6 +15709,94 @@ async fn mutating_s3_ops_are_audited_and_reads_are_not() {
     assert_eq!(del.actor.as_deref(), Some("k"));
 }
 
+/// ARCH 26.3, versioning state: a plain DELETE in an Enabled bucket inserts a delete marker through
+/// `CreateDeleteMarker`, whose activity row is co-committed with the marker. The response must
+/// still name the marker, and the audit log must gain exactly one `DeleteObject` row.
+#[tokio::test]
+async fn versioned_delete_marker_audit_is_co_committed_with_the_marker() {
+    let h = harness().await;
+    let bucket = "audit-versioned";
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let vcfg =
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                b"hello".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some(bucket),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(header(&headers, "x-amz-delete-marker"), Some("true"));
+    assert!(
+        header(&headers, "x-amz-version-id").is_some_and(|id| !id.is_empty()),
+        "the created marker's version id must be returned"
+    );
+
+    let log = h.meta.list_activity(100).await.unwrap();
+    let deletes: Vec<_> = log
+        .iter()
+        .filter(|entry| entry.action == "DeleteObject")
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "the marker path must record exactly one co-committed DeleteObject row"
+    );
+    assert_eq!(deletes[0].bucket.as_deref(), Some(bucket));
+    assert_eq!(deletes[0].key.as_deref(), Some("docs/a.txt"));
+    assert_eq!(deletes[0].actor.as_deref(), Some("k"));
+}
+
 // --- Composite multipart checksums (Phase 1) -------------------------------------------------
 
 fn crc32_b64(data: &[u8]) -> String {

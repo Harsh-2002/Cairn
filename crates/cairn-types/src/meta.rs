@@ -251,6 +251,24 @@ pub enum Mutation {
         /// Trusted governance-bypass authorization.
         bypass: GovernanceBypass,
     },
+    /// Apply one delete-family mutation and record its activity row in the same savepoint.
+    ///
+    /// This is the delete analogue of [`Mutation::PublishObjectWrite`]'s `activity` field: the
+    /// audit row commits with the delete, so acknowledgement waits for one durable commit instead
+    /// of a delete commit followed by a separate best-effort activity commit. Only
+    /// [`Mutation::DeleteVersion`] and [`Mutation::CreateDeleteMarker`] are accepted as the inner
+    /// operation; any other inner mutation is rejected. The activity row is inserted only when the
+    /// inner delete applies (`Deleted`, `DeleteNotApplied` or `DeleteMarker`), never for
+    /// `DeleteProtected`, whose request fails. A duplicate activity id is ignored because the audit
+    /// intent is already satisfied; any other activity error fails the delete rather than
+    /// acknowledging a transaction whose state is no longer trustworthy. A multi-shard router
+    /// submits the row to the global activity shard after the delete applies.
+    DeleteWithActivity {
+        /// The delete to apply: `DeleteVersion` or `CreateDeleteMarker`.
+        operation: Box<Mutation>,
+        /// The activity row committed with the delete when it applies.
+        activity: Box<ActivityEntry>,
+    },
     /// Create a multipart session, enforcing the active-session limits atomically with the insert.
     CreateMultipart {
         /// The session to create.

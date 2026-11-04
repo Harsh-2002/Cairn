@@ -171,7 +171,12 @@ paths, except an index-spool alias the caller reports it never opened. A success
 also carry the operator activity row: it commits in the same savepoint, a duplicate activity id is
 ignored because the audit intent is already satisfied, and any other activity error fails the
 publication instead of acknowledging a transaction whose state is no longer trustworthy. A
-multi-shard router submits the row to the global shard after publication. Replacement and deletion record cleanup debt in the same savepoint as
+multi-shard router submits the row to the global shard after publication. A single-object DELETE
+uses the same rule through `DeleteWithActivity`: the inner `DeleteVersion` or `CreateDeleteMarker`
+and its activity row commit in one savepoint, so a single-shard node needs one FULL commit and
+never acknowledges a delete from a transaction whose activity insert failed; with more than one
+shard the delete applies on the bucket shard first and the row is submitted to the global shard
+after it applies (a protected delete records none). Replacement and deletion record cleanup debt in the same savepoint as
 removing a live reference. Returned superseded paths are descriptive outcomes, not authority for
 direct unlink. A late failure rolls back publication, intent consumption and cleanup changes
 together.

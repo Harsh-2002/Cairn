@@ -593,6 +593,43 @@ impl MetadataStore for ShardedMetadataStore {
                 Ok(outcome)
             }
 
+            // Delete activity is account-global while the delete itself is per-bucket. One shard
+            // keeps the co-commit (the common deployment); with more than one, delete first and
+            // submit the best-effort activity to the global shard so it is never written into a
+            // bucket shard nobody reads.
+            Mutation::DeleteWithActivity {
+                operation,
+                activity,
+            } => {
+                let bucket = mutation_bucket(&operation).ok_or_else(|| {
+                    MetaError::Engine(
+                        "delete-with-activity requires DeleteVersion or CreateDeleteMarker".into(),
+                    )
+                })?;
+                let shard = self.for_bucket(&bucket);
+                if self.shards.len() == 1 {
+                    return shard
+                        .submit(Mutation::DeleteWithActivity {
+                            operation,
+                            activity,
+                        })
+                        .await;
+                }
+                let outcome = shard.submit(*operation).await?;
+                if matches!(
+                    &outcome,
+                    MutationOutcome::Deleted { .. }
+                        | MutationOutcome::DeleteNotApplied
+                        | MutationOutcome::DeleteMarker { .. }
+                ) {
+                    let _ = self
+                        .global()
+                        .submit(Mutation::RecordActivity(activity))
+                        .await;
+                }
+                Ok(outcome)
+            }
+
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
             | Mutation::ResolveObjectWrite { .. }
@@ -1410,6 +1447,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
         Mutation::DeleteVersion { bucket, .. } => bucket.as_str(),
+        Mutation::DeleteWithActivity { operation, .. } => return mutation_bucket(operation),
         Mutation::CreateBucket(b) => b.name.as_str(),
         Mutation::CreateObjectLockBucket(b) => b.name.as_str(),
         Mutation::DeleteBucket(name) => name.as_str(),

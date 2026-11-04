@@ -463,6 +463,53 @@ pub fn apply(view: &mut Overlay<'_>, mutation: Mutation) -> Result<MutationOutco
             expected_updated_at,
             require_sole_key_version,
         ),
+        // The isolated Fjall workload contract records no activity log, so the co-committed row is
+        // intentionally accepted and dropped here; the delete semantics stay identical to the
+        // plain variants above.
+        Mutation::DeleteWithActivity {
+            operation,
+            activity: _,
+        } => match *operation {
+            Mutation::DeleteVersion {
+                bucket,
+                key,
+                version_id,
+                expected_row_id,
+                expected_updated_at,
+                require_sole_key_version,
+                ..
+            } => delete(
+                view,
+                bucket,
+                key,
+                version_id,
+                expected_row_id,
+                expected_updated_at,
+                require_sole_key_version,
+            ),
+            Mutation::CreateDeleteMarker {
+                bucket,
+                key,
+                version_id,
+                owner_id,
+                now,
+                expected_current,
+                replication,
+                ..
+            } => marker(
+                view,
+                bucket,
+                key,
+                version_id,
+                owner_id,
+                now,
+                expected_current,
+                replication,
+            ),
+            _ => Err(kv::error(
+                "delete-with-activity requires DeleteVersion or CreateDeleteMarker",
+            )),
+        },
         Mutation::CreateMultipart { session, limits } => multipart::create(view, *session, limits),
         Mutation::ResolveMultipartPartWrite {
             upload_id,

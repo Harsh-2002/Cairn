@@ -2283,6 +2283,33 @@ impl State {
                 }
                 Ok(outcome)
             }
+            Mutation::DeleteWithActivity {
+                operation,
+                activity,
+            } => {
+                if !matches!(
+                    operation.as_ref(),
+                    Mutation::DeleteVersion { .. } | Mutation::CreateDeleteMarker { .. }
+                ) {
+                    return Err(MetaError::Engine(
+                        "delete-with-activity requires DeleteVersion or CreateDeleteMarker".into(),
+                    ));
+                }
+                let outcome = Self::apply_inner(st, *operation)?;
+                if matches!(
+                    &outcome,
+                    MutationOutcome::Deleted { .. }
+                        | MutationOutcome::DeleteNotApplied
+                        | MutationOutcome::DeleteMarker { .. }
+                ) && !st
+                    .activity
+                    .iter()
+                    .any(|existing| existing.id == activity.id)
+                {
+                    st.activity.push(*activity);
+                }
+                Ok(outcome)
+            }
             other => {
                 crate::storage::validate_unadmitted_mutation(&other)?;
                 Self::apply_inner(st, other)
@@ -2331,6 +2358,9 @@ impl State {
             | Mutation::PublishObjectWrite { .. }
             | Mutation::AbandonObjectWrite { .. } => {
                 Err(MetaError::Engine("nested storage operation".into()))
+            }
+            Mutation::DeleteWithActivity { .. } => {
+                Err(MetaError::Engine("nested delete operation".into()))
             }
             Mutation::BeginStorageGeneration { generation } => Ok(storage::begin(st, generation)),
             Mutation::PrepareStorageRestore { generation } => {
