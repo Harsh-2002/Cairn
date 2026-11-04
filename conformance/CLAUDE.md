@@ -346,6 +346,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `?versions` audit (12,000 versions + 12,000 markers over the exact key set), and RustFS's strict
   readback. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
   ratios. **NOT a gate.**
+- `delete_single_key_cairn.py` — **Cairn-only writer attribution** for the unversioned single-key
+  shape: it imports `delete_single_key.py`'s client unchanged and additionally scrapes `/metrics`
+  one full store-metrics tick apart on both sides of the scored window, so the writer's stage rings
+  (admission/queue/begin/apply/commit/checkpoint), commit seconds, batch size, process I/O and load
+  average describe the delete window only. Reports the stage split; never an engine ratio.
+  **NOT a gate.** Offline checks: `test_delete_single_key_cairn.py`.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
@@ -395,7 +401,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   through the management API (SSRF-guarded), unlike `soak`'s config-endpoint path. The remaining
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
   `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`,
-  `delete_versioned_single_key.py`) whose gating signal is already
+  `delete_versioned_single_key.py`, `delete_single_key_cairn.py`) whose gating signal is already
   covered by the CI correctness jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.

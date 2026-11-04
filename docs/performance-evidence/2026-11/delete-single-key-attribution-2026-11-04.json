@@ -1,0 +1,1425 @@
+{
+  "schema": 1,
+  "case": "delete_single_key_attribution",
+  "measured": "2026-11-04",
+  "method": "Cairn-only diagnostic companion to delete_single_key.py: the same exact 12,000-key 4 KiB pool and the same one-signed-DELETE-per-key client at bounded concurrency, plus /metrics scrapes one full 15 s store-metrics tick apart on both sides of the scored delete window. Arms are fresh single-node stores under the same strict settings the official comparison pins (synchronous=full, one shard, linger 0). One exclusive host-wide benchmark lock was held for each batch; no other benchmark ran concurrently. Stage means come from the writer's bounded per-stage sample rings (admission/queue/begin/apply/commit/checkpoint); commit and batch means come from the per-commit ring, which holds every commit of an arm. control-c16-final re-ran the script with the sampler restricted to the scored window on a busy host; control-c16-final2 is the final script on a quiet host and is also the arm that carries the DELETE-labelled request histogram (12,000 requests, 9.301 ms mean handler time, which is the queue plus apply plus the commit barrier). Across the session the same control binary measured 1,176-1,613 obj/s at c16 while the commit share stayed 77-84%, so only within-batch comparisons are drawn.",
+  "diagnostic": "conformance/delete_single_key_cairn.py",
+  "host": {
+    "logical_cpus": 6,
+    "load_average_note": "per-arm 1/5/15-minute load averages are recorded in each arm; the host is shared with other agents, so cross-batch rate comparisons are only valid within one alternating batch"
+  },
+  "binaries": {
+    "control": {
+      "path": "/var/tmp/cairn-performance-delete-deep/cairn-control",
+      "sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "commit": "433438f"
+    },
+    "candidate_rejected": {
+      "sha256": "b1fbe16928f31a0867fe8217b069c8776ebafc2a286c007a0eb8c2dc560555ab",
+      "description": "unmerged: derives the bucket_stats.objects delta from the removed row and its promoted successor, and inserts the storage-cleanup debt row before reading it back; removes five of roughly sixteen statements per unversioned delete"
+    }
+  },
+  "arms": {
+    "candidate-p1": {
+      "variant": "candidate-p1",
+      "binary_sha256": "b1fbe16928f31a0867fe8217b069c8776ebafc2a286c007a0eb8c2dc560555ab",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1289.831087319077,
+      "wall_seconds": 9.303543788002571,
+      "prefill_seconds": 8.085360650002258,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 12.269919403772898,
+        "p50_ms": 11.130756000056863,
+        "p90_ms": 16.906892007682472,
+        "p99_ms": 40.20998100168072,
+        "max_ms": 119.4538889976684
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00024603124999999886,
+          "total_seconds": 0.0005038719999999977
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 2.9790514028320283,
+          "total_seconds": 6.1010972729999935
+        },
+        "begin": {
+          "samples": 1848.0,
+          "mean_ms": 0.02587516829004331,
+          "total_seconds": 0.047817311000000036
+        },
+        "apply": {
+          "samples": 1849.0,
+          "mean_ms": 1.0885188880475922,
+          "total_seconds": 2.012671423999998
+        },
+        "commit": {
+          "commits": 1849.0,
+          "mean_ms": 3.9538271855056744,
+          "total_seconds": 7.3106264659999916
+        },
+        "checkpoint": {
+          "samples": 11.0,
+          "mean_ms": 43.06426845454547,
+          "total_seconds": 0.4737069530000001
+        },
+        "batch": {
+          "batches": 1849.0,
+          "mean_size": 6.725797728501893
+        }
+      },
+      "server_cpu_ms_per_object": 0.5233333333333333,
+      "server_write_bytes": 813596672,
+      "write_kib_per_object": 66.21066666666667,
+      "wal_bytes_after": 4152.0,
+      "wal_checkpoints": 11.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          6.84,
+          6.31,
+          5.37
+        ],
+        "after": [
+          6.93,
+          6.35,
+          5.39
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 51.87382682401221
+    },
+    "candidate-p2": {
+      "variant": "candidate-p2",
+      "binary_sha256": "b1fbe16928f31a0867fe8217b069c8776ebafc2a286c007a0eb8c2dc560555ab",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1559.2318180333177,
+      "wall_seconds": 7.696097437990829,
+      "prefill_seconds": 9.080846605997067,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.169913610404667,
+        "p50_ms": 9.540609986288473,
+        "p90_ms": 13.388522987952456,
+        "p99_ms": 24.63460699073039,
+        "max_ms": 57.552259997464716
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00019735791015625085,
+          "total_seconds": 0.00040418900000000174
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.539363411132812,
+          "total_seconds": 7.248616265999999
+        },
+        "begin": {
+          "samples": 1808.0,
+          "mean_ms": 0.012097282632743366,
+          "total_seconds": 0.021871887000000003
+        },
+        "apply": {
+          "samples": 1809.0,
+          "mean_ms": 0.9251613830845783,
+          "total_seconds": 1.673616942000002
+        },
+        "commit": {
+          "commits": 1809.0,
+          "mean_ms": 3.410671429519074,
+          "total_seconds": 6.169904616000005
+        },
+        "checkpoint": {
+          "samples": 9.0,
+          "mean_ms": 39.72314988888888,
+          "total_seconds": 0.3575083489999999
+        },
+        "batch": {
+          "batches": 1809.0,
+          "mean_size": 6.875069098949696
+        }
+      },
+      "server_cpu_ms_per_object": 0.5066666666666667,
+      "server_write_bytes": 807886848,
+      "write_kib_per_object": 65.746,
+      "wal_bytes_after": 52826672.0,
+      "wal_checkpoints": 9.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          6.56,
+          6.41,
+          5.46
+        ],
+        "after": [
+          6.36,
+          6.37,
+          5.45
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 51.25991588798934
+    },
+    "candidate-p3": {
+      "variant": "candidate-p3",
+      "binary_sha256": "b1fbe16928f31a0867fe8217b069c8776ebafc2a286c007a0eb8c2dc560555ab",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1507.280567210991,
+      "wall_seconds": 7.961357865977334,
+      "prefill_seconds": 7.840172206022544,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.514876531179956,
+        "p50_ms": 9.794616984436288,
+        "p90_ms": 13.62016101484187,
+        "p99_ms": 26.26590899308212,
+        "max_ms": 65.37955300882459
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.0001956787109374995,
+          "total_seconds": 0.000400749999999999
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.706124125000006,
+          "total_seconds": 7.590142208000012
+        },
+        "begin": {
+          "samples": 1774.0,
+          "mean_ms": 0.013996660653889503,
+          "total_seconds": 0.02483007599999998
+        },
+        "apply": {
+          "samples": 1775.0,
+          "mean_ms": 0.9270659825352134,
+          "total_seconds": 1.645542119000004
+        },
+        "commit": {
+          "commits": 1775.0,
+          "mean_ms": 3.6084477397183123,
+          "total_seconds": 6.4049947380000045
+        },
+        "checkpoint": {
+          "samples": 9.0,
+          "mean_ms": 44.40267266666667,
+          "total_seconds": 0.399624054
+        },
+        "batch": {
+          "batches": 1775.0,
+          "mean_size": 7.006760563380282
+        }
+      },
+      "server_cpu_ms_per_object": 0.5175000000000001,
+      "server_write_bytes": 785793024,
+      "write_kib_per_object": 63.948,
+      "wal_bytes_after": 30368552.0,
+      "wal_checkpoints": 9.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          4.83,
+          5.74,
+          5.34
+        ],
+        "after": [
+          5.08,
+          5.78,
+          5.36
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 50.267306827008724
+    },
+    "control-c16": {
+      "variant": "control-c16",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1547.9299449254368,
+      "wall_seconds": 7.752288816001965,
+      "prefill_seconds": 7.482874428998912,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.307806773174283,
+        "p50_ms": 9.754621976753697,
+        "p90_ms": 13.209622004069388,
+        "p99_ms": 27.605529001448303,
+        "max_ms": 57.2288139956072
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.0002002817382812495,
+          "total_seconds": 0.000410176999999999
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.49247900146484,
+          "total_seconds": 7.152596994999993
+        },
+        "begin": {
+          "samples": 1725.0,
+          "mean_ms": 0.010024696811594225,
+          "total_seconds": 0.01729260200000004
+        },
+        "apply": {
+          "samples": 1725.0,
+          "mean_ms": 0.9512381663768122,
+          "total_seconds": 1.6408858370000012
+        },
+        "commit": {
+          "commits": 1768.0,
+          "mean_ms": 3.536252579185521,
+          "total_seconds": 6.252094560000001
+        },
+        "checkpoint": {
+          "samples": 10.0,
+          "mean_ms": 33.8366324,
+          "total_seconds": 0.338366324
+        },
+        "batch": {
+          "batches": 1768.0,
+          "mean_size": 7.034502262443439
+        }
+      },
+      "server_cpu_ms_per_object": 0.5000000000000001,
+      "server_write_bytes": 772112384,
+      "write_kib_per_object": 62.834666666666664,
+      "wal_bytes_after": 4152.0,
+      "wal_checkpoints": 10.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          4.54,
+          4.81,
+          5.02
+        ],
+        "after": [
+          4.38,
+          4.77,
+          5.01
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 49.69047470699297
+    },
+    "control-c32": {
+      "variant": "control-c32",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 32,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 2257.0352730451305,
+      "wall_seconds": 5.316709110978991,
+      "prefill_seconds": 7.292888772004517,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 13.87667607935388,
+        "p50_ms": 12.837240006774664,
+        "p90_ms": 18.457824975484982,
+        "p99_ms": 50.81916000926867,
+        "max_ms": 78.72217599651776
+      },
+      "writer": {
+        "admission": {
+          "samples": 1354.0,
+          "mean_ms": 0.00022050221565731194,
+          "total_seconds": 0.0002985600000000004
+        },
+        "queue": {
+          "samples": 1354.0,
+          "mean_ms": 4.214962395125551,
+          "total_seconds": 5.707059082999996
+        },
+        "begin": {
+          "samples": 1153.0,
+          "mean_ms": 0.009993738074588013,
+          "total_seconds": 0.011522779999999979
+        },
+        "apply": {
+          "samples": 1154.0,
+          "mean_ms": 1.4165405840554581,
+          "total_seconds": 1.6346878339999986
+        },
+        "commit": {
+          "commits": 1154.0,
+          "mean_ms": 3.5445046646447107,
+          "total_seconds": 4.090358382999996
+        },
+        "checkpoint": {
+          "samples": 8.0,
+          "mean_ms": 52.968772874999985,
+          "total_seconds": 0.4237501829999999
+        },
+        "batch": {
+          "batches": 1154.0,
+          "mean_size": 10.777296360485268
+        }
+      },
+      "server_cpu_ms_per_object": 0.4008333333333334,
+      "server_write_bytes": 713080832,
+      "write_kib_per_object": 58.03066666666667,
+      "wal_bytes_after": 30553952.0,
+      "wal_checkpoints": 8.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          2.37,
+          4.46,
+          4.92
+        ],
+        "after": [
+          3.86,
+          4.74,
+          5.01
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 47.110732128989184
+    },
+    "control-c8": {
+      "variant": "control-c8",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 8,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 948.932092881318,
+      "wall_seconds": 12.645794245996512,
+      "prefill_seconds": 7.464323527005035,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 8.418836409260013,
+        "p50_ms": 8.050532022025436,
+        "p90_ms": 11.086482991231605,
+        "p99_ms": 14.96375200804323,
+        "max_ms": 60.96658299793489
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00019001708984374863,
+          "total_seconds": 0.0003891549999999972
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.1942820791015794,
+          "total_seconds": 6.541889698000035
+        },
+        "begin": {
+          "samples": 2048.0,
+          "mean_ms": 0.01134384960937501,
+          "total_seconds": 0.02323220400000002
+        },
+        "apply": {
+          "samples": 2048.0,
+          "mean_ms": 0.5828293779296887,
+          "total_seconds": 1.1936345660000025
+        },
+        "commit": {
+          "commits": 3126.0,
+          "mean_ms": 3.399716280870117,
+          "total_seconds": 10.627513093999987
+        },
+        "checkpoint": {
+          "samples": 8.0,
+          "mean_ms": 40.428451749999994,
+          "total_seconds": 0.323427614
+        },
+        "batch": {
+          "batches": 3126.0,
+          "mean_size": 3.9782469609724886
+        }
+      },
+      "server_cpu_ms_per_object": 0.6691666666666667,
+      "server_write_bytes": 861298688,
+      "write_kib_per_object": 70.09266666666667,
+      "wal_bytes_after": 20488792.0,
+      "wal_checkpoints": 8.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          3.14,
+          4.97,
+          5.11
+        ],
+        "after": [
+          3.05,
+          4.88,
+          5.08
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 54.56317352599581
+    },
+    "control-p1": {
+      "variant": "control-p1",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1512.822362383948,
+      "wall_seconds": 7.932193691987777,
+      "prefill_seconds": 8.650628970004618,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.530776258024465,
+        "p50_ms": 9.731177007779479,
+        "p90_ms": 13.93204799387604,
+        "p99_ms": 33.624688017880544,
+        "max_ms": 60.448665026342496
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.0002114750976562452,
+          "total_seconds": 0.0004331009999999902
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.58181964501953,
+          "total_seconds": 7.335566632999997
+        },
+        "begin": {
+          "samples": 1819.0,
+          "mean_ms": 0.013272687740516726,
+          "total_seconds": 0.024143018999999925
+        },
+        "apply": {
+          "samples": 1819.0,
+          "mean_ms": 1.0160586080263905,
+          "total_seconds": 1.8482106080000043
+        },
+        "commit": {
+          "commits": 1819.0,
+          "mean_ms": 3.4052872704782895,
+          "total_seconds": 6.194217545000009
+        },
+        "checkpoint": {
+          "samples": 10.0,
+          "mean_ms": 41.7465275,
+          "total_seconds": 0.41746527499999997
+        },
+        "batch": {
+          "batches": 1819.0,
+          "mean_size": 6.837273227047828
+        }
+      },
+      "server_cpu_ms_per_object": 0.5099999999999999,
+      "server_write_bytes": 818888704,
+      "write_kib_per_object": 66.64133333333334,
+      "wal_bytes_after": 22421072.0,
+      "wal_checkpoints": 10.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          6.43,
+          6.12,
+          5.26
+        ],
+        "after": [
+          7.23,
+          6.3,
+          5.32
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 51.0604554520105
+    },
+    "control-p2": {
+      "variant": "control-p2",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1571.053388035098,
+      "wall_seconds": 7.638187277014367,
+      "prefill_seconds": 7.62876585801132,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.091895694953564,
+        "p50_ms": 9.43785099661909,
+        "p90_ms": 13.249843992525712,
+        "p99_ms": 21.497036010259762,
+        "max_ms": 59.52000600518659
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00022091601562500068,
+          "total_seconds": 0.00045243600000000137
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.449793513183595,
+          "total_seconds": 7.065177115000003
+        },
+        "begin": {
+          "samples": 1738.0,
+          "mean_ms": 0.013483411392405038,
+          "total_seconds": 0.023434168999999956
+        },
+        "apply": {
+          "samples": 1739.0,
+          "mean_ms": 1.0112216779758478,
+          "total_seconds": 1.7585144979999996
+        },
+        "commit": {
+          "commits": 1810.0,
+          "mean_ms": 3.327189176795576,
+          "total_seconds": 6.022212409999993
+        },
+        "checkpoint": {
+          "samples": 9.0,
+          "mean_ms": 44.777615666666684,
+          "total_seconds": 0.40299854100000015
+        },
+        "batch": {
+          "batches": 1810.0,
+          "mean_size": 6.8712707182320445
+        }
+      },
+      "server_cpu_ms_per_object": 0.5099999999999998,
+      "server_write_bytes": 808501248,
+      "write_kib_per_object": 65.796,
+      "wal_bytes_after": 20678312.0,
+      "wal_checkpoints": 9.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          5.52,
+          6.16,
+          5.42
+        ],
+        "after": [
+          5.32,
+          6.1,
+          5.41
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 49.724064776994055
+    },
+    "control-p3": {
+      "variant": "control-p3",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1613.034841431663,
+      "wall_seconds": 7.439392932981718,
+      "prefill_seconds": 7.80847434597672,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 9.842491451789101,
+        "p50_ms": 9.218236984452233,
+        "p90_ms": 13.136004010448232,
+        "p99_ms": 20.45880997320637,
+        "max_ms": 65.33912901068106
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00021417871093749904,
+          "total_seconds": 0.00043863799999999803
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.316446537597656,
+          "total_seconds": 6.792082509
+        },
+        "begin": {
+          "samples": 1798.0,
+          "mean_ms": 0.011638526140155769,
+          "total_seconds": 0.02092607000000007
+        },
+        "apply": {
+          "samples": 1798.0,
+          "mean_ms": 0.9553228781979989,
+          "total_seconds": 1.717670535000002
+        },
+        "commit": {
+          "commits": 1847.0,
+          "mean_ms": 3.2499055749864647,
+          "total_seconds": 6.002575597
+        },
+        "checkpoint": {
+          "samples": 9.0,
+          "mean_ms": 40.73419233333334,
+          "total_seconds": 0.3666077310000001
+        },
+        "batch": {
+          "batches": 1847.0,
+          "mean_size": 6.7325392528424475
+        }
+      },
+      "server_cpu_ms_per_object": 0.4749999999999999,
+      "server_write_bytes": 784777216,
+      "write_kib_per_object": 63.86533333333333,
+      "wal_bytes_after": 49580112.0,
+      "wal_checkpoints": 9.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          5.11,
+          5.96,
+          5.39
+        ],
+        "after": [
+          4.94,
+          5.91,
+          5.38
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 49.71408029898885
+    },
+    "linger0-a": {
+      "variant": "linger0-a",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1162.6370675785784,
+      "wall_seconds": 10.321363677998306,
+      "prefill_seconds": 9.981673108995892,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 13.726136196145188,
+        "p50_ms": 10.712233983213082,
+        "p90_ms": 17.080458026612177,
+        "p99_ms": 56.418650987325236,
+        "max_ms": 239.7663980082143
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00019714843749999984,
+          "total_seconds": 0.0004037599999999997
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 7.633719247558593,
+          "total_seconds": 15.633857018999999
+        },
+        "begin": {
+          "samples": 1538.0,
+          "mean_ms": 0.011054680754226262,
+          "total_seconds": 0.017002098999999993
+        },
+        "apply": {
+          "samples": 1539.0,
+          "mean_ms": 0.996976372969461,
+          "total_seconds": 1.5343466380000006
+        },
+        "commit": {
+          "commits": 1712.0,
+          "mean_ms": 4.911171763434579,
+          "total_seconds": 8.407926059
+        },
+        "checkpoint": {
+          "samples": 10.0,
+          "mean_ms": 95.5452237,
+          "total_seconds": 0.9554522369999998
+        },
+        "batch": {
+          "batches": 1712.0,
+          "mean_size": 7.223714953271028
+        }
+      },
+      "server_cpu_ms_per_object": 0.5291666666666666,
+      "server_write_bytes": 790228992,
+      "write_kib_per_object": 64.309,
+      "wal_bytes_after": 41129992.0,
+      "wal_checkpoints": 10.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          4.61,
+          4.55,
+          4.83
+        ],
+        "after": [
+          4.2,
+          4.47,
+          4.8
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 54.80135607498232
+    },
+    "linger0-b": {
+      "variant": "linger0-b",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1105.1283287345689,
+      "wall_seconds": 10.858467462996487,
+      "prefill_seconds": 10.533951327000977,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 14.393158932604516,
+        "p50_ms": 11.511057004099712,
+        "p90_ms": 25.47440299531445,
+        "p99_ms": 59.5833059924189,
+        "max_ms": 264.70630601397716
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.0002342187499999997,
+          "total_seconds": 0.00047967999999999936
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 5.275668469238275,
+          "total_seconds": 10.804569024999989
+        },
+        "begin": {
+          "samples": 1420.0,
+          "mean_ms": 0.010999249295774623,
+          "total_seconds": 0.015618933999999963
+        },
+        "apply": {
+          "samples": 1421.0,
+          "mean_ms": 0.9878932582688246,
+          "total_seconds": 1.4037963199999997
+        },
+        "commit": {
+          "commits": 1695.0,
+          "mean_ms": 5.334241990560464,
+          "total_seconds": 9.041540173999987
+        },
+        "checkpoint": {
+          "samples": 10.0,
+          "mean_ms": 70.62888059999999,
+          "total_seconds": 0.7062888059999999
+        },
+        "batch": {
+          "batches": 1695.0,
+          "mean_size": 7.286135693215339
+        }
+      },
+      "server_cpu_ms_per_object": 0.5349999999999999,
+      "server_write_bytes": 782245888,
+      "write_kib_per_object": 63.659333333333336,
+      "wal_bytes_after": 53073872.0,
+      "wal_checkpoints": 10.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          5.12,
+          4.75,
+          4.87
+        ],
+        "after": [
+          5.4,
+          4.82,
+          4.89
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 55.84673598600784
+    },
+    "linger1000-a": {
+      "variant": "linger1000-a",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 1000,
+      "status": "PASS",
+      "objects_per_second": 1037.0067761678438,
+      "wall_seconds": 11.571766237000702,
+      "prefill_seconds": 9.913013825978851,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 15.228696926889825,
+        "p50_ms": 12.378312996588647,
+        "p90_ms": 25.82297002663836,
+        "p99_ms": 63.44329100102186,
+        "max_ms": 227.25991799961776
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00019299902343749976,
+          "total_seconds": 0.0003952619999999995
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 5.003386007812497,
+          "total_seconds": 10.246934543999995
+        },
+        "begin": {
+          "samples": 1408.0,
+          "mean_ms": 0.012428201704545509,
+          "total_seconds": 0.017498908000000077
+        },
+        "apply": {
+          "samples": 1408.0,
+          "mean_ms": 1.1368264254261378,
+          "total_seconds": 1.6006516070000019
+        },
+        "commit": {
+          "commits": 1441.0,
+          "mean_ms": 5.790515517002086,
+          "total_seconds": 8.344132860000006
+        },
+        "checkpoint": {
+          "samples": 7.0,
+          "mean_ms": 118.11145842857142,
+          "total_seconds": 0.826780209
+        },
+        "batch": {
+          "batches": 1441.0,
+          "mean_size": 8.56974323386537
+        }
+      },
+      "server_cpu_ms_per_object": 0.5383333333333333,
+      "server_write_bytes": 776249344,
+      "write_kib_per_object": 63.17133333333334,
+      "wal_bytes_after": 11700832.0,
+      "wal_checkpoints": 8.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          4.26,
+          4.49,
+          4.79
+        ],
+        "after": [
+          3.91,
+          4.41,
+          4.76
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 55.94422395102447
+    },
+    "linger1000-b": {
+      "variant": "linger1000-b",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 1000,
+      "status": "PASS",
+      "objects_per_second": 1325.5285468735976,
+      "wall_seconds": 9.05299250499229,
+      "prefill_seconds": 10.651726643991424,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 11.860122421227667,
+        "p50_ms": 11.421417992096394,
+        "p90_ms": 16.310273989802226,
+        "p99_ms": 43.11379400314763,
+        "max_ms": 132.5416170002427
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00018197656249999987,
+          "total_seconds": 0.00037268799999999976
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.454014415039059,
+          "total_seconds": 7.073821521999993
+        },
+        "begin": {
+          "samples": 1407.0,
+          "mean_ms": 0.011893476901208233,
+          "total_seconds": 0.016734121999999983
+        },
+        "apply": {
+          "samples": 1407.0,
+          "mean_ms": 1.112465312011373,
+          "total_seconds": 1.5652386940000018
+        },
+        "commit": {
+          "commits": 1474.0,
+          "mean_ms": 4.122237108548155,
+          "total_seconds": 6.07617749799998
+        },
+        "checkpoint": {
+          "samples": 9.0,
+          "mean_ms": 48.67581755555555,
+          "total_seconds": 0.43808235799999995
+        },
+        "batch": {
+          "batches": 1474.0,
+          "mean_size": 8.413161465400272
+        }
+      },
+      "server_cpu_ms_per_object": 0.5149999999999998,
+      "server_write_bytes": 780115968,
+      "write_kib_per_object": 63.486,
+      "wal_bytes_after": 64819992.0,
+      "wal_checkpoints": 9.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          5.1,
+          4.8,
+          4.88
+        ],
+        "after": [
+          5.22,
+          4.84,
+          4.89
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 54.19319777798955
+    },
+    "control-c16-final": {
+      "variant": "control-c16-final",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1176.3750997914854,
+      "wall_seconds": 10.200827952008694,
+      "prefill_seconds": 8.17945491601131,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 13.466888483863537,
+        "p50_ms": 12.112565978895873,
+        "p90_ms": 19.161058007739484,
+        "p99_ms": 48.8219230028335,
+        "max_ms": 79.71764699323103
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00015364453124999995,
+          "total_seconds": 0.00031466399999999987
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.1926000893554756,
+          "total_seconds": 6.538444983000014
+        },
+        "begin": {
+          "samples": 1803.0,
+          "mean_ms": 0.013948080421519717,
+          "total_seconds": 0.02514838900000005
+        },
+        "apply": {
+          "samples": 1803.0,
+          "mean_ms": 1.0780049844703266,
+          "total_seconds": 1.9436429869999985
+        },
+        "commit": {
+          "commits": 1925.0,
+          "mean_ms": 4.171727118441566,
+          "total_seconds": 8.030574703000013
+        },
+        "checkpoint": {
+          "samples": 11.0,
+          "mean_ms": 39.762201727272725,
+          "total_seconds": 0.43738421899999996
+        },
+        "batch": {
+          "batches": 1925.0,
+          "mean_size": 6.458701298701299
+        }
+      },
+      "server_cpu_ms_per_object": 0.43916666666666665,
+      "server_write_bytes": 802516992,
+      "wal_bytes_window": {
+        "min": 0.0,
+        "max": 81761432.0,
+        "last": 0.0
+      },
+      "wal_bytes_after": 64997152.0,
+      "wal_checkpoints": 11.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          6.24,
+          4.62,
+          4.68
+        ],
+        "after": [
+          6.98,
+          4.83,
+          4.75
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 52.90049859901774
+    },
+    "control-c16-final2": {
+      "variant": "control-c16-final2",
+      "binary_sha256": "c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620",
+      "concurrency": 16,
+      "linger_us": 0,
+      "status": "PASS",
+      "objects_per_second": 1489.7758643324078,
+      "wall_seconds": 8.054902947013034,
+      "prefill_seconds": 7.437454106024234,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 10.68328153464002,
+        "p50_ms": 9.902085002977401,
+        "p90_ms": 13.869562011677772,
+        "p99_ms": 35.825481987558305,
+        "max_ms": 68.86737301829271
+      },
+      "writer": {
+        "admission": {
+          "samples": 2048.0,
+          "mean_ms": 0.00019613085937500023,
+          "total_seconds": 0.0004016760000000005
+        },
+        "queue": {
+          "samples": 2048.0,
+          "mean_ms": 3.7655359257812466,
+          "total_seconds": 7.711817575999993
+        },
+        "begin": {
+          "samples": 1746.0,
+          "mean_ms": 0.014962880870561295,
+          "total_seconds": 0.02612519000000002
+        },
+        "apply": {
+          "samples": 1747.0,
+          "mean_ms": 1.0517869805380688,
+          "total_seconds": 1.8374718550000062
+        },
+        "commit": {
+          "commits": 1781.0,
+          "mean_ms": 3.5363092796181945,
+          "total_seconds": 6.298166827000005
+        },
+        "checkpoint": {
+          "samples": 10.0,
+          "mean_ms": 44.706815899999995,
+          "total_seconds": 0.44706815899999996
+        },
+        "batch": {
+          "batches": 1781.0,
+          "mean_size": 6.983717012914093
+        },
+        "request": {
+          "count": 12000.0,
+          "mean_ms": 9.301324431416655,
+          "total_seconds": 111.61589317699985
+        }
+      },
+      "server_cpu_ms_per_object": 0.5341666666666668,
+      "server_write_bytes": 790315008,
+      "wal_bytes_window": {
+        "min": 0.0,
+        "max": 104186592.0,
+        "last": 0.0
+      },
+      "wal_bytes_after": 4136512.0,
+      "wal_checkpoints": 10.0,
+      "wal_checkpointed_frames": 0.0,
+      "load_average": {
+        "before": [
+          1.89,
+          3.29,
+          4.2
+        ],
+        "after": [
+          3.38,
+          3.56,
+          4.28
+        ]
+      },
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "host_capacity": {
+        "memtotal_kib": 32659148,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "elapsed_seconds": 49.98246728500817
+    }
+  },
+  "derived_per_object": {
+    "candidate-p1": {
+      "batch_mean": 6.725797728501893,
+      "commits": 1849.0,
+      "commit_ms_per_commit": 3.9538271855056744,
+      "apply_ms_per_batch": 1.0885188880475922,
+      "commit_ms_per_object": 0.5878599602766157,
+      "apply_ms_per_object": 0.1618423467352845,
+      "commit_share_of_arm_wall": 0.7857894403020325
+    },
+    "candidate-p2": {
+      "batch_mean": 6.875069098949696,
+      "commits": 1809.0,
+      "commit_ms_per_commit": 3.410671429519074,
+      "apply_ms_per_batch": 0.9251613830845783,
+      "commit_ms_per_object": 0.4960926763688996,
+      "apply_ms_per_object": 0.13456757594275162,
+      "commit_share_of_arm_wall": 0.8016926326248206
+    },
+    "candidate-p3": {
+      "batch_mean": 7.006760563380282,
+      "commits": 1775.0,
+      "commit_ms_per_commit": 3.6084477397183123,
+      "apply_ms_per_batch": 0.9270659825352134,
+      "commit_ms_per_object": 0.5149951546192815,
+      "apply_ms_per_object": 0.13231021299348747,
+      "commit_share_of_arm_wall": 0.8045103418063383
+    },
+    "control-c16": {
+      "batch_mean": 7.034502262443439,
+      "commits": 1768.0,
+      "commit_ms_per_commit": 3.536252579185521,
+      "apply_ms_per_batch": 0.9512381663768122,
+      "commit_ms_per_object": 0.502701178740854,
+      "apply_ms_per_object": 0.13522465853133425,
+      "commit_share_of_arm_wall": 0.8064836989941186
+    },
+    "control-c32": {
+      "batch_mean": 10.777296360485268,
+      "commits": 1154.0,
+      "commit_ms_per_commit": 3.5445046646447107,
+      "apply_ms_per_batch": 1.4165405840554581,
+      "commit_ms_per_object": 0.3288862573771807,
+      "apply_ms_per_object": 0.1314374715767467,
+      "commit_share_of_arm_wall": 0.7693402624855696
+    },
+    "control-c8": {
+      "batch_mean": 3.9782469609724886,
+      "commits": 3126.0,
+      "commit_ms_per_commit": 3.399716280870117,
+      "apply_ms_per_batch": 0.5828293779296887,
+      "commit_ms_per_object": 0.8545764790929549,
+      "apply_ms_per_object": 0.1465040716796564,
+      "commit_share_of_arm_wall": 0.8403990202010849
+    },
+    "control-p1": {
+      "batch_mean": 6.837273227047828,
+      "commits": 1819.0,
+      "commit_ms_per_commit": 3.4052872704782895,
+      "apply_ms_per_batch": 1.0160586080263905,
+      "commit_ms_per_object": 0.49804756331912914,
+      "apply_ms_per_object": 0.14860582198279362,
+      "commit_share_of_arm_wall": 0.7808959016289178
+    },
+    "control-p2": {
+      "batch_mean": 6.8712707182320445,
+      "commits": 1810.0,
+      "commit_ms_per_commit": 3.327189176795576,
+      "apply_ms_per_batch": 1.0112216779758478,
+      "commit_ms_per_object": 0.48421744874165734,
+      "apply_ms_per_object": 0.14716661872929843,
+      "commit_share_of_arm_wall": 0.7884347675164584
+    },
+    "control-p3": {
+      "batch_mean": 6.7325392528424475,
+      "commits": 1847.0,
+      "commit_ms_per_commit": 3.2499055749864647,
+      "apply_ms_per_batch": 0.9553228781979989,
+      "commit_ms_per_object": 0.4827161718536389,
+      "apply_ms_per_object": 0.1418963696044796,
+      "commit_share_of_arm_wall": 0.806863631357372
+    },
+    "linger0-a": {
+      "batch_mean": 7.223714953271028,
+      "commits": 1712.0,
+      "commit_ms_per_commit": 4.911171763434579,
+      "apply_ms_per_batch": 0.996976372969461,
+      "commit_ms_per_object": 0.6798678789520498,
+      "apply_ms_per_object": 0.13801435679823054,
+      "commit_share_of_arm_wall": 0.8146138748044393
+    },
+    "linger0-b": {
+      "batch_mean": 7.286135693215339,
+      "commits": 1695.0,
+      "commit_ms_per_commit": 5.334241990560464,
+      "apply_ms_per_batch": 0.9878932582688246,
+      "commit_ms_per_object": 0.7321085161133593,
+      "apply_ms_per_object": 0.13558535002151073,
+      "commit_share_of_arm_wall": 0.8326718484732557
+    },
+    "linger1000-a": {
+      "batch_mean": 8.56974323386537,
+      "commits": 1441.0,
+      "commit_ms_per_commit": 5.790515517002086,
+      "apply_ms_per_batch": 1.1368264254261378,
+      "commit_ms_per_object": 0.6756930002429351,
+      "apply_ms_per_object": 0.13265583278314558,
+      "commit_share_of_arm_wall": 0.721076859755398
+    },
+    "linger1000-b": {
+      "batch_mean": 8.413161465400272,
+      "commits": 1474.0,
+      "commit_ms_per_commit": 4.122237108548155,
+      "apply_ms_per_batch": 1.112465312011373,
+      "commit_ms_per_object": 0.4899748002580421,
+      "apply_ms_per_object": 0.1322291645758216,
+      "commit_share_of_arm_wall": 0.6711788941224972
+    },
+    "control-c16-final": {
+      "batch_mean": 6.458701298701299,
+      "commits": 1925.0,
+      "commit_ms_per_commit": 4.171727118441566,
+      "apply_ms_per_batch": 1.0780049844703266,
+      "commit_ms_per_object": 0.6459080433523698,
+      "apply_ms_per_object": 0.1669073912253984,
+      "commit_share_of_arm_wall": 0.7872473431353848
+    },
+    "control-c16-final2": {
+      "batch_mean": 6.983717012914093,
+      "commits": 1781.0,
+      "commit_ms_per_commit": 3.5363092796181945,
+      "apply_ms_per_batch": 1.0517869805380688,
+      "commit_ms_per_object": 0.506364916144075,
+      "apply_ms_per_object": 0.15060561282668442,
+      "commit_share_of_arm_wall": 0.7819047440336357,
+      "server_request_ms_per_delete": 9.301324431416655
+    }
+  },
+  "host_capacity": {
+    "memtotal_kib": 32659148,
+    "swaptotal_kib": 8388604,
+    "logical_cpus": 6
+  }
+}
