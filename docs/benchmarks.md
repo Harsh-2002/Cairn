@@ -703,9 +703,9 @@ Notes:
   `delete_file_with_namespace_owner`/`move_to_trash_with_namespace_owner`) does not consult
   `effective_durability` and performs unsynced unlinks/renames. Cairn ACKs after a durable tombstone
   plus its co-committed audit row. Both the bulk 1.43× and the single-key ratio are therefore
-  **as-configured throughput**, not a capacity comparison at equal durability. A fair comparison
-  needs a versioned DELETE-marker arm (RustFS strict syncs `xl.meta`) or a RustFS build that fsyncs
-  the unversioned delete path.
+  **as-configured throughput**, not a capacity comparison at equal durability. The versioned
+  DELETE-marker arm below is the equal-durability measurement (RustFS strict syncs the marker
+  `xl.meta`): **3.55×** over three interleaved pairs.
 - DELETE now uses an exact pool: 100,000 × 4 KiB objects created by signed S3 PUTs at 32-way
   concurrency, then `warp delete --list-existing --objects 100000 --batch 100 --concurrent 16
   --duration 12s --noclear`. Both engines started from the same pool; the scored delete excluded
@@ -800,7 +800,8 @@ Caveats:
   key here, one request carrying up to 100 keys there — and must not be pooled. The single-key
   shape favors RustFS while the bulk shape favors Cairn; that disagreement is the reason to report
   both, not evidence of a regression in either. Neither ratio is equal-durability: RustFS's strict
-  mode does not fsync the unversioned delete path (see the † note above).
+  mode does not fsync the unversioned delete path (see the † note above). The versioned arm below is
+  the equal-durability measurement, and there Cairn is faster (3.55×).
 - The 12,000-key pool was chosen after a 3,000-key screening (943 Cairn / 656 RustFS obj/s): it puts
   the slower Cairn arm at ~15 s and the faster RustFS arm near 7 s; a larger pool only lengthens the
   Cairn arm. Two earlier 10,000-key batches measured 0.65× and 0.70× while RustFS ranged
@@ -813,6 +814,91 @@ Caveats:
   `2d5059501745682664c3d345b22274b66079c952fbec7e1ce66980ef4515cd42`). Warp is not involved in
   this measurement. Method and offline checks live in `conformance/delete_single_key.py` and
   `conformance/test_delete_single_key.py`.
+
+### Versioned single-key DELETE — the durability-equivalent arm
+
+The two unversioned DELETE ratios above are as-configured throughput, not equal-durability:
+RustFS strict never fsyncs that path. `conformance/delete_versioned_single_key.py` is the fair
+companion. It starts a fresh single-node store per arm, enables S3 versioning (`PUT
+/bucket?versioning` with `<Status>Enabled</Status>`, read back as `Enabled` on both engines),
+creates the same exact 12,000 × 4 KiB pool through signed S3 PUTs outside the scored window,
+then issues exactly one signed `DELETE /bucket/key` per key at 16-way concurrency. Every DELETE
+must return 200/204 with `x-amz-delete-marker: true`; an arm passes only when all 12,000
+markers are acknowledged, HEAD of the first/middle/last key returns 404 with that marker
+header, a bounded `list-type=2` request shows no current objects, and a fully paged `?versions`
+audit finds exactly 12,000 `<Version>` and 12,000 `<DeleteMarker>` entries covering exactly the
+prefilled key set. The RustFS bucket-durability readback must stay `strict` after every arm.
+
+Versioning changes what the DELETE does: the marker is metadata, so neither engine unlinks the
+prefilled 4 KiB bodies during the scored interval. The absolute rates are therefore **not**
+comparable with the unversioned rates above; only the Cairn/RustFS ratio within this arm is.
+RustFS 1.0.0 (commit `d47f54bf`) does apply strict to marker commits: the marker is written by
+`crates/ecstore/src/disk/local.rs::write_metadata_with_namespace_owner` (whose comment names
+delete markers) through `write_all_meta_with_namespace_owner(..., sync=true)`, which gates its
+file and directory fsyncs on `effective_durability(volume).syncs_commit_metadata()` — true only
+for `Strict`. `delete_version_inner` likewise commits a rewritten `xl.meta` through the same
+gated helper. Cairn ACKs the marker after one `synchronous=FULL` metadata transaction that
+co-commits the audit row (`Mutation::DeleteWithActivity`), with no physical data removal and no
+cleanup debt for the retained version.
+
+Method:
+
+```sh
+python3 conformance/delete_versioned_single_key.py \
+  --root /var/tmp/cairn-performance-delete-versioned-12k \
+  --cairn target/release/cairn \
+  --rustfs /var/tmp/cairn-perf-tools/rustfs \
+  --pairs 3 --objects 12000 --concurrency 16
+```
+
+**Result (3 interleaved pairs, 6 arms, 36,000 markers per engine):**
+
+| Metric | Cairn | RustFS |
+|---|---:|---:|
+| Throughput, mean of arm rates | 2,457.3 obj/s | 691.7 obj/s |
+| Per-arm rates | 2,453.4 / 2,469.9 / 2,448.7 | 685.1 / 692.2 / 697.6 |
+| Wall time per arm, mean | 4.88 s | 17.35 s |
+| p50 / p90 / p99 latency, median arm | 5.84 / 8.85 / 13.79 ms | 20.77 / 33.13 / 55.29 ms |
+| Client CPU per object, mean | 0.32 ms | 0.66 ms |
+| Prefill (excluded from score), mean | 8.03 s | 14.68 s |
+| Server peak RSS, mean | 66.1 MiB | 342.0 MiB |
+| Delete markers acknowledged | 12,000/12,000 per arm | 12,000/12,000 per arm |
+| Version history after the arm | 12,000 versions + 12,000 markers | 12,000 versions + 12,000 markers |
+
+The three per-pair Cairn/RustFS ratios were **3.581, 3.568 and 3.510; mean 3.55×**. Every arm
+passed: all 12,000 DELETEs returned 200/204 with `x-amz-delete-marker: true`, the three sampled
+HEADs returned 404 with the marker header, `list-type=2` showed no current objects, the paged
+`?versions` audit covered the exact key set in 24 pages with zero duplicates, and RustFS's
+bucket-durability readback stayed `strict` after every arm. Raw evidence:
+[`performance-evidence/2026-11/delete-versioned-single-key-2026-11-04.json`](performance-evidence/2026-11/delete-versioned-single-key-2026-11-04.json).
+
+This is the first equal-durability DELETE number, and it reverses the unversioned ranking. The
+unversioned **0.49×** (pre-#179/#180) and **0.83×** (hardened, host load ~12) are as-configured:
+RustFS's unsynced unversioned arm ran at ~1,656 obj/s, but when strict covers every marker commit the
+versioned arm runs at **691.7 obj/s** (p50 20.8 ms), while Cairn's marker is a single group-committed
+metadata transaction and 16 concurrent DELETEs share FULL commits, so it holds **2,457 obj/s** (p50
+5.8 ms). Cairn's versioned rate is also higher than its own unversioned 1,370 obj/s because a delete
+marker removes no object body and owes no cleanup debt. The comparison isolates the durability
+contract, not the data-unlink path.
+
+Caveats:
+
+- Single host, single node, one NVMe, and the host also runs the homelab services; the ratio is the
+  stable signal, not the third digit. The campaign ran under the exclusive host-wide benchmark lock
+  (`flock /tmp/cairn-deep-perf.lock`); the 1-minute load average was 3.53 immediately before and
+  15.31 immediately after (the latter is the campaign's own 6-vCPU saturation, not another
+  workload). Other agents' low-parallelism release builds may have overlapped.
+- Absolute rates are not comparable across the versioned and unversioned arms: versioning moves the
+  scored work from data unlink/cleanup to a metadata marker on both engines.
+- "Durable marker" here means the engine's declared strict commit path is engaged and readable
+  after the arm; it is not a crash-injection proof at every marker. The RustFS source audit above
+  and the strict readback are the evidence that the sync gate is on.
+- Binaries: Cairn release `c81ff6903212551143bd74da3db7537b5e94e6589534df4d4e0286fda3d3d620`
+  (commit `433438f`); RustFS 1.0.0 executable
+  `a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd` (publisher ZIP
+  `2d5059501745682664c3d345b22274b66079c952fbec7e1ce66980ef4515cd42`). Method and offline checks
+  live in `conformance/delete_versioned_single_key.py` and
+  `conformance/test_delete_versioned_single_key.py`.
 
 ## 10. Multipart assembly MD5 elision (2026-11-03)
 

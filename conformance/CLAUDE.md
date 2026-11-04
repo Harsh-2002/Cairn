@@ -339,6 +339,13 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   assertion that the bucket is empty. Records client CPU and per-pair ratios. Cairn pins FULL
   metadata durability; RustFS `strict` is **write-path only** — its unversioned DELETE path is not
   fsynced — so the ratio is as-configured, not equal-durability. **NOT a gate.**
+- `delete_versioned_single_key.py` — **the durability-equivalent single-key DELETE arm**: the same
+  fresh-store/12,000 × 4 KiB/c16 shape, but versioning is enabled first, so every DELETE creates a
+  delete marker and RustFS strict commits the marker `xl.meta`. Gates on `x-amz-delete-marker: true`
+  for every DELETE, 404 + marker header on sampled HEADs, an empty current listing, a fully paged
+  `?versions` audit (12,000 versions + 12,000 markers over the exact key set), and RustFS's strict
+  readback. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
+  ratios. **NOT a gate.**
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
@@ -387,7 +394,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   escape hatch (`CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`, set by `mesh.py`) because it wires targets
   through the management API (SSRF-guarded), unlike `soak`'s config-endpoint path. The remaining
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
-  `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`) whose gating signal is already
+  `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`,
+  `delete_versioned_single_key.py`) whose gating signal is already
   covered by the CI correctness jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.

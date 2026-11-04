@@ -43,8 +43,8 @@ ERROR_DETAIL_LIMIT = 20
 LATENCY_LIMIT = 200_000
 
 
-def signed_request(connection, secret, method, path, query=(), body=b"", digest=None):
-    """Reuse one HTTP connection per worker; sign every request independently."""
+def signed_headers(connection, secret, method, path, query=(), body=b"", digest=None):
+    """Build the SigV4 headers and canonical query for one request."""
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     day = now.strftime("%Y%m%d")
@@ -68,11 +68,30 @@ def signed_request(connection, secret, method, path, query=(), body=b"", digest=
     signature = hmac.new(signing, to_sign.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = (f"AWS4-HMAC-SHA256 Credential={ACCESS}/{scope}, "
                                 f"SignedHeaders={names}, Signature={signature}")
+    return headers, canonical_query
+
+
+def signed_request(connection, secret, method, path, query=(), body=b"", digest=None):
+    """Reuse one HTTP connection per worker; sign every request independently."""
+    headers, canonical_query = signed_headers(
+        connection, secret, method, path, query, body, digest)
     target = path + ("?" + canonical_query if query else "")
     connection.request(method, target, body=body, headers=headers)
     response = connection.getresponse()
     payload = response.read()
     return response.status, payload
+
+
+def signed_request_with_headers(connection, secret, method, path, query=(), body=b"",
+                                digest=None):
+    """Same request, but expose lower-cased response headers (delete-marker proofs)."""
+    headers, canonical_query = signed_headers(
+        connection, secret, method, path, query, body, digest)
+    target = path + ("?" + canonical_query if query else "")
+    connection.request(method, target, body=body, headers=headers)
+    response = connection.getresponse()
+    payload = response.read()
+    return response.status, {name.lower(): value for name, value in response.getheaders()}, payload
 
 
 def percentile(values, fraction):
