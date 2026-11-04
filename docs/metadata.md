@@ -153,8 +153,10 @@ data file and the index spool — not five. Legacy protocol-2 plans remain decod
 intents can still be recovered. Section 8.2 defines the ordering.
 
 An acknowledged row is visible immediately: GET/HEAD read the newest row from a bounded in-memory
-overlay keyed by (bucket, key) before the index; every key mutation, both listings, `DeleteObjects`
-and `?versionId` reads drain the overlay first. The fold task submits rows in FIFO order through the
+overlay keyed by (bucket, key) before the index. Every key mutation takes that key's stripe and
+waits for its pending fold; both listings and the bucket-emptiness check drain the whole overlay.
+`DeleteObject` and each distinct key in `DeleteObjects` use the per-key wait, so an unrelated key's
+slow fold no longer stalls a delete. The fold task submits rows in FIFO order through the
 Writer and retries a failed row a bounded number of times. An entry belongs to the bucket
 incarnation that acknowledged it: a bucket deleted and re-created under the same name never serves
 the previous incarnation's row, and a fold that can no longer apply is forgotten instead of retried

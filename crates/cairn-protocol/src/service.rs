@@ -1563,7 +1563,19 @@ impl S3Service {
         bucket: &Bucket,
     ) -> Result<S3Response> {
         let key = req.key.clone().expect("key present");
-        self.drain_overlay().await?;
+        // Only this key's pending fold can change what the delete resolves. Holding its stripe
+        // across the commit keeps a concurrent PUT of the same key ordered, while an unrelated
+        // key's slow fold no longer stalls every delete (the previous global drain did).
+        let _overlay_stripe = match &self.overlay {
+            Some(overlay) => {
+                let stripe = overlay.stripe(&bucket.name, &key).await;
+                if let Err(error) = overlay.wait_key(bucket, &key).await {
+                    return Err(Error::Internal(error.to_string()));
+                }
+                Some(stripe)
+            }
+            None => None,
+        };
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
         let event_key = key.clone();
         let now = self.clock.now();
@@ -3683,9 +3695,6 @@ impl S3Service {
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
-        // A multi-object delete must see an acknowledged write that is still waiting to fold,
-        // otherwise it reports success for a key whose row has not reached the index yet.
-        self.drain_overlay().await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
         // S3 caps a multi-object delete at 1000 keys per request (ARCH 21.5); reject a larger
@@ -3764,6 +3773,23 @@ impl S3Service {
                         "invalid key".to_owned(),
                     ));
                     return out;
+                };
+                // Distinct keys run concurrently; each waits only for its own pending fold and
+                // holds its stripe across the delete. A duplicate key's group stays sequential.
+                let _overlay_stripe = match &self.overlay {
+                    Some(overlay) => {
+                        let stripe = overlay.stripe(&bucket.name, &key).await;
+                        if let Err(error) = overlay.wait_key(bucket, &key).await {
+                            out.error = Some((
+                                key_s,
+                                "InternalError".to_owned(),
+                                format!("object index fold failed: {error}"),
+                            ));
+                            return out;
+                        }
+                        Some(stripe)
+                    }
+                    None => None,
                 };
                 // Authorize each key individually (Medium #7): a per-key denial is a per-key
                 // error, not a whole-request failure.
