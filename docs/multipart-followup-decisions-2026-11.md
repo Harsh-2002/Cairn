@@ -236,6 +236,21 @@ co-committed audit. The bulk 1.43× has the same caveat. A durability-equivalent
 versioned delete-marker arm (RustFS strict syncs `xl.meta`) or a RustFS build that fsyncs the
 unversioned delete path.
 
+**Follow-up corrections (2026-11-04):** #179 co-commits the audit row with the delete savepoint,
+so a single-shard single-key DELETE waits for one `synchronous=FULL` commit instead of delete then
+audit. #180 retires cleanup debt in exact ≤64-row batches after the physical unlink/namespace phase;
+a 12k-delete diagnostic removed 24,000 retire mutations and ~4,300 commits, but that work was
+already outside the scored interval. #182 waits only for the deleted key's overlay stripe instead of
+draining every key, so an unrelated slow fold no longer stalls deletes. #183 makes
+`CAIRN_META_SYNCHRONOUS=normal` actually apply to non-relaxed batches; the default `full` mode still
+keeps FULL for every delete/mixed batch.
+
+**Not changed:** the plaintext `<uuid>.meta` absence barrier remains. It costs one guaranteed-ENOENT
+cleanup row per plaintext delete, but the index row alone cannot prove that no stale sidecar exists
+across legacy/partial states, and batching already removed its per-row retirement commits. A versioned
+DELETE-marker benchmark (RustFS strict syncs `xl.meta`) is the fair next comparison; the current
+unversioned ratios are as-configured, not equal-durability.
+
 ## Order
 
 1. Replicated multipart layout — done.
