@@ -719,6 +719,10 @@ Notes:
   direction as the signal, not the third digit. The measured split and remaining I/O/durability
   work are in
   [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md).
+  A 2026-11-04 follow-up, measured before the section 11 completion pipeline, found the part
+  handler itself already faster than RustFS's (p50 171 vs 180 ms) and attributed the remaining
+  ratio to the per-upload `CompleteMultipartUpload` tail; see that plan's "Where the scored
+  multipart-put ratio actually goes".
 - GET 1 MiB (2.13×) and LIST 1,000 (3.76×) in Section 8 are the fr38 measurements and were not
   re-run on this host.
 
