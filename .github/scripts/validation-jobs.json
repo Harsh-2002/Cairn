@@ -3,6 +3,7 @@
   "docs": "always",
   "web-bundle": "full",
   "storage-lab": "full",
+  "reflink-filesystem": "full",
   "build": "full",
   "rust-audit": "full",
   "installer": "full",

@@ -1904,6 +1904,92 @@ async fn assemble_honors_extra_checksums_whole_object() {
     );
 }
 
+/// Completing plaintext parts on a reflink-capable filesystem shares extents instead of rewriting
+/// them, and the completed object is independent of the parts afterwards. The bytes, size and BLAKE3
+/// baseline are identical whether or not the filesystem can clone. With
+/// `CAIRN_REQUIRE_REFLINK=1` (the dedicated CI job) the clone must actually have happened, which is
+/// proved by free space: a rewrite of the ~4.1 MiB object would consume it, a clone does not.
+#[cfg(unix)]
+#[tokio::test]
+async fn reflink_completion_matches_streaming_bytes_and_shares_extents() {
+    let strict = std::env::var("CAIRN_REQUIRE_REFLINK").is_ok_and(|value| value == "1");
+    let holder = match std::env::var_os("CAIRN_REFLINK_TEST_DIR") {
+        Some(root) => {
+            std::fs::create_dir_all(&root).unwrap();
+            tempfile::tempdir_in(root).unwrap()
+        }
+        None => tempfile::tempdir().unwrap(),
+    };
+    let dir = holder.path();
+    let store = LocalBlobStore::open(dir, cairn_types::testing::fixture_storage_io())
+        .await
+        .unwrap();
+    let bucket = BucketName::parse("reflink-bkt").unwrap();
+    let upload = UploadId::generate();
+
+    // Two block-aligned parts (cloneable) and an unaligned tail (copied), so one completion
+    // exercises both placement arms.
+    let sizes = [2 * 1024 * 1024, 2 * 1024 * 1024, 100_003];
+    let mut expected = Vec::new();
+    let mut refs = Vec::new();
+    for (index, size) in sizes.iter().enumerate() {
+        let bytes: Vec<u8> = (0..*size)
+            .map(|offset| ((offset * 31 + index * 7) % 251) as u8)
+            .collect();
+        let staged = store
+            .stage_part_fixture(
+                &upload,
+                u16::try_from(index + 1).unwrap(),
+                &format!("reflink-attempt-{index}"),
+                body(bytes.clone()),
+                ChecksumSet::none(),
+                1 << 30,
+                None,
+            )
+            .await
+            .unwrap();
+        refs.push(PartRef {
+            part_number: u16::try_from(index + 1).unwrap(),
+            storage_path: staged.storage_path.clone(),
+            size: staged.size,
+            cipher: BlobCipher::KnownPlaintext,
+        });
+        expected.extend_from_slice(&bytes);
+    }
+
+    let free_bytes = || {
+        let stat = rustix::fs::statvfs(dir).unwrap();
+        stat.f_bfree * stat.f_frsize
+    };
+    let before = free_bytes();
+    let assembled = store
+        .assemble_fixture(&bucket, &refs, opts(None, "application/octet-stream"))
+        .await
+        .unwrap();
+    let consumed = before.saturating_sub(free_bytes());
+
+    assert_eq!(assembled.size_logical, expected.len() as u64);
+    assert_eq!(assembled.size_physical, expected.len() as u64);
+    assert_eq!(
+        assembled.internal_blake3,
+        blake3::hash(&expected).to_hex().to_string()
+    );
+    assert_eq!(raw_blob_bytes(dir, &assembled.storage_path), expected);
+    if strict {
+        assert!(
+            consumed < 1024 * 1024,
+            "CAIRN_REQUIRE_REFLINK=1 but completion consumed {consumed} bytes of a ~4.1 MiB \
+             object: the part extents were copied, not cloned"
+        );
+    }
+
+    // Copy-on-write independence: removing every part must not change the completed object.
+    for part in &refs {
+        std::fs::remove_file(dir.join(part.storage_path.as_str())).unwrap();
+    }
+    assert_eq!(raw_blob_bytes(dir, &assembled.storage_path), expected);
+}
+
 /// An object staged through the io_uring write path reads back byte-for-byte identically and with
 /// the same ETag as the same bytes staged through the default `tokio::fs` path. This exercises the
 /// dedicated io_uring executor end to end: create the staging tmp, stream the payload, fsync,

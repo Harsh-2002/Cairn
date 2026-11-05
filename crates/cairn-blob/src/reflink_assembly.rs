@@ -245,17 +245,33 @@ mod tests {
     use cairn_types::secret::SecretKey32;
     use std::io::Write;
 
-    /// A scratch directory on the build filesystem (not `/tmp`), so the local XFS checkout
-    /// actually exercises the reflink branch; a CI filesystem without reflink exercises the copy
-    /// fallback with the same byte and hash assertions.
+    /// A scratch directory on the build filesystem (not `/tmp`), so a local XFS/btrfs checkout
+    /// exercises the reflink branch; `CAIRN_REFLINK_TEST_DIR` selects another filesystem, and
+    /// `CAIRN_REQUIRE_REFLINK=1` turns every skip into a failure for the dedicated CI job.
     fn scratch(name: &str) -> tempfile::TempDir {
-        let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/reflink-assembly-tests");
+        let root = match std::env::var_os("CAIRN_REFLINK_TEST_DIR") {
+            Some(dir) => Path::new(&dir).join("reflink-assembly-tests"),
+            None => {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/reflink-assembly-tests")
+            }
+        };
         std::fs::create_dir_all(&root).unwrap();
         tempfile::Builder::new()
             .prefix(name)
             .tempdir_in(root)
             .unwrap()
+    }
+
+    fn require_reflink() -> bool {
+        std::env::var("CAIRN_REQUIRE_REFLINK").is_ok_and(|value| value == "1")
+    }
+
+    fn skip_unsupported(what: &str) {
+        assert!(
+            !require_reflink(),
+            "CAIRN_REQUIRE_REFLINK=1 but {what} found no reflink support"
+        );
+        eprintln!("skipping {what} assertions: filesystem has no reflink support");
     }
 
     fn write_part(root: &Path, number: u16, name: &str, bytes: &[u8]) -> PartRef {
@@ -322,9 +338,9 @@ mod tests {
         )
         .unwrap();
         let Placement::Placed { hashers, logical } = placed else {
-            // The build filesystem (ext4/tmpfs in CI) has no reflink support; the helper correctly
+            // The build filesystem (ext4/tmpfs) has no reflink support; the helper correctly
             // declined before writing anything and the caller runs the streaming pipeline.
-            eprintln!("skipping reflink placement assertions: filesystem has no reflink support");
+            skip_unsupported("reflink placement");
             return;
         };
         assert_eq!(logical, expected.len() as u64);
@@ -362,9 +378,7 @@ mod tests {
         let destination = destination(root, "assembled");
         match place(root, &[part], &destination, assembled_hasher(), 1024 * 1024) {
             Err(BlobError::Corruption(_)) => {}
-            Ok(Placement::Unsupported(_)) => {
-                eprintln!("skipping length-mismatch assertion: filesystem has no reflink support");
-            }
+            Ok(Placement::Unsupported(_)) => skip_unsupported("length-mismatch"),
             other => panic!("expected a corruption error, got {other:?}"),
         }
     }
