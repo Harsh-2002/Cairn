@@ -116,8 +116,8 @@ when source foreground matters most, use 8 for backlog/drain throughput.
 
 1. Decide the replication direction: accept the measured foreground cost and document the worker
    setting, or implement and measure a single-pass/target-side change. Do not weaken durability.
-2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600`, or 48 h) and crash
-   injection on XFS, and keep the result.
+2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=8192`, or 48 h)
+   and crash injection on XFS, and keep the result.
 3. Decide the three audit gaps (fix, accept with a written rationale, or document as unsupported).
 4. Publish a support statement: single node, Linux 5.6+, x86_64/arm64, SQLite, XFS recommended,
    asynchronous replication (RPO = lag, no automatic failover), backups required, no downgrade after
