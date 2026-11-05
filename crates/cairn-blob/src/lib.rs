@@ -2047,6 +2047,9 @@ impl BlobStore for LocalBlobStore {
             }
         };
         if let Some(sidecar) = sidecar {
+            fail::fail_point!("blob_after_data_rename", |_| Err(BlobError::Io(
+                "injected failure after multipart data rename, before sidecar rename".into()
+            )));
             let destination = paths.metadata_file.clone().ok_or_else(|| {
                 BlobError::Io("storage plan lacks a multipart metadata sidecar path".into())
             })?;
