@@ -56,8 +56,10 @@ mismatches**, and 229 sampled byte-for-byte target reads matched. RSS rose durin
 soak's built-in 50 % check failed; that check compares an early warm-up baseline to the end of a long
 run. A separate load-then-idle plateau test (180 s write, then 600 s idle) measured **90.2 MiB at the
 end of the load and 92.1 MiB after ten idle minutes (+1.9 %)**, so the growth is cache/workload
-bound, not an idle leak. The soak's long-run threshold should be changed to a post-warm-up window or
-an idle phase; the current 120 s CI run is unaffected.
+bound, not an idle leak. `conformance/soak.py` now supports `--idle-seconds` (`IDLE` in
+`soak.sh`), which uses the post-write idle delta as the leak signal; a 30 s smoke run with
+`IDLE=30` measured 34.3 → 36.9 MiB (+7.6 %, threshold 10 %) and passed. The 120 s CI run is
+unchanged.
 
 ### Independent review
 
@@ -114,7 +116,8 @@ when source foreground matters most, use 8 for backlog/drain throughput.
 
 1. Decide the replication direction: accept the measured foreground cost and document the worker
    setting, or implement and measure a single-pass/target-side change. Do not weaken durability.
-2. Run a 24–48 hour soak with an idle plateau and crash injection on XFS, and keep the result.
+2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600`, or 48 h) and crash
+   injection on XFS, and keep the result.
 3. Decide the three audit gaps (fix, accept with a written rationale, or document as unsupported).
 4. Publish a support statement: single node, Linux 5.6+, x86_64/arm64, SQLite, XFS recommended,
    asynchronous replication (RPO = lag, no automatic failover), backups required, no downgrade after
