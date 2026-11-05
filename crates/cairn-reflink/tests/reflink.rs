@@ -1,9 +1,13 @@
 //! Integration coverage for the reflink seam.
 //!
 //! The success path is exercised only on a filesystem that implements `FICLONERANGE` (XFS or
-//! btrfs locally); ext4 and tmpfs return an unsupported error and the test skips. The failure and
+//! btrfs); ext4 and tmpfs return an unsupported error and the test skips. The failure and
 //! copy-on-write semantics are what the storage engine relies on, so they are asserted whenever a
 //! clone succeeds.
+//!
+//! `CAIRN_REFLINK_TEST_DIR` places the scratch files on a chosen filesystem, and
+//! `CAIRN_REQUIRE_REFLINK=1` turns every skip into a failure so a dedicated CI job cannot silently
+//! pass on a filesystem that cannot clone.
 
 use cairn_reflink::clone_range;
 use std::fs::{File, OpenOptions};
@@ -13,7 +17,10 @@ use std::path::Path;
 const BLOCK: usize = 4096;
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("reflink-tests");
+    let root = match std::env::var_os("CAIRN_REFLINK_TEST_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir).join("reflink-tests"),
+        None => Path::new(env!("CARGO_TARGET_TMPDIR")).join("reflink-tests"),
+    };
     std::fs::create_dir_all(&root).unwrap();
     let dir = root.join(name);
     if dir.exists() {
@@ -41,6 +48,20 @@ fn read_all(path: &Path) -> Vec<u8> {
 
 /// True only for errnos that mean "this filesystem/range cannot reflink", so a genuine kernel or
 /// alignment failure on a supported filesystem still fails the test.
+fn require_reflink() -> bool {
+    std::env::var("CAIRN_REQUIRE_REFLINK").is_ok_and(|value| value == "1")
+}
+
+/// Record a skipped success-path assertion, or fail when the job requires a reflink filesystem.
+fn skip(error: &std::io::Error, what: &str) {
+    assert!(unavailable(error), "{what} failed unexpectedly: {error}");
+    assert!(
+        !require_reflink(),
+        "CAIRN_REQUIRE_REFLINK=1 but {what} found no reflink support: {error}"
+    );
+    eprintln!("skipping reflink {what} assertions: {error}");
+}
+
 fn unavailable(error: &std::io::Error) -> bool {
     if !cairn_reflink::is_supported() {
         return true;
@@ -63,8 +84,7 @@ fn clone_shares_bytes_and_isolates_later_writes() {
         .unwrap();
 
     if let Err(error) = clone_range(&dst, &src, 0, 5 * 1024 * 1024, 0) {
-        assert!(unavailable(&error), "clone failed unexpectedly: {error}");
-        eprintln!("skipping reflink success assertions: {error}");
+        skip(&error, "copy-on-write isolation");
         return;
     }
     dst.set_len(5 * 1024 * 1024).unwrap();
@@ -117,11 +137,7 @@ fn clone_multiple_ranges_preserves_concatenation() {
         sources.push(file);
     }
     if let Some(error) = first_error {
-        assert!(
-            unavailable(&error),
-            "range clone failed unexpectedly: {error}"
-        );
-        eprintln!("skipping reflink concatenation assertions: {error}");
+        skip(&error, "concatenation");
         return;
     }
     dst.set_len(expected.len() as u64).unwrap();
@@ -144,11 +160,7 @@ fn a_range_past_the_source_end_is_an_error_not_a_short_clone() {
 
     // Probe support with a valid aligned range first.
     if let Err(error) = clone_range(&dst, &src, 0, BLOCK as u64, 0) {
-        assert!(
-            unavailable(&error),
-            "clone probe failed unexpectedly: {error}"
-        );
-        eprintln!("skipping reflink bounds assertion: {error}");
+        skip(&error, "bounds");
         return;
     }
     assert!(

@@ -13,6 +13,9 @@ Keep comments short and single-line; new workflow run steps call one command, wi
 in `.github/scripts/`. Update `validation-jobs.json` with the validation job set; its regression
 test rejects missing jobs and unexpected skips. Do not turn performance-only scheduling changes
 into removal of correctness coverage: large encrypted replication remains a required full-profile job.
+`reflink-filesystem` mounts a loop XFS image (reflink on) and runs the `cairn-reflink` and
+`cairn-blob` reflink tests with `CAIRN_REQUIRE_REFLINK=1`, because hosted runners use ext4 and would
+otherwise only exercise the copy fallback.
 
 ## Release trust boundary
 

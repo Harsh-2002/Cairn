@@ -75,7 +75,10 @@ SQLite index remains `cairn-meta`'s.
   writing anything). Parts stay immutable until completion cleanup, and cleanup must `unlink` them
   — never punch holes or truncate a part in place — because the completed object shares those
   extents. The completed object is still one regular file, and the data fsync → data rename →
-  sidecar rename → directory barrier is unchanged.
+  sidecar rename → directory barrier is unchanged. The clone path is tested by the
+  `reflink-filesystem` CI job on a loop-mounted XFS image: `CAIRN_REFLINK_TEST_DIR` places the
+  scratch data there and `CAIRN_REQUIRE_REFLINK=1` turns every "no reflink support" skip into a
+  failure, and the end-to-end test proves the clone from free space. On ext4/tmpfs those tests skip.
 - **Every physical write requires a committed permit.** `stage_part` and `assemble` consume a
   `StorageCreationPermit` for the exact Writer-admitted plan and its `StorageIoLease`; `stage`
   consumes a move-only `ObjectCreationPermit` that the publication savepoint fences.

@@ -21,6 +21,24 @@ case "${1:?CI task required}" in
     cargo build --locked --manifest-path conformance/storage_lab/Cargo.toml --bins
     LAB_TEST_SERVER="$PWD/target/debug/cairn" LAB_TEST_RECOVERY_SERVER="$PWD/target/debug/cairn" LAB_TEST_FANOUT_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-fanout-lab" LAB_TEST_PACKING_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-packing-lab" LAB_TEST_METADATA_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-metadata-capacity-lab" LAB_TEST_METADATA_COMPARISON_DRIVER="$PWD/conformance/storage_lab/target/debug/cairn-metadata-comparison-lab" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
     ;;
+  reflink-filesystem)
+    # Hosted runners use ext4, so mount a loop XFS image with reflink to exercise the clone path.
+    apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any)
+    sudo apt-get "${apt_sources[@]}" update
+    sudo apt-get "${apt_sources[@]}" install -y xfsprogs=6.6.0-1ubuntu2.1
+    image="${RUNNER_TEMP}/reflink.img"
+    mount_dir="${RUNNER_TEMP}/reflink"
+    truncate -s 1G "$image"
+    sudo mkfs.xfs -q -m reflink=1 "$image"
+    mkdir -p "$mount_dir"
+    sudo mount -o loop "$image" "$mount_dir"
+    trap 'sudo umount "$mount_dir"' EXIT
+    sudo chown "$(id -u):$(id -g)" "$mount_dir"
+    findmnt --noheadings --output FSTYPE --target "$mount_dir" | grep -qx xfs
+    export CAIRN_REFLINK_TEST_DIR="$mount_dir" CAIRN_REQUIRE_REFLINK=1
+    cargo test -p cairn-reflink -- --test-threads=1
+    cargo test -p cairn-blob reflink -- --test-threads=1
+    ;;
   rust-audit-1)
     set -euo pipefail
     archive="${RUNNER_TEMP}/cargo-audit-v0.22.2.tgz"

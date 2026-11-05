@@ -99,6 +99,21 @@ jobs:
     - name: Test laboratory accounting and actual layer fixtures
       run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" storage-lab
     if: ${{ inputs.profile == 'full' }}
+  reflink-filesystem:
+    name: reflink clone path on XFS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: ./.github/actions/setup
+      with:
+        build-web: 'false'
+    - name: Clone multipart parts into a completed object on a reflink filesystem
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" reflink-filesystem
+    if: ${{ inputs.profile == 'full' }}
   build:
     name: build cairn (shared binary)
     runs-on: ubuntu-24.04
@@ -1162,6 +1177,7 @@ jobs:
     - docs
     - web-bundle
     - storage-lab
+    - reflink-filesystem
     - build
     - rust-audit
     - installer
