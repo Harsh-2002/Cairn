@@ -61,6 +61,14 @@ bound, not an idle leak. `conformance/soak.py` now supports `--idle-seconds` (`I
 `IDLE=30` measured 34.3 → 36.9 MiB (+7.6 %, threshold 10 %) and passed. The 120 s CI run is
 unchanged.
 
+A 24-hour attempt at 8 KiB objects was stopped after 1.6 hours: at 440,066 objects with 214,630
+outbox entries still unreplicated, RSS reached ~984 MiB (703 MiB anonymous, 280 MiB file-backed)
+with 0 put errors and 0 mismatches. The worker is object-rate limited for tiny objects, so the
+outbox backlog grew; the anonymous memory is the SQLite page cache/mmap filling as the database
+grew, not a fold failure, and the fixed caches cap it. That shape is not a production proxy and
+does not fit the disk for 24 hours. The gate is now 64 KiB at a bounded 25 objects/s, which keeps
+replication up and fits the free space (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`).
+
 ### Independent review
 
 A read-only review of #190–#194 (BLAKE3, sidecar v3, reflink, overlapping barriers, CI reflink job)
@@ -116,8 +124,10 @@ when source foreground matters most, use 8 for backlog/drain throughput.
 
 1. Decide the replication direction: accept the measured foreground cost and document the worker
    setting, or implement and measure a single-pass/target-side change. Do not weaken durability.
-2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=8192`, or 48 h)
-   and crash injection on XFS, and keep the result.
+2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`,
+   or 48 h) and crash injection on XFS, and keep the result. The 25 obj/s bound is required here:
+   the disk cannot hold 24 hours of unthrottled 64 KiB writes, and the 8 KiB shape backs up the
+   object-rate-limited replication worker.
 3. Decide the remaining audit gap: no rate limiting on the authentication path. The installer
    secret-to-stdout item is fixed (0600 file, path only), and OpenRC is documented as unsupported;
    both are recorded in `AUDIT.md`. Rate limiting is the only open decision.

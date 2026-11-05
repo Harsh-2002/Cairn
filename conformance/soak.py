@@ -122,6 +122,9 @@ def main():
     ap.add_argument("--source-pid", type=int, required=True)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--obj-size", type=int, default=64 * 1024)
+    # Optional aggregate object rate. 0 = as fast as the workers can go. A bounded rate lets a
+    # multi-hour run fit the disk and keeps the replication worker from being starved.
+    ap.add_argument("--rate", type=float, default=0.0)
     # Window allowed for an object to appear on the target before a sample counts as a mismatch.
     ap.add_argument("--replication-grace", type=float, default=20.0)
     # RSS may climb during warm-up (caches, pools); a leak is sustained growth past this fraction
@@ -167,6 +170,8 @@ def main():
                 written[key] = body
                 if len(written) > 2000:
                     written.pop(next(iter(written)))
+            if args.rate > 0:
+                time.sleep(args.workers / args.rate)
 
     # --- run the workload, sampling replication and RSS periodically -------------------------
     mismatches = 0
