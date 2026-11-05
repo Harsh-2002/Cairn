@@ -128,6 +128,24 @@ data across with replication or an S3-level copy (`aws s3 sync`), then cut over.
 - [ ] Spot-check a GET/PUT against a real S3 client.
 - [ ] If anything is wrong: stop, restore the snapshot, start the previous binary.
 
+## Verified release-to-main upgrade and snapshot rollback (2026-11-05)
+
+The last published release, v2026.09.13 (commit `f6fde5a`, schema v39, protocol 2), was upgraded
+to main at `b9472d2` (schema v42, protocol 3) with `conformance/upgrade_drill.py`:
+
+- plaintext, SSE-S3 and completed multipart objects were written by the release binary;
+- after the upgrade all three read back byte-for-byte; the legacy multipart object has no recorded
+  part layout, so its `?partNumber` read fails closed, as documented above;
+- legacy rows keep `internal_sha256` and have `internal_blake3` NULL;
+- a new post-upgrade multipart object records BLAKE3, a v3 sidecar, and a working `?partNumber`;
+- the released binary refuses the upgraded database (schema/protocol fence, exit 1);
+- restoring the pre-upgrade data-directory snapshot lets the released binary start and read every
+  object exactly.
+
+The drill is manual (`boto3` and `--old-bin`/`--new-bin`; it does not download releases in CI). It
+does not replace the pre-upgrade snapshot: the old binary cannot open the upgraded database, so the
+snapshot is the only rollback path.
+
 ## API and console configuration migration
 
 This change has no compatibility aliases. Replace these settings before starting the new binary:
