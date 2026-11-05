@@ -346,6 +346,13 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `?versions` audit (12,000 versions + 12,000 markers over the exact key set), and RustFS's strict
   readback. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
   ratios. **NOT a gate.**
+- `upgrade_drill.py` — **published-release to main upgrade and snapshot rollback**: runs the old
+  binary, writes plaintext/SSE-S3/multipart objects, snapshots the data directory, starts the
+  current binary, checks schema v42/protocol 3 and that legacy rows keep SHA-256, reads every old
+  object byte-for-byte (the legacy multipart part read fails closed), writes a new v3/BLAKE3
+  multipart, asserts the old binary refuses the upgraded database, and restores the snapshot so
+  the old binary can read again. Manual only: needs `boto3`, `--old-bin` and `--new-bin`.
+  **NOT a gate.**
 - `delete_single_key_cairn.py` — **Cairn-only writer attribution** for the unversioned single-key
   shape: it imports `delete_single_key.py`'s client unchanged and additionally scrapes `/metrics`
   one full store-metrics tick apart on both sides of the scored window, so the writer's stage rings
@@ -412,8 +419,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   through the management API (SSRF-guarded), unlike `soak`'s config-endpoint path. The remaining
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
   `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`,
-  `delete_versioned_single_key.py`, `delete_single_key_cairn.py`, `multipart_complete.py`) whose
-  gating signal is already covered by the CI correctness jobs; run them by hand for numbers.
+  `delete_versioned_single_key.py`, `delete_single_key_cairn.py`, `multipart_complete.py`,
+  `upgrade_drill.py`) whose gating signal is already covered by the CI correctness jobs; run them
+  by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
 
