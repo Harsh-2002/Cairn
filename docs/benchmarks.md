@@ -1372,3 +1372,169 @@ All ten workloads are at parity or better except the intentionally non-durable u
 Raw evidence:
 [`full-sweep-2026-11-05.json`](performance-evidence/2026-11/full-sweep-2026-11-05.json) and
 [`delete-versioned-single-key-2026-11-05.json`](performance-evidence/2026-11/delete-versioned-single-key-2026-11-05.json).
+## 16. Replication throughput and sender cost (2026-11-05)
+
+The 2026-09-09 replication scale run proved correctness (zero mismatches) but ended with 359-443 s
+peak lag; it was not a controlled benchmark. Section 4's soak checks correctness and memory, not
+rate. This section adds the first controlled throughput/lag measurement of the asynchronous
+outbox worker (ARCH 20) and separates the cost the source pays from the rate the worker sustains.
+
+### 16.1 Method
+
+`conformance/replication_perf.sh` starts two release `cairn` nodes on one host: a target on
+`127.0.0.1:9101` and a source on `127.0.0.1:9102`, each with its own `/var/tmp` store, console
+off, FULL metadata durability, one shard and zero group-commit linger. On the source, `replbench`
+has an enabled replication rule pointing at the target; the second versioned bucket `ctrlbench`
+has no rule. Both buckets are versioned, so the only difference between the arms is the durable
+outbox enqueue and the worker.
+
+Warp drives `put` against the source in interleaved pairs: `1m` (1 MiB, concurrency 16) and `64m`
+(64 MiB, concurrency 4), each shape scored separately and never pooled. `64m` sits exactly at the
+replication single-PUT boundary (`SINGLE_PUT_MAX_BYTES`), so both shapes exercise the single-PUT
+sender path rather than multipart replay. Pairs alternate which arm runs first, and each shape has
+a 5 s unscored warm-up per bucket.
+
+Rates use the raw load window (`Ran + 4 s`; Warp v1.8 trims two 1 s segments at each boundary), so
+bucket preparation and report printing do not dilute the metric deltas. `source PUT` is the exact
+source version/logical-byte delta. `shipped` is the `cairn_replication_completed_total` and
+`cairn_replication_bytes_total` delta over the same window. `drain` is the post-load time until
+the outbox, the source index overlay and a stable version count are all idle; the drain-active
+rate subtracts the 2 s quiet settle, and `sustained` includes the whole drain. Lag, pending and
+unreplicated are live `GET /api/v1/replication/summary` samples every 0.5 s, because the
+`/metrics` gauges only refresh on the 15 s store-metrics tick. Source and target CPU are
+`/proc/<pid>/stat` deltas.
+
+Every arm must finish drained with zero failed entries, completed equal to source writes, shipped
+bytes equal to written bytes and to target logical bytes, target versions equal to source writes,
+and a sampled byte-for-byte plus version-id check of drained versions. All arms in the reported
+runs passed every check. `--workers` (default 4) sets
+`CAIRN_REPLICATION_WORKER_CONCURRENCY`; the runs below use the default.
+
+### 16.2 Results
+
+Two interleaved baseline runs are shown, plus a third 64 MiB-only verification run; the host load
+at the start differed (5.05 and 1.63 on six CPUs for runs 1-2), and the per-arm load averages are
+in the raw reports. Pair ratios are listed in arm order.
+
+| Shape | Run | Control PUT obj/s | Replicated PUT obj/s | Repl/control per pair (mean) | Shipped during load obj/s | Drain obj/s | Lag max / p95 s | Unreplicated max | Drain s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 1 | 77.45 | 50.85 | 0.636, 0.634, 0.705 (**0.658**) | 2.69 | 31.66 | 26.0 / 24.0 | 1,366 | 49.2 |
+| 1 MiB | 2 | 81.35 | 56.28 | 0.649, 0.705, 0.732 (**0.695**) | 3.46 | 34.64 | 26.0 / 24.0 | 1,562 | 49.5 |
+| 64 MiB | 1 | 1.73 (111 MiB/s) | 1.10 (70 MiB/s) | 0.644, 0.669, 0.590 (**0.635**) | 0.27 | 1.34 (86 MiB/s) | 15.0 / 9.7 | 26 | 23.6 |
+| 64 MiB | 2 | 1.99 (127 MiB/s) | 1.25 (80 MiB/s) | 0.678, 0.581, 0.631 (**0.630**) | 0.24 | 1.56 (100 MiB/s) | 9.0 / 7.3 | 26 | 23.7 |
+| 64 MiB | 3 (verify) | 2.09 (134 MiB/s) | 1.17 (75 MiB/s) | 0.494, 0.576, 0.620 (**0.563**) | 0.37 | 2.25 (144 MiB/s) | 9.0 / 5.0 | 19 | 15.0 |
+
+| Shape | Run | Source p50 control -> replicated (ms) | Source CPU s per shipped MiB | Target CPU s per shipped MiB | Extra source CPU s/put vs control |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 1 | 155.9 -> 275.7 | 0.0186 | 0.0080 | 0.0103 |
+| 1 MiB | 2 | 158.0 -> 274.5 | 0.0185 | 0.0080 | 0.0102 |
+| 64 MiB | 1 | 2,382.6 -> 3,735.8 | 0.0142 | 0.0067 | 0.4659 |
+| 64 MiB | 2 | 1,979.8 -> 3,588.4 | 0.0141 | 0.0067 | 0.4604 |
+| 64 MiB | 3 (verify) | 2,209.7 -> 3,884.8 | 0.0141 | 0.0069 | 0.4605 |
+
+Raw reports:
+[`replication-perf-2026-11-05.json`](performance-evidence/2026-11/replication-perf-2026-11-05.json)
+(run 1),
+[`replication-perf-2026-11-05-run2.json`](performance-evidence/2026-11/replication-perf-2026-11-05-run2.json)
+(run 2) and
+[`replication-perf-2026-11-05-run3-64m.json`](performance-evidence/2026-11/replication-perf-2026-11-05-run3-64m.json)
+(run 3, 64 MiB verification).
+
+The 64 MiB arms in the first two runs verified their sample from the first version-listing page,
+which was still all 1 MiB versions from the preceding shape. The exact completed/bytes/target
+counters already covered every 64 MiB object; a third, 64 MiB-only run repeated the pairs with a
+size-filtered sampler and compared two 64 MiB versions byte-for-byte with matching version ids
+(134,217,728 bytes per arm). Run 3 ran on a quieter host: its control client reached 134 MiB/s
+against 111-127 MiB/s in runs 1-2, its worker drained 144 MiB/s, and its foreground ratio was
+0.494-0.620 (mean 0.563). That is the same worker path under a faster client, and it reinforces
+that the foreground ratio is a shared-host contention measurement rather than a fixed property
+(`replication-perf-2026-11-05-run3-64m.json`).
+
+### 16.3 What the numbers show
+
+**The worker, not hashing, caps the 1 MiB shape.** The replicated source accepted 50.9-56.3
+obj/s, but the worker drained only 31.7-34.6 obj/s. The backlog reached 1,366-1,562 entries,
+lag reached 26 s, and the post-load drain took 49 s. During the load itself only 2.7-3.5 obj/s
+were delivered, so almost all of the arm's shipping happened after the client stopped.
+
+**At 64 MiB the worker is bandwidth-balanced.** In the two baseline runs it drained 1.34-1.56
+obj/s, i.e. 86-100 MiB/s, against a replicated source rate of 70-80 MiB/s. The backlog stayed at
+26 entries or fewer, lag never exceeded 15 s, and the drain took 24 s. Run 3 drained 2.25 obj/s
+(144 MiB/s) against 75 MiB/s, still above the client. The object-count lag is visible, but the
+worker moves more bytes per second than the replicated client offered.
+
+**The client-visible cost is consistent but is a same-host upper bound.** In the two baseline
+runs, replicated source PUT throughput was 0.58-0.73x the control per pair (0.63-0.70 mean per
+run); run 3's quieter host reached 0.49-0.62 because its control client was faster while the
+worker path stayed the same. The source PUT p50 roughly doubled at 1 MiB and rose about 1.6-1.8x
+at 64 MiB. The worker's reads, the target's durable writes, the outbox transactions and the
+client's writes all share this host's six CPUs and one NVMe. On a separate destination host the
+source would still pay the enqueue and the read/hash CPU, but not the target's write path, so this
+ratio is a worst-case foreground-contention measurement, not a remote-target claim.
+
+**CPU is not the ceiling.** The whole source process spent 0.0185-0.0186 s per shipped MiB at
+1 MiB and 0.0141-0.0142 s/MiB at 64 MiB; the target spent 0.0080 and 0.0067 s/MiB. Combined that
+is about 38 and 48 MiB per CPU-second, far below what six cores could hash and copy. The extra
+source CPU per put over the control (10.3 ms at 1 MiB, 0.46 s at 64 MiB) scales with object size:
+it is the outbox enqueue and claim/complete transactions plus the first-pass read/hash, not a
+fixed per-object tax.
+
+**The mechanism is the four in-flight transfers.** Each of the four worker loops processes one
+outbox entry at a time, so the pool holds four transfers in flight. The measured drain rates imply
+about 121-126 ms of wall time per 1 MiB replica (4 / 33.2-31.7) and about 2.8-3.0 s per
+64 MiB replica (4 / 1.45-1.34). Those are the same order as the control client's durable-write
+p50 (156-158 ms at 1 MiB, 2.0-2.4 s at 64 MiB), so the per-transfer cost is consistent with a
+durable write of that size on this host.
+At 1 MiB, four transfers at that latency cannot reach the 50-56 obj/s the client offers; at
+64 MiB, four large transfers already exceed the offered byte rate.
+
+### 16.4 Candidate: in-flight concurrency before the read path
+
+The measured 1 MiB gap is a concurrency/latency gap, not a hashing gap. The first safe experiment
+is configuration only: sweep `--workers` 8 and 16 with this same harness (it sets
+`CAIRN_REPLICATION_WORKER_CONCURRENCY`; an unknown `CAIRN_*` name is rejected by the strict
+config). That raises the in-flight transfer count without changing code, durability or the wire
+format, and the harness records the client-visible source PUT cost so the sweep cannot
+silently trade client throughput for ship rate. If the drain rate rises roughly with concurrency
+until the destination or the source writer saturates, the 1 MiB lag is fixed by capacity, not by
+a new read path. At 64 MiB the worker already exceeds the offered byte rate, so the sweep should
+not be expected to help that shape.
+
+Only if the concurrency sweep plateaus should the per-transfer path change. A stage split must
+cover both ends: the destination's durable write and fsync are the other candidate, because the
+per-transfer wall matches a durable write of the same size on this host, and a target-side fsync
+or writer stall would show up there rather than in source CPU. The suspected double read is real
+and measurable: the extra source CPU per put is about 0.010 s per 1 MiB and 0.007 s
+per MiB at 64 MiB, roughly a tenth of the per-transfer wall before counting the latency of the
+second open. Removing it would need either chunked SigV4 signing while streaming (the destination
+must validate the chunk chain; Cairn's receiver and generic S3 support would have to be checked)
+or a payload SHA-256 persisted at write time (a cost on every write, including objects that never
+replicate). Neither is justified by this data yet: the benchmark bounds the double read's CPU at
+about 8-16 % of the per-transfer wall, while the four-way in-flight cap accounts for the
+1.6x shortfall. Measure the stage split and the concurrency sweep before changing the sender.
+
+### 16.5 Limits
+
+- **One host.** Source, target, Warp and the sampler share six logical CPUs and one NVMe device;
+  the absolute rates move with host load (the per-arm load averages are in the raw reports). The
+  interleaved control/replicated pairs are the stable signal, not the absolute number.
+- **Warm and cumulative state.** Objects are written to the same bucket for the whole shape, so
+  the source and target stores grow across arms (both arms equally); the page cache is warm and
+  the 30 s windows are short. This is a diagnostic measurement, not a capacity or cold-start claim.
+- **Single-PUT only.** Both shapes exercise the single-PUT sender path: 1 MiB normally and 64 MiB
+  exactly at `SINGLE_PUT_MAX_BYTES`. Objects with a recorded multipart part layout replay their
+  parts and are not measured here.
+- **Client SHA-256 is on.** Warp computes the payload SHA-256 by default; it shares the host with
+  the two nodes.
+- **Sampling window.** Warp v1.8 trims two 1 s segments at each boundary of its displayed score,
+  so the metric deltas use `Ran + 4 s` (clamped to the measured wall). The scored `obj/s` is
+  reported separately; it excludes the ramp edges, while the exact delta includes them.
+- **Drain definition.** Drain is measured to a 2 s quiet settle (outbox empty, overlay empty,
+  versions stable); the drain-active rate subtracts that settle. A backlog that never clears is
+  reported as an unsettled drain rather than hidden in an average.
+- **Sampler cost.** The 0.5 s live summary and `/metrics` scrapes add a small constant load to
+  the source and target in every arm; it is not part of the product but is part of every number.
+- **Verification sample.** Four (1 MiB) or two (64 MiB) drained versions per replicated arm are
+  compared byte-for-byte with their version ids; the exact completed/bytes/target counters cover
+  every object. The first two runs' 64 MiB samples were size-blind; run 3 is the size-filtered
+  confirmation.

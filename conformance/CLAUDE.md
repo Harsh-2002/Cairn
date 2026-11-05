@@ -328,6 +328,17 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   source/receiver staging; the existing release-build benchmark CI job runs that full-size arm.
   Allow at least 16 GiB working space for native multipart staging plus MinIO replicas. Crash/debt coverage is
   tracked separately in Phase 4C; this harness covers healthy delivery, not real AWS credentials.
+- `replication_perf.sh` (+`.py`) — **controlled two-node replication throughput benchmark**, not a
+  gate. A target and source on 127.0.0.1, `replbench` with an enabled rule against `ctrlbench` with
+  none (both versioned), and Warp `put` in interleaved control/replicated pairs at 1 MiB/c16 and
+  64 MiB/c4 — the two shapes are never pooled. Per arm it records exact source PUT counts, shipped
+  bytes/objects from the replication counters, live 0.5 s lag/queue samples (the `/metrics` gauges
+  only move on the 15 s tick), source/target CPU, drain time and a byte-for-byte + version-id
+  sample check. It pins FULL metadata durability, takes the host-wide benchmark lock, keeps both
+  stores on `/var/tmp` (XFS) and cleans them on success. `--workers` (default 4) sets
+  `CAIRN_REPLICATION_WORKER_CONCURRENCY` for a follow-up 4/8/16 sweep. Offline checks:
+  `test_replication_perf.py` (run from `conformance/`). Results and limits:
+  `../docs/benchmarks.md` §16.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
   host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Manual only; it is
   not wired into CI. **Report-not-gate**: the signal is the Cairn/MinIO ratio, and it fails ONLY on
@@ -420,8 +431,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   non-gated items are pure **benchmarks/measurement tools** (`warp.sh`, `warp_escalate.sh`,
   `load_profile.sh`, `sendfile_bench.sh`, `delete_single_key.py`,
   `delete_versioned_single_key.py`, `delete_single_key_cairn.py`, `multipart_complete.py`,
-  `upgrade_drill.py`) whose gating signal is already covered by the CI correctness jobs; run them
-  by hand for numbers.
+  `upgrade_drill.py`, `replication_perf.py`) whose gating signal is already covered by the CI
+  correctness jobs; run them by hand for numbers.
 - Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
   testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.
 
