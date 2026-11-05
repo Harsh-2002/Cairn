@@ -127,6 +127,10 @@ def main():
     # RSS may climb during warm-up (caches, pools); a leak is sustained growth past this fraction
     # of the post-warmup baseline.
     ap.add_argument("--leak-threshold-pct", type=float, default=50.0)
+    # Optional idle phase after the write workload. A long run fills caches during the load, so
+    # the load-phase baseline is not a leak signal; the idle delta is.
+    ap.add_argument("--idle-seconds", type=int, default=0)
+    ap.add_argument("--idle-leak-threshold-pct", type=float, default=10.0)
     args = ap.parse_args()
 
     src = make_client(args.source_endpoint, args.source_access_key, args.source_secret)
@@ -167,7 +171,8 @@ def main():
     # --- run the workload, sampling replication and RSS periodically -------------------------
     mismatches = 0
     verified = 0
-    rss_samples = []  # (elapsed_s, rss_kib)
+    rss_samples = []  # (elapsed_s, rss_kib) during the write workload
+    idle_samples = []  # rss_kib after the writers stop, for the leak signal
     start = time.monotonic()
     deadline = start + args.duration
 
@@ -220,6 +225,20 @@ def main():
 
         stop.set()
 
+    if args.idle_seconds > 0:
+        print(f"  idle {args.idle_seconds}s (writers stopped; sampling RSS) ...", flush=True)
+        idle_start = time.monotonic()
+        while time.monotonic() - idle_start < args.idle_seconds:
+            time.sleep(1.0)
+            rss = read_rss_kib(args.source_pid)
+            if rss is not None:
+                idle_samples.append(rss)
+            if len(idle_samples) % 30 == 0:
+                print(
+                    f"  idle={int(time.monotonic() - idle_start):>4}s  rss={rss / 1024:.1f}MiB",
+                    flush=True,
+                )
+
     # --- final replication drain + verification sweep ----------------------------------------
     # Let the source's replication worker drain anything in flight, then do a last sample.
     time.sleep(args.replication_grace)
@@ -238,10 +257,22 @@ def main():
             print(f"  MISMATCH (final) on {key}", flush=True)
 
     # --- leak check --------------------------------------------------------------------------
-    # Drop the warm-up third; compare the median of the first remaining quarter against the last.
+    # With an idle phase, compare the first and last quarter after the writers stop. Otherwise
+    # drop the warm-up third; compare the median of the first remaining quarter against the last.
     leaked = False
     leak_detail = "insufficient RSS samples"
-    if len(rss_samples) >= 8:
+    if args.idle_seconds > 0 and len(idle_samples) >= 8:
+        head = sorted(idle_samples[: max(1, len(idle_samples) // 4)])
+        tail = sorted(idle_samples[-max(1, len(idle_samples) // 4):])
+        base = head[len(head) // 2]
+        end = tail[len(tail) // 2]
+        growth_pct = 100.0 * (end - base) / base if base else 0.0
+        leaked = growth_pct > args.idle_leak_threshold_pct
+        leak_detail = (
+            f"idle {base / 1024:.1f}MiB -> {end / 1024:.1f}MiB "
+            f"({growth_pct:+.1f}%, threshold {args.idle_leak_threshold_pct:.0f}%)"
+        )
+    elif len(rss_samples) >= 8:
         warm = len(rss_samples) // 3
         steady = [r for _, r in rss_samples[warm:]]
         head = sorted(steady[: max(1, len(steady) // 4)])
@@ -257,7 +288,7 @@ def main():
 
     print("", flush=True)
     print("=== soak summary ===", flush=True)
-    print(f"  duration:            {args.duration}s", flush=True)
+    print(f"  duration:            {args.duration}s (idle {args.idle_seconds}s)", flush=True)
     print(f"  source PUTs:         {put_count[0]} (errors {put_errors[0]})", flush=True)
     print(f"  objects verified:    {verified} byte-for-byte on the target", flush=True)
     print(f"  replication mismatch:{mismatches}", flush=True)

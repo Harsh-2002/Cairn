@@ -31,6 +31,7 @@ PY="${PY:-/tmp/cairnvenv/bin/python}"
 PORT1="${PORT1:-9083}"   # target (mirror)
 PORT2="${PORT2:-9084}"   # source
 DURATION="${DURATION:-120}"
+IDLE="${IDLE:-0}"
 BUCKET="${BUCKET:-soak}"
 REPL_INTERVAL="${REPL_INTERVAL:-2}"
 
@@ -125,7 +126,7 @@ note "both nodes healthy"
   --source-access-key "$S_AKID" --source-secret "$S_SECRET" \
   --target-endpoint "http://127.0.0.1:$PORT1" \
   --target-access-key "$T_AKID" --target-secret "$T_SECRET" \
-  --bucket "$BUCKET" --duration "$DURATION" --source-pid "$SRV2" \
+  --bucket "$BUCKET" --duration "$DURATION" --idle-seconds "$IDLE" --source-pid "$SRV2" \
   || fail "soak harness reported a failure (mismatch or leak); see output above"
 
 note "soak passed: 0 replication mismatches, source RSS flat"
