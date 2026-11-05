@@ -118,7 +118,9 @@ when source foreground matters most, use 8 for backlog/drain throughput.
    setting, or implement and measure a single-pass/target-side change. Do not weaken durability.
 2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=8192`, or 48 h)
    and crash injection on XFS, and keep the result.
-3. Decide the three audit gaps (fix, accept with a written rationale, or document as unsupported).
+3. Decide the remaining audit gap: no rate limiting on the authentication path. The installer
+   secret-to-stdout item is fixed (0600 file, path only), and OpenRC is documented as unsupported;
+   both are recorded in `AUDIT.md`. Rate limiting is the only open decision.
 4. Publish the final 1.0 support statement after gates 1–3. The current supported scope and known
    limits are already written in [`support.md`](support.md): single node, Linux 5.6+, x86_64/arm64,
    SQLite, XFS recommended, asynchronous replication (RPO = lag, no automatic failover), backups

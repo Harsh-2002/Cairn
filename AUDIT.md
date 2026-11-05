@@ -83,10 +83,10 @@ path or a precise explanation of why it's reachable.
 - Master-key-ring rotation — old-key retention window, atomicity against concurrent secret access.
 - Root credential handling (`CAIRN_ROOT_ACCESS_KEY`/`SECRET_KEY`) and the documented dev default —
   confirm it's rejected or loudly warned on outside dev.
-- **`install.sh` prints the generated access/secret key to stdout on completion** (`install.sh` around
-  the `print_access` step) — this lands in shell scrollback/history/CI logs on an automated install.
-  Verified present as of 2026-07-29; treat as a standing item to re-check (not yet triaged into an
-  issue — do so on the next run if still true).
+- **`install.sh` secret handling — resolved 2026-11-05.** The installer writes the generated secret
+  to `/etc/cairn/cairn.env` (or the Docker `.env`) under `umask 077` and `chmod 0600`, and prints only
+  the access key and the file path (`install.sh:255`, `:383-400`, `:602-607`). Re-check if the
+  delivery path changes; the secret must never return to stdout.
 
 ### 4.2 Authorization
 - Bucket policy engine — Allow/Deny precedence, wildcard/condition matching, default-deny fallthrough,
@@ -249,10 +249,10 @@ delete a row once its status is stable and uncontroversial enough that it belong
 | 2026-07-29 | Master key zeroization | Clean | See Section 4.1 |
 | 2026-07-29 | CORS origin reflection | Clean, correctly scoped | See Section 4.5 |
 | 2026-07-29 | `unsafe` scope | Narrow, justified (sendfile.rs + one reflink ioctl) | See Section 4.6 |
-| 2026-07-29 | Rate limiting on auth path | **Open gap** — none exists | See Section 4.5 |
+| 2026-07-29 | Rate limiting on auth path | **Open gap** — none exists; documented as outside the supported scope, deploy behind a rate-limiting proxy | See Section 4.5 and `docs/support.md` |
 | 2026-09-06 | Dependency audit in CI | Fixed | Pinned cargo-audit plus both npm audit policies; fresh scans still required. |
-| 2026-07-29 | `install.sh` secret-to-stdout | **Open, untriaged** | See Section 4.1 |
-| 2026-07-29 | OpenRC unit hardening | **Open gap** — systemd hardened, OpenRC not | See Section 4.7 |
+| 2026-07-29 | `install.sh` secret-to-stdout | **Fixed** 2026-11-05: secret written to a 0600 file, only the path printed | See Section 4.1 |
+| 2026-07-29 | OpenRC unit hardening | **Documented limitation** — systemd is the supported service manager; OpenRC is not supported | See Section 4.7 and `docs/support.md` |
 | 2026-09-06 | Original ten CodeQL alerts | Triaged and dismissed | #26–32 retained explicit CLI credential output (`won't fix`); #33–35 field-insensitive configuration taint (`false positive`). These are not ten code fixes. |
 | 2026-09-09 | Bootstrap Bearer export CodeQL #44 | Reviewed; retained explicit CLI output (`won't fix`) | PR #103's shared credential encoder adds a tracked secret-to-stdout path at `crates/cairn-server/src/main.rs:2769`. This is the same node-local `bootstrap` export accepted for #31/#32 and documented in ARCH 14.5/24.3. The command intentionally prints operator credentials; captured stdout remains sensitive. The console/session and server logging paths do not print the encoded token. No logging-rule suppression or production vulnerability fix is claimed. |
 | 2026-09-25 | Trusted-proxy startup-error CodeQL #45 | **Fixed on main** in PRs #111–#113 | `Config::trusted_proxy_allowlist` previously included a rejected `CAIRN_TRUSTED_PROXIES` value in its `ConfigError`; `main` printed that error to stderr. PR #111 made the proxy error fixed, PR #112 made the generic `Config::load()` failure output constant, and PR #113 made the backup-topology refusal constant while preserving the same single-SQLite guard. Real-binary regressions check startup and backup stderr. A separately dispatched full CI/CodeQL run on exact merged main `d0dcd5d` passed; GitHub changed alert #45 to `fixed` at 2026-09-25 10:47 UTC. No alert dismissal was used. |
