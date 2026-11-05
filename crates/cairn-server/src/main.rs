@@ -102,7 +102,7 @@ enum Command {
         /// Stop after this many candidate versions.
         #[arg(long)]
         limit: Option<usize>,
-        /// Also upgrade an existing v1 sidecar to v2 when the row records the part layout.
+        /// Also upgrade an existing v1 sidecar to the row's current record (v3 with BLAKE3, or v2 for a legacy row).
         #[arg(long)]
         upgrade_v1: bool,
     },

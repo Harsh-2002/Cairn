@@ -76,7 +76,7 @@ const READ_CHUNK: usize = 64 * 1024;
 const ASSEMBLY_READ_CHUNK: usize = 4 * READ_CHUNK;
 
 /// How many assembly chunks the leased reader may run ahead of the staging sink. Assembly is
-/// dominated by the mandatory internal SHA-256 (measured ~330 MiB/s on a reference core without
+/// dominated by the mandatory internal BLAKE3 baseline (measured ~3 GiB/s on the reference host;
 /// SHA-NI), while the part reads and the sink writes are a fraction of that; hashing one chunk
 /// ahead of the write keeps both busy without retaining more than a few 256-KiB buffers.
 const ASSEMBLY_PIPELINE_DEPTH: usize = 2;
@@ -668,7 +668,7 @@ async fn write_staged(
 ) -> Result<StagedWrite, BlobError> {
     let (compress, block_pol) = encoding_policies(opts);
     validate_stage_len(opts, opts.content_length)?;
-    // A part's internal SHA-256 baseline is discarded at assembly, so the part path computes it
+    // A part's internal baseline is discarded at assembly, so the part path computes it
     // only when the client requested SHA-256 or the signed payload needs verification.
     let mut hashers = if part {
         Hashers::new_for_part(&opts.extra_checksums)
@@ -959,8 +959,8 @@ async fn write_assembled_chunk(
 /// The blocking half of assembly: read each part in order, hash the plaintext, and hand the chunk
 /// to the staging sink through a bounded channel (ARCH 27).
 ///
-/// Hashing is deliberately on this side rather than on the reactor: the internal SHA-256 is
-/// mandatory and costs more than the reads and writes together, so the sink's write hop runs on
+/// Hashing is deliberately on this side rather than on the reactor: the internal BLAKE3 baseline
+/// is still the largest single CPU term for plaintext assembly, so the sink's write hop runs on
 /// the reactor while this job hashes the next chunk. A part staged encrypted
 /// (`PartRef.cipher != KnownPlaintext`) is decrypted here through the same metadata-version-pinned
 /// CRNB reader GET uses, so `assemble` always sees plaintext before it re-encodes under the object
@@ -1865,7 +1865,7 @@ impl BlobStore for LocalBlobStore {
             paths.lease.try_child()?,
         )
         .await?;
-        // Hash the assembled plaintext once, computing the internal SHA-256 and any supplementary
+        // Hash the assembled plaintext once, computing the internal BLAKE3 baseline and any supplementary
         // checksums the caller requested via `opts.extra_checksums` (a whole-object FULL_OBJECT
         // recompute at CompleteMultipartUpload). A completion supplies the composite multipart
         // ETag in its seed, so the whole-object MD5 has no consumer and is skipped; an assembly

@@ -628,7 +628,7 @@ pub struct ObjectMetadataRecord {
 }
 
 /// Fields known before the body is staged. The blob fills sizes, ETag, checksums, compression,
-/// storage path and internal SHA-256 after the streaming pass.
+/// storage path and internal BLAKE3 baseline after the streaming pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMetadataSeed {
     pub bucket: BucketName,
@@ -876,8 +876,70 @@ impl ObjectMetadataRecord {
             && self.size_physical == row.size_physical
     }
 
+    /// Reject a record whose generation and payload disagree, or whose baseline is malformed.
+    ///
+    /// This is the single generation invariant for writers and readers. [`Self::encode`] applies it
+    /// before a record can become durable and [`Self::decode`] applies it to every record read from
+    /// disk, so a writer cannot create a sidecar that a later rebuild would have to skip.
+    pub fn validate_generation(&self) -> Result<(), MetaError> {
+        let has_blake3 = self.internal_blake3.is_some();
+        let has_sha256 = self.internal_sha256.is_some();
+        if has_blake3 && has_sha256 {
+            return Err(invalid(
+                "object metadata must not carry two internal baselines",
+            ));
+        }
+        for digest in [
+            self.internal_blake3.as_deref(),
+            self.internal_sha256.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    "object metadata internal baseline must be 64 hex characters",
+                ));
+            }
+        }
+        match self.format_version {
+            OBJECT_METADATA_V1_FORMAT_VERSION => {
+                if self.multipart_parts.is_some() {
+                    return Err(invalid(
+                        "object metadata v1 must not carry a multipart part layout",
+                    ));
+                }
+                if has_blake3 {
+                    return Err(invalid(
+                        "object metadata v1/v2 must not carry a BLAKE3 baseline",
+                    ));
+                }
+            }
+            OBJECT_METADATA_V2_FORMAT_VERSION => {
+                if self.multipart_parts.is_none() {
+                    return Err(invalid(
+                        "object metadata v2 requires a multipart part layout",
+                    ));
+                }
+                if has_blake3 {
+                    return Err(invalid(
+                        "object metadata v1/v2 must not carry a BLAKE3 baseline",
+                    ));
+                }
+            }
+            OBJECT_METADATA_V3_FORMAT_VERSION => {
+                if !has_blake3 {
+                    return Err(invalid("object metadata v3 requires a BLAKE3 baseline"));
+                }
+            }
+            _ => return Err(invalid("unsupported object metadata format version")),
+        }
+        Ok(())
+    }
+
     /// Canonical bytes for the sidecar file.
     pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
+        self.validate_generation()?;
         let bytes =
             serde_json::to_vec(self).map_err(|error| MetaError::Engine(error.to_string()))?;
         if bytes.len() > OBJECT_METADATA_MAX_BYTES {
@@ -893,33 +955,8 @@ impl ObjectMetadataRecord {
         }
         let record: Self =
             serde_json::from_slice(bytes).map_err(|error| MetaError::Engine(error.to_string()))?;
-        if record.internal_blake3.is_some() && record.internal_sha256.is_some() {
-            return Err(invalid(
-                "object metadata must not carry two internal baselines",
-            ));
-        }
-        match record.format_version {
-            OBJECT_METADATA_V1_FORMAT_VERSION if record.multipart_parts.is_some() => Err(invalid(
-                "object metadata v1 must not carry a multipart part layout",
-            )),
-            OBJECT_METADATA_V2_FORMAT_VERSION if record.multipart_parts.is_none() => Err(invalid(
-                "object metadata v2 requires a multipart part layout",
-            )),
-            OBJECT_METADATA_V1_FORMAT_VERSION | OBJECT_METADATA_V2_FORMAT_VERSION
-                if record.internal_blake3.is_some() =>
-            {
-                Err(invalid(
-                    "object metadata v1/v2 must not carry a BLAKE3 baseline",
-                ))
-            }
-            OBJECT_METADATA_V3_FORMAT_VERSION if record.internal_blake3.is_none() => {
-                Err(invalid("object metadata v3 requires a BLAKE3 baseline"))
-            }
-            OBJECT_METADATA_V1_FORMAT_VERSION
-            | OBJECT_METADATA_V2_FORMAT_VERSION
-            | OBJECT_METADATA_V3_FORMAT_VERSION => Ok(record),
-            _ => Err(invalid("unsupported object metadata format version")),
-        }
+        record.validate_generation()?;
+        Ok(record)
     }
 }
 
@@ -1218,6 +1255,57 @@ mod tests {
             created_at: Timestamp(1),
             updated_at: Timestamp(2),
         }
+    }
+
+    #[test]
+    fn encode_rejects_inconsistent_generations_and_malformed_baselines() {
+        let path = StoragePath::generate(&BucketName::parse("bucket").unwrap());
+        let mut record = ObjectMetadataRecord::from_existing(
+            &object_row(None, false, Some(path)),
+            Vec::new(),
+            ExplicitObjectLockIntent::default(),
+        )
+        .unwrap();
+        assert!(record.encode().is_ok(), "a current v3 record must encode");
+
+        let mut without_blake3 = record.clone();
+        without_blake3.internal_blake3 = None;
+        assert!(without_blake3.encode().is_err(), "v3 needs BLAKE3");
+
+        let mut both = record.clone();
+        both.internal_sha256 = Some("11".repeat(32));
+        assert!(both.encode().is_err(), "two baselines must be refused");
+
+        let mut short = record.clone();
+        short.internal_blake3 = Some("0".repeat(63));
+        assert!(short.encode().is_err(), "a short digest must be refused");
+
+        let parts = vec![MultipartPartRecord {
+            part_number: 1,
+            size: 5,
+        }];
+        let mut v1_with_parts = record.clone();
+        v1_with_parts.format_version = OBJECT_METADATA_V1_FORMAT_VERSION;
+        v1_with_parts.multipart_parts = Some(parts.clone());
+        assert!(v1_with_parts.encode().is_err(), "v1 forbids a layout");
+
+        let mut v2_without_parts = record.clone();
+        v2_without_parts.format_version = OBJECT_METADATA_V2_FORMAT_VERSION;
+        v2_without_parts.multipart_parts = None;
+        assert!(v2_without_parts.encode().is_err(), "v2 requires a layout");
+
+        let mut v2_legacy = record.clone();
+        v2_legacy.format_version = OBJECT_METADATA_V2_FORMAT_VERSION;
+        v2_legacy.multipart_parts = Some(parts);
+        v2_legacy.internal_blake3 = None;
+        v2_legacy.internal_sha256 = Some("22".repeat(32));
+        assert!(v2_legacy.encode().is_ok(), "a legacy v2 record stays valid");
+
+        record.format_version = 99;
+        assert!(
+            record.encode().is_err(),
+            "an unknown generation must be refused"
+        );
     }
 
     #[test]

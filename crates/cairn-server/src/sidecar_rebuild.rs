@@ -413,7 +413,8 @@ fn rebuilt_row(record: &ObjectMetadataRecord) -> ObjectVersionRow {
         replicated_at: None,
         created_at: record.created_at,
         updated_at: record.updated_at,
-        // A completed multipart object's v2 record carries its part layout, so `?partNumber`
+        // A completed multipart object's v3 record carries its BLAKE3 baseline and part layout, so
+        // `?partNumber`
         // survives a rebuild. Older v1 assembled-object sidecars restore the row without it.
         multipart_parts: record.multipart_parts.clone(),
     }
