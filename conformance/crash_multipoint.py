@@ -19,6 +19,8 @@ survives), stop, run `cairn integrity`, and assert either eager recovery already
 exclusive recovery reclaimed it, with no intent/debt or visible object remaining in either case.
 
 Requires a binary built with --features failpoints. Config via env: BIN, DATA, PORT.
+Set CRASH_MPU_PART_BYTES=5242880 on a reflink-capable data directory (XFS/btrfs) to exercise the
+plaintext-completion clone path instead of the default tiny unaligned part, which copies.
 """
 import datetime, hashlib, hmac, http.client, json, os, signal, subprocess, sys, time, urllib.parse
 from pathlib import Path
@@ -31,6 +33,14 @@ PORT = int(os.environ.get("PORT", "9089"))
 REGION = "us-east-1"
 HOST = ("127.0.0.1", PORT)
 BUCKET = "crashbkt"
+# The default is the historical tiny part (9216 bytes, unaligned, so the completion copies). A
+# reflink-capable run sets CRASH_MPU_PART_BYTES to a block-aligned 5 MiB so the completion clones.
+MPU_PART_BYTES = int(os.environ.get("CRASH_MPU_PART_BYTES", "9216"))
+MPU_MARKER = b"part-data"
+
+
+def mpu_part():
+    return (MPU_MARKER * (MPU_PART_BYTES // len(MPU_MARKER) + 1))[:MPU_PART_BYTES]
 
 PASS, FAIL = [], []
 def check(name, cond, detail=""):
@@ -179,7 +189,7 @@ def op_multipart(ak, sk, bucket, key):
     if b"<UploadId>" not in body: return -1  # initiate failed
     uid = body.split(b"<UploadId>")[1].split(b"</UploadId>")[0].decode()
     st, _, etag = s3("PUT", f"/{bucket}/{key}", query={"partNumber": "1", "uploadId": uid},
-                     headers={"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, body=b"part-data" * 1024, ak=ak, sk=sk)
+                     headers={"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, body=mpu_part(), ak=ak, sk=sk)
     xml = (f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
            f"</CompleteMultipartUpload>")
     # The Complete assembles the parts into the final blob; the seam panics after it is durable.
@@ -189,9 +199,9 @@ def op_multipart(ak, sk, bucket, key):
 # (seam, opname, op, key, encrypt, plaintext-marker the op body carries)
 SEAMS = [
     ("blob_after_durable", "PutObject", op_put, "doomed-put", False, b"crash-me"),
-    ("blob_after_assemble", "CompleteMultipartUpload", op_multipart, "doomed-mpu", False, b"part-data"),
+    ("blob_after_assemble", "CompleteMultipartUpload", op_multipart, "doomed-mpu", False, MPU_MARKER),
     ("blob_after_durable", "PutObject @at-rest", op_put, "doomed-put-enc", True, b"crash-me"),
-    ("blob_after_assemble", "CompleteMultipartUpload @at-rest", op_multipart, "doomed-mpu-enc", True, b"part-data"),
+    ("blob_after_assemble", "CompleteMultipartUpload @at-rest", op_multipart, "doomed-mpu-enc", True, MPU_MARKER),
 ]
 
 print(f"=== multi-point durability crash regression (BIN={BIN}) ===", flush=True)
@@ -258,7 +268,7 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
                       f"record={record}")
                 if seam == "blob_after_assemble":
                     check(f"[{tag}] the completed-multipart sidecar carries the exact part layout",
-                          record.get("multipart_parts") == [{"part_number": 1, "size": len(b"part-data" * 1024)}],
+                          record.get("multipart_parts") == [{"part_number": 1, "size": MPU_PART_BYTES}],
                           f"parts={record.get('multipart_parts')}")
         else:
             note(f"[{tag}] exact-path recovery retired the data+metadata pair before pairing inspection")
