@@ -1334,3 +1334,41 @@ This is the scored `multipart_put_5m` row that previously read 0.77x. Raw eviden
 [`reflink-completion-2026-11-04.json`](performance-evidence/2026-11/reflink-completion-2026-11-04.json)
 and
 [`reflink-completion-pre-overlap-2026-11-04.json`](performance-evidence/2026-11/reflink-completion-pre-overlap-2026-11-04.json).
+
+## 15. Full scoreboard after BLAKE3 and reflink (2026-11-05)
+
+The complete `conformance/rustfs_compare.py --case all` sweep on the post-#192 main binary
+`08738d1cbf1e468a4d0cdd410a79dcb0e2eddb8d4c21b8daae7c0d2f02927177`, three interleaved strict
+pairs of 12-second arms, RustFS 1.0.0 `a2dedb78…` and Warp 1.8.2 `fc7661a6…`. The shared host's
+load average rose from about 0.5 to 15 during the 56-minute run (the 100k-object DELETE prefill,
+unrelated homelab services, and three unrelated Node processes), so the **absolute** rates are far
+below the quieter runs in sections 8-9. The interleaved ratio is the stable signal; do not pool
+these absolute numbers with the earlier tables.
+
+| Workload | Cairn | RustFS | Ratio |
+|---|---:|---:|---:|
+| PUT 4 KiB, c32 | 564 / 479 / 578 obj/s | 276 / 244 / 213 | **2.24×** |
+| PUT 1 MiB, c16 | 97.6 / 80.3 / 90.1 | 83.4 / 81.4 / 71.5 | **1.14×** |
+| GET 4 KiB, c16 | 13,742 / 13,637 / 13,451 | 12,513 / 12,303 / 12,311 | **1.10×** |
+| GET 1 MiB, c16 | 3,765 / 3,765 / 3,752 | 1,985 / 1,977 / 1,928 | **1.92×** |
+| HEAD 4 KiB, c16 | 18,477 / 18,467 / 18,619 | 16,530 / 16,621 / 16,500 | **1.12×** |
+| LIST 1,000 keys | 154,254 / 153,805 / 159,862 | 29,179 / 29,751 / 28,936 | **5.33×** |
+| DELETE 4 KiB, c16, batch 100† | 1,301 / 1,344 / 1,120 | 2,624 / 2,523 / 2,254 | **0.51×** |
+| Mixed 1 MiB, c16 | 546 / 465 / 451 | 505 / 453 / 361 | **1.12×** |
+| Multipart part GET, 10×5 MiB | 1,056 / 1,049 / 989 | 391 / 391 / 390 | **2.64×** |
+| Multipart upload, 10×5 MiB | 25.13 / 22.10 / 25.17 | 22.06 / 24.26 / 21.48 | **1.07×** |
+
+† **The unversioned DELETE row is as-configured, not equal durability, and it is disk-sensitive.**
+RustFS strict does not fsync the unversioned delete path, so a slower disk depresses Cairn's rate
+and leaves RustFS roughly unchanged. The same row measured 1.43× on a faster disk on 2026-11-03
+(section 9); the 0.51× here is not a code regression — the 100k prefill took 222-291 s for Cairn
+versus 418-467 s for RustFS, confirming a slower host/disk during this sweep. The equal-durability
+arm is the versioned delete-marker comparison: a fresh 3-pair run on the same code and host state
+measured **5.17×** (Cairn 1,147.7 / 910.7 / 908.8 vs RustFS 197.0 / 190.9 / 185.0 obj/s, 12,000
+markers each, exact version/marker audits and strict readback). The earlier 3.55× result remains a
+conservative reference.
+
+All ten workloads are at parity or better except the intentionally non-durable unversioned DELETE.
+Raw evidence:
+[`full-sweep-2026-11-05.json`](performance-evidence/2026-11/full-sweep-2026-11-05.json) and
+[`delete-versioned-single-key-2026-11-05.json`](performance-evidence/2026-11/delete-versioned-single-key-2026-11-05.json).
