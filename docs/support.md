@@ -59,8 +59,10 @@ evidence and the remaining pre-1.0 gates are in
   (`CAIRN_REPLICATION_WORKER_CONCURRENCY`): 4 is the balance, 2 favours source foreground, 8 favours
   backlog drain.
 - **Long-duration evidence.** The 2026-11-05 record includes a 30-minute soak with a 10-minute idle
-  plateau and a running 24-hour soak. A 48-hour soak and power-loss testing remain open gates for
-  the final 1.0 declaration.
+  plateau and a 24-hour soak at 25 obj/s with 64 KiB objects. The rate bound is deliberate: the
+  disk cannot hold 24 hours of unthrottled writes, and an 8 KiB attempt showed the replication
+  worker is object-rate limited, so the outbox backs up. A 48-hour soak and power-loss testing
+  remain open gates for the final 1.0 declaration; measure your own object mix.
 - **Third-party audit.** The security/architecture review is internal. It is not a certification.
 
 ## Operational checklist

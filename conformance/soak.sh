@@ -33,6 +33,7 @@ PORT2="${PORT2:-9084}"   # source
 DURATION="${DURATION:-120}"
 IDLE="${IDLE:-0}"
 OBJ_SIZE="${OBJ_SIZE:-65536}"
+RATE="${RATE:-0}"
 BUCKET="${BUCKET:-soak}"
 REPL_INTERVAL="${REPL_INTERVAL:-2}"
 
@@ -128,7 +129,7 @@ note "both nodes healthy"
   --target-endpoint "http://127.0.0.1:$PORT1" \
   --target-access-key "$T_AKID" --target-secret "$T_SECRET" \
   --bucket "$BUCKET" --duration "$DURATION" --idle-seconds "$IDLE" \
-  --obj-size "$OBJ_SIZE" --source-pid "$SRV2" \
+  --obj-size "$OBJ_SIZE" --rate "$RATE" --source-pid "$SRV2" \
   || fail "soak harness reported a failure (mismatch or leak); see output above"
 
 note "soak passed: 0 replication mismatches, source RSS flat"
