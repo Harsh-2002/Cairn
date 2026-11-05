@@ -202,6 +202,9 @@ SEAMS = [
     ("blob_after_assemble", "CompleteMultipartUpload", op_multipart, "doomed-mpu", False, MPU_MARKER),
     ("blob_after_durable", "PutObject @at-rest", op_put, "doomed-put-enc", True, b"crash-me"),
     ("blob_after_assemble", "CompleteMultipartUpload @at-rest", op_multipart, "doomed-mpu-enc", True, MPU_MARKER),
+    # The data file is renamed, the sidecar is fsynced but not renamed, and the task panics before
+    # the metadata commit. Recovery must leave no visible object, row or orphan pair.
+    ("blob_after_data_rename", "CompleteMultipartUpload", op_multipart, "doomed-mpu-rename", False, MPU_MARKER),
 ]
 
 print(f"=== multi-point durability crash regression (BIN={BIN}) ===", flush=True)

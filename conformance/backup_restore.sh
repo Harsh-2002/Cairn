@@ -382,19 +382,22 @@ use_data_dir "$D3"
 OUT="$("$BIN" restore "$BK")" || fail "restore into the legacy-sidecar target failed: $OUT"
 LEGACY_SIDECAR="$D3/data/$MP_BUCKET/$MP_SIDECAR"
 [ -f "$LEGACY_SIDECAR" ] || fail "the legacy-sidecar target is missing $MP_SIDECAR"
-"$PYBIN" - "$LEGACY_SIDECAR" "$D3/data/cairn.db" <<'PY' || fail "could not build the layout-less v1 fixture"
+"$PYBIN" - "$LEGACY_SIDECAR" "$D3/data/cairn.db" "$PAY/multi.bin" <<'PY' || fail "could not build the layout-less v1 fixture"
+import hashlib
 import json
 import sqlite3
 import sys
 
-sidecar, database = sys.argv[1], sys.argv[2]
+sidecar, database, payload = sys.argv[1], sys.argv[2], sys.argv[3]
 record = json.loads(open(sidecar).read())
 # Exactly what an older writer's v1 record can express: the object's identity and bytes, no layout,
 # and only the legacy SHA-256 baseline.
 record["format_version"] = 1
 record.pop("multipart_parts", None)
 record.pop("internal_blake3", None)
-record["internal_sha256"] = None
+# A real legacy baseline, not None: the rebuild-and-scrub path must select SHA-256 here.
+with open(payload, "rb") as file:
+    record["internal_sha256"] = hashlib.sha256(file.read()).hexdigest()
 with open(sidecar, "w") as file:
     json.dump(record, file, separators=(",", ":"))
 
