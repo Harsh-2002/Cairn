@@ -119,9 +119,10 @@ when source foreground matters most, use 8 for backlog/drain throughput.
 2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=8192`, or 48 h)
    and crash injection on XFS, and keep the result.
 3. Decide the three audit gaps (fix, accept with a written rationale, or document as unsupported).
-4. Publish a support statement: single node, Linux 5.6+, x86_64/arm64, SQLite, XFS recommended,
-   asynchronous replication (RPO = lag, no automatic failover), backups required, no downgrade after
-   schema v42/sidecar v3.
+4. Publish the final 1.0 support statement after gates 1–3. The current supported scope and known
+   limits are already written in [`support.md`](support.md): single node, Linux 5.6+, x86_64/arm64,
+   SQLite, XFS recommended, asynchronous replication (RPO = lag, no automatic failover), backups
+   required, no downgrade after schema v42/sidecar v3.
 
 Until then: suitable for a single-node deployment with backups and a tested restore, on XFS or
 btrfs, with the pre-upgrade snapshot retained.

@@ -121,7 +121,8 @@ disabled in standard builds; see
 Current status: **release candidate for a single node with backups, not yet 1.0.** The full
 scoreboard, upgrade/rollback drill, 30-minute replication soak, idle memory plateau and independent
 review are recorded in [the stability record](docs/stability-2026-11-05.md), along with the four
-gates that remain before a 1.0 support statement.
+gates that remain before a 1.0 support statement. The supported deployment scope and known limits
+are in [the support statement](docs/support.md).
 
 [Planned work](docs/delivery.md#32-phased-implementation-roadmap) includes external KMS integration,
 remote cold-tier transition/restore and zero-copy HTTPS reads.
