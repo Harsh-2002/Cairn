@@ -250,7 +250,7 @@ impl AnchoredPath {
 
     /// Atomically replace an existing destination.
     ///
-    /// Offline maintenance only (the node lock excludes live writers): the v1 → v2 sidecar
+    /// Offline maintenance only (the node lock excludes live writers): the v1 → current sidecar
     /// upgrade rewrites the durable record in place. Every live publication keeps the
     /// [`Self::rename_to`] no-replace guarantee.
     pub(crate) fn replace_to(&self, destination: &Self) -> std::io::Result<()> {

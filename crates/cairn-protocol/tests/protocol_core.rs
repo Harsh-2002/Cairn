@@ -20019,6 +20019,11 @@ async fn put_writes_a_sidecar_that_matches_the_published_row() {
     assert_eq!(record.size_physical, row.size_physical);
     assert_eq!(record.etag, row.etag);
     assert_eq!(record.content_type, row.content_type);
+    assert_eq!(
+        record.format_version,
+        cairn_types::storage::OBJECT_METADATA_V3_FORMAT_VERSION
+    );
+    assert_eq!(record.internal_blake3, row.internal_blake3);
     assert_eq!(record.internal_sha256, row.internal_sha256);
     assert_eq!(record.checksums, row.checksums);
     assert_eq!(record.sse_descriptor, row.sse_descriptor);

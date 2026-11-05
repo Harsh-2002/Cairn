@@ -34,7 +34,8 @@ enum ExistingSidecar {
     SkipV1,
     /// The sidecar and the index row disagree: leave the durable record untouched.
     Conflict,
-    /// A v1 record that names the row exactly: replace it with the row's v2 record.
+    /// A v1 record that names the row exactly: replace it with the row's current record (v3 for
+    /// a BLAKE3 row, v2 for a legacy row).
     Upgrade,
 }
 
@@ -59,9 +60,12 @@ fn classify_existing_sidecar(
             }
         }
         OBJECT_METADATA_V2_FORMAT_VERSION => {
-            // A v2 record is never rewritten. If the row now carries the BLAKE3 baseline, the
-            // durable record is older than the index truth and an operator must resolve it.
-            if existing.multipart_parts != row.multipart_parts || row.internal_blake3.is_some() {
+            // A v2 record is never rewritten. A layout, baseline or BLAKE3 disagreement means the
+            // durable record is not the index truth and an operator must resolve it.
+            if existing.multipart_parts != row.multipart_parts
+                || existing.internal_sha256 != row.internal_sha256
+                || row.internal_blake3.is_some()
+            {
                 ExistingSidecar::Conflict
             } else {
                 ExistingSidecar::Keep
@@ -88,7 +92,8 @@ fn classify_existing_sidecar(
 /// because its parent directory is outside the permit's bucket directory.
 ///
 /// With `upgrade_v1`, an object assembled between the v1 sidecar stage and the v2 part-layout stage
-/// also gets its existing v1 record replaced by the row's v2 record, after the record identity is
+/// also gets its existing v1 record replaced by the row's current v3/v2 record, after the record
+/// identity is
 /// checked against the row. Without the flag an existing sidecar is never touched.
 pub(crate) fn run(
     cfg: Config,
@@ -539,7 +544,7 @@ mod tests {
             ExistingSidecar::Conflict
         );
 
-        // A v2 record whose layout disagrees with the row is reported, not replaced.
+        // A v2 record whose layout or SHA-256 disagrees with the row is reported, not replaced.
         let mut different_layout = v2.clone();
         different_layout.multipart_parts = Some(vec![MultipartPartRecord {
             part_number: 1,
@@ -549,9 +554,15 @@ mod tests {
             classify_existing_sidecar(&different_layout, &row),
             ExistingSidecar::Conflict
         );
+        let mut stale_sha256 = v2.clone();
+        stale_sha256.internal_sha256 = Some("cd".repeat(32));
+        assert_eq!(
+            classify_existing_sidecar(&stale_sha256, &row),
+            ExistingSidecar::Conflict
+        );
 
         // A row with the BLAKE3 baseline classifies against the v3 generation. The same v2 record
-        // becomes an upgrade target, and a v3 record with a stale baseline is a conflict.
+        // is a conflict (a v2 record is never rewritten), as is a v3 record with a stale baseline.
         let mut blake3_row = row.clone();
         blake3_row.internal_blake3 = Some("ab".repeat(32));
         blake3_row.internal_sha256 = None;

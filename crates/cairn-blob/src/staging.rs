@@ -97,6 +97,12 @@ impl Staging {
                         "staging file still has a queued physical write".into(),
                     ));
                 }
+                if !writer.buffer().is_empty() {
+                    return Err(BlobError::Io(
+                        "staging file has buffered bytes; reflink placement requires an empty sink"
+                            .into(),
+                    ));
+                }
                 writer
                     .get_ref()
                     .owner
@@ -117,7 +123,7 @@ impl Staging {
         self.commit_inner(destination, false, None).await
     }
 
-    /// Atomically replace an existing destination for offline maintenance (the v1 → v2 sidecar
+    /// Atomically replace an existing destination for offline maintenance (the v1 → current sidecar
     /// upgrade). Live publication always uses [`Self::commit`], whose rename refuses to replace.
     pub(crate) async fn commit_replacing(
         self,
@@ -288,6 +294,26 @@ mod tests {
     use cairn_types::storage::{StorageToken, io::StorageIoWatch};
     use futures_util::FutureExt;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn run_file_op_rejects_buffered_bytes_and_accepts_an_empty_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged");
+        let mut staging = Staging::create(
+            AnchoredPath::fixture(&path),
+            false,
+            None,
+            crate::owned_file::test_lease(),
+        )
+        .await
+        .unwrap();
+        staging.run_file_op(|_| Ok(())).await.unwrap();
+        staging.write_all(b"buffered").await.unwrap();
+        assert!(
+            staging.run_file_op(|_| Ok(())).await.is_err(),
+            "a sink with buffered bytes must be refused rather than cloned over"
+        );
+    }
 
     #[tokio::test]
     async fn trim_failure_prevents_publication_and_in_place_success() {
