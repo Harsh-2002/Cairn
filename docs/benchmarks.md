@@ -1408,7 +1408,8 @@ Every arm must finish drained with zero failed entries, completed equal to sourc
 bytes equal to written bytes and to target logical bytes, target versions equal to source writes,
 and a sampled byte-for-byte plus version-id check of drained versions. All arms in the reported
 runs passed every check. `--workers` (default 4) sets
-`CAIRN_REPLICATION_WORKER_CONCURRENCY`; the runs below use the default.
+`CAIRN_REPLICATION_WORKER_CONCURRENCY`; the baseline runs below use the default and 16.4 overrides
+it for the sweep.
 
 ### 16.2 Results
 
@@ -1488,32 +1489,55 @@ durable write of that size on this host.
 At 1 MiB, four transfers at that latency cannot reach the 50-56 obj/s the client offers; at
 64 MiB, four large transfers already exceed the offered byte rate.
 
-### 16.4 Candidate: in-flight concurrency before the read path
+### 16.4 Worker-count sweep (1 MiB)
 
-The measured 1 MiB gap is a concurrency/latency gap, not a hashing gap. The first safe experiment
-is configuration only: sweep `--workers` 8 and 16 with this same harness (it sets
-`CAIRN_REPLICATION_WORKER_CONCURRENCY`; an unknown `CAIRN_*` name is rejected by the strict
-config). That raises the in-flight transfer count without changing code, durability or the wire
-format, and the harness records the client-visible source PUT cost so the sweep cannot
-silently trade client throughput for ship rate. If the drain rate rises roughly with concurrency
-until the destination or the source writer saturates, the 1 MiB lag is fixed by capacity, not by
-a new read path. At 64 MiB the worker already exceeds the offered byte rate, so the sweep should
-not be expected to help that shape.
+`--workers` was run at 2 and 8 on the same release binary and 1 MiB shape, two pairs each, under
+the host lock; the 4-worker row is the baseline from 16.2. The host load differed between the arms
+(2 workers started at 9.41, 8 workers at 0.47, the baseline runs at 1.63 and 5.05 on six CPUs), so
+absolute rates are not comparable across rows; the replicated/control ratio and the worker-side
+drain/lag are the paired signals.
 
-Only if the concurrency sweep plateaus should the per-transfer path change. A stage split must
-cover both ends: the destination's durable write and fsync are the other candidate, because the
-per-transfer wall matches a durable write of the same size on this host, and a target-side fsync
-or writer stall would show up there rather than in source CPU. The suspected double read is real
-and measurable: the extra source CPU per put is about 0.010 s per 1 MiB and 0.007 s
-per MiB at 64 MiB, roughly a tenth of the per-transfer wall before counting the latency of the
-second open. Removing it would need either chunked SigV4 signing while streaming (the destination
-must validate the chunk chain; Cairn's receiver and generic S3 support would have to be checked)
-or a payload SHA-256 persisted at write time (a cost on every write, including objects that never
-replicate). Neither is justified by this data yet: the benchmark bounds the double read's CPU at
-about 8-16 % of the per-transfer wall, while the four-way in-flight cap accounts for the
-1.6x shortfall. Measure the stage split and the concurrency sweep before changing the sender.
+| Workers | Foreground ratio (per pair) | Shipped during load obj/s | Drain obj/s | Lag max / p95 s | Unreplicated max | Drain s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 0.794 (0.794/0.794) | 4.3 | 25.4 | 27.0 / 25.5 | 1,779 | 71.5 |
+| 4 (baseline) | 0.66-0.70 mean (0.636-0.732) | 2.7-3.5 | 31.7-34.6 | 26.0 / 24.0 | 1,366-1,562 | 49.2-49.5 |
+| 8 | 0.613 (0.587/0.640) | 9.9 | 49.1 | 20.0 / 19.0 | 1,320 | 32.4 |
 
-### 16.5 Limits
+Source CPU per shipped MiB stayed 0.0182-0.0191 s and the extra source CPU per PUT 9.7-10.6 ms
+across the three settings, so the sweep moves latency and queueing rather than the per-byte CPU
+cost. Raw reports:
+[`replication-perf-workers-2-2026-11-05.json`](performance-evidence/2026-11/replication-perf-workers-2-2026-11-05.json)
+and
+[`replication-perf-workers-8-2026-11-05.json`](performance-evidence/2026-11/replication-perf-workers-8-2026-11-05.json).
+
+**Recommendation:** keep the 4-worker default as the balance. Use 2 workers when source foreground
+throughput matters most (ratio 0.794, but the slowest drain and the largest backlog); use 8 workers
+for backlog/drain throughput (drain 49.1 obj/s, lag 20 s) at a 0.613 foreground ratio. This is an
+operator choice; do not change the product default.
+
+### 16.5 Candidate: in-flight concurrency before the read path
+
+The worker-count sweep in 16.4 confirms the in-flight mechanism rather than a hashing limit:
+2 workers improved the foreground ratio to 0.794 but drained only 25.4 obj/s; 8 workers raised the
+drain to 49.1 obj/s and cut lag to 20 s, at a 0.613 foreground ratio; 4 remains the balance. A
+16-worker run was not measured. If more ship capacity is needed than 8 provides, the next
+experiment is 16 or a stage split, not a read-path rewrite: the harness records the client-visible
+source PUT cost, so a further sweep cannot silently trade client throughput for ship rate.
+
+Only then should the per-transfer path change. A stage split must cover both ends: the
+destination's durable write and fsync are the other candidate, because the per-transfer wall
+matches a durable write of the same size on this host, and a target-side fsync or writer stall
+would show up there rather than in source CPU. The suspected double read is real and measurable:
+the extra source CPU per put is about 0.010 s per 1 MiB and 0.007 s per MiB at 64 MiB, roughly a
+tenth of the per-transfer wall before counting the latency of the second open. Removing it would
+need either chunked SigV4 signing while streaming (the destination must validate the chunk chain;
+Cairn's receiver and generic S3 support would have to be checked) or a payload SHA-256 persisted at
+write time (a cost on every write, including objects that never replicate). Neither is justified
+by this data yet: the benchmark bounds the double read's CPU at about 8-16 % of the per-transfer
+wall, while the in-flight cap accounts for the 1.6x shortfall. Measure the stage split before
+changing the sender.
+
+### 16.6 Limits
 
 - **One host.** Source, target, Warp and the sampler share six logical CPUs and one NVMe device;
   the absolute rates move with host load (the per-arm load averages are in the raw reports). The

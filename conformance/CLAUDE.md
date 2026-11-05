@@ -336,7 +336,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   only move on the 15 s tick), source/target CPU, drain time and a byte-for-byte + version-id
   sample check. It pins FULL metadata durability, takes the host-wide benchmark lock, keeps both
   stores on `/var/tmp` (XFS) and cleans them on success. `--workers` (default 4) sets
-  `CAIRN_REPLICATION_WORKER_CONCURRENCY` for a follow-up 4/8/16 sweep. Offline checks:
+  `CAIRN_REPLICATION_WORKER_CONCURRENCY` for worker-count sweeps (docs §16.4). Offline checks:
   `test_replication_perf.py` (run from `conformance/`). Results and limits:
   `../docs/benchmarks.md` §16.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
