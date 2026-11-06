@@ -11,21 +11,24 @@ It is designed for a single node; asynchronous bucket replication provides copie
 
 ## What it supports
 
-- **S3:** multipart uploads, range reads, checksums, versioning, presigned URLs, tagging, CORS,
-  lifecycle expiration and Object Lock. See the [S3 compatibility matrix](docs/s3-api-matrix.md).
-- **Console:** manage buckets, users and policies; upload, preview and share objects; inspect
-  usage, metrics and replication.
+- **S3:** multipart uploads and part reads, range reads, checksums, versioning, presigned URLs,
+  tagging, CORS, lifecycle expiration and incomplete-upload abort, Object Lock and per-bucket object
+  TTL. See the [S3 compatibility matrix](docs/s3-api-matrix.md).
+- **Console:** manage buckets, users and policies; upload, preview and share objects; inspect usage,
+  metrics, replication and import jobs.
 - **Security:** native TLS, bucket policies, scoped temporary credentials, SSE-S3 and transparent
   object encryption at rest (`CAIRN_ENCRYPT_AT_REST=true`). The `aws:kms` interface uses key labels
   backed by the node's master-key ring; it does not integrate with an external KMS or provide
   independent cryptographic isolation between key IDs.
 - **Storage and operations:** block compression, durable writes, asynchronous replication,
-  webhooks, S3 import, integrity checks, backup/restore and Prometheus metrics.
+  webhooks, S3 import, quotas, object expiry, integrity checks, backup/restore and Prometheus
+  metrics.
 
 ## Install
 
-Requires Linux 5.6+ with `openat2` support and a local filesystem that supports durable file and
-directory synchronization. Docker uses the host's kernel.
+Requires Linux 5.6+ on x86_64 or aarch64 with `openat2` support and a local filesystem that
+supports durable file and directory synchronization. XFS is recommended; btrfs also supports
+reflink completion, and ext4 works through the streaming-copy path. Docker uses the host's kernel.
 
 The installer sets up Docker or a host service, generates credentials and a master key, and can
 configure TLS. Running it again updates the installation:
@@ -78,7 +81,7 @@ Docker's `--env-file` supplies those variables; Cairn itself does not read a con
 | `CAIRN_API_ADDR` | `0.0.0.0:7373` | S3 + native management listener |
 | `CAIRN_CONSOLE_ADDR` | `0.0.0.0:7374` | Console, browser API and download links; `off` leaves native API available |
 | `CAIRN_DATA_DIR` | `./data` | Object storage root |
-| `CAIRN_DB_PATH` | `./data/cairn.db` | Metadata database |
+| `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata/index database |
 | `CAIRN_MASTER_KEY` | Development key | Set a persistent 32-byte hex master key |
 | `CAIRN_ENCRYPT_AT_REST` | `false` | Encrypt newly written objects without requiring client SSE headers |
 | `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | Unset | Native TLS certificate and private key |
@@ -97,7 +100,8 @@ for your durability requirements.
 ## Build and contribute
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, a local build/run walkthrough and the
-required checks. Build the React console before the Rust binary so it is embedded correctly.
+required checks. The React console requires Node 26.13.0 or newer; build it before the Rust binary
+so it is embedded correctly.
 
 The [engineering specification](docs/CLAUDE.md) describes the architecture and invariants;
 [CONTRACT.md](CONTRACT.md) records architectural constraints.
@@ -118,11 +122,12 @@ disabled in standard builds; see
 
 ## Stability
 
-Current status: **release candidate for a single node with backups, not yet 1.0.** The full
-scoreboard, upgrade/rollback drill, 30-minute replication soak, idle memory plateau and independent
-review are recorded in [the stability record](docs/stability-2026-11-05.md), along with the four
-gates that remain before a 1.0 support statement. The supported deployment scope and known limits
-are in [the support statement](docs/support.md).
+Current status: **1.0 release candidate** for a single node with backups. The full scoreboard,
+upgrade/rollback drill, replication baseline, abrupt-process-kill drill, idle memory plateau and
+independent review are recorded in [the stability record](docs/stability-2026-11-05.md). Before
+1.0, the remaining gate is a 24–48 hour replication soak (power-loss testing remains site-specific);
+the result will be recorded there. The supported deployment scope and known limits are in
+[the support statement](docs/support.md).
 
 [Planned work](docs/delivery.md#32-phased-implementation-roadmap) includes external KMS integration,
 remote cold-tier transition/restore and zero-copy HTTPS reads.
