@@ -23,32 +23,6 @@ const dockerRun = `docker run -d --name cairn \\
   -v cairn-data:/data --env-file ./cairn.env \\
   ghcr.io/harsh-2002/cairn:latest`;
 
-const compose = `services:
-  cairn:
-    image: ghcr.io/harsh-2002/cairn:latest
-    container_name: cairn
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:7373:7373"   # S3 + native administration
-      - "127.0.0.1:7374:7374"   # optional web console
-    volumes:
-      - cairn-data:/data
-    env_file:
-      - ./cairn.env
-    environment:
-      CAIRN_REGION: "us-east-1"
-
-      # Optional overrides
-      # CAIRN_ENCRYPT_AT_REST: "true"         # off by default
-      # CAIRN_S3_DOMAIN: "s3.example.com"     # virtual-host style
-      # CAIRN_TLS_CERT_PATH: "/certs/tls.crt" # TLS (set both)
-      # CAIRN_TLS_KEY_PATH: "/certs/tls.key"
-      # CAIRN_CONSOLE_ADDR: "off"             # API-only operation
-      # CAIRN_API_PUBLIC_URL: "https://s3.example.com"
-      # CAIRN_CONSOLE_PUBLIC_URL: "https://console.example.com"
-volumes:
-  cairn-data:`;
-
 const awsConfig = "aws configure --profile cairn";
 
 const awsUse = `# A short alias for the endpoint
@@ -66,113 +40,83 @@ const envs = [
   {
     name: "CAIRN_MASTER_KEY",
     def: "a dev key (insecure)",
-    desc: "A 32-byte hex key that seals every secret at rest. Set it in production — a node still on the built-in key refuses to bind a public address. Keep it constant for the life of your data.",
+    desc: "A 32-byte hex key for encrypting secrets. Set it once and keep it safe; the built-in key is for local tests only.",
   },
   {
     name: "CAIRN_ROOT_ACCESS_KEY",
     def: "cairn",
-    desc: "The root administrator's access key, ensured on every startup.",
+    desc: "The admin access key. The default is fine for local use; change it for a public node.",
   },
   {
     name: "CAIRN_ROOT_SECRET_KEY",
     def: "cairnadmin",
-    desc: "The root administrator's secret. Override it before exposing a node.",
+    desc: "The admin secret. Change it before exposing the node.",
   },
   {
     name: "CAIRN_API_ADDR",
     def: "0.0.0.0:7373",
-    desc: "S3 and native administration at /api/v1, plus health, readiness, metrics, STS and API share links.",
+    desc: "S3 and the admin API. Health, metrics and temporary credentials live here too.",
   },
   {
     name: "CAIRN_CONSOLE_ADDR",
     def: "0.0.0.0:7374",
-    desc: "The console, browser sessions and forced-download share links. Set to off / none / disabled for API-only operation; native administration stays available.",
+    desc: "The web console. Set to off for API-only operation.",
   },
   {
     name: "CAIRN_DATA_DIR",
     def: "./data",
-    desc: "Root of object storage; /data in the container. Must share a filesystem with the metadata database.",
+    desc: "Where object files live; /data in the container.",
   },
   {
     name: "CAIRN_DB_PATH",
     def: "./data/cairn.db",
-    desc: "The SQLite metadata file; /data/cairn.db in the container. Use the offline backup procedure for metadata and object data together.",
-  },
-  {
-    name: "CAIRN_REGION",
-    def: "us-east-1",
-    desc: "The region label returned by the location API and checked in the SigV4 credential scope.",
+    desc: "The SQLite index; /data/cairn.db in the container.",
   },
   {
     name: "CAIRN_TLS_CERT_PATH / _KEY_PATH",
-    def: "unset (plaintext)",
-    desc: "Set both to enable built-in TLS; otherwise run plaintext behind a TLS-terminating proxy.",
+    def: "unset",
+    desc: "Set both for built-in TLS; otherwise use a TLS-terminating proxy.",
   },
   {
     name: "CAIRN_ENCRYPT_AT_REST",
     def: "off",
-    desc: "Transparently encrypt every stored object at rest, even when the client sends no SSE header.",
-  },
-  {
-    name: "CAIRN_S3_DOMAIN",
-    def: "unset",
-    desc: "Base domain for virtual-host-style addressing (bucket.domain); unset serves path-style only.",
-  },
-  {
-    name: "CAIRN_API_PUBLIC_URL",
-    def: "unset",
-    desc: "External API origin for S3 presigned URLs and API share links. Must differ from the console origin.",
-  },
-  {
-    name: "CAIRN_CONSOLE_PUBLIC_URL",
-    def: "unset",
-    desc: "External console origin for download shares. Set both public origins behind a reverse proxy; this does not enable a disabled console.",
-  },
-  {
-    name: "CAIRN_TRUSTED_PROXIES",
-    def: "unset",
-    desc: "Exact proxy IPs or CIDRs allowed to supply forwarding headers. Required when a proxy terminates HTTPS for console sessions.",
+    desc: "Encrypt every object on disk, even when the client does not ask for it.",
   },
   {
     name: "CAIRN_META_SYNCHRONOUS",
     def: "full",
-    desc: "full commits control-plane and multipart metadata durably before acknowledgement. normal relaxes the metadata barrier; recent control-plane writes may be lost on power loss, while ordinary objects are rebuilt from their durable files.",
-  },
-  {
-    name: "CAIRN_ALLOW_INSECURE",
-    def: "off",
-    desc: "Permit the built-in insecure defaults on a public bind — for a closed demo rig only, never production.",
+    desc: "full flushes the index before saying yes. normal is faster but can lose recent admin or settings changes; objects are rebuilt from disk.",
   },
 ];
 
 const features = [
   {
     h: "S3 API",
-    p: "Buckets and objects, byte-range and conditional reads and writes, multipart upload with part reads (?partNumber), copy, and bulk delete. v1/v2 and version listings. Checksums (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256). Versioning, tagging, CORS, lifecycle expiration and incomplete-upload abort, object lock (WORM), per-bucket object TTL, and presigned URLs. SigV4 — header and streaming-chunked — and Bearer authentication. The aws CLI and the standard AWS SDKs work against it.",
+    p: "Buckets, objects, versions, large uploads, range reads, checksums, tags, lifecycle, Object Lock and shareable links. Standard S3 clients work unchanged.",
   },
   {
     h: "Web console",
-    p: "Manage buckets and users on its own port. Browse, upload, preview, and share objects. Public download links can use the console while the API stays private; uploads and inline previews need the separate API origin. Disabling the console leaves native administration available through the API and CLI.",
+    p: "Browse, upload, preview and share from the browser. Manage buckets, users and settings. Turn it off and the API still works.",
   },
   {
     h: "Access control",
-    p: "Bucket policies, identity policies, ACLs, Block Public Access, and Object Ownership — a real policy-evaluation engine, not a role check. Short-lived credentials through the AWS-STS surface (AssumeRole, GetSessionToken), served on the S3 port or the management API.",
+    p: "Bucket and user policies, access lists (ACLs), Block Public Access, ownership controls and temporary credentials.",
   },
   {
     h: "Security & encryption",
-    p: "Native TLS. AES-256-GCM encryption of secrets at rest, with online master-key rotation. Server-side object encryption: per-bucket SSE-S3, an aws:kms request surface, optional mandatory-encryption enforcement, and transparent encryption of every object at rest.",
+    p: "TLS, encrypted secrets, and server-side encryption at rest. The AWS KMS option is a label over the node key, not a separate key service.",
   },
   {
     h: "Durability",
-    p: "Writes are staged, fsynced, and atomically renamed before they are acknowledged. Control-plane and multipart writes also commit their metadata transaction first; an ordinary object's index row folds asynchronously, and startup rebuild restores it. On restart Cairn reconciles and reclaims orphaned data. Acknowledged writes survive power loss.",
+    p: "Files are flushed to disk before Cairn says yes. The database catches up; if it is lost, startup rebuilds it from the files.",
   },
   {
     h: "Storage efficiency",
-    p: "Optional per-bucket block compression, with range reads that touch only the blocks they need. Plaintext, uncompressed, unencrypted multipart completion can share the parts' extents with reflink on XFS or btrfs instead of rewriting the assembled bytes.",
+    p: "Optional compression that still supports range reads. Large uploads can finish faster on XFS or btrfs.",
   },
   {
     h: "Operations",
-    p: "Prometheus metrics, liveness and readiness endpoints, structured logs, and a built-in Docker health check. Asynchronous bucket replication, webhooks, streaming import from MinIO, Garage, R2, AWS or another Cairn, per-bucket quotas, and object TTL expiry. Native administration and S3 share one API endpoint; the CLI also handles offline backup, restore and storage baselines.",
+    p: "Metrics, health checks, replication, webhooks, import, quotas and object expiry. Backup and restore from the CLI.",
   },
 ];
 
@@ -185,9 +129,8 @@ const features = [
       Self-hosted, S3-compatible<br /> object storage.
     </h1>
     <p class="lead">
-      Cairn speaks the S3 API, stores objects as durable files on a normal filesystem, and keeps its
-      object index in embedded SQLite — rebuildable from those files. One static binary. No external
-      database, no clustering layer, no separate storage daemon to run.
+      Keep files, backups and app data on your own server. Cairn speaks the S3 API, stores
+      everything as normal files, and runs as one binary — no external database or cluster.
     </p>
     <div class="cta">
       <a class="btn" href="#get-started">Get started</a>
@@ -199,34 +142,28 @@ const features = [
   {/* 2 — What it is */}
   <Section eyebrow="What it is" title="A single-node object store that speaks S3">
     <p>
-      Cairn implements the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and
-      the <code>aws</code> CLI work against it without special-casing. Object bytes and their
-      per-object metadata live in durable files on a POSIX filesystem; SQLite holds the object index
-      and is the control-plane authority. Point any S3 client at it, or use the built-in web console.
+      Point any S3 client at it — the AWS CLI, an SDK, or the built-in console — and it keeps your
+      data as files on a normal disk. A small SQLite database holds the index and settings, not the
+      data itself.
     </p>
     <dl class="points">
       <div>
-        <dt>Plain files on disk</dt>
+        <dt>Your files, your disk</dt>
         <dd>
-          Object data lives in ordinary filesystem files. A plaintext single-part object is one file
-          — payload plus a metadata trailer; compression, encryption, and multipart completion add a
-          sidecar. Use S3 or the CLI to export the original object bytes.
+          Objects are ordinary files on disk, not a proprietary store. Cairn handles compression and
+          encryption; use S3 or the CLI to export the original bytes.
         </dd>
       </div>
       <div>
-        <dt>Embedded SQLite metadata</dt>
+        <dt>A small database, not a server</dt>
         <dd>
-          SQLite holds the object index and the control plane — buckets, users, policies,
-          replication, activity. The object index is rebuildable from the object files at startup;
-          control-plane state is covered by backup.
+          SQLite holds the index and settings. If the index is lost, Cairn rebuilds it from the
+          object files at startup.
         </dd>
       </div>
       <div>
-        <dt>One static binary</dt>
-        <dd>
-          The server, the web console, and the CLI ship as one file — on a homelab box, a VPS, or a
-          small production node. A distroless container image is published too.
-        </dd>
+        <dt>One binary</dt>
+        <dd>Server, console and CLI in one file. A distroless container image is published too.</dd>
       </div>
     </dl>
   </Section>
@@ -254,162 +191,111 @@ const features = [
   {/* 6 — Performance */}
   <Section eyebrow="Performance" title="Measure the workload you run">
     <p>
-      Cairn's benchmark suite covers small-object rates, large-object bandwidth, metadata queries,
-      and sustained replication. A repeatable MinIO <code>warp</code> comparison runs both servers
-      on the same host with the same workload. Results depend on the hardware, build, object sizes,
-      encryption, compression, and durability settings.
+      We compare Cairn with RustFS and MinIO&apos;s <code>warp</code> on the same host, with the same
+      workload. Results depend on the hardware, object size and durability settings, so read the
+      ratios, not just the absolute numbers.
     </p>
     <p>
-      On the shared reference host, the current interleaved scoreboard puts Cairn at{" "}
-      <strong>2.24×</strong> RustFS on 4 KiB PUT,{" "}
-      <strong>1.14×</strong> on 1 MiB PUT,{" "}
-      <strong>1.92×</strong> on 1 MiB GET,{" "}
-      <strong>5.33×</strong> on a 1,000-key LIST,{" "}
-      <strong>1.07×</strong> on the scored multipart upload, and{" "}
-      <strong>5.17×</strong> on the equal-durability versioned DELETE. The host is shared, so the
-      ratio is the signal; absolute rates vary with the run.
+      On our shared test host, Cairn was faster than RustFS on every equal-durability workload:{" "}
+      <strong>2.24×</strong> on 4 KiB writes, <strong>1.14×</strong> on 1 MiB writes,{" "}
+      <strong>1.92×</strong> on 1 MiB reads, <strong>5.33×</strong> on listing 1,000 keys,{" "}
+      <strong>1.07×</strong> on multipart uploads, and <strong>5.17×</strong> on versioned deletes.
     </p>
     <p class="note">
-      The unversioned DELETE row is as-configured and is not an equal-durability comparison. The
-      multipart row includes reflink completion on XFS.
-    </p>
-    <p>
-      The <a class="link" href={`${docs}/benchmarks.md`}>benchmark record</a> includes measurements,
-      limitations, and reproduction commands. The <a class="link" href={`${docs}/scaling-limits.md`}>
-      scaling guide</a> explains the single-node and single-writer limits to consider when sizing a
-      deployment.
+      The unversioned delete row is not an equal-durability comparison. The{" "}
+      <a class="link" href={`${docs}/benchmarks.md`}>benchmark record</a> has the method,
+      limitations and reproduction commands; the{" "}
+      <a class="link" href={`${docs}/scaling-limits.md`}>scaling guide</a> covers sizing limits.
     </p>
   </Section>
 
   {/* 6 — Why Cairn */}
   <Section eyebrow="Why Cairn" title="Built to replace a single-node MinIO">
     <p>
-      If you run a single-node MinIO, or any single-drive or single-host S3 endpoint, Cairn is built
-      to replace it: a simpler operational model, a smaller and safer binary, transparent compression,
-      an embedded console, and asynchronous replication for redundancy — without losing S3
-      compatibility. The wire protocol is a commodity; the console and the operational model are the
-      product.
+      If you run a single-node MinIO, Cairn is a simpler replacement: one binary, normal files, a
+      built-in console and async replication — without a cluster to operate.
     </p>
     <dl class="points">
       <div>
         <dt>Written in Rust</dt>
-        <dd>
-          Predictable, garbage-collector-free tail latency, and memory safety on a surface that parses
-          untrusted input — SigV4 chunk framing, S3 XML, policy JSON — with no runtime cost.
-        </dd>
+        <dd>Fast, predictable and memory-safe.</dd>
       </div>
       <div>
         <dt>Self-contained</dt>
-        <dd>
-          The web console is compiled into the binary; there is no separate service to deploy. The CLI
-          gives the same control from a terminal.
-        </dd>
+        <dd>Console and CLI live inside the binary; nothing extra to deploy.</dd>
       </div>
       <div>
-        <dt>Honest about what it is</dt>
-        <dd>Single-node by design, and clear about the line. See Scope.</dd>
+        <dt>Honest about limits</dt>
+        <dd>Single-node by design. The trade-offs are written down, not hidden.</dd>
       </div>
     </dl>
   </Section>
 
   {/* 7 — Scope */}
   <Section eyebrow="Scope" title="Single-node by design">
-    <p>
-      Cairn is single-node by design: one process, one data filesystem, one metadata store.
-      That&apos;s the line, and it&apos;s deliberate — it&apos;s what keeps Cairn simple to operate.
-    </p>
+    <p>That is deliberate — it keeps the system small and easy to run.</p>
     <ul class="scope">
       <li>
-        Cross-host redundancy comes from <strong>asynchronous bucket replication</strong> — eventually
-        consistent, with observable lag — not from clustering. There is no consensus, cross-host
-        sharding, or erasure coding.
+        <strong>Need a copy elsewhere?</strong> Use async bucket replication. It is not a cluster, and
+        it does not fail over automatically.
       </li>
       <li>
-        <strong>Drive redundancy is left to the storage underneath</strong>: ZFS, RAID, or a
-        replicated block volume.
+        <strong>Disk redundancy</strong> is your filesystem&apos;s job: ZFS, RAID or a replicated
+        volume.
       </li>
       <li>
-        <strong>Supported deployment:</strong> one node on Linux 5.6+ (x86_64 or aarch64) with a local
-        filesystem. XFS is recommended; btrfs also supports reflink completion; ext4 and other
-        filesystems use the streaming-copy path. Backups and a tested restore are required, and the
-        data directory must not sit on a container&apos;s overlayfs writable layer.
+        <strong>Supported:</strong> Linux 5.6+ on x86_64 or arm64. XFS is recommended; ext4 works.
+        Backups and a tested restore are required.
       </li>
       <li>
-        <strong>Storage format:</strong> protocol 3, schema v42, sidecar v3. New objects carry a
-        BLAKE3 integrity baseline; legacy objects keep SHA-256. Downgrade after v42 is unsupported —
-        roll back by restoring the pre-upgrade snapshot.
+        <strong>Format:</strong> new objects use a fast BLAKE3 checksum; older objects keep SHA-256.
+        The format is one-way after v42 — restore a snapshot to go back.
       </li>
       <li>
-        Server-side encryption is real, but the <code>aws:kms</code> key id is a validated
-        <strong> label over the node&apos;s master-key ring</strong>, not independent key material — so
-        it is SDK compatibility, not cryptographic tenant isolation. A dedicated external KMS with
-        distinct per-key material isn&apos;t implemented yet.
+        <strong>Not built in:</strong> login rate limiting. Put a proxy or firewall in front of a
+        public endpoint. The AWS KMS option is a label, not a separate key service.
       </li>
       <li>
-        <strong>Rate limiting on the authentication path is not built in.</strong> Put a reverse proxy
-        or network policy in front of a public endpoint. The{" "}
-        <a class="link" href={`${docs}/support.md`}>support statement</a> records this and the other
-        deliberate limits.
-      </li>
-      <li>
-        The target is <strong>homelab and small-to-mid production</strong> that wants the S3 API and a
-        console without running a distributed system.
+        <strong>Best for</strong> homelabs and small-to-mid production.
       </li>
     </ul>
+    <p class="note">
+      Full supported scope and operational limits are in the{" "}
+      <a class="link" href={`${docs}/support.md`}>support statement</a>.
+    </p>
   </Section>
 
   {/* 8 — Get started / deploy */}
   <Section eyebrow="Get started" title="Deploy Cairn" id="get-started">
     <p>
-      Requires Linux 5.6+ on <code>x86_64</code> or <code>aarch64</code>, with <code>openat2</code>
-      support and durable file and directory synchronization. Docker uses the host's kernel. The
-      installer sets up a host service or Docker, generates credentials and a master key, and updates
-      an existing install when run again. It keeps both ports on loopback unless you explicitly
-      expose them.
+      Requires Linux 5.6+ on <code>x86_64</code> or <code>arm64</code>. The installer sets up Docker
+      or a host service, creates credentials and a key, and keeps both ports on localhost.
     </p>
     <CodeBlock code={install} />
 
-    <h3 class="deploy__h">Run the container directly</h3>
+    <h3 class="deploy__h">Run with Docker</h3>
     <p>
-      Create <code>cairn.env</code> once to save a master key and administrator credentials. This
-      command refuses to overwrite an existing file. Reuse the same file whenever you recreate the
-      container with its data volume, and keep it out of version control.
+      Create <code>cairn.env</code> once. It holds the master key and admin secret; keep it out of
+      version control and reuse it with the data volume.
     </p>
     <CodeBlock code={envFile} />
-    <p>
-      The image runs as nonroot, stores data in <code>/data</code>, and includes a readiness health
-      check. Start it with the saved environment file:
-    </p>
+    <p>The image runs as nonroot and stores data in <code>/data</code>. Start it:</p>
     <CodeBlock code={dockerRun} />
-
-    <h3 class="deploy__h">Or with Docker Compose</h3>
-    <p>
-      Use the same <code>cairn.env</code> alongside this file and run <code>docker compose up -d</code>.
-      Optional overrides are commented; certificate paths also need corresponding volume mounts.
-    </p>
-    <CodeBlock label="docker-compose.yml" code={compose} />
     <p class="note">
-      Open <code>http://localhost:7374</code> and sign in with access key <code>cairn</code> and the
-      secret saved in <code>cairn.env</code>. S3 and native administration use
-      <code>http://localhost:7373</code>. These examples publish both ports on loopback.
-    </p>
-    <p class="note">
-      For remote access, configure TLS and distinct API and console origins using the{" "}
+      Open <code>http://localhost:7374</code> and sign in with <code>cairn</code> and the secret
+      from <code>cairn.env</code>. For remote access, use TLS and the{" "}
       <a class="link" href={`${docs}/operations.md#api-and-console-ingress`}>ingress guide</a>.
-      Restrict <code>/api/v1</code> at the API ingress if S3 is public but administration is private.
-      Existing installations should follow the
-      <a class="link" href={`${docs}/upgrade-rollback.md`}>upgrade and rollback guide</a> before updating.
+      Upgrading? Follow the{" "}
+      <a class="link" href={`${docs}/upgrade-rollback.md`}>upgrade and rollback guide</a>.
     </p>
   </Section>
 
   {/* 9 — Configuration */}
   <Section eyebrow="Configuration" title="Configure with the environment">
     <p>
-      Cairn is configured entirely by <code>CAIRN_*</code> environment variables — no config file, no
-      server flags — so a deployment is reproducible whether it runs on a host or in a container.
-      Invalid values and unknown names fail fast at startup. Set a persistent
-      <code>CAIRN_MASTER_KEY</code> and a non-default <code>CAIRN_ROOT_SECRET_KEY</code> for a real
-      node. <code>cairn validate-config</code> checks the environment before starting the server.
+      Cairn uses <code>CAIRN_*</code> environment variables: no config file, no server flags.
+      Unknown names or bad values fail at startup, and <code>cairn validate-config</code> checks the
+      environment first.
     </p>
     <div class="table-scroll">
       <table class="envtable">
@@ -434,66 +320,52 @@ const features = [
       </table>
     </div>
     <p class="note">
-      That&apos;s the common set. Replication, lifecycle, webhooks, KMS allow-listing, metadata
-      sharding, runtime and durability tuning are covered in the full{" "}
+      That&apos;s the common set. Replication workers, object TTL, scrubbing, lifecycle, webhooks,
+      KMS and sharding are in the full{" "}
       <a class="link" href={`${docs}/configuration.md`}><code>CAIRN_*</code> reference</a>.
     </p>
     <p class="note">
-      Upgrading an earlier installation? Retired listener and public-URL names are rejected. Follow
-      the <a class="link" href={`${docs}/upgrade-rollback.md#api-and-console-configuration-migration`}>
-      configuration migration</a>. The Cairn CLI uses <code>--api-endpoint</code> or
-      <code>CAIRN_API_ENDPOINT</code> for both administration and S3 operations.
+      Upgrading? Old listener and URL names are rejected; follow the{" "}
+      <a class="link" href={`${docs}/upgrade-rollback.md#api-and-console-configuration-migration`}>
+      configuration migration</a>. The CLI uses <code>--api-endpoint</code> or{" "}
+      <code>CAIRN_API_ENDPOINT</code>.
     </p>
   </Section>
 
   {/* 10 — Using the AWS CLI */}
   <Section eyebrow="Usage" title="Use it with the AWS CLI">
     <p>
-      Because Cairn speaks the S3 API, the <code>aws</code> CLI and the AWS SDKs work against it
-      unmodified — you just point them at the endpoint. Configure a named profile with the access
-      key and secret from your installer or <code>cairn.env</code>, and region <code>us-east-1</code>:
+      The <code>aws</code> CLI and the AWS SDKs work unchanged — just point them at the endpoint.
+      Configure a profile with the keys from your installer or <code>cairn.env</code>:
     </p>
     <CodeBlock code={awsConfig} />
-    <p>Use that profile for bucket and object commands:</p>
+    <p>Then use normal bucket and object commands:</p>
     <CodeBlock code={awsUse} />
     <p class="note">
-      Multipart uploads, byte-range reads, versioning, tagging, and presigned URLs are supported.
-      See the <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API
-      support matrix</a> for the exact surface.
+      Multipart uploads, range reads, versions, tags and presigned links work. See the{" "}
+      <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API matrix</a> for the exact surface.
     </p>
   </Section>
 
   {/* 11 — Release policy */}
   <Section eyebrow="Releases" title="One version, always the latest">
     <p>
-      Cairn is calendar-versioned. A release is tagged <code>vYYYY.MM.DD</code>, and exactly one
-      release is ever active: cutting one publishes today&apos;s tag, attaches the static
-      <code>linux/amd64</code> and <code>linux/arm64</code> binaries with a <code>SHA256SUMS</code>
-      manifest, promotes the signed multi-arch image to its version tag and <code>:latest</code>, and
-      retires strictly older calendar-versioned releases and tags. A release is a deliberate, manual
-      act, gated on a green CI run for the exact commit it ships.
+      Cairn uses calendar versions (<code>vYYYY.MM.DD</code>). Older releases and tags are retired,
+      so the latest release is the supported one. Releases are cut manually, only after CI is green.
     </p>
     <p>
-      Binaries and checksums have keyless signatures; the binaries and container image carry build
-      provenance. Every release includes an SPDX software bill of materials and an immutable image
-      digest. See <a class="link" href={`${repo}/blob/main/SECURITY.md#verifying-release-artifacts`}>
-      artifact verification</a> before deploying.
+      Binaries and the container image are signed, with checksums, a software bill of materials
+      (SBOM) and build provenance. See the{" "}
+      <a class="link" href={`${repo}/blob/main/SECURITY.md#verifying-release-artifacts`}>
+      verification guide</a> before deploying.
     </p>
     <p>
       Current status: <strong>1.0 release candidate</strong> for a single node with backups and a
-      tested restore. The measured evidence, remaining gates, and supported deployment scope are in
-      the <a class="link" href={`${docs}/stability-2026-11-05.md`}>stability record</a> and{" "}
-      <a class="link" href={`${docs}/support.md`}>support statement</a>.
-    </p>
-    <p>
-      Why keep only one active version? Cairn is single-node, self-hosted infrastructure — not a
-      library other code compiles against — so there is no dependency graph pinning old versions and
-      no back-catalogue of stale binaries to pick the wrong one from. One line moves forward: the
-      latest release is the supported release. The version is baked into the binary and reported by
-      <code>cairn --version</code> and the console's node details, and always equals the tag it shipped in; a
-      local build reports a <code>-dev</code> string so it is never mistaken for a release. Each node
-      checks for a newer version hourly and surfaces a hint in the console — best-effort, and off if
-      you set <code>CAIRN_UPDATE_CHECK_ENABLED=false</code>.
+      tested restore. The evidence and limits are in the{" "}
+      <a class="link" href={`${docs}/stability-2026-11-05.md`}>stability record</a> and{" "}
+      <a class="link" href={`${docs}/support.md`}>support statement</a>. The binary reports its
+      version and checks for updates hourly; turn that off with{" "}
+      <code>CAIRN_UPDATE_CHECK_ENABLED=false</code>.
     </p>
   </Section>
 

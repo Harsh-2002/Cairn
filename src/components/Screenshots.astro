@@ -13,56 +13,53 @@ const H = 1047;
 
 const hero = {
   slug: "overview-dashboard",
-  caption:
-    "The Overview: bucket, object, and version counts beside node details, compression savings, and per-bucket storage.",
+  caption: "Buckets, objects, storage and node health at a glance.",
 };
 
 const shots = [
   {
     slug: "bucket-browser",
-    caption: "Browsing a bucket, with per-object preview, download, tagging, copy, share and delete.",
+    caption: "Browse, preview, share or delete objects.",
   },
   {
     slug: "object-preview",
-    caption: "Objects preview in place — images, video, audio, PDFs, Markdown, JSON, CSV and text.",
+    caption: "Preview images, video, PDFs, Markdown, JSON and text in place.",
   },
   {
     slug: "bucket-settings-access",
-    caption: "A validated bucket-policy editor, object ownership, and Block Public Access.",
+    caption: "Edit bucket policy, ownership and public-access settings.",
   },
   {
     slug: "bucket-settings-data-protection",
-    caption: "Encryption at rest, Object Lock, and lifecycle rules, per bucket.",
+    caption: "Encryption, Object Lock and lifecycle rules per bucket.",
   },
   {
     slug: "credentials-temporary",
-    caption: "Minting a short-lived scoped credential, with a policy builder that says what it can do.",
+    caption: "Create short-lived, scoped credentials.",
   },
   {
     slug: "metrics-charts",
-    caption: "Requests, errors, throughput and latency over time, from Cairn's own stored metrics.",
+    caption: "Requests, errors, throughput and latency over time.",
   },
   {
     slug: "tags-browser",
-    caption: "Every object tag in use, and the objects carrying the one you pick.",
+    caption: "See every tag in use and the objects that carry it.",
   },
   {
     slug: "activity-audit-log",
-    caption: "An audit log of administrative actions, with actor, bucket and key.",
+    caption: "An audit log of admin actions, with actor, bucket and key.",
   },
   {
     slug: "bucket-settings-replication",
-    caption: "Replication rules and remote targets for asynchronous cross-host copies.",
+    caption: "Replication rules and remote targets.",
   },
 ];
 ---
 
 <Section eyebrow="Console" title="What it looks like">
   <p>
-    The S3 wire protocol is a commodity; the console is the reason to pick Cairn. It ships inside the
-    same binary — nothing extra to deploy — and handles administration alongside object browsing,
-    uploads and sharing. These screenshots show a development build; the configuration reference
-    below uses the current release's endpoint names.
+    The console ships in the same binary. These are real screens from a running node — browse and
+    share objects, manage buckets and users, and check health and activity.
   </p>
 
   <figure class="shot shot--hero">
