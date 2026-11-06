@@ -49,6 +49,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `mesh.sh` (+`.py`) — **5-node FULL mesh** replication (stdlib only): convergence, fan-out latency,
   version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
   integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.
+- `kill_recovery.py` — **SIGKILL under a live PUT load**, then restart the same store: every
+  acknowledged PUT reads back exactly, a completed 10 MiB multipart keeps its full body and
+  `?partNumber=1/2`, a lost-response PUT is either exact or absent (never torn), and offline
+  `cairn integrity` reports `errors=0`. This is a process crash, not a power loss. Manual; requires
+  boto3. **NOT a gate.**
 - `crash_consistency.sh` — the F-4 durability property at one crash seam (orphan-blob reclaim).
 - `scrub.sh` — integrity scrub, **five arms, one throwaway node each**: corrupt a stored blob on disk
   and assert the background scrub (`CAIRN_SCRUB_INTERVAL_SECS`) flags it

@@ -69,6 +69,15 @@ grew, not a fold failure, and the fixed caches cap it. That shape is not a produ
 does not fit the disk for 24 hours. The gate is now 64 KiB at a bounded 25 objects/s, which keeps
 replication up and fits the free space (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`).
 
+### Abrupt process kill
+
+`conformance/kill_recovery.py` SIGKILLed a live node three times under six concurrent PUT
+workers (602 acknowledged objects across the rounds). After each restart every acknowledged
+object read back byte-for-byte, the completed 10 MiB multipart object kept its full body and
+`?partNumber=1/2`, no in-flight object was torn, and offline `cairn integrity` reported
+`errors=0` (4-5 orphans and 1-2 staging aliases reclaimed per round). This is a **process
+crash**, not a power loss: the kernel page cache survives, so disk-cache loss remains untested.
+
 ### Independent review
 
 A read-only review of #190–#194 (BLAKE3, sidecar v3, reflink, overlapping barriers, CI reflink job)
@@ -127,7 +136,8 @@ when source foreground matters most, use 8 for backlog/drain throughput.
 2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`,
    or 48 h) and crash injection on XFS, and keep the result. The 25 obj/s bound is required here:
    the disk cannot hold 24 hours of unthrottled 64 KiB writes, and the 8 KiB shape backs up the
-   object-rate-limited replication worker.
+   object-rate-limited replication worker. A separate three-round SIGKILL drill already passes;
+   true power-loss testing still needs a site-specific plan.
 3. Decide the remaining audit gap: no rate limiting on the authentication path. The installer
    secret-to-stdout item is fixed (0600 file, path only), and OpenRC is documented as unsupported;
    both are recorded in `AUDIT.md`. Rate limiting is the only open decision.
