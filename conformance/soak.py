@@ -16,8 +16,8 @@ while it runs:
   * samples the SOURCE process RSS (`/proc/<pid>/status` VmRSS) throughout and checks it stays
     roughly flat -> a monotonic climb past the threshold is flagged as a leak.
 
-Exit status: 0 only if replication mismatches == 0 AND the source RSS did not grow past the leak
-threshold; non-zero otherwise.
+Exit status: 0 only if there were no PUT errors, no replication mismatches, at least one verified
+object, and the source RSS did not grow past the leak threshold; non-zero otherwise.
 
 Object keys are deliberately restricted to a URL-safe alphabet (no '(', ')', or spaces) so the
 soak exercises the replication and durability paths, not the unrelated SigV4 key-encoding defect
@@ -300,6 +300,9 @@ def main():
     print(f"  source RSS:          {leak_detail}", flush=True)
 
     ok = True
+    if put_errors[0] != 0:
+        print("  FAIL: source PUT errors occurred", flush=True)
+        ok = False
     if mismatches != 0:
         print("  FAIL: replication produced mismatches", flush=True)
         ok = False
