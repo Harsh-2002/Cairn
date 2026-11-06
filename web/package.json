@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=26.13.0"
+  },
   "description": "The embedded Cairn admin console: React 19 + Tailwind v4 + shadcn/ui, built with Vite into dist/ and embedded into the server binary by crates/cairn-web.",
   "scripts": {
     "dev": "vite",

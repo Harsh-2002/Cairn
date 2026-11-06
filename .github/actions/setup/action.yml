@@ -28,7 +28,7 @@ runs:
   - name: Set up Node
     uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
     with:
-      node-version: 22.23.2
+      node-version: 26.13.0
       cache: npm
       cache-dependency-path: web/package-lock.json
     if: ${{ inputs.web-artifact == '' && inputs.build-web == 'true' }}

@@ -7,7 +7,7 @@ what an implementation must preserve. Folder-level `CLAUDE.md` files provide con
 ## Build and run locally
 
 You need Linux 5.6+ with `openat2` support, Rust via rustup (the checkout selects its toolchain),
-Node.js 22 with npm, a C/C++ build toolchain, CMake, pkg-config and OpenSSL's command-line tool.
+Node.js 26.13.0 or newer with npm, a C/C++ build toolchain, CMake, pkg-config and OpenSSL's command-line tool.
 SQLite and the compression libraries are built from bundled sources.
 
 ```sh
