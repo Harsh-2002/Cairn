@@ -43,10 +43,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   ON for minting.**
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
 - `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3);
-  any PUT error, replication mismatch, zero verifications or RSS leak fails it.
-  `IDLE=<seconds>` adds a post-write idle phase and uses the idle RSS delta as the long-run leak
-  signal (default `IDLE=0`, so the 120 s CI run is unchanged); `DURATION=86400 IDLE=600` is the
-  24-hour gate shape. For the single-node **mixed-feature** soak see `soak_features.sh` below.
+  any PUT error, replication mismatch, zero verifications or leak-check failure fails it.
+  `IDLE=<seconds>` adds a post-write idle phase and gates on the **anonymous** RSS (`RssAnon`)
+  delta; total and file-backed RSS are logged separately so SQLite page-cache/mmap warming is not
+  reported as a heap leak (default `IDLE=0`, so the 120 s CI run is unchanged). `DURATION=7200
+  IDLE=900` is the current gate shape; `DURATION=86400 IDLE=600` remains the long shape. For the
+  single-node **mixed-feature** soak see `soak_features.sh` below.
 - `mesh.sh` (+`.py`) — **5-node FULL mesh** replication (stdlib only): convergence, fan-out latency,
   version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
   integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.

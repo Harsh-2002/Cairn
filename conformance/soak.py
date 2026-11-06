@@ -13,11 +13,12 @@ while it runs:
   * every few seconds reads back a random sample of already-PUT objects from the TARGET and
     compares them BYTE-FOR-BYTE against what was written to the source -> any mismatch (wrong
     bytes, or not replicated within the grace window) is counted;
-  * samples the SOURCE process RSS (`/proc/<pid>/status` VmRSS) throughout and checks it stays
-    roughly flat -> a monotonic climb past the threshold is flagged as a leak.
+  * samples the SOURCE process RSS (`VmRSS`, `RssAnon`, `RssFile`) throughout. After the writers
+    stop, the leak gate uses **anonymous** RSS (`RssAnon`); total RSS is reported separately
+    because SQLite page-cache and mmap pages are file-backed and warm after the load.
 
 Exit status: 0 only if there were no PUT errors, no replication mismatches, at least one verified
-object, and the source RSS did not grow past the leak threshold; non-zero otherwise.
+object, and the source anonymous RSS did not grow past the leak threshold; non-zero otherwise.
 
 Object keys are deliberately restricted to a URL-safe alphabet (no '(', ')', or spaces) so the
 soak exercises the replication and durability paths, not the unrelated SigV4 key-encoding defect
@@ -83,6 +84,20 @@ def read_rss_kib(pid):
     except (OSError, ValueError):
         return None
     return None
+
+
+def read_rss_parts(pid):
+    """SOURCE VmRSS/RssAnon/RssFile in KiB; None if the process is gone."""
+    parts = {}
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="ascii") as fh:
+            for line in fh:
+                for key in ("VmRSS", "RssAnon", "RssFile"):
+                    if line.startswith(key + ":"):
+                        parts[key] = int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return parts if "VmRSS" in parts else None
 
 
 def setup_buckets(src, tgt, bucket):
@@ -177,7 +192,7 @@ def main():
     mismatches = 0
     verified = 0
     rss_samples = []  # (elapsed_s, rss_kib) during the write workload
-    idle_samples = []  # rss_kib after the writers stop, for the leak signal
+    idle_samples = []  # VmRSS/RssAnon/RssFile dicts after the writers stop
     start = time.monotonic()
     deadline = start + args.duration
 
@@ -235,12 +250,15 @@ def main():
         idle_start = time.monotonic()
         while time.monotonic() - idle_start < args.idle_seconds:
             time.sleep(1.0)
-            rss = read_rss_kib(args.source_pid)
-            if rss is not None:
-                idle_samples.append(rss)
+            parts = read_rss_parts(args.source_pid)
+            if parts is not None:
+                idle_samples.append(parts)
             if len(idle_samples) % 30 == 0:
                 print(
-                    f"  idle={int(time.monotonic() - idle_start):>4}s  rss={rss / 1024:.1f}MiB",
+                    f"  idle={int(time.monotonic() - idle_start):>4}s  "
+                    f"rss={parts['VmRSS'] / 1024:.1f}MiB  "
+                    f"anon={parts.get('RssAnon', 0) / 1024:.1f}MiB  "
+                    f"file={parts.get('RssFile', 0) / 1024:.1f}MiB",
                     flush=True,
                 )
 
@@ -266,30 +284,44 @@ def main():
     # drop the warm-up third; compare the median of the first remaining quarter against the last.
     leaked = False
     leak_detail = "insufficient RSS samples"
+    total_detail = "insufficient RSS samples"
+
+    def quarter_median(samples, key):
+        values = sorted(int(sample.get(key, 0)) for sample in samples)
+        return values[len(values) // 2]
+
     if args.idle_seconds > 0 and len(idle_samples) >= 8:
-        head = sorted(idle_samples[: max(1, len(idle_samples) // 4)])
-        tail = sorted(idle_samples[-max(1, len(idle_samples) // 4):])
-        base = head[len(head) // 2]
-        end = tail[len(tail) // 2]
-        growth_pct = 100.0 * (end - base) / base if base else 0.0
+        head = idle_samples[: max(1, len(idle_samples) // 4)]
+        tail = idle_samples[-max(1, len(idle_samples) // 4):]
+        anon_base = quarter_median(head, "RssAnon")
+        anon_end = quarter_median(tail, "RssAnon")
+        total_base = quarter_median(head, "VmRSS")
+        total_end = quarter_median(tail, "VmRSS")
+        growth_pct = 100.0 * (anon_end - anon_base) / anon_base if anon_base else 0.0
+        total_growth_pct = 100.0 * (total_end - total_base) / total_base if total_base else 0.0
         leaked = growth_pct > args.idle_leak_threshold_pct
         leak_detail = (
-            f"idle {base / 1024:.1f}MiB -> {end / 1024:.1f}MiB "
+            f"idle anon {anon_base / 1024:.1f}MiB -> {anon_end / 1024:.1f}MiB "
             f"({growth_pct:+.1f}%, threshold {args.idle_leak_threshold_pct:.0f}%)"
+        )
+        total_detail = (
+            f"idle total {total_base / 1024:.1f}MiB -> {total_end / 1024:.1f}MiB "
+            f"({total_growth_pct:+.1f}%; file-backed cache is not a leak)"
         )
     elif len(rss_samples) >= 8:
         warm = len(rss_samples) // 3
         steady = [r for _, r in rss_samples[warm:]]
-        head = sorted(steady[: max(1, len(steady) // 4)])
-        tail = sorted(steady[-max(1, len(steady) // 4):])
-        base = head[len(head) // 2]
-        end = tail[len(tail) // 2]
+        values = sorted(steady[: max(1, len(steady) // 4)])
+        base = values[len(values) // 2]
+        values = sorted(steady[-max(1, len(steady) // 4):])
+        end = values[len(values) // 2]
         growth_pct = 100.0 * (end - base) / base if base else 0.0
         leaked = growth_pct > args.leak_threshold_pct
         leak_detail = (
             f"baseline {base / 1024:.1f}MiB -> steady-end {end / 1024:.1f}MiB "
             f"({growth_pct:+.1f}%, threshold {args.leak_threshold_pct:.0f}%)"
         )
+        total_detail = leak_detail
 
     print("", flush=True)
     print("=== soak summary ===", flush=True)
@@ -297,7 +329,8 @@ def main():
     print(f"  source PUTs:         {put_count[0]} (errors {put_errors[0]})", flush=True)
     print(f"  objects verified:    {verified} byte-for-byte on the target", flush=True)
     print(f"  replication mismatch:{mismatches}", flush=True)
-    print(f"  source RSS:          {leak_detail}", flush=True)
+    print(f"  source leak metric:  {leak_detail}", flush=True)
+    print(f"  source total RSS:    {total_detail}", flush=True)
 
     ok = True
     if put_errors[0] != 0:
@@ -310,7 +343,7 @@ def main():
         print("  FAIL: nothing verified on the target (replication never landed)", flush=True)
         ok = False
     if leaked:
-        print("  FAIL: source RSS grew past the leak threshold", flush=True)
+        print("  FAIL: source leak metric grew past the threshold", flush=True)
         ok = False
     if put_count[0] == 0:
         print("  FAIL: no PUTs succeeded against the source", flush=True)
