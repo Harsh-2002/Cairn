@@ -42,7 +42,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   revoke + durable-session-backed interoperable SigV4 presigned URLs), pure curl. **Control listener
   ON for minting.**
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
-- `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3).
+- `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3);
+  any PUT error, replication mismatch, zero verifications or RSS leak fails it.
   `IDLE=<seconds>` adds a post-write idle phase and uses the idle RSS delta as the long-run leak
   signal (default `IDLE=0`, so the 120 s CI run is unchanged); `DURATION=86400 IDLE=600` is the
   24-hour gate shape. For the single-node **mixed-feature** soak see `soak_features.sh` below.

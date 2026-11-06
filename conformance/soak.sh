@@ -20,8 +20,8 @@
 #   DURATION=60 conformance/soak.sh                              # shorter run
 #   BIN=target/debug/cairn PY=/tmp/cairnvenv/bin/python conformance/soak.sh
 #
-# Exit status: 0 only if mismatches == 0 AND the source RSS did not grow past the leak threshold;
-# non-zero on any infrastructure failure or assertion failure.
+# Exit status: 0 only if PUT errors == 0, mismatches == 0, at least one object verified, and the
+# source RSS did not grow past the leak threshold; non-zero on any failure.
 set -euo pipefail
 export CAIRN_CONSOLE_ADDR=off  # multi-node harness: no web console listener (would collide on the default web console port)
 
