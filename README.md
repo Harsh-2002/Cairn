@@ -11,8 +11,10 @@ deployed to GitHub Pages at **https://harsh-2002.github.io/Cairn/**.
 
 ## Develop
 
+Requires Node 22.23.4 or newer.
+
 ```sh
-npm install
+npm ci           # reproducible install from package-lock.json
 npm run dev      # http://localhost:4321/Cairn/
 npm run check    # Astro + TypeScript diagnostics
 npm run build    # -> dist/
