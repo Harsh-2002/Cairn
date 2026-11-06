@@ -136,7 +136,7 @@ const envs = [
   {
     name: "CAIRN_META_SYNCHRONOUS",
     def: "full",
-    desc: "full makes acknowledged writes durable across power loss. normal reduces synchronization but may lose recent acknowledged writes after power loss.",
+    desc: "full commits control-plane and multipart metadata durably before acknowledgement. normal relaxes the metadata barrier; recent control-plane writes may be lost on power loss, while ordinary objects are rebuilt from their durable files.",
   },
   {
     name: "CAIRN_ALLOW_INSECURE",
@@ -148,7 +148,7 @@ const envs = [
 const features = [
   {
     h: "S3 API",
-    p: "Buckets and objects, byte-range and conditional reads, multipart upload, copy, and bulk delete. v1/v2 and version listings. Checksums (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256). Versioning, tagging, CORS, lifecycle expiration, object lock (WORM), and presigned URLs. SigV4 — header and streaming-chunked — and Bearer authentication. The aws CLI and the standard AWS SDKs work against it.",
+    p: "Buckets and objects, byte-range and conditional reads and writes, multipart upload with part reads (?partNumber), copy, and bulk delete. v1/v2 and version listings. Checksums (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256). Versioning, tagging, CORS, lifecycle expiration and incomplete-upload abort, object lock (WORM), per-bucket object TTL, and presigned URLs. SigV4 — header and streaming-chunked — and Bearer authentication. The aws CLI and the standard AWS SDKs work against it.",
   },
   {
     h: "Web console",
@@ -156,7 +156,7 @@ const features = [
   },
   {
     h: "Access control",
-    p: "Bucket policies, ACLs, Block Public Access, and Object Ownership — a real policy-evaluation engine, not a role check. Short-lived credentials through the AWS-STS surface (AssumeRole, GetSessionToken), served on the S3 port or the management API.",
+    p: "Bucket policies, identity policies, ACLs, Block Public Access, and Object Ownership — a real policy-evaluation engine, not a role check. Short-lived credentials through the AWS-STS surface (AssumeRole, GetSessionToken), served on the S3 port or the management API.",
   },
   {
     h: "Security & encryption",
@@ -164,15 +164,15 @@ const features = [
   },
   {
     h: "Durability",
-    p: "Writes are staged, fsynced, atomically renamed, and acknowledged only after a single metadata commit. On restart Cairn reconciles and reclaims orphaned data. Acknowledged writes survive power loss.",
+    p: "Writes are staged, fsynced, and atomically renamed before they are acknowledged. Control-plane and multipart writes also commit their metadata transaction first; an ordinary object's index row folds asynchronously, and startup rebuild restores it. On restart Cairn reconciles and reclaims orphaned data. Acknowledged writes survive power loss.",
   },
   {
     h: "Storage efficiency",
-    p: "Optional per-bucket block compression, with range reads that touch only the blocks they need.",
+    p: "Optional per-bucket block compression, with range reads that touch only the blocks they need. Plaintext, uncompressed, unencrypted multipart completion can share the parts' extents with reflink on XFS or btrfs instead of rewriting the assembled bytes.",
   },
   {
     h: "Operations",
-    p: "Prometheus metrics, liveness and readiness endpoints, structured logs, and a built-in Docker health check. Asynchronous bucket replication, webhooks, and streaming import from MinIO, Garage, R2, AWS or another Cairn. Native administration and S3 share one API endpoint; the CLI also handles offline backup, restore and storage baselines.",
+    p: "Prometheus metrics, liveness and readiness endpoints, structured logs, and a built-in Docker health check. Asynchronous bucket replication, webhooks, streaming import from MinIO, Garage, R2, AWS or another Cairn, per-bucket quotas, and object TTL expiry. Native administration and S3 share one API endpoint; the CLI also handles offline backup, restore and storage baselines.",
   },
 ];
 
@@ -185,9 +185,9 @@ const features = [
       Self-hosted, S3-compatible<br /> object storage.
     </h1>
     <p class="lead">
-      Cairn speaks the S3 API, stores objects as plain files on a normal filesystem, and keeps all
-      metadata in embedded SQLite. One static binary. No external database, no clustering layer, no
-      separate storage daemon to run.
+      Cairn speaks the S3 API, stores objects as durable files on a normal filesystem, and keeps its
+      object index in embedded SQLite — rebuildable from those files. One static binary. No external
+      database, no clustering layer, no separate storage daemon to run.
     </p>
     <div class="cta">
       <a class="btn" href="#get-started">Get started</a>
@@ -200,23 +200,25 @@ const features = [
   <Section eyebrow="What it is" title="A single-node object store that speaks S3">
     <p>
       Cairn implements the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and
-      the <code>aws</code> CLI work against it without special-casing. Object bytes live as plain files
-      on a POSIX filesystem; all metadata lives in one embedded SQLite database, which is the single
-      source of truth. Point any S3 client at it, or use the built-in web console.
+      the <code>aws</code> CLI work against it without special-casing. Object bytes and their
+      per-object metadata live in durable files on a POSIX filesystem; SQLite holds the object index
+      and is the control-plane authority. Point any S3 client at it, or use the built-in web console.
     </p>
     <dl class="points">
       <div>
         <dt>Plain files on disk</dt>
         <dd>
-          Object data lives in ordinary filesystem files. Compression and encryption are handled by
-          Cairn; use S3 or the CLI to export the original object bytes.
+          Object data lives in ordinary filesystem files. A plaintext single-part object is one file
+          — payload plus a metadata trailer; compression, encryption, and multipart completion add a
+          sidecar. Use S3 or the CLI to export the original object bytes.
         </dd>
       </div>
       <div>
         <dt>Embedded SQLite metadata</dt>
         <dd>
-          All metadata in one database file, with a single commit point for visible writes. Back up
-          metadata and object data together using the offline backup command.
+          SQLite holds the object index and the control plane — buckets, users, policies,
+          replication, activity. The object index is rebuildable from the object files at startup;
+          control-plane state is covered by backup.
         </dd>
       </div>
       <div>
@@ -256,6 +258,20 @@ const features = [
       and sustained replication. A repeatable MinIO <code>warp</code> comparison runs both servers
       on the same host with the same workload. Results depend on the hardware, build, object sizes,
       encryption, compression, and durability settings.
+    </p>
+    <p>
+      On the shared reference host, the current interleaved scoreboard puts Cairn at{" "}
+      <strong>2.24×</strong> RustFS on 4 KiB PUT,{" "}
+      <strong>1.14×</strong> on 1 MiB PUT,{" "}
+      <strong>1.92×</strong> on 1 MiB GET,{" "}
+      <strong>5.33×</strong> on a 1,000-key LIST,{" "}
+      <strong>1.07×</strong> on the scored multipart upload, and{" "}
+      <strong>5.17×</strong> on the equal-durability versioned DELETE. The host is shared, so the
+      ratio is the signal; absolute rates vary with the run.
+    </p>
+    <p class="note">
+      The unversioned DELETE row is as-configured and is not an equal-durability comparison. The
+      multipart row includes reflink completion on XFS.
     </p>
     <p>
       The <a class="link" href={`${docs}/benchmarks.md`}>benchmark record</a> includes measurements,
@@ -299,7 +315,7 @@ const features = [
   {/* 7 — Scope */}
   <Section eyebrow="Scope" title="Single-node by design">
     <p>
-      Cairn is single-node by design: one process, one data filesystem, one metadata database.
+      Cairn is single-node by design: one process, one data filesystem, one metadata store.
       That&apos;s the line, and it&apos;s deliberate — it&apos;s what keeps Cairn simple to operate.
     </p>
     <ul class="scope">
@@ -313,10 +329,27 @@ const features = [
         replicated block volume.
       </li>
       <li>
+        <strong>Supported deployment:</strong> one node on Linux 5.6+ (x86_64 or aarch64) with a local
+        filesystem. XFS is recommended; btrfs also supports reflink completion; ext4 and other
+        filesystems use the streaming-copy path. Backups and a tested restore are required, and the
+        data directory must not sit on a container&apos;s overlayfs writable layer.
+      </li>
+      <li>
+        <strong>Storage format:</strong> protocol 3, schema v42, sidecar v3. New objects carry a
+        BLAKE3 integrity baseline; legacy objects keep SHA-256. Downgrade after v42 is unsupported —
+        roll back by restoring the pre-upgrade snapshot.
+      </li>
+      <li>
         Server-side encryption is real, but the <code>aws:kms</code> key id is a validated
-        <strong> label over the one node master key</strong>, not independent key material — so it is
-        SDK compatibility, not cryptographic tenant isolation. A dedicated external KMS with distinct
-        per-key material isn&apos;t implemented yet.
+        <strong> label over the node&apos;s master-key ring</strong>, not independent key material — so
+        it is SDK compatibility, not cryptographic tenant isolation. A dedicated external KMS with
+        distinct per-key material isn&apos;t implemented yet.
+      </li>
+      <li>
+        <strong>Rate limiting on the authentication path is not built in.</strong> Put a reverse proxy
+        or network policy in front of a public endpoint. The{" "}
+        <a class="link" href={`${docs}/support.md`}>support statement</a> records this and the other
+        deliberate limits.
       </li>
       <li>
         The target is <strong>homelab and small-to-mid production</strong> that wants the S3 API and a
@@ -328,10 +361,11 @@ const features = [
   {/* 8 — Get started / deploy */}
   <Section eyebrow="Get started" title="Deploy Cairn" id="get-started">
     <p>
-      Requires Linux 5.6+ with <code>openat2</code> support and durable file and directory
-      synchronization. Docker uses the host's kernel. The installer sets up a host service or Docker,
-      generates credentials and a master key, and updates an existing install when run again.
-      It keeps both ports on loopback unless you explicitly expose them.
+      Requires Linux 5.6+ on <code>x86_64</code> or <code>aarch64</code>, with <code>openat2</code>
+      support and durable file and directory synchronization. Docker uses the host's kernel. The
+      installer sets up a host service or Docker, generates credentials and a master key, and updates
+      an existing install when run again. It keeps both ports on loopback unless you explicitly
+      expose them.
     </p>
     <CodeBlock code={install} />
 
@@ -360,7 +394,7 @@ const features = [
       <code>http://localhost:7373</code>. These examples publish both ports on loopback.
     </p>
     <p class="note">
-      For remote access, configure TLS and distinct API and console origins using the
+      For remote access, configure TLS and distinct API and console origins using the{" "}
       <a class="link" href={`${docs}/operations.md#api-and-console-ingress`}>ingress guide</a>.
       Restrict <code>/api/v1</code> at the API ingress if S3 is public but administration is private.
       Existing installations should follow the
@@ -446,6 +480,12 @@ const features = [
       artifact verification</a> before deploying.
     </p>
     <p>
+      Current status: <strong>1.0 release candidate</strong> for a single node with backups and a
+      tested restore. The measured evidence, remaining gates, and supported deployment scope are in
+      the <a class="link" href={`${docs}/stability-2026-11-05.md`}>stability record</a> and{" "}
+      <a class="link" href={`${docs}/support.md`}>support statement</a>.
+    </p>
+    <p>
       Why keep only one active version? Cairn is single-node, self-hosted infrastructure — not a
       library other code compiles against — so there is no dependency graph pinning old versions and
       no back-catalogue of stale binaries to pick the wrong one from. One line moves forward: the
@@ -467,6 +507,7 @@ const features = [
       <a class="link" href={`${docs}/configuration.md`}>Configuration</a>
       <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API matrix</a>
       <a class="link" href={`${docs}/operations.md`}>Operations</a>
+      <a class="link" href={`${docs}/support.md`}>Support &amp; scope</a>
     </nav>
     <nav class="linkrow linkrow--muted" aria-label="Project">
       <a class="link" href={repo}>GitHub</a>

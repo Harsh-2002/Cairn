@@ -23,41 +23,44 @@ const layers = [
   {
     tier: "Metadata",
     nodes: ["Writer — group-commit", "WAL read pool", "read-through cache", "SQLite (WAL)"],
-    desc: "Metadata mutations go through one group-committing writer. Object publication commits here after the bytes are durable. Reads use a WAL connection pool and a bounded read-through cache.",
+    desc: "Metadata mutations go through a group-committing writer (one per shard). Control-plane and multipart writes commit here after the bytes are durable; an ordinary object's index row folds asynchronously because its durable file is authoritative. Reads use a WAL connection pool and a bounded read-through cache.",
   },
   {
     tier: "Object bytes",
-    nodes: ["BlobStore", "plain files (POSIX)", "block compression", "reconciliation"],
-    desc: "Every physical write requires durable Writer admission before staging, fsync and rename. Exact cleanup claims reclaim superseded or orphaned paths; full startup reconciliation remains mandatory.",
+    nodes: ["BlobStore", "plain files (POSIX)", "block compression", "BLAKE3 baseline", "reflink completion", "reconciliation"],
+    desc: "Multipart parts are durably admitted before creation; ordinary objects use a move-only creation permit and a single fenced publication savepoint. Every write is fsynced and renamed into place, and exact cleanup claims reclaim superseded or orphaned paths. A full startup scan remains mandatory.",
   },
   {
     tier: "Background",
-    nodes: ["replication", "lifecycle", "webhooks", "integrity scrub", "multipart sweep", "key re-wrap"],
-    desc: "Durable outbox-driven workers run off the metadata store: asynchronous replication, lifecycle expiry, webhook delivery, and an opt-in integrity scrub.",
+    nodes: ["replication", "lifecycle", "webhooks", "object TTL", "integrity scrub", "multipart sweep", "key re-wrap"],
+    desc: "Durable outbox-driven workers run off the metadata store: asynchronous replication, lifecycle and object-TTL expiry, webhook delivery, multipart cleanup, and an opt-in integrity scrub.",
   },
 ];
 
 // The write path is an ordered contract: bytes are durable before the metadata
-// transaction that references them, and that commit is the one linearization point.
+// transaction that references them. That commit is the linearization point for
+// control-plane and multipart writes; an ordinary object's durable file is
+// authoritative and its index row folds asynchronously.
 const steps = [
   "stage bytes",
   "fsync file",
   "rename",
   "fsync dir",
   "validate hashes",
-  "commit metadata",
+  "publish + index",
   "reclaim",
 ];
 ---
 
 <Section eyebrow="Architecture" title="How it works">
   <p>
-    Cairn is one process with an API listener, an optional console, and two durable stores — no clustering layer, no external
-    database, no separate storage daemon. A request flows straight down the stack: authenticated,
-    authorized, and handled, then committed. Reads come off a WAL pool; every write goes through a
-    single group-committing writer, so the database has exactly one linearization point. Each store
-    sits behind a small trait interface, so the SQLite metadata engine, the file BlobStore, and the
-    crypto layer are swappable without touching the S3 surface above them.
+    Cairn is one process with an API listener, an optional console, and two durable stores — no
+    clustering layer, no external database, no separate storage daemon. A request flows straight
+    down the stack: authenticated, authorized, and handled. Object bytes commit to the filesystem;
+    metadata mutations go through a group-committing writer (one per shard), so control-plane and
+    multipart writes have one linearization point. Reads come off a WAL pool. Each store sits behind
+    a small trait interface, so the SQLite metadata engine, the file BlobStore, and the crypto layer
+    are swappable without touching the S3 surface above them.
   </p>
 
   <div class="arch">
@@ -84,8 +87,11 @@ const steps = [
   <p class="arch__lead">
     Durability is an ordered contract. Object bytes are staged and fsynced <em>before</em> the
     metadata transaction that publishes them. With the default fully synchronous metadata setting,
-    an acknowledged write is durable across power loss. On restart, Cairn reconciles unfinished
-    storage work and reclaims orphaned paths.
+    control-plane and multipart writes are acknowledged only after that commit; an ordinary object
+    is acknowledged after its file and directory barrier, and its index row folds asynchronously
+    because the file already carries the facts. Either way, an acknowledged write is durable across
+    power loss. On restart, Cairn rebuilds any missing index rows from the object files and reclaims
+    orphaned paths.
   </p>
 
   <div class="writepath" role="list" aria-label="Durable write path, in order">
@@ -106,9 +112,16 @@ const steps = [
     }
   </div>
   <p class="writepath__note">
-    Durable Writer admission precedes step 1. The publication commit (step 6) makes the object
-    visible; subsequent cleanup is retried independently. Protect against disk or host failure with
-    appropriate underlying storage, backups and replication.
+    Durable admission precedes step 1 for multipart writes; an ordinary object uses a move-only
+    creation permit. Step 6 is the linearization point for control-plane and multipart writes; an
+    ordinary object's row folds asynchronously, and startup rebuild restores it. Subsequent cleanup
+    is retried independently. Protect against disk or host failure with appropriate underlying
+    storage, backups and replication.
+  </p>
+  <p class="writepath__note">
+    New objects record a BLAKE3 internal baseline in a v3 trailer or sidecar; legacy objects keep
+    their SHA-256 baseline. The storage protocol floor is 3, and there is no downgrade after schema
+    v42.
   </p>
 </Section>
 
