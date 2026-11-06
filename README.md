@@ -11,7 +11,7 @@ deployed to GitHub Pages at **https://harsh-2002.github.io/Cairn/**.
 
 ## Develop
 
-Requires Node 22.23.4 or newer.
+Requires Node 26.13.0 or newer.
 
 ```sh
 npm ci           # reproducible install from package-lock.json
