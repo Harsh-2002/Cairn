@@ -12,8 +12,9 @@
 #   * a boto3 PUT workload runs continuously against the source;
 #   * every few seconds a random sample of already-PUT objects is read back from the TARGET and
 #     compared byte-for-byte against what was written  ->  replication mismatches MUST be 0;
-#   * the source process RSS is sampled throughout and must stay roughly flat (no monotonic
-#     growth)  ->  no leak.
+#   * the source process RSS is sampled throughout. After the writers stop, the leak gate uses
+#     anonymous RSS (RssAnon); total and file-backed RSS are reported separately so SQLite
+#     page-cache/mmap warming is not mistaken for a heap leak.
 #
 # Usage:
 #   conformance/soak.sh
@@ -21,7 +22,7 @@
 #   BIN=target/debug/cairn PY=/tmp/cairnvenv/bin/python conformance/soak.sh
 #
 # Exit status: 0 only if PUT errors == 0, mismatches == 0, at least one object verified, and the
-# source RSS did not grow past the leak threshold; non-zero on any failure.
+# gated source leak metric did not grow past the threshold; non-zero on any failure.
 set -euo pipefail
 export CAIRN_CONSOLE_ADDR=off  # multi-node harness: no web console listener (would collide on the default web console port)
 
@@ -132,4 +133,4 @@ note "both nodes healthy"
   --obj-size "$OBJ_SIZE" --rate "$RATE" --source-pid "$SRV2" \
   || fail "soak harness reported a failure (mismatch or leak); see output above"
 
-note "soak passed: 0 replication mismatches, source RSS flat"
+note "soak passed: 0 replication mismatches, source leak metric flat"
