@@ -903,7 +903,8 @@ impl MetadataStore for AsyncMetadataStore {
             .await
             .query(
                 "SELECT status, COUNT(*) FROM replication_outbox \
-                 WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
+                 WHERE status IN ('pending','claimed','failed') \
+                   AND (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
                 vec![b.clone()],
             )
             .await?;
@@ -913,10 +914,21 @@ impl MetadataStore for AsyncMetadataStore {
                 "pending" => counts.pending = n,
                 "claimed" => counts.claimed = n,
                 "failed" => counts.failed = n,
-                "completed" => counts.completed = n,
                 _ => {}
             }
         }
+        // Completed rows are retained for the retention window but are not active work.
+        // Count them on the status index instead of scanning the whole outbox.
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT COUNT(*) FROM replication_outbox \
+                 WHERE status='completed' AND (?1 IS NULL OR bucket_name = ?1)",
+                vec![b.clone()],
+            )
+            .await?;
+        counts.completed = rows.first().map_or(0, |r| r.get_i64(0) as u64);
         // Per-target waiting/active/failed breakdown.
         let rows = self
             .reader()
@@ -926,7 +938,10 @@ impl MetadataStore for AsyncMetadataStore {
                  SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
                  SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), \
                  SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END) \
-                 FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY target_arn",
+                 FROM replication_outbox \
+                 WHERE status IN ('pending','claimed','failed') \
+                   AND (?1 IS NULL OR bucket_name = ?1) \
+                 GROUP BY target_arn",
                 vec![b.clone()],
             )
             .await?;

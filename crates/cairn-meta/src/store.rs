@@ -1618,7 +1618,8 @@ impl MetadataStore for SqliteMetadataStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT status, COUNT(*) FROM replication_outbox \
-                     WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
+                     WHERE status IN ('pending','claimed','failed') \
+                       AND (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
                 )
                 .map_err(engine_err)?;
             let rows = stmt
@@ -1632,10 +1633,20 @@ impl MetadataStore for SqliteMetadataStore {
                     "pending" => counts.pending = n,
                     "claimed" => counts.claimed = n,
                     "failed" => counts.failed = n,
-                    "completed" => counts.completed = n,
                     _ => {}
                 }
             }
+            drop(stmt);
+            // Completed rows are retained for the retention window but are not active work.
+            // Count them on the status index instead of scanning the whole outbox.
+            counts.completed = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM replication_outbox \
+                     WHERE status='completed' AND (?1 IS NULL OR bucket_name = ?1)",
+                    params![b],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(engine_err)? as u64;
             // Per-target waiting/active/failed breakdown (idle targets are dropped below).
             let mut stmt = conn
                 .prepare(
@@ -1643,7 +1654,9 @@ impl MetadataStore for SqliteMetadataStore {
                      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
                      SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), \
                      SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END) \
-                     FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) \
+                     FROM replication_outbox \
+                     WHERE status IN ('pending','claimed','failed') \
+                       AND (?1 IS NULL OR bucket_name = ?1) \
                      GROUP BY target_arn",
                 )
                 .map_err(engine_err)?;
