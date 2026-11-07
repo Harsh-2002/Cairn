@@ -16,12 +16,12 @@ from rustfs_compare import (CASES, analyze_warp_put_timeline, arm_usage, cairn_m
                             capacity_compatible,
                             diskstats_delta, io_pressure_totals, parse_diskstats,
                             parse_host_capacity,
-                            parse_process_stat, parse_warp, parse_warp_aggregate,
-                            prepare_verified_bucket, process_cpu_snapshot, process_io_delta,
-                            process_io_snapshot, put_timeline_valid,
-                            scored_host_window,
-                            server_environment, run_arm, tree_usage, unrelated_cpu_delta,
-                            verify_rustfs_durability, warp_benchdata_paths)
+                            mount_identity, parse_process_stat, parse_warp,
+                            parse_warp_aggregate, prepare_verified_bucket,
+                            process_cpu_snapshot, process_io_delta, process_io_snapshot,
+                            put_timeline_valid, scored_host_window, server_environment,
+                            run_arm, tree_usage, unrelated_cpu_delta,
+                            verify_rustfs_durability, volume_identity, warp_benchdata_paths)
 
 
 class PairSummaryTests(unittest.TestCase):
@@ -418,6 +418,32 @@ class StrictDurabilityTests(unittest.TestCase):
                               'cairn_put_stage_seconds_sum{stage="storage_admission",result="ok"} 0.2',
                               'cairn_put_timing_dropped_total 0',
                               'cairn_writer_batch_size_count 2'])
+
+
+class VolumeIdentityTests(unittest.TestCase):
+    def test_records_filesystem_and_mount_options_for_an_existing_path(self):
+        device = os.stat(".").st_dev
+        identity = volume_identity(Path("."), device)
+        self.assertEqual(identity["major"], os.major(device))
+        self.assertEqual(identity["minor"], os.minor(device))
+        self.assertIsNotNone(identity["filesystem"])
+        self.assertIsNotNone(identity["mount_options"])
+        # A block-backed path may report a model; tmpfs/overlay may not. Never guess one.
+        self.assertIn(identity["rotational"], (None, "0", "1"))
+        self.assertIn(identity["write_cache"], (None, "write back", "write through"))
+
+    def test_tmpfs_reports_no_block_device_fields(self):
+        if not Path("/dev/shm").is_dir():
+            self.skipTest("no /dev/shm")
+        identity = volume_identity(Path("/dev/shm"), os.stat("/dev/shm").st_dev)
+        self.assertEqual(identity["filesystem"], "tmpfs")
+        self.assertIsNone(identity["model"])
+        self.assertIsNone(identity["write_cache"])
+
+    def test_mount_identity_returns_the_filesystem_for_the_current_directory(self):
+        filesystem, options = mount_identity(Path("."))
+        self.assertIsNotNone(filesystem)
+        self.assertIsNotNone(options)
 
 
 if __name__ == "__main__":

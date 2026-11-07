@@ -1429,7 +1429,9 @@ plus five indexes (`bkv`, `latest`, covering-latest, `storage_path`, `expire`), 
 (table and index), and the stats roll-ups: **66 KiB of device writes per delete** on the current
 schema. The benchmark device is a consumer QLC NVMe (Samsung MZVLQ512HALU, write-back cache, no
 power-loss protection) sustaining about **57 MB/s** at the observed queue depth (33.5 ms average
-write service, 100% busy). A 12 s window therefore carries about 684 MB / 66 KiB ≈ 10.3k deletes,
+write service, 100% busy). Every arm now records `host_volume_identity` (model, rotational flag,
+write-cache mode, filesystem and mount options), so a row is reproducible against the same
+storage class instead of an asserted host state. A 12 s window therefore carries about 684 MB / 66 KiB ≈ 10.3k deletes,
 i.e. ≈860/s; the arm measured 840. Commit count is not the limiter, and neither co-committing the
 audit nor batching 100 deletes into one mutation moved it.
 
@@ -1444,6 +1446,22 @@ Evidence: [`delete-sync-cleanup128-2026-11-07.json`](performance-evidence/2026-1
 [`delete-paired-cleanup128-2026-11-07.json`](performance-evidence/2026-11/delete-paired-cleanup128-2026-11-07.json),
 [`delete-bulk-mutation-2026-11-07.json`](performance-evidence/2026-11/delete-bulk-mutation-2026-11-07.json) and
 [`delete-bulk-mutation-cleanup128-2026-11-07.json`](performance-evidence/2026-11/delete-bulk-mutation-cleanup128-2026-11-07.json).
+
+### 15.3 No-flush code ceiling (diagnostic, 2026-11-07)
+
+The same binary, harness and 100k-object pool with the store on a 4 GiB tmpfs deleted
+**5,680.3 obj/s** (p50 279.6 ms per 100-key request). The scored window still wrote 4.5 GB for
+68,160 deletes — **66 KiB per delete**, identical to the NVMe arm — but the 819 metadata fsyncs
+cost **0.95 ms total** instead of 12.0 s. The server was CPU-bound (17.0 CPU-s over 17.2 s).
+
+This is a **code-path ceiling, not a durable benchmark**: tmpfs has no power-loss durability and is
+never a scoreboard row. It establishes the attribution: with the device's durable-write cost
+removed, the same delete path is **3.2× RustFS's 1,783.5 obj/s**. The 0.45× NVMe row is therefore
+the cost of a write-back consumer QLC drive without power-loss protection (Samsung
+MZVLQ512HALU), not the delete architecture. Matching 1,783.5 durably on that device needs at most
+~32 KiB per delete; the code path itself needs no change.
+
+Evidence: [`delete-tmpfs-code-ceiling-2026-11-07.json`](performance-evidence/2026-11/delete-tmpfs-code-ceiling-2026-11-07.json).
 
 ## 16. Replication throughput and sender cost (2026-11-05)
 
