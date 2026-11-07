@@ -215,9 +215,12 @@ const RETIRE_BATCH: usize = 64;
 /// concurrent cleanup in the same directory into one fsync, so this also bounds how many exact
 /// unlinks share one absence barrier. Eight left the unversioned DELETE path fsync-bound: a
 /// 100k-object delete arm issued 622 directory fsyncs for 7,459 deletes. The work per cleanup is
-/// small (one unlink and one prune), and every row keeps its own exact claim and identity checks;
-/// 32 merely lets the existing coalescer amortize the barrier over a larger batch.
-const CLEANUP_IO_CONCURRENCY: usize = 32;
+/// small (one unlink and one prune), and every row keeps its own exact claim and identity checks.
+/// A 100k-object delete arm at 32 still issued 273 directory fsyncs (~8.8 s) for ~6.9k deletes on
+/// a saturated consumer NVMe; 128 lets the coalescer amortize one absence barrier over a larger
+/// batch. The `buffer_unordered` window is the only bound, so memory stays one cleanup row per
+/// in-flight unlink.
+const CLEANUP_IO_CONCURRENCY: usize = 128;
 
 /// Drain one bounded batch through exact Writer claims. Errors and stale/expired acknowledgements
 /// retain debt and quota; a physical ENOENT still passes through the blob's namespace sync barrier.
