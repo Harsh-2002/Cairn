@@ -1463,6 +1463,31 @@ MZVLQ512HALU), not the delete architecture. Matching 1,783.5 durably on that dev
 
 Evidence: [`delete-tmpfs-code-ceiling-2026-11-07.json`](performance-evidence/2026-11/delete-tmpfs-code-ceiling-2026-11-07.json).
 
+### 15.4 Index and storage-token write-path cuts (2026-11-08)
+
+The page accounting attributed the ~66 KiB device write per random-key unversioned delete to the
+`object_versions` row plus its indexes and the exact cleanup-debt row. Two measured cuts, both
+durability-neutral:
+
+- **Schema v43** drops `idx_object_versions_bkv`. Migration v1 had created both
+  `UNIQUE(bucket_name, key, version_id)` and an explicit index with the same columns, so every
+  version write and delete maintained the key twice. The UNIQUE auto-index serves the same exact
+  lookup and version-ordered range seek (asserted by a query-plan test). Cairn-only arm:
+  **839.8 → 910.9 obj/s (+8.5%)**, prefill 326 s, zero errors.
+- **UUIDv7 `StorageToken`** makes the cleanup table's primary key and its `(lease_until, id)` and
+  `(bucket_name, id)` claim indexes append in insertion order instead of scattering across random
+  leaves. The token stays an internal 32-hex identity; its random tail still makes collisions
+  negligible. Combined arm: **1,147.0 obj/s** (+36.6% over 839.8, +26.0% over v43 alone), prefill
+  313 s, zero errors.
+
+A 100k-row SQLite replica with the real DDL measures the WAL cost per delete as 32.5 KiB full,
+28.5 KiB without `bkv`, and 23.3 KiB with both cuts — a **28% reduction**, which matches the
+observed direction. The device still writes ~52 KiB per delete and is saturated at ~60 MB/s, so
+the remaining gap is still bytes, not commits.
+
+Evidence: [`delete-v43-index-drop-2026-11-08.json`](performance-evidence/2026-11/delete-v43-index-drop-2026-11-08.json)
+and [`delete-v43-v7-token-2026-11-08.json`](performance-evidence/2026-11/delete-v43-v7-token-2026-11-08.json).
+
 ## 16. Replication throughput and sender cost (2026-11-05)
 
 The 2026-09-09 replication scale run proved correctness (zero mismatches) but ended with 359-443 s

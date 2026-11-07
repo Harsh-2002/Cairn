@@ -20,9 +20,15 @@ pub struct StorageToken(String);
 
 impl StorageToken {
     /// Mint an identity; identities are never deliberately reused.
+    ///
+    /// Time-ordered (UUIDv7): the cleanup table's primary key and its `(lease_until, id)` and
+    /// `(bucket_name, id)` claim indexes then append in insertion order instead of scattering
+    /// across random leaves. A random v4 id made every unversioned delete pay several extra
+    /// index-page writes. This is an internal identity, not a bearer secret; the random tail
+    /// still makes collisions negligible and the timestamp is not exposed to clients.
     #[must_use]
     pub fn generate() -> Self {
-        Self(uuid::Uuid::new_v4().simple().to_string())
+        Self(uuid::Uuid::now_v7().simple().to_string())
     }
 
     /// Canonical database representation.
@@ -1777,5 +1783,24 @@ mod tests {
                 .admit(StorageAdmission::Granted(Box::new(receipt)), lease)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn storage_tokens_are_canonical_and_time_ordered() {
+        let first = StorageToken::generate();
+        let second = StorageToken::generate();
+        for token in [&first, &second] {
+            let value = token.as_str();
+            assert_eq!(value.len(), 32);
+            assert!(
+                value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(StorageToken::try_from(value.to_owned()).is_ok());
+        }
+        // UUIDv7's leading 48 bits are the millisecond timestamp. Within one millisecond the
+        // random tail may order either way (still page-local); the prefix must never go backwards.
+        assert!(first.as_str()[..12] <= second.as_str()[..12]);
     }
 }
