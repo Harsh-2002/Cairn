@@ -1398,8 +1398,8 @@ differ because the RustFS interleave and the sync probe affect the run; the dire
 
 This row remains **as-configured, not equal durability**: RustFS 1.0.0 strict does not fsync the
 unversioned delete path. The equal-durability number is the versioned **5.17×** row. The remaining
-cost is the metadata commit (about 45 deletes per fsync); the next candidate is a bulk unversioned
-delete mutation.
+cost is device write amplification, not the metadata commit; the bulk-delete mutation candidate was
+measured and rejected in section 15.2.
 
 The 2026-11-05 sweep used Warp 1.8.2 `fc7661…`; this run used the available 1.8.2 RDMA build
 `118c…`. Do not pool absolutes across the two clients or the loaded and clean hosts.
@@ -1409,6 +1409,41 @@ Evidence: [`delete-batching-baseline-2026-11-07.json`](performance-evidence/2026
 [`delete-sync-baseline-2026-11-07.json`](performance-evidence/2026-11/delete-sync-baseline-2026-11-07.json),
 [`delete-sync-cleanup32-2026-11-07.json`](performance-evidence/2026-11/delete-sync-cleanup32-2026-11-07.json) and
 [`delete-sync-fanout128-2026-11-07.json`](performance-evidence/2026-11/delete-sync-fanout128-2026-11-07.json).
+
+### 15.2 Cleanup concurrency 128 and the device-write wall (2026-11-07)
+
+#217 left the cleanup drain at 32 concurrent unlinks. #219 raises it to 128 and measures the same
+Cairn-only arm and sync probe: **723.4 → 839.8 obj/s (+16.1%)**, directory fsyncs **172 → 117**,
+metadata fsyncs 168 → 164, zero errors. A same-session pair measured Cairn **808.5 obj/s** against
+RustFS **1,783.5** (**0.45×**), with prefill 340.8 s vs 525.7 s.
+
+A bulk unversioned-delete mutation was implemented and measured, then reverted. It applied one
+`DeleteObjects` request as one writer mutation and co-committed the aggregate audit row, so the
+request paid one commit instead of one per key plus a separate audit commit. It measured
+**577.4 obj/s at cleanup 32** and **641.3 at cleanup 128** — both below the per-key path. The commit
+count fell as designed (135 and 149 metadata fsyncs), but bytes per delete rose from 66 KiB to
+~89 KiB and the device, not the barrier, was already the limit.
+
+The row is device-write bound. A random-key unversioned delete writes the `object_versions` row
+plus five indexes (`bkv`, `latest`, covering-latest, `storage_path`, `expire`), exact cleanup debt
+(table and index), and the stats roll-ups: **66 KiB of device writes per delete** on the current
+schema. The benchmark device is a consumer QLC NVMe (Samsung MZVLQ512HALU, write-back cache, no
+power-loss protection) sustaining about **57 MB/s** at the observed queue depth (33.5 ms average
+write service, 100% busy). A 12 s window therefore carries about 684 MB / 66 KiB ≈ 10.3k deletes,
+i.e. ≈860/s; the arm measured 840. Commit count is not the limiter, and neither co-committing the
+audit nor batching 100 deletes into one mutation moved it.
+
+Matching RustFS's 1,783 obj/s while durable would need at most ~32 KiB per delete on this device — a
+2× write-amplification cut through the schema and index set, not a tuning change. On storage with
+power-loss protection (fsync near 0.1–1 ms and sustained GB/s) the same durable path is not
+byte-capped. The row remains **as-configured, not equal durability**: RustFS 1.0.0 strict does not
+fsync its unversioned delete path. The equal-durability DELETE number remains the versioned
+**5.17×** arm.
+
+Evidence: [`delete-sync-cleanup128-2026-11-07.json`](performance-evidence/2026-11/delete-sync-cleanup128-2026-11-07.json),
+[`delete-paired-cleanup128-2026-11-07.json`](performance-evidence/2026-11/delete-paired-cleanup128-2026-11-07.json),
+[`delete-bulk-mutation-2026-11-07.json`](performance-evidence/2026-11/delete-bulk-mutation-2026-11-07.json) and
+[`delete-bulk-mutation-cleanup128-2026-11-07.json`](performance-evidence/2026-11/delete-bulk-mutation-cleanup128-2026-11-07.json).
 
 ## 16. Replication throughput and sender cost (2026-11-05)
 
