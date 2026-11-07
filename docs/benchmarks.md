@@ -1488,6 +1488,10 @@ the remaining gap is still bytes, not commits.
 Evidence: [`delete-v43-index-drop-2026-11-08.json`](performance-evidence/2026-11/delete-v43-index-drop-2026-11-08.json)
 and [`delete-v43-v7-token-2026-11-08.json`](performance-evidence/2026-11/delete-v43-v7-token-2026-11-08.json).
 
+The remaining page (`object_versions` primary-key layout) needs a schema v44 table rebuild; the
+measured plan, refactor surface, migration gates and acceptance threshold are in
+[`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).
+
 ## 16. Replication throughput and sender cost (2026-11-05)
 
 The 2026-09-09 replication scale run proved correctness (zero mismatches) but ended with 359-443 s

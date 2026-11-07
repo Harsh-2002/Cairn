@@ -65,3 +65,5 @@ protocol-3 design record and measurements).
   [`multipart-upload-performance-plan-2026-11.md`](multipart-upload-performance-plan-2026-11.md);
   the accepted replication/authority/performance/benchmark decisions are
   [`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md).
+- The unversioned-delete write-amplification plan (schema v44, proposed) is
+  [`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).
