@@ -367,13 +367,17 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `?versions` audit (12,000 versions + 12,000 markers over the exact key set), and RustFS's strict
   readback. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
   ratios. **NOT a gate.**
-- `upgrade_drill.py` — **published-release to main upgrade and snapshot rollback**: runs the old
-  binary, writes plaintext/SSE-S3/multipart objects, snapshots the data directory, starts the
-  current binary, checks schema v42/protocol 3 and that legacy rows keep SHA-256, reads every old
-  object byte-for-byte (the legacy multipart part read fails closed), writes a new v3/BLAKE3
-  multipart, asserts the old binary refuses the upgraded database, and restores the snapshot so
-  the old binary can read again. Manual only: needs `boto3`, `--old-bin` and `--new-bin`.
-  **NOT a gate.**
+- `upgrade_drill.py` — **published-release to current-schema upgrade and snapshot rollback**: runs
+  the pinned old binary, writes plaintext/SSE-S3/multipart objects plus a GOVERNANCE-retained,
+  legal-held object, snapshots the data directory, starts the current binary, asserts schema v44 and
+  protocol 3, the clustered `object_versions` shape (`WITHOUT ROWID`, id index present, partial
+  `latest_cover` absent), zero `foreign_key_check` violations, the exact Object Lock retention and
+  legal-hold rows, and that legacy rows keep SHA-256; reads every old object byte-for-byte (the
+  legacy multipart part read fails closed), writes a new v3/BLAKE3 multipart, asserts the old binary
+  refuses the upgraded database, and restores the snapshot so the old binary can read again. The
+  pinned old binary is schema v39/protocol 2; the target is schema v44/protocol 3. Runs in
+  `validate.yml` (full profile) against `v2026.09.13`; manual invocation still works with `--old-bin`
+  and `--new-bin`. **Gate.**
 - `delete_single_key_cairn.py` — **Cairn-only writer attribution** for the unversioned single-key
   shape: it imports `delete_single_key.py`'s client unchanged and additionally scrapes `/metrics`
   one full store-metrics tick apart on both sides of the scored window, so the writer's stage rings

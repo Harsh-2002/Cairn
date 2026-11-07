@@ -152,9 +152,20 @@ to main at `b9472d2` (schema v42, protocol 3) with `conformance/upgrade_drill.py
 - restoring the pre-upgrade data-directory snapshot lets the released binary start and read every
   object exactly.
 
-The drill is manual (`boto3` and `--old-bin`/`--new-bin`; it does not download releases in CI). It
-does not replace the pre-upgrade snapshot: the old binary cannot open the upgraded database, so the
-snapshot is the only rollback path.
+The drill runs in `validate.yml` (full profile) against the pinned `v2026.09.13` asset; manual runs
+still take `--old-bin`/`--new-bin`. On 2026-11-08 it was extended and re-run from the same pinned
+release (schema v39/protocol 2) to main `f885b5a9` (schema v44/protocol 3):
+
+- a GOVERNANCE-retained, legal-held object written by the old binary keeps its exact retention
+  mode/date and legal hold after the rebuild, and `PRAGMA foreign_key_check` is empty;
+- `object_versions` is clustered (`WITHOUT ROWID`), `idx_object_versions_id` exists and the partial
+  `latest_cover` index is absent;
+- every old plaintext, SSE-S3 and multipart object still reads byte-for-byte; the legacy
+  `?partNumber` read fails closed; new multipart writes are v3/BLAKE3;
+- the old binary refuses the v44 database, and the snapshot rollback reads every old object.
+
+The drill does not replace the pre-upgrade snapshot: the old binary cannot open the upgraded
+database, so the snapshot is the only rollback path.
 
 ## API and console configuration migration
 

@@ -28,6 +28,7 @@
   "console-session": "full",
   "error-pages": "full",
   "backup-restore": "full",
+  "upgrade-drill": "full",
   "fast-io-conformance": "full",
   "mesh": "full",
   "rotation": "full",

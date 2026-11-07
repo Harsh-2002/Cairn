@@ -659,6 +659,31 @@ jobs:
     - name: Remote multipart response loss, durable cleanup and offline restore
       run: BIN=target/debug/cairn python3 conformance/recovery_remote.py --cleanup-lease
     if: ${{ inputs.profile == 'full' }}
+  upgrade-drill:
+    name: published-release upgrade + snapshot rollback
+    needs:
+    - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: cairn-bin
+        path: target/debug
+    - run: chmod +x target/debug/cairn
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.13.14
+    - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
+    - name: Upgrade to v44, assert clustered shape/locks, refusal and rollback
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" upgrade-drill
+    if: ${{ inputs.profile == 'full' }}
   fast-io-conformance:
     name: fast-io sendfile conformance + keep-alive engagement
     runs-on: ubuntu-24.04
@@ -1094,6 +1119,7 @@ jobs:
     - console-browser
     - error-pages
     - backup-restore
+    - upgrade-drill
     - rotation
     - share
     - concurrency
@@ -1203,6 +1229,7 @@ jobs:
     - console-browser
     - error-pages
     - backup-restore
+    - upgrade-drill
     - fast-io-conformance
     - mesh
     - rotation

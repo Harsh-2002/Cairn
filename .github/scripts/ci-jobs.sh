@@ -8,6 +8,18 @@ case "${1:?CI task required}" in
     sudo apt-get "${apt_sources[@]}" update
     sudo apt-get "${apt_sources[@]}" install -y musl-tools=1.2.4-2
     ;;
+  upgrade-drill)
+    chmod +x target/debug/cairn
+    mkdir -p /var/tmp/cairn-upgrade
+    gh release download v2026.09.13 --repo "$GITHUB_REPOSITORY" \
+      --pattern cairn-linux-amd64 --pattern SHA256SUMS \
+      --dir /var/tmp/cairn-upgrade --clobber
+    (cd /var/tmp/cairn-upgrade && sha256sum -c SHA256SUMS --ignore-missing && chmod +x cairn-linux-amd64)
+    python3 conformance/upgrade_drill.py \
+      --root /var/tmp/cairn-upgrade/run \
+      --old-bin /var/tmp/cairn-upgrade/cairn-linux-amd64 \
+      --new-bin target/debug/cairn --port 9090
+    ;;
   console-browser)
     chmod +x target/debug/cairn
     BIN=target/debug/cairn BROWSER=1 python3 conformance/api_console.py
