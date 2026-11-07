@@ -122,12 +122,12 @@ disabled in standard builds; see
 
 ## Stability
 
-Current status: **1.0 release candidate** for a single node with backups. The full scoreboard,
-upgrade/rollback drill, replication baseline, abrupt-process-kill drill, idle memory plateau and
-independent review are recorded in [the stability record](docs/stability-2026-11-05.md). Before
-1.0, the remaining gate is a 24–48 hour replication soak (power-loss testing remains site-specific);
-the result will be recorded there. The supported deployment scope and known limits are in
-[the support statement](docs/support.md).
+Current status: **1.0** for a single node with backups. The 24-hour correctness run passed with
+1,697,128 PUTs, 0 errors and 0 replication mismatches; after the replication-metrics fix, the 2-hour
+anonymous-RSS gate passed (155.6 → 153.5 MiB, −1.3%). The full scoreboard, upgrade/rollback drill,
+replication baseline, abrupt-process-kill drill and independent review are recorded in
+[the stability record](docs/stability-2026-11-05.md). The supported deployment scope and known
+limits are in [the support statement](docs/support.md).
 
 [Planned work](docs/delivery.md#32-phased-implementation-roadmap) includes external KMS integration,
 remote cold-tier transition/restore and zero-copy HTTPS reads.

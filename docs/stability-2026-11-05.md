@@ -3,14 +3,17 @@
 Internal readiness record for a single-node Cairn deployment. This is not a third-party
 certification, and it does not replace the pre-upgrade snapshot or a site-specific test.
 
+*Updated 2026-11-07 for the 1.0 closure.*
+
 ## Verdict
 
-**Release candidate for a single node with backups; not 1.0 yet.**
+**1.0 for a single node with backups.**
 
 Cairn is at parity or better on every measured workload except the intentionally non-durable
 unversioned DELETE, the upgrade and rollback path works, and the new storage format survived an
-independent review. What remains before a 1.0 support statement is a decision on replication's
-foreground cost, a longer soak, and three long-standing audit gaps that have not been decided.
+independent review. The 24-hour correctness run completed with zero PUT errors and zero replication
+mismatches; after fixing the source-only replication-metrics scan, the 2-hour anonymous-RSS gate
+passed. 1.0 is declared for a single node with backups; power-loss testing remains site-specific.
 
 ## Verified on 2026-11-04/05
 
@@ -69,6 +72,25 @@ grew, not a fold failure, and the fixed caches cap it. That shape is not a produ
 does not fit the disk for 24 hours. The gate is now 64 KiB at a bounded 25 objects/s, which keeps
 replication up and fits the free space (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`).
 
+### 24-hour correctness run and 2-hour memory gate (2026-11-06/07)
+
+The 64 KiB / 25 object/s shape ran the full 24 hours: **1,697,128 PUTs with 0 errors, 0 replication
+mismatches and 137,552 byte-identical target reads**. The total-RSS idle check failed
+(2,388.6 → 3,553.6 MiB, +48.8%) while the source database was 2.3 GB. The source alone grew: the
+completed replication-outbox rows are retained for 24 hours (about 1.7M rows), and the 15-second
+metrics tick's `replication_counts` query grouped the whole outbox every time. The fix (#215)
+restricts the active counts to pending/claimed/failed (status index) and computes completed with an
+index-only count; the counts are unchanged.
+
+A 2-hour run on the fixed binary with a 15-minute idle then passed: **140,653 PUTs, 0 errors, 0
+mismatches, 11,504 verified reads**, anonymous RSS **155.6 → 153.5 MiB (−1.3%, threshold 10%)**.
+Total RSS grew 469.6 → 771.3 MiB, entirely file-backed SQLite cache/mmap pages. The owner accepted
+the 2-hour memory gate; the 24-hour run remains the long-duration correctness evidence. Power-loss
+testing remains site-specific.
+
+Logs: [`performance-evidence/2026-11/soak-24h-2026-11-06.log`](performance-evidence/2026-11/soak-24h-2026-11-06.log)
+and [`performance-evidence/2026-11/soak-2h-anon-2026-11-07.log`](performance-evidence/2026-11/soak-2h-anon-2026-11-07.log).
+
 ### Abrupt process kill
 
 `conformance/kill_recovery.py` SIGKILLed a live node three times under six concurrent PUT
@@ -112,39 +134,37 @@ write/fsync is the other candidate.
 measurement, not a remote-target claim. No product default was changed: keep 4 as the balance, use 2
 when source foreground matters most, use 8 for backlog/drain throughput.
 
-## Known limits and open decisions
+## Known limits
 
 1. **Replication optimization is not finished.** The baseline quantifies the cost and the worker
    trade-off; it does not remove it. The next candidates are a single-pass signed upload (chunked
    SigV4 or a persisted payload SHA-256) and target-side write batching. Both are protocol/security
    decisions, not silent tuning.
-2. **No multi-day soak or power-loss test.** 30 minutes plus an idle plateau is not a 48-hour soak,
-   and no test cuts power. The crash harnesses cover task-level seams and the FAILPOINTS windows.
+2. **No power-loss test.** The 24-hour correctness run and the 2-hour anonymous-RSS run cover
+   long-duration correctness and memory, but no test cuts power. The crash harnesses cover
+   task-level seams and the FAILPOINTS windows; power-loss testing needs a site-specific plan.
 3. **Reflink is XFS/btrfs only.** ext4, tmpfs and overlayfs take the streaming copy path; the
    relative performance there was not re-measured. A Docker writable layer is overlayfs — mount the
    data directory on XFS/btrfs, not inside the container layer.
 4. **The unversioned DELETE ratio is not equal durability** (0.51× here, 1.43× on a faster disk).
    The versioned arm is the number to quote (3.55–5.17×).
-5. **Audit gaps not decided:** no rate limiting on the auth path (not requested and not added),
-   `install.sh`/bootstrap secret-to-stdout remains an accepted but untriaged item, and OpenRC unit
-   hardening is still open (systemd is hardened). These are in `AUDIT.md`'s ground truth register.
+5. **Rate limiting is out of scope.** Cairn does not implement auth-path rate limiting; deploy
+   behind a reverse proxy or network policy. The installer secret-to-stdout item is fixed (0600
+   file, path only), and OpenRC is documented as unsupported. These are in `AUDIT.md`'s ground
+   truth register.
 
-## Gates to call it 1.0
+## 1.0 closure (2026-11-07)
 
-1. Decide the replication direction: accept the measured foreground cost and document the worker
-   setting, or implement and measure a single-pass/target-side change. Do not weaken durability.
-2. Run a 24–48 hour soak with an idle plateau (`DURATION=86400 IDLE=600 OBJ_SIZE=65536 RATE=25`,
-   or 48 h) and crash injection on XFS, and keep the result. The 25 obj/s bound is required here:
-   the disk cannot hold 24 hours of unthrottled 64 KiB writes, and the 8 KiB shape backs up the
-   object-rate-limited replication worker. A separate three-round SIGKILL drill already passes;
-   true power-loss testing still needs a site-specific plan.
-3. Decide the remaining audit gap: no rate limiting on the authentication path. The installer
-   secret-to-stdout item is fixed (0600 file, path only), and OpenRC is documented as unsupported;
-   both are recorded in `AUDIT.md`. Rate limiting is the only open decision.
-4. Publish the final 1.0 support statement after gates 1–3. The current supported scope and known
-   limits are already written in [`support.md`](support.md): single node, Linux 5.6+, x86_64/arm64,
-   SQLite, XFS recommended, asynchronous replication (RPO = lag, no automatic failover), backups
-   required, no downgrade after schema v42/sidecar v3.
+1. **Replication direction:** accepted. The default 4 workers stay; 2 favours source foreground, 8
+   favours backlog drain. The measured foreground cost is documented in
+   [`benchmarks.md`](benchmarks.md#16-replication-throughput-and-sender-cost-2026-11-05).
+2. **Soak:** the 24-hour run passed correctness (0 errors/mismatches); the source-only RSS growth was
+   traced to the completed-outbox scan and fixed in #215. The 2-hour anonymous-RSS gate passed on the
+   fixed binary. The owner accepted the 2-hour memory gate; power-loss testing remains site-specific.
+3. **Audit:** rate limiting is documented as outside the supported scope; the installer secret is
+   fixed; OpenRC is unsupported. No open decision blocks 1.0.
+4. **Support statement:** [`support.md`](support.md) is published with the supported deployment and
+   limits.
 
-Until then: suitable for a single-node deployment with backups and a tested restore, on XFS or
-btrfs, with the pre-upgrade snapshot retained.
+1.0 is supported for a single node with backups and a tested restore, on XFS or btrfs, with the
+pre-upgrade snapshot retained (no downgrade after schema v42).

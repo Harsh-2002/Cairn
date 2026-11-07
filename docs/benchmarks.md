@@ -255,10 +255,11 @@ The boto3 driver (`conformance/soak.py`, run with the `/tmp/cairnvenv` python) e
 - every few seconds reads a random sample of already-PUT objects back from the **target** and
   compares them **byte-for-byte** against what was written — any mismatch (or non-arrival past a
   grace window) is counted;
-- samples the **source** process RSS (`/proc/<pid>/status` `VmRSS`) throughout and, after dropping
-  the warm-up window, checks steady-state RSS did not grow past a threshold (default 50%).
+- samples the **source** `VmRSS`, `RssAnon` and `RssFile` throughout. With `IDLE>0`, the leak gate
+  uses the post-write **anonymous** RSS delta and reports total/file-backed growth separately;
+  without an idle phase, the steady-state total-RSS check applies (default 50%).
 
-It exits non-zero unless replication mismatches are **0** and the source RSS stayed flat.
+It exits non-zero unless replication mismatches are **0** and the gated leak metric stayed flat.
 
 ### How to run
 
@@ -277,12 +278,13 @@ DURATION=60 BIN=target/debug/cairn PY=/tmp/cairnvenv/bin/python conformance/soak
 | source PUTs (60s) | **5023** (0 errors) |
 | objects verified byte-identical on the target | **93** |
 | replication mismatches | **0** |
-| source RSS (steady state) | **23.8 MiB → 26.3 MiB (+10.6%)**, under the 50% leak threshold |
+| source RSS (steady state, total VmRSS) | **23.8 MiB → 26.3 MiB (+10.6%)**, under the 50% leak threshold |
 
 Verdict: **PASS** — replication landed every sampled object byte-for-byte (0 mismatches), and the
 source's resident set stayed essentially flat across ~5k PUTs (the small rise is pool/cache warm-up,
 not a monotonic climb). At the CI default `DURATION=120` the PUT and verified counts roughly double
-while the RSS picture is unchanged.
+while the RSS picture is unchanged. The 1.0 gate used a 2-hour run with a 15-minute idle and the
+anonymous-RSS check; see the stability record.
 
 ## 5. Metadata sharding (the write-throughput escape valve)
 

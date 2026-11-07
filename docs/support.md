@@ -1,9 +1,8 @@
 # Support and deployment scope
 
-**Status: 1.0 release candidate (2026-11-05).** This page states what is supported today, what is
-not, and the operational conditions the durability claims assume. It is the basis for the 1.0
-support statement; it does not grant an SLA and is not a third-party certification. The measured
-evidence and the remaining pre-1.0 gates are in
+**Status: 1.0 (2026-11-07).** This page states what is supported today, what is not, and the
+operational conditions the durability claims assume. It does not grant an SLA and is not a
+third-party certification. The measured evidence is in
 [`stability-2026-11-05.md`](stability-2026-11-05.md).
 
 ## Supported deployment
@@ -59,10 +58,13 @@ evidence and the remaining pre-1.0 gates are in
   (`CAIRN_REPLICATION_WORKER_CONCURRENCY`): 4 is the balance, 2 favours source foreground, 8 favours
   backlog drain.
 - **Long-duration evidence.** The 2026-11-05 record includes a 30-minute soak with a 10-minute idle
-  plateau and a 24-hour soak at 25 obj/s with 64 KiB objects. The rate bound is deliberate: the
-  disk cannot hold 24 hours of unthrottled writes, and an 8 KiB attempt showed the replication
-  worker is object-rate limited, so the outbox backs up. A 48-hour soak and power-loss testing
-  remain open gates for the final 1.0 declaration; measure your own object mix.
+  plateau. A 24-hour run at 25 obj/s with 64 KiB objects completed **1,697,128 PUTs with 0 errors,
+  0 replication mismatches and 137,552 verified reads**. It exposed source-only RSS growth from
+  completed replication-outbox rows scanned by the metrics tick; #215 restricts the active counts to
+  pending/claimed/failed and counts completed on the status index. A 2-hour run on the fixed binary
+  with a 15-minute idle passed with **140,653 PUTs, 0 errors, 0 mismatches and anonymous RSS
+  155.6 → 153.5 MiB (−1.3%)**. The owner accepted the 2-hour memory gate. Power-loss testing remains
+  site-specific; measure your own object mix.
 - **Third-party audit.** The security/architecture review is internal. It is not a certification.
 
 ## Operational checklist
