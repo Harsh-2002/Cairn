@@ -1010,6 +1010,88 @@ UPDATE storage_protocol SET minimum_reader=3, minimum_writer=3;
 DROP INDEX IF EXISTS idx_object_versions_bkv;
 "#,
     },
+    Migration {
+        version: 44,
+        name: "cluster object versions by their natural key",
+        sql: r#"
+-- A random-key unversioned delete was dominated by page writes across the rowid table, the id
+-- primary-key index, the UNIQUE(bucket_name,key,version_id) auto-index, the storage_path index and
+-- the partial latest_cover index. Rebuild the table WITHOUT ROWID with the natural key as the
+-- primary key: the table and the unique key collapse into one B-tree, and lookups keep the same
+-- ordered seek. The id stays a plain, uniquely indexed column (lifecycle row identity and the
+-- storage-authority cursor keep their exact queries). The partial latest_cover index is dropped:
+-- current listings read the clustered (bucket_name,key,version_id) table directly, which is the
+-- unversioned case and still ordered by key; versioned listings scan a key's versions and filter
+-- is_latest. The trade is measured against the LIST and versioned-listing gates.
+-- object_locks has a cascading foreign key, so DROP TABLE object_versions would delete every
+-- lock row. Preserve them for the duration of the rebuild (locks stay enforced while the metadata
+-- transaction runs) and restore them against the new table below.
+CREATE TEMP TABLE object_locks_v44 AS SELECT * FROM object_locks;
+
+CREATE TABLE object_versions_v44 (
+    id                 TEXT NOT NULL,
+    bucket_name        TEXT NOT NULL,
+    key                TEXT NOT NULL,
+    version_id         TEXT NOT NULL,
+    is_latest          INTEGER NOT NULL,
+    is_delete_marker   INTEGER NOT NULL,
+    size_logical       INTEGER NOT NULL,
+    size_physical      INTEGER NOT NULL,
+    etag               TEXT NOT NULL,
+    content_type       TEXT NOT NULL,
+    storage_path       TEXT,
+    compression        TEXT NOT NULL,
+    storage_class      TEXT NOT NULL,
+    cold_locator       TEXT,
+    owner_id           TEXT NOT NULL,
+    user_metadata      TEXT NOT NULL,
+    acl                TEXT,
+    checksums          TEXT NOT NULL,
+    replication_status TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    sse_descriptor     TEXT,
+    content_encoding   TEXT,
+    cache_control      TEXT,
+    content_disposition TEXT,
+    content_language   TEXT,
+    expires            TEXT,
+    replicated_at      INTEGER,
+    internal_sha256    TEXT,
+    expire_at          INTEGER,
+    multipart_parts    TEXT,
+    internal_blake3    TEXT,
+    PRIMARY KEY (bucket_name, key, version_id)
+) WITHOUT ROWID;
+
+INSERT INTO object_versions_v44 (
+    id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+    etag,content_type,storage_path,compression,storage_class,cold_locator,owner_id,
+    user_metadata,acl,checksums,replication_status,created_at,updated_at,sse_descriptor,
+    content_encoding,cache_control,content_disposition,content_language,expires,replicated_at,
+    internal_sha256,expire_at,multipart_parts,internal_blake3)
+SELECT
+    id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+    etag,content_type,storage_path,compression,storage_class,cold_locator,owner_id,
+    user_metadata,acl,checksums,replication_status,created_at,updated_at,sse_descriptor,
+    content_encoding,cache_control,content_disposition,content_language,expires,replicated_at,
+    internal_sha256,expire_at,multipart_parts,internal_blake3
+FROM object_versions;
+
+DROP TABLE object_versions;
+ALTER TABLE object_versions_v44 RENAME TO object_versions;
+
+CREATE UNIQUE INDEX idx_object_versions_id ON object_versions (id);
+CREATE INDEX idx_object_versions_storage_path ON object_versions (storage_path);
+CREATE INDEX idx_object_versions_expire ON object_versions
+    (expire_at, bucket_name, key, version_id)
+    WHERE expire_at IS NOT NULL;
+
+INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+SELECT bucket_name, key, version_id, lock_mode, retain_until, legal_hold FROM object_locks_v44;
+DROP TABLE object_locks_v44;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1358,7 +1440,7 @@ mod tests {
     #[test]
     fn v43_drops_the_duplicate_key_index_but_keeps_lookup_coverage() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        migrate_fixture_through(&conn, 43);
         assert!(
             !index_exists(&conn, "idx_object_versions_bkv"),
             "the explicit index duplicates the UNIQUE auto-index and must be gone"
@@ -1377,6 +1459,69 @@ mod tests {
             assert!(
                 plan.contains("sqlite_autoindex_object_versions_2"),
                 "query must use the unique auto-index, got: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn v44_clusters_versions_by_natural_key_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 43);
+        conn.execute(
+            "INSERT INTO object_versions
+             (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+              etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,
+              created_at,updated_at)
+             VALUES ('row-1','b','k','null',1,0,4,4,'e','text/plain','Uncompressed','Standard',
+                     'owner','[]','[]',1,1)",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='object_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("WITHOUT ROWID"),
+            "table must be clustered: {sql}"
+        );
+        assert!(index_exists(&conn, "idx_object_versions_id"));
+        assert!(index_exists(&conn, "idx_object_versions_storage_path"));
+        assert!(
+            !index_exists(&conn, "idx_ov_latest_cover"),
+            "the rowid-only covering index is replaced by the clustered table"
+        );
+        let (key, size): (String, i64) = conn
+            .query_row(
+                "SELECT key,size_logical FROM object_versions WHERE id='row-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (key.as_str(), size),
+            ("k", 4),
+            "v44 must copy existing rows"
+        );
+
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT id FROM object_versions \
+             WHERE bucket_name='b' AND key='k' AND version_id='v'",
+            "EXPLAIN QUERY PLAN SELECT id FROM object_versions \
+             WHERE bucket_name='b' AND key='k' ORDER BY version_id",
+        ] {
+            let plan: String = conn
+                .query_row(sql, [], |row| row.get(3))
+                .unwrap_or_else(|error| panic!("plan failed for {sql}: {error}"));
+            assert!(
+                plan.contains("PRIMARY KEY"),
+                "query must use the clustered primary key, got: {plan}"
             );
         }
     }
@@ -1569,7 +1714,7 @@ mod tests {
     #[test]
     fn migration_v2_renames_quota_and_index_changes() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        migrate_fixture_through(&conn, 2);
 
         // The compression column was renamed to the spec name (ARCH 34.1) and the quota column
         // was added (ARCH 27.5).
@@ -1718,7 +1863,7 @@ mod tests {
     #[test]
     fn migration_v11_swaps_latest_index_for_partial_cover() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        migrate_fixture_through(&conn, 11);
         // The partial covering index replaces the narrow latest index (ARCH 30.3).
         assert!(index_exists(&conn, "idx_ov_latest_cover"));
         assert!(!index_exists(&conn, "idx_object_versions_latest"));
@@ -1773,7 +1918,12 @@ mod tests {
         // simulate "existing data at upgrade time" by inserting before v12 runs: run migrations up
         // to v11 by faking the recorded version.
         run_migrations(&conn).unwrap();
-        assert!(index_exists(&conn, "idx_ov_latest_cover")); // sanity: full chain applied
+        let applied: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(applied, latest_version(), "sanity: full chain applied");
 
         // Both roll-up tables exist.
         for t in ["bucket_stats", "user_stats"] {
@@ -1899,11 +2049,28 @@ mod tests {
                      version_id TEXT NOT NULL,
                      is_latest INTEGER NOT NULL DEFAULT 1,
                      is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                     etag TEXT NOT NULL DEFAULT '',
                      size_logical INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     size_physical INTEGER NOT NULL DEFAULT 0,
+                     etag TEXT NOT NULL DEFAULT '',
+                     content_type TEXT NOT NULL DEFAULT '',
+                     storage_path TEXT,
+                     compression TEXT NOT NULL DEFAULT '',
                      storage_class TEXT NOT NULL DEFAULT 'Standard',
+                     cold_locator TEXT,
                      owner_id TEXT NOT NULL DEFAULT '',
+                     user_metadata TEXT NOT NULL DEFAULT '[]',
+                     acl TEXT,
+                     checksums TEXT NOT NULL DEFAULT '[]',
+                     replication_status TEXT,
+                     created_at INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     sse_descriptor TEXT,
+                     content_encoding TEXT,
+                     cache_control TEXT,
+                     content_disposition TEXT,
+                     content_language TEXT,
+                     expires TEXT,
+                     replicated_at INTEGER,
                      UNIQUE (bucket_name, key, version_id)
                  );
                  CREATE INDEX idx_ov_latest_cover ON object_versions
@@ -2131,8 +2298,7 @@ mod tests {
     #[test]
     fn migration_v28_adds_row_identity_to_current_listing_cover() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate_fixture_through(&conn, 27);
-        run_migrations(&conn).unwrap();
+        migrate_fixture_through(&conn, 28);
         let columns = conn
             .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
             .unwrap()
@@ -2153,7 +2319,6 @@ mod tests {
                 "updated_at",
                 "storage_class",
                 "owner_id",
-                "expire_at",
             ]
         );
 
@@ -2179,8 +2344,7 @@ mod tests {
     #[test]
     fn migration_v40_adds_object_ttl_storage() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate_fixture_through(&conn, 39);
-        run_migrations(&conn).unwrap();
+        migrate_fixture_through(&conn, 40);
 
         let ttl_column: i64 = conn
             .query_row(

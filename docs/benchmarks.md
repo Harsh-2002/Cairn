@@ -1488,6 +1488,24 @@ the remaining gap is still bytes, not commits.
 Evidence: [`delete-v43-index-drop-2026-11-08.json`](performance-evidence/2026-11/delete-v43-index-drop-2026-11-08.json)
 and [`delete-v43-v7-token-2026-11-08.json`](performance-evidence/2026-11/delete-v43-v7-token-2026-11-08.json).
 
+**Schema v44** rebuilds `object_versions` `WITHOUT ROWID` with
+`PRIMARY KEY (bucket_name, key, version_id)`: the rowid table and the separate unique key collapse
+into one B-tree, `id` stays a uniquely indexed plain column, and the partial `latest_cover` index is
+dropped in favour of the clustered key order. Lock side rows are preserved across the parent drop.
+Cairn-only delete arm: **1,447.3 obj/s** (+72.3% over 839.8, +26.2% over v43+UUIDv7), prefill 315 s,
+zero errors, ~33 KiB of device writes per delete. The device is no longer saturated. Current
+listing is **171,764 obj/s** against the 154,254 / 153,805 / 159,862 §15 arms (+10% over their
+mean), so the covering-index removal did not regress listings. Against RustFS's 1,783.5 this is
+**0.81×** — still as-configured, not equal durability. The libSQL backend keeps the rowid layout
+because its engine rejects `WITHOUT ROWID` as experimental; its schema stays at v42.
+
+The remaining page is the indexed `id` column. Removing it needs the storage-authority cursor and
+key re-wrap to use the natural key; the plan and acceptance threshold are in
+[`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).
+
+Evidence: [`delete-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/delete-v44-clustered-2026-11-08.json)
+and [`list-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/list-v44-clustered-2026-11-08.json).
+
 ## 16. Replication throughput and sender cost (2026-11-05)
 
 The 2026-09-09 replication scale run proved correctness (zero mismatches) but ended with 359-443 s

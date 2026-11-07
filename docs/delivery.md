@@ -356,7 +356,7 @@ bounded release; restore and fresh generations invalidate release authorization 
 | multipart_parts | text | Nullable; JSON array of `{part_number,size}` records for an object completed by a multipart upload (migration v41). Part numbers may be non-contiguous; the offset is the sum of the sizes that precede the selected number, and `GET`/`HEAD ?partNumber=N` serves that part. NULL for single-part PUTs, copies, and objects completed before v41. |
 | created_at, updated_at | timestamp | Not null. |
 | Unique key | | The combination of bucket, key, and version identifier is unique. |
-| Index | | Over bucket and key and version ordering, for current-version lookup and version listing. The partial latest-row covering index includes `id` as of migration v28 so lifecycle row-identity enumeration remains index-only. |
+| Index | | Over bucket and key and version ordering, for current-version lookup and version listing. Migration v44 clusters the default SQLite table on this key (`WITHOUT ROWID`) and keeps `id` uniquely indexed, so the table serves ordered current listings directly; the libSQL backend keeps the partial latest-row covering index (v28) because its engine rejects `WITHOUT ROWID`. |
 
 **Object tags.** Associated with an object version, a small set of key-value pairs, stored so they can be returned by the tagging operations and matched by lifecycle and policy.
 
