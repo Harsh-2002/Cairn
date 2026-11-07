@@ -1422,7 +1422,7 @@ A bulk unversioned-delete mutation was implemented and measured, then reverted. 
 request paid one commit instead of one per key plus a separate audit commit. It measured
 **577.4 obj/s at cleanup 32** and **641.3 at cleanup 128** — both below the per-key path. The commit
 count fell as designed (135 and 149 metadata fsyncs), but bytes per delete rose from 66 KiB to
-91 KiB and the device, not the barrier, was already the limit.
+~89 KiB and the device, not the barrier, was already the limit.
 
 The row is device-write bound. A random-key unversioned delete writes the `object_versions` row
 plus five indexes (`bkv`, `latest`, covering-latest, `storage_path`, `expire`), exact cleanup debt
