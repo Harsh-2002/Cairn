@@ -998,6 +998,18 @@ ALTER TABLE object_versions ADD COLUMN internal_blake3 TEXT;
 UPDATE storage_protocol SET minimum_reader=3, minimum_writer=3;
 "#,
     },
+    Migration {
+        version: 43,
+        name: "drop the duplicate object-version key index",
+        sql: r#"
+-- v1 created UNIQUE (bucket_name, key, version_id) and an explicit index with exactly the same
+-- columns, so every version write and delete maintained the same key twice. SQLite's UNIQUE
+-- auto-index serves every equality lookup and version-ordered range seek the explicit index did;
+-- dropping it removes one index-page write from every unversioned delete. The auto-index remains
+-- and is asserted by the schema test, so this is not a loss of lookup coverage.
+DROP INDEX IF EXISTS idx_object_versions_bkv;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1341,6 +1353,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn v43_drops_the_duplicate_key_index_but_keeps_lookup_coverage() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(
+            !index_exists(&conn, "idx_object_versions_bkv"),
+            "the explicit index duplicates the UNIQUE auto-index and must be gone"
+        );
+        // The UNIQUE(bucket_name,key,version_id) auto-index must serve both the exact-row lookup
+        // and the version-ordered range seek the dropped index described.
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT id FROM object_versions \
+             WHERE bucket_name='b' AND key='k' AND version_id='v'",
+            "EXPLAIN QUERY PLAN SELECT id FROM object_versions \
+             WHERE bucket_name='b' AND key='k' ORDER BY version_id",
+        ] {
+            let plan: String = conn
+                .query_row(sql, [], |row| row.get(3))
+                .unwrap_or_else(|error| panic!("plan failed for {sql}: {error}"));
+            assert!(
+                plan.contains("sqlite_autoindex_object_versions_2"),
+                "query must use the unique auto-index, got: {plan}"
+            );
+        }
     }
 
     fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {

@@ -1,0 +1,701 @@
+{
+  "schema": 2,
+  "cases": [
+    [
+      "delete_4k",
+      "delete-existing",
+      "4KiB",
+      16,
+      [
+        "--objects",
+        "100000",
+        "--batch",
+        "100",
+        "--list-existing",
+        "--noclear"
+      ]
+    ]
+  ],
+  "pairs": 1,
+  "duration": 12,
+  "host_capacity": {
+    "memtotal_kib": 32659144,
+    "swaptotal_kib": 8388604,
+    "logical_cpus": 6
+  },
+  "allow_ballooning": false,
+  "metrics_drain_seconds": 0,
+  "diagnostic_sync_probe": true,
+  "engine_selection": "cairn",
+  "strict_settings": {
+    "cairn": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+    },
+    "rustfs": {
+      "RUSTFS_DURABILITY_MODE": "strict",
+      "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+      "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+    }
+  },
+  "max_seconds": 3600,
+  "max_bytes": 10000000000,
+  "binary_sha256": {
+    "cairn": "b4f2a489f09d474785e3acafd69a23229564e59e9d6e391dac254ecf34621508",
+    "warp": "118c359e4bafa292a61712b22141d0283855f38686a96a4aa4b95f7a9e59b488"
+  },
+  "arms": [
+    {
+      "case": "delete_4k",
+      "engine": "cairn",
+      "order": 1,
+      "duration_requested_seconds": 12,
+      "concurrency": 16,
+      "command": [
+        "/var/tmp/cairn-perf-tools/warp/warp-rdma/warp",
+        "delete",
+        "--host",
+        "127.0.0.1:18001",
+        "--region",
+        "us-east-1",
+        "--lookup",
+        "path",
+        "--bucket",
+        "cairn-benchmark",
+        "--concurrent",
+        "16",
+        "--duration",
+        "12s",
+        "--no-color",
+        "--benchdata",
+        "/var/tmp/cairn-performance-delete-v43/01-cairn-delete_4k-qaju2dyt/warp",
+        "--objects",
+        "100000",
+        "--batch",
+        "100",
+        "--list-existing",
+        "--noclear"
+      ],
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "prefill": {
+        "objects": 100000,
+        "seconds": 326.027
+      },
+      "strict_settings": {
+        "CAIRN_META_SYNCHRONOUS": "full",
+        "CAIRN_META_SHARDS": "1",
+        "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+      },
+      "warp_exit": 0,
+      "limit_hit": false,
+      "load_elapsed_seconds": 18.162772304999635,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "load_start_unix_seconds": 1794077670.478347,
+      "load_end_unix_seconds": 1794077688.6413634,
+      "warp_operation_timeline": {
+        "status": "unavailable: only standalone PUT is aligned"
+      },
+      "host_io_pressure_delta_us": {
+        "some": 2975266,
+        "full": 2727163
+      },
+      "host_volume_device": {
+        "major": 259,
+        "minor": 2
+      },
+      "host_volume_identity": {
+        "major": 259,
+        "minor": 2,
+        "model": "SAMSUNG MZVLQ512HALU-000H1",
+        "rotational": "0",
+        "write_cache": "write back",
+        "filesystem": "xfs",
+        "mount_options": "rw,noatime,inode64,logbufs=8,logbsize=32k,noquota"
+      },
+      "host_volume_diskstats_before": {
+        "reads": 1124266,
+        "read_sectors": 127120148,
+        "read_ms": 525079,
+        "writes": 902373,
+        "write_sectors": 81213466,
+        "write_ms": 52877066,
+        "io_ms": 963264,
+        "weighted_io_ms": 53402145,
+        "name": "nvme0n1p2"
+      },
+      "host_volume_diskstats_after": {
+        "reads": 1124294,
+        "read_sectors": 127124212,
+        "read_ms": 525086,
+        "writes": 933235,
+        "write_sectors": 82843160,
+        "write_ms": 53854936,
+        "io_ms": 974968,
+        "weighted_io_ms": 54380023,
+        "name": "nvme0n1p2"
+      },
+      "host_volume_diskstats_load_delta": {
+        "reads": 28,
+        "read_sectors": 4064,
+        "read_ms": 7,
+        "writes": 30862,
+        "write_sectors": 1629694,
+        "write_ms": 977870,
+        "io_ms": 11704,
+        "weighted_io_ms": 977878
+      },
+      "server_process_io_load_delta": {
+        "rchar": 198029312,
+        "wchar": 791152719,
+        "syscr": 48347,
+        "syscw": 321363,
+        "read_bytes": 0,
+        "write_bytes": 758566912
+      },
+      "load_samples": [
+        {
+          "elapsed_seconds": 2.0494036649997724,
+          "unix_seconds": 1794077672.5277507,
+          "processes": {
+            "server": {
+              "cpu_seconds": 97.18,
+              "rss_bytes": 194908160
+            },
+            "client": {
+              "cpu_seconds": 1.96,
+              "rss_bytes": 102346752
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.32,
+            "top": [
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 643,
+                "name": "containerd",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 772,
+                "name": "dockerd",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.02
+              },
+              {
+                "pid": 8563,
+                "name": "ffmpeg",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 561,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 277535367,
+            "full": 230226552
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 902821,
+            "write_sectors": 81325134,
+            "write_ms": 53056421,
+            "io_ms": 964100,
+            "weighted_io_ms": 53581508,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 552865532,
+            "wchar": 3410281998,
+            "syscr": 135041,
+            "syscw": 1662846,
+            "read_bytes": 163840,
+            "write_bytes": 3675832320
+          }
+        },
+        {
+          "elapsed_seconds": 5.084104718000162,
+          "unix_seconds": 1794077675.5624516,
+          "processes": {
+            "server": {
+              "cpu_seconds": 97.21,
+              "rss_bytes": 197935104
+            },
+            "client": {
+              "cpu_seconds": 2.07,
+              "rss_bytes": 102596608
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.43,
+            "top": [
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.08
+              },
+              {
+                "pid": 349827,
+                "name": "openviking-serv",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 8563,
+                "name": "ffmpeg",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 31,
+                "name": "ksoftirqd/2",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 561,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 277542024,
+            "full": 230232644
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 903482,
+            "write_sectors": 81339250,
+            "write_ms": 53057202,
+            "io_ms": 964148,
+            "weighted_io_ms": 53582289,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 553389820,
+            "wchar": 3411596424,
+            "syscr": 135169,
+            "syscw": 1662874,
+            "read_bytes": 163840,
+            "write_bytes": 3675832320
+          }
+        },
+        {
+          "elapsed_seconds": 8.109173071999976,
+          "unix_seconds": 1794077678.58752,
+          "processes": {
+            "server": {
+              "cpu_seconds": 98.66,
+              "rss_bytes": 274272256
+            },
+            "client": {
+              "cpu_seconds": 2.15,
+              "rss_bytes": 109088768
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.64,
+            "top": [
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 349827,
+                "name": "openviking-serv",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 3442,
+                "name": "opencloud",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 8563,
+                "name": "ffmpeg",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 561,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 278169019,
+            "full": 230814631
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 915901,
+            "write_sectors": 81953346,
+            "write_ms": 53317589,
+            "io_ms": 966104,
+            "weighted_io_ms": 53842675,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 643190524,
+            "wchar": 3723312224,
+            "syscr": 157093,
+            "syscw": 1792687,
+            "read_bytes": 163840,
+            "write_bytes": 3987853312
+          }
+        },
+        {
+          "elapsed_seconds": 11.117238468999858,
+          "unix_seconds": 1794077681.595585,
+          "processes": {
+            "server": {
+              "cpu_seconds": 99.34,
+              "rss_bytes": 289914880
+            },
+            "client": {
+              "cpu_seconds": 2.18,
+              "rss_bytes": 109232128
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.48000000000000004,
+            "top": [
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 349827,
+                "name": "openviking-serv",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 8563,
+                "name": "ffmpeg",
+                "cpu_seconds": 0.03
+              },
+              {
+                "pid": 643,
+                "name": "containerd",
+                "cpu_seconds": 0.02
+              }
+            ],
+            "processes_seen": 561,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 278943305,
+            "full": 231516615
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 918641,
+            "write_sectors": 82237859,
+            "write_ms": 53394492,
+            "io_ms": 968652,
+            "weighted_io_ms": 53919578,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 684498684,
+            "wchar": 3892540480,
+            "syscr": 167178,
+            "syscw": 1865103,
+            "read_bytes": 163840,
+            "write_bytes": 4157083648
+          }
+        },
+        {
+          "elapsed_seconds": 14.158247427999413,
+          "unix_seconds": 1794077684.636594,
+          "processes": {
+            "server": {
+              "cpu_seconds": 99.73,
+              "rss_bytes": 293724160
+            },
+            "client": {
+              "cpu_seconds": 2.2,
+              "rss_bytes": 109252608
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 0.81,
+            "top": [
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.11
+              },
+              {
+                "pid": 4855,
+                "name": "python3",
+                "cpu_seconds": 0.09
+              },
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 367479,
+                "name": "node-MainThread",
+                "cpu_seconds": 0.04
+              },
+              {
+                "pid": 367480,
+                "name": "node-MainThread",
+                "cpu_seconds": 0.04
+              }
+            ],
+            "processes_seen": 565,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 279600452,
+            "full": 232134547
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 923864,
+            "write_sectors": 82468538,
+            "write_ms": 53575255,
+            "io_ms": 971376,
+            "weighted_io_ms": 54100341,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 715181820,
+            "wchar": 4003136824,
+            "syscr": 174669,
+            "syscw": 1911405,
+            "read_bytes": 163840,
+            "write_bytes": 4267675648
+          }
+        },
+        {
+          "elapsed_seconds": 17.195250750000014,
+          "unix_seconds": 1794077687.6735978,
+          "processes": {
+            "server": {
+              "cpu_seconds": 100.29,
+              "rss_bytes": 295133184
+            },
+            "client": {
+              "cpu_seconds": 2.23,
+              "rss_bytes": 109871104
+            }
+          },
+          "unrelated_process_cpu": {
+            "sampled_cpu_seconds": 1.46,
+            "top": [
+              {
+                "pid": 772,
+                "name": "dockerd",
+                "cpu_seconds": 0.52
+              },
+              {
+                "pid": 643,
+                "name": "containerd",
+                "cpu_seconds": 0.5
+              },
+              {
+                "pid": 4829,
+                "name": "go2rtc",
+                "cpu_seconds": 0.07
+              },
+              {
+                "pid": 349827,
+                "name": "openviking-serv",
+                "cpu_seconds": 0.05
+              },
+              {
+                "pid": 8454,
+                "name": "frigate.process",
+                "cpu_seconds": 0.03
+              }
+            ],
+            "processes_seen": 566,
+            "exited_since_previous": 0
+          },
+          "host_io_pressure_totals_us": {
+            "some": 280135962,
+            "full": 232631608
+          },
+          "host_volume_diskstats": {
+            "reads": 1124294,
+            "read_sectors": 127124212,
+            "read_ms": 525086,
+            "writes": 932792,
+            "write_sectors": 82757399,
+            "write_ms": 53835495,
+            "io_ms": 974156,
+            "weighted_io_ms": 54360582,
+            "name": "nvme0n1p2"
+          },
+          "server_process_io": {
+            "rchar": 750862076,
+            "wchar": 4126019240,
+            "syscr": 183380,
+            "syscw": 1962711,
+            "read_bytes": 163840,
+            "write_bytes": 4390526976
+          }
+        }
+      ],
+      "load_samples_dropped": 0,
+      "unrelated_process_cpu_final_interval": {
+        "sampled_cpu_seconds": 0.15,
+        "top": [
+          {
+            "pid": 4829,
+            "name": "go2rtc",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 8563,
+            "name": "ffmpeg",
+            "cpu_seconds": 0.02
+          },
+          {
+            "pid": 4855,
+            "name": "python3",
+            "cpu_seconds": 0.01
+          },
+          {
+            "pid": 8391,
+            "name": "frigate.output",
+            "cpu_seconds": 0.01
+          },
+          {
+            "pid": 8454,
+            "name": "frigate.process",
+            "cpu_seconds": 0.01
+          }
+        ],
+        "processes_seen": 565,
+        "exited_since_previous": 1
+      },
+      "unrelated_process_cpu_observed_seconds": 4.290000000000001,
+      "unrelated_process_cpu_valid_intervals": 7,
+      "server_cpu_seconds": 4.030000000000001,
+      "client_cpu_seconds": 2.21,
+      "server_peak_rss": 295133184,
+      "client_peak_rss": 109871104,
+      "peak_bytes": 1050681344,
+      "peak_inodes": 100012,
+      "server_last_cpu": 100.29,
+      "client_last_cpu": 2.23,
+      "summary": "* Average: 910.90 obj/s",
+      "analyzed_seconds": 10.0,
+      "objects_per_second": 910.9,
+      "mib_per_second": null,
+      "reports": {
+        "DELETE": {
+          "summary": "* Average: 910.90 obj/s",
+          "analyzed_seconds": 10.0,
+          "request_latency_ms": {
+            "avg": 1613.6,
+            "p50": 1406.2,
+            "p90": 2720.7,
+            "p99": 3054.1
+          }
+        }
+      },
+      "reported_errors": 0,
+      "error_line_count": 0,
+      "warp_output": "\nReport: DELETE. Concurrency: 16. Ran: 10s\n * Average: 910.90 obj/s\n * Reqs: Avg: 1613.6ms, 50%: 1406.2ms, 90%: 2720.7ms, 99%: 3054.1ms, Fastest: 285.8ms, Slowest: 3241.3ms, StdDev: 710.6ms\n\nThroughput, split into 10 x 1s:\n * Fastest: 2223.44 obj/s\n * 50% Median: 814.67 obj/s\n * Slowest: 559.01 obj/s\n\n\n",
+      "warp_output_truncated": false,
+      "sync_probe": {
+        "fsync_root": {
+          "calls": 100003,
+          "total_ms": 129.38598,
+          "max_ms": 2.656419
+        },
+        "fsync_staging": {
+          "calls": 3,
+          "total_ms": 2.634114,
+          "max_ms": 2.632332
+        },
+        "fsync_other_dir": {
+          "calls": 11842,
+          "total_ms": 321749.760004,
+          "max_ms": 1026.599746
+        },
+        "fsync_other": {
+          "calls": 322,
+          "total_ms": 54108.299382,
+          "max_ms": 1364.236356
+        },
+        "fdatasync": {
+          "calls": 100000,
+          "total_ms": 5368806.510834,
+          "max_ms": 1321.874528
+        }
+      },
+      "sync_probe_load_delta": {
+        "fsync_root": {
+          "calls": 0,
+          "total_ms": 0.0
+        },
+        "fsync_staging": {
+          "calls": 0,
+          "total_ms": 0.0
+        },
+        "fsync_other_dir": {
+          "calls": 106,
+          "total_ms": 4470.471409999998
+        },
+        "fsync_other": {
+          "calls": 184,
+          "total_ms": 11426.586757999998
+        },
+        "fdatasync": {
+          "calls": 0,
+          "total_ms": 0.0
+        }
+      },
+      "sync_probe_status": "captured",
+      "status": "PASS"
+    }
+  ],
+  "elapsed_seconds": 351.4225772770005
+}
