@@ -353,6 +353,65 @@ def volume_diskstats(device):
         return None
 
 
+def _read_sysfs(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def mount_identity(path):
+    """Return (filesystem, mount_options) for the longest mount covering `path`."""
+    try:
+        resolved = path.resolve(strict=True)
+        mounts = Path("/proc/self/mounts").read_text().splitlines()
+    except OSError:
+        return None, None
+    best = None
+    for line in mounts:
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point = fields[1].replace("\\040", " ")
+        if resolved == Path(mount_point) or Path(mount_point) in resolved.parents:
+            if best is None or len(mount_point) > len(best[0]):
+                best = (mount_point, fields[2], fields[3])
+    return (best[1], best[2]) if best is not None else (None, None)
+
+
+def volume_identity(volume, device):
+    """Describe the storage class behind one arm.
+
+    The same code path measures differently by an order of magnitude on a write-back consumer
+    drive without power-loss protection versus server storage, so a throughput row is only
+    reproducible against the same device. Record the block model, rotational flag and write-cache
+    mode from sysfs plus the filesystem and mount options. A tmpfs or network mount has no block
+    entry; those fields stay null rather than guessing a device.
+    """
+    filesystem, mount_options = mount_identity(volume)
+    identity = {
+        "major": os.major(device),
+        "minor": os.minor(device),
+        "model": None,
+        "rotational": None,
+        "write_cache": None,
+        "filesystem": filesystem,
+        "mount_options": mount_options,
+    }
+    link = Path(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}")
+    try:
+        resolved = link.resolve(strict=True)
+    except OSError:
+        return identity
+    # /sys/dev/block/M:N points at the partition; the whole disk is its parent when the
+    # `partition` attribute exists. Whole-disk devices have no such attribute.
+    disk = resolved.parent if (resolved / "partition").exists() else resolved
+    identity["model"] = _read_sysfs(disk / "device/model")
+    identity["rotational"] = _read_sysfs(disk / "queue/rotational")
+    identity["write_cache"] = _read_sysfs(disk / "queue/write_cache")
+    return identity
+
+
 def diskstats_delta(before, after):
     """Reject missing, replaced, or reset host counters rather than report false progress."""
     if not before or not after or before["name"] != after["name"]:
@@ -429,7 +488,8 @@ def parse_warp(output, operation):
     inline_errors = [int(x) for x in re.findall(r"\b(\d+) errors\b", text)]
     errors = max(sum(error_lines), sum(inline_errors), text.count("<ERROR>"))
     return {
-        "summary": line,
+        # An arm that reported errors has no usable score, even if Warp printed an average.
+        "summary": line if errors == 0 else None,
         "analyzed_seconds": target.get("analyzed_seconds"),
         "objects_per_second": float(objects.group(1)) if objects else None,
         "mib_per_second": float(bandwidth.group(1)) if bandwidth else None,
@@ -841,6 +901,7 @@ def run_arm(args, root, case, engine, index, deadline):
                                           if pressure_before and pressure_after else None),
             "host_volume_device": {"major": os.major(volume_device),
                                    "minor": os.minor(volume_device)},
+            "host_volume_identity": volume_identity(volume, volume_device),
             "host_volume_diskstats_before": device_before,
             "host_volume_diskstats_after": device_after,
             "host_volume_diskstats_load_delta": diskstats_delta(device_before, device_after),
