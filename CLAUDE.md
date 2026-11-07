@@ -133,7 +133,7 @@ above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v42 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  is v43 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
   `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
   scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
   bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
@@ -147,7 +147,9 @@ above remain the source of truth.
   current-listing covering index), v41 multipart completed-object part layout
   (`object_versions.multipart_parts`) for `GET`/`HEAD ?partNumber`, v42 BLAKE3 internal integrity
   baselines (`object_versions.internal_blake3`, legacy `internal_sha256` retained, sidecar v3, and
-  storage protocol floor 3).
+  storage protocol floor 3), v43 dropped the explicit `idx_object_versions_bkv` index that
+  duplicated the `UNIQUE(bucket_name, key, version_id)` auto-index (lookups and version-ordered
+  seeks use the auto-index; the drop removes one index-page write per unversioned delete).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is
