@@ -274,7 +274,8 @@ across pairs while RustFS stayed ~1.65k). Raw evidence:
 [`performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json`](performance-evidence/2026-11/delete-single-key-post-co-commit-2026-11-04.json).
 
 **Durability fairness:** the ratio is **as-configured, not equal-durability**. RustFS 1.0.0's
-`strict` mode does not cover its unversioned DELETE path: `delete_version_inner` →
+RustFS 1.0.0 `strict` mode does not cover its unversioned DELETE path (1.0.2+ adds a strictly
+gated delete journal; see `benchmarks.md` §15.5): `delete_version_inner` →
 `delete_file_with_namespace_owner`/`move_to_trash_with_namespace_owner` performs unsynced unlinks and
 renames and does not consult `effective_durability`. Cairn ACKs after a durable tombstone plus the
 co-committed audit. The bulk 1.43× has the same caveat. A durability-equivalent comparison needs a

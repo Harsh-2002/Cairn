@@ -49,9 +49,13 @@ third-party certification. The measured evidence is in
   unencrypted multipart completions on the same XFS/btrfs filesystem. Every other shape and
   filesystem uses the streaming copy path. The copy path is correct but does not get the reflink
   completion speedup.
-- **The unversioned DELETE ratio.** RustFS 1.0.0 strict does not fsync its unversioned delete path,
-  so the unversioned comparison is as-configured throughput, not equal durability. Quote the
-  versioned delete-marker arm instead.
+- **The unversioned DELETE ratio.** RustFS 1.0.0 and 1.0.1 strict do not fsync their unversioned
+  delete path, so those comparisons are as-configured throughput, not equal durability. From 1.0.2
+  through 1.0.4 a user-bucket unversioned delete commits a strict-gated recovery journal and quorum
+  receipt before success (the `xl.meta` unlink itself is still not directory-synced), so an
+  unversioned DELETE ratio must name the RustFS version; every recorded row is 1.0.0. Quote the
+  versioned delete-marker arm for equal durability, and re-run the unversioned row against 1.0.4
+  before publishing it.
 - **Replication throughput on a remote target.** The controlled benchmark runs both nodes on one
   host, which is a worst-case contention measurement. A remote target changes the network and disk
   contention; measure it for the deployment. The worker count is tunable
