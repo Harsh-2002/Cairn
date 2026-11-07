@@ -1,7 +1,8 @@
 # Unversioned-delete write amplification: remaining plan (2026-11-08)
 
-**Status: proposed.** The next step is a storage-format migration (schema v44) and needs an explicit
-go-ahead. Nothing in this document is implemented.
+**Status: v44 implemented.** The clustered `object_versions` table ships (schema v44) and measures
+1,447.3 obj/s. The remaining proposal is the removal of the indexed `id` column; it changes the
+storage-authority cursor and key re-wrap and still needs an explicit go-ahead.
 
 ## Where the row stands
 
@@ -9,7 +10,8 @@ go-ahead. Nothing in this document is implemented.
 |---|---:|---|
 | #219 baseline | 839.8 obj/s | ~66 KiB device writes per delete |
 | v43 (drop duplicate `bkv` index) | 910.9 | +8.5% |
-| v43 + UUIDv7 `StorageToken` | **1,147.0** | **+36.6%** |
+| v43 + UUIDv7 `StorageToken` | 1,147.0 | +36.6% |
+| **v44 clustered table** | **1,447.3** | **+72.3%**, ~33 KiB device/delete |
 | RustFS, same host | 1,783.5 | as-configured, RustFS does not fsync this path |
 
 The device is still saturated: about **52 KiB written per random-key delete** at the drive's
@@ -38,9 +40,9 @@ Matching RustFS's 1,783.5 obj/s on this device needs at most **~32 KiB of device
 delete**. Because device bytes are roughly twice the WAL budget, the WAL must fall to ~15–16 KiB
 per delete — four pages total including cleanup.
 
-## Recommended design
+## Implemented design (v44)
 
-Rebuild `object_versions` as `WITHOUT ROWID` with
+Rebuilt `object_versions` as `WITHOUT ROWID` with
 `PRIMARY KEY (bucket_name, key, version_id)`.
 
 - The table *is* the unique key: the rowid table page and the separate `UNIQUE` auto-index collapse
@@ -50,12 +52,15 @@ Rebuild `object_versions` as `WITHOUT ROWID` with
 - Keep `storage_path` (reconcile/ownership) and `latest_cover` (current listing). Secondary indexes
   on a `WITHOUT ROWID` table append the primary key; `latest_cover` already leads with it, so only
   `storage_path` grows modestly.
-- Expected: table (1 page) + `storage_path` (1) + `latest_cover` (1) + cleanup (~0.75) ≈ 3.75
-  pages, ~15 KiB WAL → ~30 KiB device → **~1,900 obj/s** at the measured device rate.
+- The shipped v44 keeps the uniquely indexed `id` and **drops** `latest_cover`: table (1) +
+  `id` (1) + `storage_path` (1) + cleanup (~1) ≈ 4 pages, ~16 KiB WAL → ~33 KiB device →
+  **1,447.3 obj/s** measured, with LIST at 171,764 obj/s (above the 154k §15 mean).
+- The libSQL backend cannot enable `WITHOUT ROWID` (experimental in its engine), so it keeps the
+  rowid table and stays at schema v42; the semantic contract is identical.
 
 ### Refactors the id-index removal requires
 
-1. `apply.rs` and `cairn-meta-async/src/apply.rs` version promotion
+1. `apply.rs` version promotion
    (`UPDATE object_versions SET is_latest=1 WHERE id=?`): update by the primary key of the promoted
    row, which the preceding `SELECT` already has.
 2. `baseline.rs` storage-authority page (`WHERE id>? ORDER BY id LIMIT ?`): change the cursor and
