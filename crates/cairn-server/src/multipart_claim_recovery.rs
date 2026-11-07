@@ -211,6 +211,13 @@ pub(crate) struct StorageCleanupDrain {
 /// small without weakening any per-row validation. 64 rows turn a full 1,000-row page into at
 /// most 16 retire submissions instead of 1,000.
 const RETIRE_BATCH: usize = 64;
+/// Concurrent cleanup unlinks per claimed page. The directory-barrier coalescer batches every
+/// concurrent cleanup in the same directory into one fsync, so this also bounds how many exact
+/// unlinks share one absence barrier. Eight left the unversioned DELETE path fsync-bound: a
+/// 100k-object delete arm issued 622 directory fsyncs for 7,459 deletes. The work per cleanup is
+/// small (one unlink and one prune), and every row keeps its own exact claim and identity checks;
+/// 32 merely lets the existing coalescer amortize the barrier over a larger batch.
+const CLEANUP_IO_CONCURRENCY: usize = 32;
 
 /// Drain one bounded batch through exact Writer claims. Errors and stale/expired acknowledgements
 /// retain debt and quota; a physical ENOENT still passes through the blob's namespace sync barrier.
@@ -258,7 +265,7 @@ pub(crate) async fn drain_storage_cleanup(
                 }
             }
         })
-        .buffer_unordered(8);
+        .buffer_unordered(CLEANUP_IO_CONCURRENCY);
     let mut reclaimed: Vec<StorageCleanup> = Vec::with_capacity(claimed);
     while let Some(result) = operations.next().await {
         if let Some(cleanup) = result? {

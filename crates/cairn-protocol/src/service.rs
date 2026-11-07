@@ -4077,7 +4077,11 @@ impl S3Service {
                     results
                 }
             })
-            .buffered(32)
+            // The unversioned delete path is writer-fsync bound: 32 concurrent keys kept the
+            // group-commit batch at roughly 40 and made the 12-second arm ~0.35x RustFS. Let the
+            // writer fill more of its 256-mutation batch; per-key authorization, duplicate-key
+            // ordering and the exact tombstone/cleanup contract are unchanged.
+            .buffered(128)
             .collect::<Vec<_>>()
             .await
             .into_iter()
