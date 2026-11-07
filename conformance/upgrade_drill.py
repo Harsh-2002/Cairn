@@ -4,7 +4,10 @@
 Runs the last published release, writes plaintext/multipart/encrypted objects,
 stops it, snapshots the whole data directory, starts the current binary on the
 same data, and verifies:
-  * schema v42 and storage-protocol floor 3,
+  * schema v44 and storage-protocol floor 3,
+  * a clustered object_versions table (WITHOUT ROWID), the id index present and the
+    partial latest_cover index absent, with zero foreign-key violations,
+  * Object Lock retention and legal hold written by the old binary survive the rebuild,
   * every old object still reads byte-for-byte (including ?partNumber),
   * old rows keep internal_sha256 and have internal_blake3 NULL,
   * the old multipart sidecar is v2 and the rebuilt/current sidecar is v3,
@@ -12,8 +15,8 @@ same data, and verifies:
   * the old binary refuses the upgraded database,
   * copying the pre-upgrade snapshot back lets the old binary start and read.
 
-Not a CI gate: it needs a published binary and a live server, and boto3 is not in the CI image.
-Manual run with a throwaway venv (or any boto3-enabled interpreter):
+Runs in CI (`.github/workflows/validate.yml`) against the pinned release; boto3 comes from the
+pinned conformance requirements. Manual run with any boto3-enabled interpreter:
   gh release download v2026.09.13 --repo Harsh-2002/Cairn \
     --pattern cairn-linux-amd64 --pattern SHA256SUMS --dir /var/tmp/cairn-upgrade
   (cd /var/tmp/cairn-upgrade && sha256sum -c SHA256SUMS --ignore-missing)
@@ -23,6 +26,7 @@ Manual run with a throwaway venv (or any boto3-enabled interpreter):
 """
 import argparse
 import atexit
+import datetime
 import json
 import os
 import re
@@ -38,6 +42,7 @@ import boto3
 from botocore.config import Config
 
 BUCKET = "upgrade-drill"
+LOCK_BUCKET = "upgrade-drill-lock"
 SERVERS = []
 
 
@@ -127,6 +132,40 @@ def client(port, access, secret):
     )
 
 
+def write_lock_object(s3):
+    """Write a GOVERNANCE-retained, legal-held object with the old binary."""
+    s3.create_bucket(Bucket=LOCK_BUCKET, ObjectLockEnabledForBucket=True)
+    body = b"locked before upgrade"
+    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+    s3.put_object(
+        Bucket=LOCK_BUCKET,
+        Key="locked",
+        Body=body,
+        ObjectLockMode="GOVERNANCE",
+        ObjectLockRetainUntilDate=until,
+        ObjectLockLegalHoldStatus="ON",
+    )
+    retention = s3.get_object_retention(Bucket=LOCK_BUCKET, Key="locked")["Retention"]
+    legal = s3.get_object_legal_hold(Bucket=LOCK_BUCKET, Key="locked")["LegalHold"]
+    return {
+        "body": body,
+        "mode": retention["Mode"],
+        "retain_until": int(retention["RetainUntilDate"].timestamp()),
+        "legal_hold": 1 if legal["Status"] == "ON" else 0,
+    }
+
+
+def verify_lock_object(s3, expected):
+    body = s3.get_object(Bucket=LOCK_BUCKET, Key="locked")["Body"].read()
+    assert body == expected["body"], "locked object body mismatch"
+    retention = s3.get_object_retention(Bucket=LOCK_BUCKET, Key="locked")["Retention"]
+    legal = s3.get_object_legal_hold(Bucket=LOCK_BUCKET, Key="locked")["LegalHold"]
+    assert retention["Mode"] == expected["mode"]
+    assert int(retention["RetainUntilDate"].timestamp()) == expected["retain_until"]
+    assert (1 if legal["Status"] == "ON" else 0) == expected["legal_hold"]
+    log("  locked object: retention mode/date and legal hold exact")
+
+
 def write_objects(s3):
     s3.create_bucket(Bucket=BUCKET)
     plain = b"plaintext before upgrade " + bytes(range(256)) * 64
@@ -161,6 +200,7 @@ def write_objects(s3):
         "encrypted": encrypted,
         "multipart": b"".join(parts),
         "multipart_etag": completed["ETag"],
+        "lock": write_lock_object(s3),
     }
 
 
@@ -194,14 +234,39 @@ def db_state(root):
         blake3 = "internal_blake3" if "internal_blake3" in columns else "NULL"
         rows = conn.execute(
             f"SELECT key, internal_sha256 IS NOT NULL, {blake3} IS NOT NULL "
-            "FROM object_versions WHERE is_delete_marker=0 ORDER BY key"
+            "FROM object_versions WHERE is_delete_marker=0 AND bucket_name=?1 ORDER BY key",
+            (BUCKET,),
         ).fetchall()
         parts = None
         if "multipart_parts" in columns:
             parts = conn.execute(
                 "SELECT multipart_parts FROM object_versions WHERE key='multipart'"
             ).fetchone()[0]
-        return schema, proto, rows, parts
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='object_versions'"
+        ).fetchone()[0]
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='object_versions'"
+            )
+        }
+        fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        locks = conn.execute(
+            "SELECT bucket_name,key,version_id,lock_mode,retain_until,legal_hold "
+            "FROM object_locks WHERE bucket_name=?1 ORDER BY key",
+            (LOCK_BUCKET,),
+        ).fetchall()
+        return {
+            "schema": schema,
+            "proto": proto,
+            "rows": rows,
+            "parts": parts,
+            "table_sql": table_sql or "",
+            "indexes": indexes,
+            "fk_violations": fk_violations,
+            "locks": locks,
+        }
     finally:
         conn.close()
 
@@ -236,10 +301,14 @@ def main():
     s3 = client(args.port, access, secret)
     expected = write_objects(s3)
     verify_objects(s3, expected)
+    verify_lock_object(s3, expected["lock"])
     stop(proc)
-    old_schema, old_proto, old_rows, old_parts = db_state(root)
+    old_state = db_state(root)
     old_sidecar, _ = sidecar_version(root)
-    log(f"  released state: schema v{old_schema}, protocol {old_proto}, sidecar v{old_sidecar}")
+    log(
+        f"  released state: schema v{old_state['schema']}, protocol {old_state['proto']}, "
+        f"sidecar v{old_sidecar}, locks={old_state['locks']}"
+    )
     if old_sidecar is None:
         log("  released multipart has no sidecar (the release predates it); upgrade must still read it")
 
@@ -253,14 +322,27 @@ def main():
         args.new_bin, root, args.port, key, creds=(access, secret)
     )
     s3 = client(args.port, access, secret)
-    schema, proto, rows, parts = db_state(root)
-    log(f"  upgraded state: schema v{schema}, protocol {proto}, rows={rows}")
-    assert schema >= 42, f"expected schema >= 42, got {schema}"
-    assert proto == (3, 3), f"expected protocol (3,3), got {proto}"
-    log(f"  legacy multipart layout after upgrade: {parts!r} (absent is expected for this release)")
-    for key_name, has_sha, has_blake3 in rows:
+    state = db_state(root)
+    log(
+        f"  upgraded state: schema v{state['schema']}, protocol {state['proto']}, "
+        f"rows={state['rows']}"
+    )
+    assert state["schema"] >= 44, f"expected schema >= 44, got {state['schema']}"
+    assert state["proto"] == (3, 3), f"expected protocol (3,3), got {state['proto']}"
+    assert "WITHOUT ROWID" in state["table_sql"], "object_versions is not clustered"
+    assert "idx_object_versions_id" in state["indexes"], "the id index is missing"
+    assert "idx_ov_latest_cover" not in state["indexes"], "the partial cover should be dropped"
+    assert not state["fk_violations"], f"foreign-key violations: {state['fk_violations']}"
+    assert state["locks"] == old_state["locks"], (
+        "Object Lock rows changed across the rebuild: "
+        f"{old_state['locks']} -> {state['locks']}"
+    )
+    log("  v44 shape: clustered table, id index, no partial cover, 0 FK violations")
+    log(f"  legacy multipart layout after upgrade: {state['parts']!r} (absent is expected for this release)")
+    for key_name, has_sha, has_blake3 in state["rows"]:
         assert has_sha and not has_blake3, f"legacy row {key_name} changed baseline: {has_sha}/{has_blake3}"
     verify_objects(s3, expected, part_reads=True)
+    verify_lock_object(s3, expected["lock"])
 
     log("== 4. new post-upgrade multipart writes record BLAKE3 and a v3 sidecar")
     # The startup rebuild leaves the durable v2 sidecar intact; only a new write is v3.
@@ -281,7 +363,7 @@ def main():
         body = s3.get_object(Bucket=BUCKET, Key="multipart-new", PartNumber=number)["Body"].read()
         assert body == new_parts[number - 1], "new multipart part-number read mismatch"
         log(f"  GET multipart-new ?partNumber={number}: exact")
-    schema2, _, rows2, _ = db_state(root)
+    rows2 = db_state(root)["rows"]
     new_row = [row for row in rows2 if row[0] == "multipart-new"][0]
     assert new_row[2] and not new_row[1], f"new multipart row lacks BLAKE3: {new_row}"
     log(f"  new multipart row: internal_blake3={new_row[2]}, internal_sha256={new_row[1]}")
@@ -298,6 +380,7 @@ def main():
     assert new_sidecar == 3, f"new multipart sidecar should be v3, got {new_sidecar}"
     log("  new multipart sidecar: v3 with internal_blake3")
     verify_objects(s3, expected, part_reads=True)
+    verify_lock_object(s3, expected["lock"])
     stop(proc)
 
     log("== 5. the released binary must refuse the upgraded database")
@@ -329,10 +412,11 @@ def main():
     )
     s3 = client(args.port + 2, access, secret)
     verify_objects(s3, expected)
+    verify_lock_object(s3, expected["lock"])
     stop(proc)
     log("  rollback read every pre-upgrade object exactly")
 
-    log("PASS: release -> main upgrade, v42/v3, old-binary refusal, and snapshot rollback")
+    log("PASS: release -> v44 upgrade, lock preservation, old-binary refusal, and snapshot rollback")
 
 
 if __name__ == "__main__":

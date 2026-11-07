@@ -30,9 +30,12 @@ third-party certification. The measured evidence is in
   redundancy and geo-distribution.
 - **Backup/restore** per [`backup-restore.md`](backup-restore.md), with the data directory and
   SQLite database kept together on the same filesystem.
-- **Upgrade:** forward upgrade is supported from the last published release (verified
-  v2026.09.13 → schema v42/sidecar v3). **Downgrade is unsupported** after schema v42; the old
-  binary refuses the upgraded database. Restore the pre-upgrade snapshot to roll back.
+- **Upgrade:** forward upgrade is supported from the last published release. The pinned
+  `v2026.09.13` binary (schema v39, protocol 2) upgrades to the current schema v44/protocol 3,
+  verified by `conformance/upgrade_drill.py` (clustered table, Object Lock retention/legal-hold
+  preservation, zero foreign-key violations, exact old-object reads and old-binary refusal) and
+  gated in CI. **Downgrade is unsupported** after schema v42; the old binary refuses the upgraded
+  database. Restore the pre-upgrade snapshot to roll back.
 - **TLS and access control:** native TLS on the listeners, SigV4/Bearer authentication, the
   policy/ACL/BPA/ownership engine, and the management console. Put a reverse proxy or network
   policy in front of a public deployment (see the limits below).
