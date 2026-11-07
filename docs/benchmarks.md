@@ -1374,6 +1374,42 @@ All ten workloads are at parity or better except the intentionally non-durable u
 Raw evidence:
 [`full-sweep-2026-11-05.json`](performance-evidence/2026-11/full-sweep-2026-11-05.json) and
 [`delete-versioned-single-key-2026-11-05.json`](performance-evidence/2026-11/delete-versioned-single-key-2026-11-05.json).
+### 15.1 Unversioned DELETE after writer batching (2026-11-07)
+
+The 2026-11-05 unversioned DELETE row was measured on a loaded host. A clean-host reproduction with
+the 1.0 binary (`f3d1c4…`) measured Cairn at **655.4 / 708.3 / 684.0 obj/s** against RustFS
+**1,787.5 / 3,094.9 / 1,933.1** (pair ratios 0.37 / 0.23 / 0.35×). The cost was in the
+cleanup/commit path, not CPU: 622 directory fsyncs (10.9 s) plus 181 metadata fsyncs (12.2 s) for
+7,459 deletes, with only ~2 s of server CPU.
+
+#217 raises cleanup I/O from 8 to 32 concurrent unlinks and the bulk-delete fan-out from 32 to 128
+distinct keys. The exact claims, identity checks, absence barriers, authorization, audit and
+tombstone semantics are unchanged.
+
+| 3 interleaved pairs, clean host, 12 s | Cairn | RustFS | Pair ratios |
+|---|---:|---:|---:|
+| Baseline `f3d1c4…` | 655.4 / 708.3 / 684.0 | 1,787.5 / 3,094.9 / 1,933.1 | 0.37 / 0.23 / 0.35× |
+| After #217 `f854a8…` | **783.3 / 737.2 / 720.4** | 1,741.7 / 1,906.6 / 2,934.2 | **0.45 / 0.39 / 0.25×** |
+
+Cairn's mean absolute rate rose **682.5 → 747.0 obj/s (+9.4%)**; the mean of the three pair ratios
+moved **0.32 → 0.36×**. The Cairn-only sync-probe arm measured **621.6 → 723.4 obj/s (+16.4%)**,
+with directory fsyncs **622 → 172** and metadata fsyncs 181 → 168. The paired and single-arm rates
+differ because the RustFS interleave and the sync probe affect the run; the direction is consistent.
+
+This row remains **as-configured, not equal durability**: RustFS 1.0.0 strict does not fsync the
+unversioned delete path. The equal-durability number is the versioned **5.17×** row. The remaining
+cost is the metadata commit (about 45 deletes per fsync); the next candidate is a bulk unversioned
+delete mutation.
+
+The 2026-11-05 sweep used Warp 1.8.2 `fc7661…`; this run used the available 1.8.2 RDMA build
+`118c…`. Do not pool absolutes across the two clients or the loaded and clean hosts.
+
+Evidence: [`delete-batching-baseline-2026-11-07.json`](performance-evidence/2026-11/delete-batching-baseline-2026-11-07.json),
+[`delete-batching-paired-2026-11-07.json`](performance-evidence/2026-11/delete-batching-paired-2026-11-07.json),
+[`delete-sync-baseline-2026-11-07.json`](performance-evidence/2026-11/delete-sync-baseline-2026-11-07.json),
+[`delete-sync-cleanup32-2026-11-07.json`](performance-evidence/2026-11/delete-sync-cleanup32-2026-11-07.json) and
+[`delete-sync-fanout128-2026-11-07.json`](performance-evidence/2026-11/delete-sync-fanout128-2026-11-07.json).
+
 ## 16. Replication throughput and sender cost (2026-11-05)
 
 The 2026-09-09 replication scale run proved correctness (zero mismatches) but ended with 359-443 s
