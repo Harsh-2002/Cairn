@@ -1499,6 +1499,12 @@ mean), so the covering-index removal did not regress listings. Against RustFS's 
 **0.81×** — still as-configured, not equal durability. The libSQL backend keeps the rowid layout
 because its engine rejects `WITHOUT ROWID` as experimental; its schema stays at v42.
 
+A bulk `DeleteUnversionedKeys` mutation with a co-committed aggregate audit was implemented on top
+of v44 and measured, then reverted: **1,477.3 obj/s** against 1,447.3 (+2.1%, within device noise),
+with ~39 KiB against ~33 KiB of device writes per delete and 248 against 240 metadata fsyncs. The
+per-key writer already coalesced 260+ keys per commit, so the per-request audit rows were not the
+limiter; the extra per-request transaction raised bytes instead.
+
 The remaining page is the indexed `id` column. Removing it needs the storage-authority cursor and
 key re-wrap to use the natural key; the plan and acceptance threshold are in
 [`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).

@@ -85,6 +85,15 @@ Rebuilt `object_versions` as `WITHOUT ROWID` with
 - **Acceptance:** the same 100k-object delete arm must clear RustFS's same-session rate (1,783.5 in
   the current pair) or the migration is reverted before release.
 
+## Measured and rejected
+
+A `DeleteUnversionedKeys` bulk mutation that applied a whole request in one savepoint and
+co-committed its aggregate audit row was implemented on v44 and measured: **1,477.3 obj/s** against
+1,447.3 for the per-key path (+2.1%, within device noise), ~39 KiB against ~33 KiB of device writes
+per delete, and 248 against 240 metadata fsyncs. The per-key writer already coalesced 260+ keys per
+commit, so the per-request audit rows were not the limiter; the smaller per-request transaction
+raised bytes. Reverted.
+
 ## Explicit non-goals
 
 - No durability relaxation: the durable metadata commit remains the ACK point.
