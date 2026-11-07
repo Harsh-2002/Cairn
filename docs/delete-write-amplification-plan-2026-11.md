@@ -12,7 +12,7 @@ storage-authority cursor and key re-wrap and still needs an explicit go-ahead.
 | v43 (drop duplicate `bkv` index) | 910.9 | +8.5% |
 | v43 + UUIDv7 `StorageToken` | 1,147.0 | +36.6% |
 | **v44 clustered table** | **1,447.3** | **+72.3%**, ~33 KiB device/delete |
-| RustFS, same host | 1,783.5 | as-configured, RustFS does not fsync this path |
+| RustFS 1.0.0, same host | 1,783.5 | as-configured (1.0.2+ journals deletes; §15.5) |
 
 The device is still saturated: about **52 KiB written per random-key delete** at the drive's
 ~57 MB/s sustained rate. Every attempt that only reduced commits (bulk mutation, audit co-commit,

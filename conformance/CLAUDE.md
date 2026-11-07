@@ -357,8 +357,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `delete_4k` bulk ratio: a fresh store per arm, an exact 12,000 × 4 KiB pool, exactly one signed S3
   DELETE per key at 16-way concurrency, exact 200/204 + 404 spot checks, and a bounded `list-type=2`
   assertion that the bucket is empty. Records client CPU and per-pair ratios. Cairn pins FULL
-  metadata durability; RustFS `strict` is **write-path only** — its unversioned DELETE path is not
-  fsynced — so the ratio is as-configured, not equal-durability. **NOT a gate.**
+  metadata durability; RustFS 1.0.0/1.0.1 `strict` is **write-path only** — its unversioned DELETE
+  path is not fsynced — so that ratio is as-configured, not equal-durability. RustFS 1.0.2+ journals
+  the delete under strict (see `docs/benchmarks.md` §15.5), so name the version. **NOT a gate.**
 - `delete_versioned_single_key.py` — **the durability-equivalent single-key DELETE arm**: the same
   fresh-store/12,000 × 4 KiB/c16 shape, but versioning is enabled first, so every DELETE creates a
   delete marker and RustFS strict commits the marker `xl.meta`. Gates on `x-amz-delete-marker: true`

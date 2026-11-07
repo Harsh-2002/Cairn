@@ -1526,6 +1526,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v44_preserves_object_lock_rows_and_keeps_their_cascade() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 43);
+        conn.execute_batch(
+            "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region)
+                 VALUES ('b','owner',0,'enabled','BucketOwnerEnforced','us-east-1');
+             INSERT INTO object_versions
+                 (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,
+                  etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,
+                  created_at,updated_at)
+                 VALUES ('row-locked','b','locked','v1',1,0,0,0,'','text/plain','{}','STANDARD',
+                         'owner','[]','[]',0,0),
+                        ('row-hold','b','held','v1',1,0,0,0,'','text/plain','{}','STANDARD',
+                         'owner','[]','[]',0,0),
+                        ('row-free','b','free','v1',1,0,0,0,'','text/plain','{}','STANDARD',
+                         'owner','[]','[]',0,0);
+             INSERT INTO object_locks VALUES ('b','locked','v1','COMPLIANCE',4102444800,0);
+             INSERT INTO object_locks VALUES ('b','held','v1',NULL,NULL,1);",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let locks: Vec<(String, Option<String>, Option<i64>, i64)> = conn
+            .prepare(
+                "SELECT key, lock_mode, retain_until, legal_hold FROM object_locks ORDER BY key",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            locks,
+            vec![
+                ("held".to_owned(), None, None, 1),
+                (
+                    "locked".to_owned(),
+                    Some("COMPLIANCE".to_owned()),
+                    Some(4102444800),
+                    0
+                ),
+            ],
+            "WORM retention and legal hold must survive the table rebuild exactly"
+        );
+        let violations = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count();
+        assert_eq!(
+            violations, 0,
+            "the restored lock rows must satisfy the foreign key to the new table"
+        );
+        let temp_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='object_locks_v44'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temp_left, 0,
+            "the migration must not leave its temp copy behind"
+        );
+
+        // The cascade must still tie a lock to its (rebuilt) parent row.
+        conn.execute("DELETE FROM object_versions WHERE id='row-locked'", [])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM object_locks WHERE key='locked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "deleting the version must still cascade its lock row"
+        );
+    }
+
     fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
         conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",

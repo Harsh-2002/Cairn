@@ -67,3 +67,5 @@ protocol-3 design record and measurements).
   [`multipart-followup-decisions-2026-11.md`](multipart-followup-decisions-2026-11.md).
 - The unversioned-delete write-amplification plan (schema v44, proposed) is
   [`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).
+- The 1.0 completion plan (release-blocking, security, reliability, performance and gate ownership)
+  is [`1.0-completion-plan-2026-11.md`](1.0-completion-plan-2026-11.md).

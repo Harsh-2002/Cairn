@@ -750,8 +750,9 @@ empty, and (for RustFS) the bucket-durability readback is `strict`. The driver r
 and the exact pool count. Cairn pins `CAIRN_META_SYNCHRONOUS=full`, `CAIRN_META_SHARDS=1` and
 `CAIRN_META_GROUP_COMMIT_LINGER_MICROS=0`; RustFS uses `RUSTFS_DURABILITY_MODE=strict`,
 `RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict` and `RUSTFS_DRIVE_SYNC_ENABLE=true`, the same settings
-as `rustfs_compare.py`. As the note above explains, that RustFS mode does **not** fsync the
-unversioned delete path; the single-key ratio is as-configured, not equal-durability.
+as `rustfs_compare.py`. As the note above explains, RustFS 1.0.0/1.0.1 strict does **not** fsync
+the unversioned delete path (1.0.2+ journals it; see §15.5); the single-key ratio is as-configured,
+not equal-durability.
 
 Two independent five-pair batches were run with the pair order reversed on every other pair; the
 second used the same command with `--root /var/tmp/cairn-performance-delete-single-key-12k-b`:
@@ -814,8 +815,9 @@ Caveats:
   `delete_4k` **1.43×** bulk ratio. The two shapes measure different server work — one request per
   key here, one request carrying up to 100 keys there — and must not be pooled. The single-key
   shape favors RustFS while the bulk shape favors Cairn; that disagreement is the reason to report
-  both, not evidence of a regression in either. Neither ratio is equal-durability: RustFS's strict
-  mode does not fsync the unversioned delete path (see the † note above). The versioned arm below is
+  both, not evidence of a regression in either. Neither ratio is equal-durability: RustFS
+  1.0.0/1.0.1 strict does not fsync the unversioned delete path (1.0.2+ journals it; see §15.5). The
+  versioned arm below is
   the equal-durability measurement, and there Cairn is faster (3.55×).
 - The 12,000-key pool was chosen after a 3,000-key screening (943 Cairn / 656 RustFS obj/s): it puts
   the slower Cairn arm at ~15 s and the faster RustFS arm near 7 s; a larger pool only lengthens the
@@ -905,7 +907,7 @@ recorded in
 ### Versioned single-key DELETE — the durability-equivalent arm
 
 The two unversioned DELETE ratios above are as-configured throughput, not equal-durability:
-RustFS strict never fsyncs that path. `conformance/delete_versioned_single_key.py` is the fair
+RustFS 1.0.0/1.0.1 strict never fsyncs that path (1.0.2+ journals the delete; see §15.5). `conformance/delete_versioned_single_key.py` is the fair
 companion. It starts a fresh single-node store per arm, enables S3 versioning (`PUT
 /bucket?versioning` with `<Status>Enabled</Status>`, read back as `Enabled` on both engines),
 creates the same exact 12,000 × 4 KiB pool through signed S3 PUTs outside the scored window,
@@ -1361,8 +1363,8 @@ these absolute numbers with the earlier tables.
 | Multipart upload, 10×5 MiB | 25.13 / 22.10 / 25.17 | 22.06 / 24.26 / 21.48 | **1.07×** |
 
 † **The unversioned DELETE row is as-configured, not equal durability, and it is disk-sensitive.**
-RustFS strict does not fsync the unversioned delete path, so a slower disk depresses Cairn's rate
-and leaves RustFS roughly unchanged. The same row measured 1.43× on a faster disk on 2026-11-03
+RustFS 1.0.0 strict does not fsync the unversioned delete path (1.0.2+ journals it; see §15.5),
+so a slower disk depresses Cairn's rate and leaves RustFS roughly unchanged. The same row measured 1.43× on a faster disk on 2026-11-03
 (section 9); the 0.51× here is not a code regression — the 100k prefill took 222-291 s for Cairn
 versus 418-467 s for RustFS, confirming a slower host/disk during this sweep. The equal-durability
 arm is the versioned delete-marker comparison: a fresh 3-pair run on the same code and host state
@@ -1397,7 +1399,8 @@ with directory fsyncs **622 → 172** and metadata fsyncs 181 → 168. The paire
 differ because the RustFS interleave and the sync probe affect the run; the direction is consistent.
 
 This row remains **as-configured, not equal durability**: RustFS 1.0.0 strict does not fsync the
-unversioned delete path. The equal-durability number is the versioned **5.17×** row. The remaining
+unversioned delete path (1.0.2 changed this; see §15.5). The equal-durability number is the versioned
+**5.17×** row. The remaining
 cost is device write amplification, not the metadata commit; the bulk-delete mutation candidate was
 measured and rejected in section 15.2.
 
@@ -1511,6 +1514,31 @@ key re-wrap to use the natural key; the plan and acceptance threshold are in
 
 Evidence: [`delete-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/delete-v44-clustered-2026-11-08.json)
 and [`list-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/list-v44-clustered-2026-11-08.json).
+
+### 15.5 RustFS delete durability changed after 1.0.1 (2026-11-08)
+
+Every row above measures **RustFS 1.0.0**, the pinned comparator. A source review of the later
+releases (tags read from the repository; no binary was run) changes how the unversioned row must be
+worded:
+
+| RustFS | Unversioned user-bucket delete under `strict` |
+|---|---|
+| 1.0.0, 1.0.1 | no fsync on the `xl.meta` unlink or trash rename |
+| 1.0.2–1.0.4 (the `crates/ecstore/src/disk` layer is byte-identical) | a recoverable-delete journal and quorum-commit receipt are fsynced under strict; the `xl.meta` unlink itself is still not directory-synced |
+
+The change is `delete_version_recoverable_with_namespace_owner` in
+`crates/ecstore/src/set_disk/ops/object.rs`, with `activate_delete_preparation` /
+`finish_delete_transaction_with_namespace_owner` in `crates/ecstore/src/disk/local/delete_recovery.rs`
+(PR #8468). 1.0.3 is a console-only update; 1.0.4 is certificates/trust roots. RustFS also changed the
+new-bucket durability default from `relaxed` (1.0.0) to `inherit` (1.0.4); the harness already forces
+`RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict`.
+
+Consequence: the unversioned DELETE rows are **as-configured for 1.0.0 only**. Against 1.0.4 the
+durability gap is narrower (a synchronous recovery journal versus no journal), so the row must be
+re-run with the 1.0.4 binary (x86_64-gnu asset SHA-256
+`4a25e48f5b5ae610a679b5324206962c6fb0eb20a9fa7ab6cb20e178cf6c534b`) before it is published. Do not
+pool 1.0.0 and 1.0.4 absolutes. Until that run, the versioned **5.17×** row remains the
+equal-durability DELETE number.
 
 ## 16. Replication throughput and sender cost (2026-11-05)
 

@@ -11,9 +11,10 @@ decision that is **fixed at first init** and cannot be changed later.
 
 ## 1. Versioning and stability
 
-- Cairn is **pre-1.0** (`Cargo.toml` is `0.x`). Until a tagged `1.0`, minor releases may change
-  behaviour; pin to a specific tag or commit for production and read the release notes before
-  upgrading.
+- Cairn is **1.0 as a support status (2026-11-07)**; the crate version in `Cargo.toml` remains
+  `0.1.0`, and release identity is the CalVer tag. Pin to a specific tag or commit for production
+  and read the release notes before upgrading. The forward-upgrade contract below is the 1.0
+  contract; older tags remain forward-compatible only through the append-only migration path.
 - The **on-disk contract is the stable part**: object bytes and their per-object metadata are plain
   files, and SQLite holds the object index and the control-plane state. The schema evolves only
   through **append-only migrations**
@@ -68,6 +69,15 @@ for legacy rows. Rerun until the summary reports `candidates=0`.
    answer `/readyz` until migrations and startup reconciliation have completed), then re-affirms the
    root admin and resumes the background loops (replication drain, lifecycle, WAL checkpoint, scrub).
 5. Verify: `cairn validate-config` (or watch the startup log), then `GET /readyz` → `ready`.
+
+**Table-rebuild migrations and space.** Schema v44 rebuilds `object_versions` `WITHOUT ROWID` in
+one transaction. Measured on a 1M-row SQLite replica with the v44 DDL: about 66 s, a ~661 MB WAL peak, and a database growth
+from 441 MB to 657 MB (the old pages stay on the freelist until a vacuum). Scale roughly linearly:
+a 100M-row store is on the order of two hours and tens of gigabytes of transient space. Keep free
+space of at least three times the `object_versions` table (plus the pre-upgrade snapshot) and plan a
+maintenance window. The rebuild is atomic: a crash rolls it back, leaving the pre-upgrade state.
+There is no `CAIRN_*` selector to skip it. If startup runs out of space, SQLite returns
+`SQLITE_FULL`, the migration transaction rolls back, and the node does not become ready.
 
 **Migrations are forward-only.** There is no automatic down-migration. Starting with the
 storage-protocol v35 safeguard, startup rejects unsupported newer schemas or protocol state before
