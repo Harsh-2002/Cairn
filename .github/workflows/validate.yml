@@ -1182,6 +1182,8 @@ jobs:
         web-artifact: web-dist
     - run: cargo build --release --bin cairn
     - name: Real encrypted >2 GiB and >5 GiB replication to Cairn and MinIO
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: BIN=target/release/cairn LARGE_ENCRYPT=true bash conformance/replication_large.sh
     if: ${{ inputs.profile == 'full' }}
     needs:

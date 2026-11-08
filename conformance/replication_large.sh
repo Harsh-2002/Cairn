@@ -15,9 +15,18 @@ MINIO_CACHE="${MINIO_CACHE:-/tmp/cairn-minio-verified}"
 MINIO="$MINIO_CACHE/minio-$MINIO_ARCH-$MINIO_VERSION"
 mkdir -p "$MINIO_CACHE"
 if [ ! -f "$MINIO" ]; then
+  name="minio.linux-$MINIO_ARCH.$MINIO_VERSION"
   download="$(mktemp "$MINIO_CACHE/.download.XXXXXX")"
   trap 'rm -f "$download"' EXIT
-  curl -fsSL -o "$download" "https://github.com/minio/minio/releases/download/$MINIO_VERSION/minio.linux-$MINIO_ARCH.$MINIO_VERSION"
+  # GitHub's unauthenticated release-asset CDN has been returning intermittent 503/504s. Prefer
+  # the authenticated release API when a token is available; keep curl as the no-token fallback.
+  if [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1 \
+      && gh release download "$MINIO_VERSION" --repo minio/minio --pattern "$name" --dir "$MINIO_CACHE" --clobber; then
+    cp "$MINIO_CACHE/$name" "$download"
+    rm -f "$MINIO_CACHE/$name"
+  else
+    curl -fsSL -o "$download" "https://github.com/minio/minio/releases/download/$MINIO_VERSION/$name"
+  fi
   printf '%s  %s\n' "$MINIO_SHA" "$download" | sha256sum -c - >/dev/null
   chmod 0700 "$download"
   mv "$download" "$MINIO"
