@@ -148,8 +148,8 @@ jobs:
         persist-credentials: false
     - name: Install pinned cargo-audit
       env:
-        AUDIT_URL: https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
         AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        GH_TOKEN: ${{ github.token }}
       run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-1
     - run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-2
     if: ${{ inputs.profile == 'full' }}

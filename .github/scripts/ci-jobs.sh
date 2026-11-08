@@ -53,8 +53,9 @@ case "${1:?CI task required}" in
     ;;
   rust-audit-1)
     set -euo pipefail
-    archive="${RUNNER_TEMP}/cargo-audit-v0.22.2.tgz"
-    curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" "$AUDIT_URL"
+    name=cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+    archive="${RUNNER_TEMP}/${name}"
+    gh release download 'cargo-audit/v0.22.2' --repo rustsec/rustsec --pattern "$name" --dir "$RUNNER_TEMP" --clobber
     printf '%s  %s\n' "$AUDIT_SHA256" "$archive" | sha256sum -c -
     tar -xzf "$archive" -C "$RUNNER_TEMP"
     ;;
