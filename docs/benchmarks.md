@@ -1347,7 +1347,9 @@ pairs of 12-second arms, RustFS 1.0.0 `a2dedb78…` and Warp 1.8.2 `fc7661a6…`
 load average rose from about 0.5 to 15 during the 56-minute run (the 100k-object DELETE prefill,
 unrelated homelab services, and three unrelated Node processes), so the **absolute** rates are far
 below the quieter runs in sections 8-9. The interleaved ratio is the stable signal; do not pool
-these absolute numbers with the earlier tables.
+these absolute numbers with the earlier tables. **This is the RustFS 1.0.0 record. The current
+comparison is [§15.6](#156-rustfs-104-paired-scoreboard-2026-11-08) against RustFS 1.0.4; do not
+pool the two versions.**
 
 | Workload | Cairn | RustFS | Ratio |
 |---|---:|---:|---:|
@@ -1533,12 +1535,66 @@ The change is `delete_version_recoverable_with_namespace_owner` in
 new-bucket durability default from `relaxed` (1.0.0) to `inherit` (1.0.4); the harness already forces
 `RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict`.
 
-Consequence: the unversioned DELETE rows are **as-configured for 1.0.0 only**. Against 1.0.4 the
-durability gap is narrower (a synchronous recovery journal versus no journal), so the row must be
-re-run with the 1.0.4 binary (x86_64-gnu asset SHA-256
-`4a25e48f5b5ae610a679b5324206962c6fb0eb20a9fa7ab6cb20e178cf6c534b`) before it is published. Do not
-pool 1.0.0 and 1.0.4 absolutes. Until that run, the versioned **5.17×** row remains the
-equal-durability DELETE number.
+Consequence: the unversioned DELETE rows are **as-configured for 1.0.0 only**. The 1.0.4 rerun
+(x86_64-gnu asset SHA-256
+`4a25e48f5b5ae610a679b5324206962c6fb0eb20a9fa7ab6cb20e178cf6c534b`) measures Cairn at **19.95×**
+on the bulk arm, **16.53×** on the single-key arm and **32.49×** on the versioned marker arm; the
+journal makes RustFS's deletes 16-32x slower than Cairn. See §15.6. Do not pool 1.0.0 and 1.0.4
+absolutes.
+
+### 15.6 RustFS 1.0.4 paired scoreboard (2026-11-08)
+
+RustFS 1.0.2 changed strict unversioned deletes to a recoverable journal plus quorum receipt
+(§15.5), so the 1.0.0 delete rows are historical. This is the current comparison on the same host,
+harness and strict settings: three interleaved pairs per case, 12-second arms. RustFS 1.0.4
+x86_64-gnu binary SHA-256 `2a843ec9a0a6139a8203a2c67265fedfdd003bd3390bf03811ae37ae5b9e2cdf`
+(publisher asset `4a25e48f…c534b`), Warp 1.8.2 `118c…`.
+
+| Workload | Cairn (3 pairs) | RustFS 1.0.4 (3 pairs) | Pair ratios | Mean |
+|---|---:|---:|---|---:|
+| PUT 4 KiB, c32 | 1,688 / 1,116 / 1,245 obj/s | 1,020 / 698 / 642 | 1.66 / 1.60 / 1.94 | **1.73×** |
+| PUT 1 MiB, c16 | 103.9 / 67.1 / 89.1 obj/s | 96.1 / 69.9 / 75.6 | 1.08 / 0.96 / 1.18 | **1.07×** |
+| GET 4 KiB, c16 | 12,864 / 14,765 / 14,293 obj/s | 12,569 / 12,559 / 11,329 | 1.02 / 1.18 / 1.26 | **1.15×** |
+| GET 1 MiB, c16 | 3,347 / 2,785 / 3,364 obj/s | 1,941 / 1,939 / 1,911 | 1.72 / 1.44 / 1.76 | **1.64×** |
+| HEAD 4 KiB, c16 | 16,337 / 19,756 / 19,287 obj/s | 13,057 / 16,987 / 16,905 | 1.25 / 1.16 / 1.14 | **1.18×** |
+| LIST 1,000 keys | 125,464 / 168,182 / 169,174 obj/s | 32,230 / 28,407 / 30,356 | 3.89 / 5.92 / 5.57 | **5.13×** |
+| Mixed 1 MiB, c16 | 387 / 390 / 406 obj/s | 192 / 188 / 200 | 2.02 / 2.08 / 2.03 | **2.04×** |
+| Multipart part GET, 10×5 MiB | 1,069 / 1,074 / 1,037 obj/s | 387 / 394 / 393 | 2.76 / 2.73 / 2.64 | **2.71×** |
+| Multipart upload, 10×5 MiB | 22.15 / 23.59 / 22.64 obj/s | 21.20 / 21.20 / 21.14 | 1.05 / 1.11 / 1.07 | **1.08×** |
+| **Bulk unversioned DELETE**, 100k | 2,494 / 2,398 / 2,408 obj/s | 124.2 / 117.9 / 123.9 | 20.07 / 20.34 / 19.44 | **19.95×** |
+| **Single-key unversioned DELETE**, 12k | 615 / 713 / 592 obj/s | 37.8 / 39.1 / 39.4 | 16.28 / 18.26 / 15.05 | **16.53×** |
+| **Versioned DELETE** (equal durability), 12k | 1,030 / 723 / 794 obj/s | 26.9 / 25.9 / 25.4 | 38.34 / 27.88 / 31.26 | **32.49×** |
+
+Every row is at or above parity. The two within ~8% — PUT 1 MiB and the scored multipart upload —
+should be quoted as **parity**, not a clear win; one PUT 1 MiB pair came out at 0.96×. The three
+DELETE rows are **16.5–32.5×** because RustFS 1.0.4 fsyncs a journal and quorum receipt per delete
+while Cairn commits one tombstone and batches the cleanup. The versioned marker arm is the strictest
+equal-durability DELETE number: each arm deletes the exact 12,000-key pool, verifies 12,000 marker
+versions, and checks the marker headers.
+
+Method and limits:
+
+- The ten non-delete rows are three interleaved pairs per case. The 100k-object DELETE prefill made
+  a single `--case all` 3-pair sweep exceed its 3,600-second budget at arm 41, so the delete rows and
+  the shorter put-1M/mixed/multipart cases were re-run as separate 3-pair sessions with the same
+  harness and settings. Do not pool absolutes across sessions; each row's ratio is paired within
+  its own session.
+- The host is shared (6-core i5-9400T, consumer QLC NVMe, homelab services). Absolute rates move
+  run to run: Cairn's bulk delete measured 1,447 obj/s in an earlier session and 2,400 here; the
+  paired ratio is the stable signal.
+- The 1.0.4 unversioned delete journals and quorum-fsyncs before success but still does not
+  directory-sync the `xl.meta` unlink itself. The versioned marker arm is the strictest
+  equal-durability comparison.
+- Do not pool 1.0.0 and 1.0.4 rows. The 1.0.0 table in §15 remains the record of that release.
+
+Evidence: [`rustfs-1.0.4-sweep-partial-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-sweep-partial-2026-11-08.json),
+[`rustfs-1.0.4-put-1m-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-put-1m-2026-11-08.json),
+[`rustfs-1.0.4-mixed-1m-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-mixed-1m-2026-11-08.json),
+[`rustfs-1.0.4-multipart-get-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-multipart-get-2026-11-08.json),
+[`rustfs-1.0.4-multipart-put-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-multipart-put-2026-11-08.json),
+[`rustfs-1.0.4-delete-bulk-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-delete-bulk-2026-11-08.json),
+[`rustfs-1.0.4-delete-single-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-delete-single-2026-11-08.json) and
+[`rustfs-1.0.4-delete-versioned-2026-11-08.json`](performance-evidence/2026-11/rustfs-1.0.4-delete-versioned-2026-11-08.json).
 
 ## 16. Replication throughput and sender cost (2026-11-05)
 

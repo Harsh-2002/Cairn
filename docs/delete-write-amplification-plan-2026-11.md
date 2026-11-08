@@ -1,8 +1,10 @@
 # Unversioned-delete write amplification: remaining plan (2026-11-08)
 
-**Status: v44 implemented.** The clustered `object_versions` table ships (schema v44) and measures
-1,447.3 obj/s. The remaining proposal is the removal of the indexed `id` column; it changes the
-storage-authority cursor and key re-wrap and still needs an explicit go-ahead.
+**Status: v44 implemented; the delete gap is closed against RustFS 1.0.4.** The clustered
+`object_versions` table ships (schema v44) and measures 1,447.3 obj/s on the earlier session and
+2,400+ on the quieter 1.0.4 session. Against RustFS 1.0.4, Cairn wins the bulk (19.95x), single
+(16.53x) and versioned (32.49x) delete arms; the optional `id`-index removal is no longer needed
+for the scoreboard and remains a documented option only.
 
 ## Where the row stands
 
@@ -13,6 +15,7 @@ storage-authority cursor and key re-wrap and still needs an explicit go-ahead.
 | v43 + UUIDv7 `StorageToken` | 1,147.0 | +36.6% |
 | **v44 clustered table** | **1,447.3** | **+72.3%**, ~33 KiB device/delete |
 | RustFS 1.0.0, same host | 1,783.5 | as-configured (1.0.2+ journals deletes; §15.5) |
+| RustFS 1.0.4, bulk / single / versioned | 118-124 / 38 / 26 obj/s | Cairn **19.95x / 16.53x / 32.49x** |
 
 The device is still saturated: about **52 KiB written per random-key delete** at the drive's
 ~57 MB/s sustained rate. Every attempt that only reduced commits (bulk mutation, audit co-commit,
