@@ -23,7 +23,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use cache::CachedMetadataStore;
 pub use range::{prefix_upper_bound, successor};
@@ -149,7 +149,42 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // statement instead of recompiling per call. The capacity covers the distinct hot SQL in
     // `apply.rs` with headroom so the LRU never evicts a hot statement mid-batch (ARCH 30.3).
     write_conn.set_prepared_statement_cache_capacity(64);
+    // A v44 table rebuild can run for minutes on a large store. Log the starting size and the
+    // filesystem headroom before entering it, then the elapsed time and WAL peak after it returns:
+    // an operator watching startup can tell a slow migration from a stalled one, and a free-space
+    // shortfall is visible before the transaction fails closed.
+    let db_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    // The database file does not exist yet on a fresh store; statvfs the containing filesystem.
+    let space_path = db_path.parent().unwrap_or(db_path);
+    let available_bytes = available_space(space_path);
+    if let Some(available) = available_bytes {
+        let needed = db_bytes.saturating_mul(3);
+        if needed > available {
+            tracing::warn!(
+                db_bytes,
+                available_bytes = available,
+                recommended_bytes = needed,
+                "free space is below 3x the database size; a table-rebuild migration may need more"
+            );
+        }
+    }
+    tracing::info!(
+        db_bytes,
+        available_bytes = available_bytes.unwrap_or(0),
+        "metadata schema migration starting"
+    );
+    let migration_started = Instant::now();
     schema::run_migrations(&write_conn).map_err(map)?;
+    let elapsed_seconds = migration_started.elapsed().as_secs_f64();
+    let wal_bytes = std::fs::metadata(store::wal_sidecar_path(db_path))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    tracing::info!(
+        elapsed_seconds,
+        wal_bytes,
+        available_bytes = available_space(space_path).unwrap_or(0),
+        "metadata schema migration complete"
+    );
     let writer = Writer::spawn(write_conn, opts.group_commit_linger, opts.synchronous_full);
 
     // The read pool: WAL snapshot readers, query-only.
@@ -169,6 +204,23 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
         pool,
         db_path: Some(db_path.to_owned()),
     })
+}
+
+/// Unprivileged free bytes on the filesystem holding `path`, when the platform can answer.
+#[cfg(unix)]
+fn available_space(path: &Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let fragment = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Some(stat.f_bavail * fragment)
+}
+
+#[cfg(not(unix))]
+fn available_space(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// Open an in-memory store (shared cache) for tests.
@@ -295,5 +347,15 @@ impl ReconcileOracle for SqliteReconcileOracle {
         })
         .await
         .map_err(|e| MetaError::Engine(e.to_string()))?
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn available_space_reports_a_positive_value_for_a_temp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = super::available_space(dir.path()).expect("statvfs answers on a temp directory");
+        assert!(free > 0, "free space must be positive: {free}");
     }
 }

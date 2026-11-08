@@ -76,8 +76,11 @@ from 441 MB to 657 MB (the old pages stay on the freelist until a vacuum). Scale
 a 100M-row store is on the order of two hours and tens of gigabytes of transient space. Keep free
 space of at least three times the `object_versions` table (plus the pre-upgrade snapshot) and plan a
 maintenance window. The rebuild is atomic: a crash rolls it back, leaving the pre-upgrade state.
-There is no `CAIRN_*` selector to skip it. If startup runs out of space, SQLite returns
-`SQLITE_FULL`, the migration transaction rolls back, and the node does not become ready.
+There is no `CAIRN_*` selector to skip it. Startup logs
+`metadata schema migration starting` with the database size and unprivileged free bytes, warns when
+free space is below the 3× rule, and logs `metadata schema migration complete` with the elapsed
+seconds and WAL size. If startup still runs out of space, SQLite returns `SQLITE_FULL`, the
+migration transaction rolls back, and the node does not become ready.
 
 **Migrations are forward-only.** There is no automatic down-migration. Starting with the
 storage-protocol v35 safeguard, startup rejects unsupported newer schemas or protocol state before

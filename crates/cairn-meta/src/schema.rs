@@ -1205,6 +1205,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         if m.version <= applied {
             continue;
         }
+        let started = std::time::Instant::now();
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(m.sql)?;
         tx.execute(
@@ -1212,7 +1213,12 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             rusqlite::params![m.version, m.name, now_millis()],
         )?;
         tx.commit()?;
-        tracing::info!(version = m.version, name = m.name, "applied migration");
+        tracing::info!(
+            version = m.version,
+            name = m.name,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "applied migration"
+        );
     }
     if share_sanitation_pending(conn)? {
         // No read pool exists yet. Move the scrubbed v25 pages into the main database and truncate
