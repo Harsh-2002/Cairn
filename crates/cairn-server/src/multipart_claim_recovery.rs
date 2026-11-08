@@ -218,9 +218,13 @@ const RETIRE_BATCH: usize = 64;
 /// small (one unlink and one prune), and every row keeps its own exact claim and identity checks.
 /// A 100k-object delete arm at 32 still issued 273 directory fsyncs (~8.8 s) for ~6.9k deletes on
 /// a saturated consumer NVMe; 128 lets the coalescer amortize one absence barrier over a larger
-/// batch. The `buffer_unordered` window is the only bound, so memory stays one cleanup row per
+/// batch. Each cleanup makes two `spawn_blocking` calls (unlink, directory sync), so the fan-out
+/// also bounds the Tokio blocking pool: a 180 s mixed-feature soak at 128 reached 430/512 threads,
+/// and the CI thread-shape gate failed once at +35 threads. 64 keeps the coalescer amortization and
+/// the exact per-row claims while halving that burst; the delete-arm cost is measured before this
+/// lands. The `buffer_unordered` window is the only bound, so memory stays one cleanup row per
 /// in-flight unlink.
-const CLEANUP_IO_CONCURRENCY: usize = 128;
+const CLEANUP_IO_CONCURRENCY: usize = 64;
 
 /// Drain one bounded batch through exact Writer claims. Errors and stale/expired acknowledgements
 /// retain debt and quota; a physical ENOENT still passes through the blob's namespace sync barrier.

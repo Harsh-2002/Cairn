@@ -1582,6 +1582,9 @@ Method and limits:
 - The host is shared (6-core i5-9400T, consumer QLC NVMe, homelab services). Absolute rates move
   run to run: Cairn's bulk delete measured 1,447 obj/s in an earlier session and 2,400 here; the
   paired ratio is the stable signal.
+- The delete rows were measured at cleanup fan-out 128. The R-6 reliability bound lowers it to 64;
+  a Cairn-only arm at 64 measured **2,456 obj/s**, inside the 2,398-2,494 range above, so the
+  ratios are unchanged (see `delete-cleanup64-2026-11-08.json`).
 - The 1.0.4 unversioned delete journals and quorum-fsyncs before success but still does not
   directory-sync the `xl.meta` unlink itself. The versioned marker arm is the strictest
   equal-durability comparison.
