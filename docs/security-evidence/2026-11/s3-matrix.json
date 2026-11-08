@@ -1,0 +1,202 @@
+[
+ {
+  "name": "anonymous public GET allowed",
+  "ok": true,
+  "detail": "200"
+ },
+ {
+  "name": "anonymous private GET denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "anonymous public PUT denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "anonymous LIST denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "presigned GET works",
+  "ok": true,
+  "detail": "200"
+ },
+ {
+  "name": "tampered presign signature denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "expired presign denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "presign scope swap denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "presign method confusion denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "presign host swap denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "member cannot GET private",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "member cannot read admin users",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "anonymous management denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "STS mint succeeds",
+  "ok": true,
+  "detail": "200"
+ },
+ {
+  "name": "STS allowed object GET",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "STS sibling object denied",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "STS PUT denied",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "STS cannot use management API",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "locked object version created",
+  "ok": true,
+  "detail": "01a1bbc3e35378e283f403db04726893"
+ },
+ {
+  "name": "locked retention is exact GOVERNANCE",
+  "ok": true,
+  "detail": "{'Mode': 'GOVERNANCE', 'RetainUntilDate': datetime.datetime(2026, 11, 9, 15, 25, 39, tzinfo=tzutc())}"
+ },
+ {
+  "name": "locked legal hold is ON",
+  "ok": true,
+  "detail": "{'Status': 'ON'}"
+ },
+ {
+  "name": "version DELETE denied",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "governance-bypass version DELETE still denied by legal hold",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "locked version still exists after bypass attempt",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "traversal-key PUT is stored as data",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "traversal-key GET returns our bytes, not local file",
+  "ok": true,
+  "detail": "b'cairn-pentest-traversal'"
+ },
+ {
+  "name": "encoded traversal anonymous denied",
+  "ok": true,
+  "detail": "404"
+ },
+ {
+  "name": "console admin login succeeds",
+  "ok": true,
+  "detail": "200"
+ },
+ {
+  "name": "session cookie reads system",
+  "ok": true,
+  "detail": "200"
+ },
+ {
+  "name": "cookie POST without Origin denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "cookie POST with wrong Origin denied",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "cookie POST with exact Origin succeeds",
+  "ok": true,
+  "detail": "201"
+ },
+ {
+  "name": "console cookie not honored on S3 port",
+  "ok": true,
+  "detail": "403"
+ },
+ {
+  "name": "HSTS present",
+  "ok": true,
+  "detail": "max-age=31536000"
+ },
+ {
+  "name": "X-Content-Type-Options nosniff",
+  "ok": true,
+  "detail": "nosniff"
+ },
+ {
+  "name": "CSP restricts scripts",
+  "ok": true,
+  "detail": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'"
+ },
+ {
+  "name": "Permissions-Policy present",
+  "ok": true,
+  "detail": "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+ },
+ {
+  "name": "Referrer-Policy present",
+  "ok": true,
+  "detail": "no-referrer"
+ },
+ {
+  "name": "COOP present",
+  "ok": true,
+  "detail": "same-origin"
+ },
+ {
+  "name": "CORP present",
+  "ok": true,
+  "detail": "same-origin"
+ }
+]

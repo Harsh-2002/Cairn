@@ -1545,8 +1545,9 @@ absolutes.
 ### 15.6 RustFS 1.0.4 paired scoreboard (2026-11-08)
 
 RustFS 1.0.2 changed strict unversioned deletes to a recoverable journal plus quorum receipt
-(§15.5), so the 1.0.0 delete rows are historical. This is the current comparison on the same host,
-harness and strict settings: three interleaved pairs per case, 12-second arms. RustFS 1.0.4
+(§15.5), so the 1.0.0 delete rows are historical. **Owner-accepted as the published comparator on
+2026-11-08; 1.0.4 remains the latest RustFS release.** This is the current comparison on the same
+host, harness and strict settings: three interleaved pairs per case, 12-second arms. RustFS 1.0.4
 x86_64-gnu binary SHA-256 `2a843ec9a0a6139a8203a2c67265fedfdd003bd3390bf03811ae37ae5b9e2cdf`
 (publisher asset `4a25e48f…c534b`), Warp 1.8.2 `118c…`.
 

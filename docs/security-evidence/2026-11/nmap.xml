@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.98 scan initiated Sun Nov  8 14:25:35 2026 as: /usr/bin/nmap -sV -sC -p9443,9444 -oX /out/nmap.xml -oN /out/nmap.txt 127.0.0.1 -->
+<nmaprun scanner="nmap" args="/usr/bin/nmap -sV -sC -p9443,9444 -oX /out/nmap.xml -oN /out/nmap.txt 127.0.0.1" start="1794147935" startstr="Sun Nov  8 14:25:35 2026" version="7.98" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="2" services="9443-9444"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1794147935" endtime="1794147977"><status state="up" reason="localhost-response" reason_ttl="0"/>
+<address addr="127.0.0.1" addrtype="ipv4"/>
+<hostnames>
+<hostname name="localhost" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="9443"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="tungsten-https" servicefp="SF-Port9443-TCP:V=7.98%T=SSL%I=7%D=11/8%Time=6AF0866B%P=x86_64-unknown-linux-gnu%r(GetRequest,19B,&quot;HTTP/1\.0\x20403\x20Forbidden\r\ncontent-type:\x20application/xml\r\nx-amz-request-id:\x2080431e28625179c1000000000000001a\r\nvary:\x20accept,\x20sec-fetch-dest,\x20upgrade-insecure-requests\r\ncontent-length:\x20187\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:47\x20GMT\r\n\r\n&lt;\?xml\x20version=\&quot;1\.0\&quot;\x20encoding=\&quot;UTF-8\&quot;\?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access\x20denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001a&lt;/RequestId&gt;&lt;/Error&gt;&quot;)%r(HTTPOptions,19B,&quot;HTTP/1\.0\x20403\x20Forbidden\r\ncontent-type:\x20application/xml\r\nx-amz-request-id:\x2080431e28625179c1000000000000001b\r\nvary:\x20accept,\x20sec-fetch-dest,\x20upgrade-insecure-requests\r\ncontent-length:\x20187\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&lt;\?xml\x20version=\&quot;1\.0\&quot;\x20encoding=\&quot;UTF-8\&quot;\?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access\x20denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001b&lt;/RequestId&gt;&lt;/Error&gt;&quot;)%r(RTSPRequest,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;)%r(RPCCheck,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;)%r(DNSVersionBindReqTCP,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;)%r(DNSStatusRequestTCP,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;)%r(Help,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;)%r(SSLSessionReq,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n&quot;);" tunnel="ssl" method="table" conf="3"/><script id="ssl-cert" output="Subject: commonName=localhost&#xa;Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1&#xa;Not valid before: 2026-11-08T14:24:09&#xa;Not valid after:  2026-11-10T14:24:09"><table key="subject">
+<elem key="commonName">localhost</elem>
+</table>
+<table key="issuer">
+<elem key="commonName">localhost</elem>
+</table>
+<table key="pubkey">
+<elem key="type">rsa</elem>
+<elem key="bits">2048</elem>
+<elem key="modulus">C0A0D3D439A89E83C2D3985B15F38FDE03556F7799B25EFFE858FA512F0A5813AC3C94F1FC2713EDBD1918770A964DC5DD76264DEE00426FABE2C7F21670454E26953AAFD47ED3314FC2833686C37573FED776A82CC52DA47B53B9EE6A439D2A03DEC41948709B95075CE3615F96A11AB20D446037560BEB15D8FE81B97AA0A9943748D57A73DDD39E3772A4066F4CF91A8BEF8A54931FA0A2C1A60D58C73BE855B60520594A7152B23CC4201CC9EF8B0FD7F41A50901A4A66AE21B8C7E8FFE7D091472DEF3B05E4AAEE9932811B3021E25DFEA30C5EE60C04C70A187ED11B1F8FB18DD21C4076DA402D5715C1CB7D6F9681277E84460FC43405B18DCD334E6D</elem>
+<elem key="exponent">65537</elem>
+</table>
+<table key="extensions">
+<table>
+<elem key="name">X509v3 Subject Key Identifier</elem>
+<elem key="value">17:AE:09:01:41:48:0D:72:79:F6:8E:A3:27:03:F5:D0:5F:DF:56:B0</elem>
+</table>
+<table>
+<elem key="name">X509v3 Authority Key Identifier</elem>
+<elem key="value">17:AE:09:01:41:48:0D:72:79:F6:8E:A3:27:03:F5:D0:5F:DF:56:B0</elem>
+</table>
+<table>
+<elem key="name">X509v3 Basic Constraints</elem>
+<elem key="value">CA:TRUE</elem>
+<elem key="critical">true</elem>
+</table>
+<table>
+<elem key="name">X509v3 Subject Alternative Name</elem>
+<elem key="value">DNS:localhost, IP Address:127.0.0.1</elem>
+</table>
+</table>
+<elem key="sig_algo">sha256WithRSAEncryption</elem>
+<table key="validity">
+<elem key="notBefore">2026-11-08T14:24:09</elem>
+<elem key="notAfter">2026-11-10T14:24:09</elem>
+</table>
+<elem key="md5">1244b663c28d87fd7da67b7ec9ab9704</elem>
+<elem key="sha1">5fc5fb0d54b4d80b233fc1a97f581b6776d9c1d9</elem>
+<elem key="sha256">ee6920829fd8408c40e65af3691fdb5772c3f2055a265fa3d93b03d333c1c7b9</elem>
+<elem key="pem">-&#45;&#45;&#45;&#45;BEGIN CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;MIIDJTCCAg2gAwIBAgIUKsKKFWToQ9QJLi0txDsj98MFdRMwDQYJKoZIhvcNAQEL&#xa;BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTEwODE0MjQwOVoXDTI2MTEx&#xa;MDE0MjQwOVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF&#xa;AAOCAQ8AMIIBCgKCAQEAwKDT1DmonoPC05hbFfOP3gNVb3eZsl7/6Fj6US8KWBOs&#xa;PJTx/CcT7b0ZGHcKlk3F3XYmTe4AQm+r4sfyFnBFTiaVOq/UftMxT8KDNobDdXP+&#xa;13aoLMUtpHtTue5qQ50qA97EGUhwm5UHXONhX5ahGrINRGA3VgvrFdj+gbl6oKmU&#xa;N0jVenPd0543cqQGb0z5GovvilSTH6CiwaYNWMc76FW2BSBZSnFSsjzEIBzJ74sP&#xa;1/QaUJAaSmauIbjH6P/n0JFHLe87BeSq7pkygRswIeJd/qMMXuYMBMcKGH7RGx+P&#xa;sY3SHEB22kAtVxXBy31vloEnfoRGD8Q0BbGNzTNObQIDAQABo28wbTAdBgNVHQ4E&#xa;FgQUF64JAUFIDXJ59o6jJwP10F/fVrAwHwYDVR0jBBgwFoAUF64JAUFIDXJ59o6j&#xa;JwP10F/fVrAwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH&#xa;BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAACe8fzlIVyN9zJ1T90oiWBsMYPtgg6Z&#xa;Uxdc+Iiq/bysEBaC1D1KXZNlp1tck+y9I/tx2xtljdjXg3CvH42KawfrdNbLjvCy&#xa;wJ5rQoxejqwtOZ96Rkac7kf2hPmwVqmR5uxri5e2zeTCLd02L3iqAcA01O2XsdEX&#xa;uHsiJPT2b8RszG3nGnjokYf/MECblIHsKroojrIQiyfPm3gv8JGBjOYNdhb3WtP/&#xa;1CoSClhYP8CrxTHj83qJVTalz52/YRgd5dYkGsejpUOw9nJAOks0nM1PT0cRFwiX&#xa;TgGyE4/z2DkQ3NTKAdO/saY4ui1Vem0lRSkHkNDReSfX4wcdS+I/nig=&#xa;-&#45;&#45;&#45;&#45;END CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;</elem>
+</script><script id="fingerprint-strings" output="&#xa;  DNSStatusRequestTCP, DNSVersionBindReqTCP, Help, RPCCheck, RTSPRequest, SSLSessionReq: &#xa;    HTTP/1.1 400 Bad Request&#xa;    connection: close&#xa;    content-length: 0&#xa;    date: Sun, 08 Nov 2026 14:25:52 GMT&#xa;  GetRequest: &#xa;    HTTP/1.0 403 Forbidden&#xa;    content-type: application/xml&#xa;    x-amz-request-id: 80431e28625179c1000000000000001a&#xa;    vary: accept, sec-fetch-dest, upgrade-insecure-requests&#xa;    content-length: 187&#xa;    date: Sun, 08 Nov 2026 14:25:47 GMT&#xa;    &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001a&lt;/RequestId&gt;&lt;/Error&gt;&#xa;  HTTPOptions: &#xa;    HTTP/1.0 403 Forbidden&#xa;    content-type: application/xml&#xa;    x-amz-request-id: 80431e28625179c1000000000000001b&#xa;    vary: accept, sec-fetch-dest, upgrade-insecure-requests&#xa;    content-length: 187&#xa;    date: Sun, 08 Nov 2026 14:25:52 GMT&#xa;    &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001b&lt;/RequestId&gt;&lt;/Error&gt;"><elem key="DNSStatusRequestTCP, DNSVersionBindReqTCP, Help, RPCCheck, RTSPRequest, SSLSessionReq">&#xa;    HTTP/1.1 400 Bad Request&#xa;    connection: close&#xa;    content-length: 0&#xa;    date: Sun, 08 Nov 2026 14:25:52 GMT</elem>
+<elem key="GetRequest">&#xa;    HTTP/1.0 403 Forbidden&#xa;    content-type: application/xml&#xa;    x-amz-request-id: 80431e28625179c1000000000000001a&#xa;    vary: accept, sec-fetch-dest, upgrade-insecure-requests&#xa;    content-length: 187&#xa;    date: Sun, 08 Nov 2026 14:25:47 GMT&#xa;    &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001a&lt;/RequestId&gt;&lt;/Error&gt;</elem>
+<elem key="HTTPOptions">&#xa;    HTTP/1.0 403 Forbidden&#xa;    content-type: application/xml&#xa;    x-amz-request-id: 80431e28625179c1000000000000001b&#xa;    vary: accept, sec-fetch-dest, upgrade-insecure-requests&#xa;    content-length: 187&#xa;    date: Sun, 08 Nov 2026 14:25:52 GMT&#xa;    &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;&lt;Error&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Message&gt;access denied&lt;/Message&gt;&lt;Resource&gt;/&lt;/Resource&gt;&lt;RequestId&gt;80431e28625179c1000000000000001b&lt;/RequestId&gt;&lt;/Error&gt;</elem>
+</script><script id="ssl-date" output="TLS randomness does not represent time"></script></port>
+<port protocol="tcp" portid="9444"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="wso2esb-console" servicefp="SF-Port9444-TCP:V=7.98%T=SSL%I=7%D=11/8%Time=6AF08683%P=x86_64-unknown-linux-gnu%r(GetRequest,556,&quot;HTTP/1\.0\x20200\x20OK\r\ncontent-type:\x20text/html\r\ncontent-security-policy:\x20frame-ancestors\x20&apos;none&apos;\r\nx-frame-options:\x20DENY\r\nx-amz-request-id:\x2080431e28625179c1000000000000001d\r\ncontent-length:\x201139\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n&lt;!doctype\x20html&gt;\n&lt;html\x20lang=\&quot;en\&quot;&gt;\n\x20\x20&lt;head&gt;\n\x20\x20\x20\x20&lt;meta\x20charset=\&quot;utf-8\&quot;\x20/&gt;\n\x20\x20\x20\x20&lt;meta\x20name=\&quot;viewport\&quot;\x20content=\&quot;width=device-width,\x20initial-scale=1\&quot;\x20/&gt;\n\x20\x20\x20\x20&lt;meta\x20name=\&quot;color-scheme\&quot;\x20content=\&quot;light\x20dark\&quot;\x20/&gt;\n\x20\x20\x20\x20&lt;link\x20rel=\&quot;icon\&quot;\x20type=\&quot;image/svg\+xml\&quot;\x20href=\&quot;\./favicon\.svg\&quot;\x20/&gt;\n\x20\x20\x20\x20&lt;title&gt;Cairn\x20\xe2\x80\x94\x20Console&lt;/title&gt;\n\x20\x20\x20\x20&lt;script\x20type=\&quot;module\&quot;\x20crossorigin\x20src=\&quot;\./assets/index-Da4f1ant\.js\&quot;&gt;&lt;/script&gt;\n\x20\x20\x20\x20&lt;link\x20rel=\&quot;modulepreload\&quot;\x20crossorigin\x20href=\&quot;\./assets/utils-BZuXOkQX\.js\&quot;&gt;\n\x20\x20\x20\x20&lt;link\x20rel=\&quot;modulepreload\&quot;\x20crossorigin\x20href=\&quot;\./assets/react-dom-DcQwUiVd\.js\&quot;&gt;\n\x20\x20\x20\x20&lt;link\x20rel=\&quot;modulepreload\&quot;\x20crossorigin\x20href=\&quot;\./assets/hooks-DjTH693o\.js\&quot;&gt;\n\x20\x20\x20\x20&lt;link\x20rel=\&quot;modulepreload\&quot;\x20crossorigin\x20href=\&quot;\./asse&quot;)%r(HTTPOptions,BC,&quot;HTTP/1\.0\x20404\x20Not\x20Found\r\ncontent-type:\x20application/json\r\nx-amz-request-id:\x2080431e28625179c1000000000000001e\r\ncontent-length:\x2021\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n{\&quot;error\&quot;:\&quot;not\x20found\&quot;}&quot;)%r(RTSPRequest,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n&quot;)%r(RPCCheck,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n&quot;)%r(DNSVersionBindReqTCP,67,&quot;HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n&quot;);" tunnel="ssl" method="table" conf="3"/><script id="fingerprint-strings" output="&#xa;  DNSVersionBindReqTCP, RPCCheck, RTSPRequest: &#xa;    HTTP/1.1 400 Bad Request&#xa;    connection: close&#xa;    content-length: 0&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT&#xa;  GetRequest: &#xa;    HTTP/1.0 200 OK&#xa;    content-type: text/html&#xa;    content-security-policy: frame-ancestors &apos;none&apos;&#xa;    x-frame-options: DENY&#xa;    x-amz-request-id: 80431e28625179c1000000000000001d&#xa;    content-length: 1139&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT&#xa;    &lt;!doctype html&gt;&#xa;    &lt;html lang=&quot;en&quot;&gt;&#xa;    &lt;head&gt;&#xa;    &lt;meta charset=&quot;utf-8&quot; /&gt;&#xa;    &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot; /&gt;&#xa;    &lt;meta name=&quot;color-scheme&quot; content=&quot;light dark&quot; /&gt;&#xa;    &lt;link rel=&quot;icon&quot; type=&quot;image/svg+xml&quot; href=&quot;./favicon.svg&quot; /&gt;&#xa;    &lt;title&gt;Cairn &#xa;    Console&lt;/title&gt;&#xa;    &lt;script type=&quot;module&quot; crossorigin src=&quot;./assets/index-Da4f1ant.js&quot;&gt;&lt;/script&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/utils-BZuXOkQX.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/react-dom-DcQwUiVd.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/hooks-DjTH693o.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./asse&#xa;  HTTPOptions: &#xa;    HTTP/1.0 404 Not Found&#xa;    content-type: application/json&#xa;    x-amz-request-id: 80431e28625179c1000000000000001e&#xa;    content-length: 21&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT&#xa;    {&quot;error&quot;:&quot;not found&quot;}"><elem key="DNSVersionBindReqTCP, RPCCheck, RTSPRequest">&#xa;    HTTP/1.1 400 Bad Request&#xa;    connection: close&#xa;    content-length: 0&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT</elem>
+<elem key="GetRequest">&#xa;    HTTP/1.0 200 OK&#xa;    content-type: text/html&#xa;    content-security-policy: frame-ancestors &apos;none&apos;&#xa;    x-frame-options: DENY&#xa;    x-amz-request-id: 80431e28625179c1000000000000001d&#xa;    content-length: 1139&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT&#xa;    &lt;!doctype html&gt;&#xa;    &lt;html lang=&quot;en&quot;&gt;&#xa;    &lt;head&gt;&#xa;    &lt;meta charset=&quot;utf-8&quot; /&gt;&#xa;    &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot; /&gt;&#xa;    &lt;meta name=&quot;color-scheme&quot; content=&quot;light dark&quot; /&gt;&#xa;    &lt;link rel=&quot;icon&quot; type=&quot;image/svg+xml&quot; href=&quot;./favicon.svg&quot; /&gt;&#xa;    &lt;title&gt;Cairn &#xa;    Console&lt;/title&gt;&#xa;    &lt;script type=&quot;module&quot; crossorigin src=&quot;./assets/index-Da4f1ant.js&quot;&gt;&lt;/script&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/utils-BZuXOkQX.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/react-dom-DcQwUiVd.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./assets/hooks-DjTH693o.js&quot;&gt;&#xa;    &lt;link rel=&quot;modulepreload&quot; crossorigin href=&quot;./asse</elem>
+<elem key="HTTPOptions">&#xa;    HTTP/1.0 404 Not Found&#xa;    content-type: application/json&#xa;    x-amz-request-id: 80431e28625179c1000000000000001e&#xa;    content-length: 21&#xa;    date: Sun, 08 Nov 2026 14:26:11 GMT&#xa;    {&quot;error&quot;:&quot;not found&quot;}</elem>
+</script><script id="ssl-date" output="TLS randomness does not represent time"></script><script id="ssl-cert" output="Subject: commonName=localhost&#xa;Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1&#xa;Not valid before: 2026-11-08T14:24:09&#xa;Not valid after:  2026-11-10T14:24:09"><table key="subject">
+<elem key="commonName">localhost</elem>
+</table>
+<table key="issuer">
+<elem key="commonName">localhost</elem>
+</table>
+<table key="pubkey">
+<elem key="type">rsa</elem>
+<elem key="bits">2048</elem>
+<elem key="modulus">C0A0D3D439A89E83C2D3985B15F38FDE03556F7799B25EFFE858FA512F0A5813AC3C94F1FC2713EDBD1918770A964DC5DD76264DEE00426FABE2C7F21670454E26953AAFD47ED3314FC2833686C37573FED776A82CC52DA47B53B9EE6A439D2A03DEC41948709B95075CE3615F96A11AB20D446037560BEB15D8FE81B97AA0A9943748D57A73DDD39E3772A4066F4CF91A8BEF8A54931FA0A2C1A60D58C73BE855B60520594A7152B23CC4201CC9EF8B0FD7F41A50901A4A66AE21B8C7E8FFE7D091472DEF3B05E4AAEE9932811B3021E25DFEA30C5EE60C04C70A187ED11B1F8FB18DD21C4076DA402D5715C1CB7D6F9681277E84460FC43405B18DCD334E6D</elem>
+<elem key="exponent">65537</elem>
+</table>
+<table key="extensions">
+<table>
+<elem key="name">X509v3 Subject Key Identifier</elem>
+<elem key="value">17:AE:09:01:41:48:0D:72:79:F6:8E:A3:27:03:F5:D0:5F:DF:56:B0</elem>
+</table>
+<table>
+<elem key="name">X509v3 Authority Key Identifier</elem>
+<elem key="value">17:AE:09:01:41:48:0D:72:79:F6:8E:A3:27:03:F5:D0:5F:DF:56:B0</elem>
+</table>
+<table>
+<elem key="name">X509v3 Basic Constraints</elem>
+<elem key="value">CA:TRUE</elem>
+<elem key="critical">true</elem>
+</table>
+<table>
+<elem key="name">X509v3 Subject Alternative Name</elem>
+<elem key="value">DNS:localhost, IP Address:127.0.0.1</elem>
+</table>
+</table>
+<elem key="sig_algo">sha256WithRSAEncryption</elem>
+<table key="validity">
+<elem key="notBefore">2026-11-08T14:24:09</elem>
+<elem key="notAfter">2026-11-10T14:24:09</elem>
+</table>
+<elem key="md5">1244b663c28d87fd7da67b7ec9ab9704</elem>
+<elem key="sha1">5fc5fb0d54b4d80b233fc1a97f581b6776d9c1d9</elem>
+<elem key="sha256">ee6920829fd8408c40e65af3691fdb5772c3f2055a265fa3d93b03d333c1c7b9</elem>
+<elem key="pem">-&#45;&#45;&#45;&#45;BEGIN CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;MIIDJTCCAg2gAwIBAgIUKsKKFWToQ9QJLi0txDsj98MFdRMwDQYJKoZIhvcNAQEL&#xa;BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTEwODE0MjQwOVoXDTI2MTEx&#xa;MDE0MjQwOVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF&#xa;AAOCAQ8AMIIBCgKCAQEAwKDT1DmonoPC05hbFfOP3gNVb3eZsl7/6Fj6US8KWBOs&#xa;PJTx/CcT7b0ZGHcKlk3F3XYmTe4AQm+r4sfyFnBFTiaVOq/UftMxT8KDNobDdXP+&#xa;13aoLMUtpHtTue5qQ50qA97EGUhwm5UHXONhX5ahGrINRGA3VgvrFdj+gbl6oKmU&#xa;N0jVenPd0543cqQGb0z5GovvilSTH6CiwaYNWMc76FW2BSBZSnFSsjzEIBzJ74sP&#xa;1/QaUJAaSmauIbjH6P/n0JFHLe87BeSq7pkygRswIeJd/qMMXuYMBMcKGH7RGx+P&#xa;sY3SHEB22kAtVxXBy31vloEnfoRGD8Q0BbGNzTNObQIDAQABo28wbTAdBgNVHQ4E&#xa;FgQUF64JAUFIDXJ59o6jJwP10F/fVrAwHwYDVR0jBBgwFoAUF64JAUFIDXJ59o6j&#xa;JwP10F/fVrAwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH&#xa;BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAACe8fzlIVyN9zJ1T90oiWBsMYPtgg6Z&#xa;Uxdc+Iiq/bysEBaC1D1KXZNlp1tck+y9I/tx2xtljdjXg3CvH42KawfrdNbLjvCy&#xa;wJ5rQoxejqwtOZ96Rkac7kf2hPmwVqmR5uxri5e2zeTCLd02L3iqAcA01O2XsdEX&#xa;uHsiJPT2b8RszG3nGnjokYf/MECblIHsKroojrIQiyfPm3gv8JGBjOYNdhb3WtP/&#xa;1CoSClhYP8CrxTHj83qJVTalz52/YRgd5dYkGsejpUOw9nJAOks0nM1PT0cRFwiX&#xa;TgGyE4/z2DkQ3NTKAdO/saY4ui1Vem0lRSkHkNDReSfX4wcdS+I/nig=&#xa;-&#45;&#45;&#45;&#45;END CERTIFICATE-&#45;&#45;&#45;&#45;&#xa;</elem>
+</script></port>
+</ports>
+<times srtt="71" rttvar="3767" to="100000"/>
+</host>
+<runstats><finished time="1794147978" timestr="Sun Nov  8 14:26:18 2026" summary="Nmap done at Sun Nov  8 14:26:18 2026; 1 IP address (1 host up) scanned in 42.98 seconds" elapsed="42.98" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

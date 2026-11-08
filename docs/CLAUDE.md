@@ -69,3 +69,5 @@ protocol-3 design record and measurements).
   [`delete-write-amplification-plan-2026-11.md`](delete-write-amplification-plan-2026-11.md).
 - The 1.0 completion plan (release-blocking, security, reliability, performance and gate ownership)
   is [`1.0-completion-plan-2026-11.md`](1.0-completion-plan-2026-11.md).
+- The 2026-11-08 automated end-to-end pentest report and raw evidence are
+  [`security-pentest-2026-11.md`](security-pentest-2026-11.md) and `security-evidence/2026-11/`.
