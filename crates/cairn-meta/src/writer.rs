@@ -170,6 +170,10 @@ pub struct Writer {
     /// cache exposes counts the server mirrors into the registry (this crate has no `metrics` dep).
     commit_samples: Arc<Mutex<VecDeque<CommitSample>>>,
     stage_samples: Arc<StageSamples>,
+    /// While `true`, new mutations park before reserving a queue slot. The server's WAL
+    /// checkpointer raises this when the log reaches its backpressure high-water mark and clears
+    /// it after a truncating checkpoint drains the log. Existing in-flight mutations finish.
+    writes_paused: tokio::sync::watch::Sender<bool>,
 }
 
 impl Writer {
@@ -183,6 +187,7 @@ impl Writer {
         let loop_samples = commit_samples.clone();
         let stage_samples = Arc::new(Mutex::new(StageBuffer::default()));
         let loop_stages = stage_samples.clone();
+        let (writes_paused, _) = tokio::sync::watch::channel(false);
         std::thread::Builder::new()
             .name("cairn-meta-writer".to_owned())
             .spawn(move || {
@@ -202,6 +207,7 @@ impl Writer {
             queue_depth,
             commit_samples,
             stage_samples,
+            writes_paused,
         }
     }
 
@@ -243,9 +249,24 @@ impl Writer {
             .dropped
     }
 
+    /// Pause or resume admission of new mutations. The WAL checkpointer raises this at the
+    /// backpressure high-water mark so writers cannot grow the log faster than a reader-pinned
+    /// checkpoint can drain it. In-flight mutations and control messages are unaffected.
+    pub fn set_writes_paused(&self, paused: bool) {
+        self.writes_paused.send_replace(paused);
+    }
+
+    /// Wait until the checkpointer has cleared the high-water pause. A closed watch (writer
+    /// shutting down) releases the waiter so `submit` can surface `WriterClosed` naturally.
+    async fn wait_for_admission(&self) {
+        let mut paused = self.writes_paused.subscribe();
+        while *paused.borrow() && paused.changed().await.is_ok() {}
+    }
+
     /// Submit a mutation; the returned future resolves only after the batch containing it has
     /// been made durable.
     pub async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        self.wait_for_admission().await;
         let (ack_tx, ack_rx) = oneshot::channel();
         let start = Instant::now();
         // Reserve before incrementing: a cancelled admission must not strand queue-depth counts.
@@ -455,17 +476,19 @@ fn timed_checkpoint(
 ///
 /// This runs on the writer thread, serialized with commit batches (`Control::Checkpoint` in the job
 /// loop), so a TRUNCATE that blocks stalls every queued mutation behind it. The writer connection
-/// carries a 5s `busy_timeout` (for its `BEGIN IMMEDIATE`s), and a TRUNCATE contended by an active
-/// WAL reader — the read pool holds snapshots, so this is the normal case — would otherwise honour
-/// that timeout and busy-wait up to 5s, freezing every PUT/DELETE/CompleteMPU in the meantime. We
-/// drop the busy handler for the duration of the checkpoint so a contended TRUNCATE returns `busy`
-/// *immediately* (the background checkpoint loop already retries on its next tick), then restore the
-/// connection's prior `busy_timeout` so nothing else on it changes.
+/// carries a 5s `busy_timeout` (for its `BEGIN IMMEDIATE`s); using that here would freeze every
+/// PUT/DELETE/CompleteMPU for up to five seconds while a reader finishes. Returning `busy`
+/// immediately is almost as bad under sustained read load: the read pool keeps at least one
+/// snapshot active, so every tick loses the race and the WAL only truncates after the workload
+/// stops. A short fixed wait is the middle ground — it lets a normal millisecond-scale read finish
+/// so the checkpoint can truncate, while bounding the worst-case writer stall.
+const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
 fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
     let prev_ms: i64 = conn
         .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
         .unwrap_or(0);
-    let _ = conn.busy_timeout(Duration::from_millis(0));
+    let _ = conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT);
     let stats = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
         Ok(WalCheckpointStats {
             busy: r.get::<_, i64>(0)? != 0,
@@ -832,11 +855,13 @@ mod tests {
     #[tokio::test]
     async fn cancelled_admission_does_not_inflate_queue_depth() {
         let (tx, _rx) = mpsc::channel(1);
+        let (writes_paused, _) = tokio::sync::watch::channel(false);
         let writer = Writer {
             tx,
             queue_depth: Arc::new(AtomicUsize::new(0)),
             commit_samples: Arc::new(Mutex::new(VecDeque::new())),
             stage_samples: Arc::new(Mutex::new(StageBuffer::default())),
+            writes_paused,
         };
         let (reply, _) = oneshot::channel();
         writer
@@ -852,6 +877,37 @@ mod tests {
         );
         assert_eq!(writer.queue_depth(), 0);
         assert!(writer.drain_stage_samples().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_writer_holds_new_submissions_until_resumed() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::run_migrations(&conn).unwrap();
+        let writer = Writer::spawn(conn, None, true);
+        writer.set_writes_paused(true);
+
+        let mutation = Mutation::DeleteBucket(cairn_types::BucketName::parse("absent").unwrap());
+        let mut blocked = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.submit(mutation).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut blocked)
+                .await
+                .is_err(),
+            "a paused writer must not admit a new mutation"
+        );
+
+        writer.set_writes_paused(false);
+        let result = tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("resuming admission releases the waiter")
+            .expect("join the submit task");
+        assert!(
+            result.is_ok(),
+            "the released mutation must complete: {result:?}"
+        );
+        writer.checkpoint_and_shutdown().await.unwrap();
     }
 
     #[test]
@@ -1028,11 +1084,14 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(pinned.busy, "a pinned reader must report busy: {pinned:?}");
-        // Old behaviour busy-waits ~5s; the fix returns instantly. A 2s ceiling separates the two
-        // with a wide margin either way (no timing flake).
+        // Old behaviour busy-waits ~5s; the fix waits only the bounded 100ms grace for a reader.
         assert!(
             elapsed < Duration::from_secs(2),
             "contended TRUNCATE must not busy-wait the writer (took {elapsed:?})"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "the checkpoint must give a reader the bounded grace period (took {elapsed:?})"
         );
         // The connection's busy_timeout is restored, so commits still get their 5s window.
         let restored: i64 = writer

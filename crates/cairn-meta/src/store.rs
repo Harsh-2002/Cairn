@@ -180,6 +180,12 @@ impl SqliteMetadataStore {
         self.writer.queue_depth()
     }
 
+    /// Pause or resume admission of new metadata mutations. The server's WAL checkpointer uses
+    /// this as its write-side backpressure gate when a reader prevents the log from truncating.
+    pub fn set_writes_paused(&self, paused: bool) {
+        self.writer.set_writes_paused(paused);
+    }
+
     /// Drain the writer's per-commit samples buffered since the last call (ARCH 26.2). The server
     /// records each into the `cairn_writer_commit_seconds` and `cairn_writer_batch_size` histograms
     /// on its metrics tick — the same expose-and-mirror shape as `writer_queue_depth`, since this
