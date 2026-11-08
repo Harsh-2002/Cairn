@@ -185,6 +185,12 @@ removing a live reference. Returned superseded paths are descriptive outcomes, n
 direct unlink. A late failure rolls back publication, intent consumption and cleanup changes
 together.
 
+**Ownership tokens are internal identities, not bearer credentials.** `StorageToken` values name
+storage generations, write attempts, cleanup claims and completion claims. They are UUIDv7 so the
+claim indexes append in insertion order, but the timestamp is not a secret and no client sees it;
+possession of a token conveys no authentication or authorization authority. Object Lock authority
+remains inside the version-publication savepoint, not in the token.
+
 Cancellation closes further I/O lease admission and marks the intent, but cannot prove that a
 blocking task, queued backend operation or prepared result has stopped. After the actual ownership
 set drains, `Resolve` carries its unforgeable quiescence proof through the Writer FIFO. Resolution
