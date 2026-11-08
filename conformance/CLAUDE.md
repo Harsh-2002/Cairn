@@ -306,12 +306,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   staging directory and exact cleanup/quota debt within 30 seconds of its response, `/healthz`
   never *stopping* (60 s per-probe **wedge** timeout — latency is load, not signal), server alive, and
   a 5xx counter EQUAL to the declared budget, which for this mix is exactly **zero** (every
-  deliberate rejection here is a 4xx). **GATED, leak shape** (middle-third vs last-third, the
-  `stress.sh` windowing, each requiring BOTH a % growth AND a meaningful absolute delta so a +4 fd
-  wobble cannot fail a run): RSS, fd and thread counts must not climb; staging bytes and WAL bytes
-  must **plateau** — asserted as *last-third minimum vs middle-third maximum*, because a healthy
-  sawtooth always comes back down. **GATED, ceilings:** the same RSS/fd/thread/WAL knobs and defaults
-  as `stress.sh`. The launcher pins `CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=15` (the 300 s default is
+  deliberate rejection here is a 4xx). **GATED, leak shape:** RSS and fd use the middle-third vs
+  last-third mean window (each requiring BOTH a % growth AND a meaningful absolute delta so a +4 fd
+  wobble cannot fail a run). Threads, staging bytes and WAL bytes must **plateau** — asserted as
+  *last-third minimum vs middle-third maximum* — because a healthy sawtooth comes back down and
+  tokio's blocking pool warms lazily; the absolute ceilings still catch a runaway. **GATED,
+  ceilings:** the same RSS/fd/thread/WAL knobs and defaults as `stress.sh`. The launcher pins `CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=15` (the 300 s default is
   longer than a CI soak, which would make the WAL climb by *configuration* and the gate unsound) and
   `CAIRN_REQUEST_TIMEOUT_SECS=600` (so a slow runner cannot manufacture a 503). Two assertions need a
   long run and report as **explicitly SKIPPED** rather than silently passing when it is too short:

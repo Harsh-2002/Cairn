@@ -38,10 +38,13 @@
 #     saturating debug-build workload is offered load, not signal), and the server is alive at the end.
 #   * HTTP 5xx EQUAL to the driver's declared budget, which for this mix is exactly ZERO: every
 #     deliberate rejection here (WORM, tampered token, expired session) is a 4xx.
-# GATED — STEADY-STATE LEAK SHAPE (last-third mean vs middle-third mean, the stress.sh windowing;
-#   the first third is excluded because it is cold-start/cache warm-up, not steady state). Every one
-#   requires BOTH a % growth AND a meaningful ABSOLUTE delta, so a +4 fd wobble can never fail a run:
-#   * RSS, fd count, thread count must not climb.
+# GATED — STEADY-STATE LEAK SHAPE (the first third is excluded because it is cold-start/cache
+#   warm-up, not steady state). RSS and fd count use the stress.sh mean window and require BOTH a %
+#   growth AND a meaningful ABSOLUTE delta, so a +4 fd wobble can never fail a run:
+#   * RSS and fd count must not climb.
+#   * thread count must PLATEAU: tokio's worker count is fixed, but its blocking pool grows lazily
+#     with in-flight spawn_blocking work and idles out, so a mean shift can be warm-up. The last
+#     third must return to the middle third's floor; the absolute ceiling catches a runaway.
 #   * staging bytes must PLATEAU, not grow monotonically (reclaim + the sweeper must keep up).
 #   * WAL must sawtooth under its ceiling rather than climb monotonically.
 # GATED — ABSOLUTE CEILINGS as backstops: RSS / fd / threads / WAL, same knobs and defaults as
@@ -104,11 +107,12 @@ RSS_LEAK_MIN_KIB="${RSS_LEAK_MIN_KIB:-65536}"
 # far outside that wobble and is what a per-request handle leak looks like after a few thousand ops.
 FD_LEAK_PCT="${FD_LEAK_PCT:-25}"
 FD_LEAK_MIN="${FD_LEAK_MIN:-32}"
-# threads: tokio's worker count is fixed at startup and the blocking pool is bounded and idles out,
-# so the thread count is flat under constant load. +16 threads (and 10%) is a pool that is growing
-# rather than reusing.
-THREAD_LEAK_PCT="${THREAD_LEAK_PCT:-10}"
-THREAD_LEAK_MIN="${THREAD_LEAK_MIN:-16}"
+# threads: tokio's worker count is fixed at startup, but the blocking pool scales lazily with the
+# in-flight spawn_blocking work and keeps idle threads for a while. A mean-shift gate therefore
+# flags ordinary pool warm-up. Gate the invariant that matters instead: the last third's MINIMUM
+# must not sit more than +16 above the middle third's MAXIMUM. The absolute ceiling below still
+# catches a runaway pool.
+THREAD_PLATEAU_MIN="${THREAD_PLATEAU_MIN:-16}"
 # staging: multipart parts are staged then either assembled or reclaimed, so the directory sawtooths
 # around a working set proportional to the IN-FLIGHT sessions (a constant here), never to the total
 # number of sessions. The gate is therefore a PLATEAU test rather than a mean-growth test — see
@@ -331,10 +335,11 @@ col_climb() { # <col> -> "mid late growth%"
     printf "%.0f %.0f %.1f", mid, late, g
   }' "$SAMPLES" 2>/dev/null
 }
-# PLATEAU test for a signal that is SUPPOSED to sawtooth (staging bytes, WAL bytes): compare the
-# last third's MINIMUM to the middle third's MAXIMUM. A healthy sawtooth keeps coming back down, so
-# its last-third minimum sits below the middle-third maximum and the delta is <= 0. A signal that
-# never returns to its earlier floor is climbing monotonically, whatever its mean does.
+# PLATEAU test for a signal that is SUPPOSED to sawtooth or warm lazily (threads, staging bytes,
+# WAL bytes): compare the last third's MINIMUM to the middle third's MAXIMUM. A healthy sawtooth
+# keeps coming back down, and a lazily warmed pool eventually returns to its earlier floor, so the
+# delta stays small. A signal that never returns to its earlier floor is climbing monotonically,
+# whatever its mean does.
 col_monotonic() { # <col> -> "min_late max_mid delta"
   awk -F'\t' -v c="$1" '{r[NR]=$c; n=NR} END {
     if (n < 6) { print "0 0 0"; exit }
@@ -357,6 +362,9 @@ $(col_climb 2)
 EOF
 read -r th_mid th_late th_pct <<EOF
 $(col_climb 3)
+EOF
+read -r th_minlate th_maxmid th_delta <<EOF
+$(col_monotonic 3)
 EOF
 read -r wal_mid wal_late wal_pct <<EOF
 $(col_climb 4)
@@ -419,8 +427,10 @@ leak_gate() { # <name> <mid> <late> <pct> <pct-threshold> <abs-threshold>
 }
 GATE_FAIL="$GATE_FAIL $(leak_gate rss_leak   "$rss_mid" "$rss_late" "$rss_pct" "$RSS_LEAK_PCT"    "$RSS_LEAK_MIN_KIB")"
 GATE_FAIL="$GATE_FAIL $(leak_gate fd_leak    "$fd_mid"  "$fd_late"  "$fd_pct"  "$FD_LEAK_PCT"     "$FD_LEAK_MIN")"
-GATE_FAIL="$GATE_FAIL $(leak_gate thread_leak "$th_mid" "$th_late"  "$th_pct"  "$THREAD_LEAK_PCT" "$THREAD_LEAK_MIN")"
-# Plateau gates: staging bytes and WAL bytes must come back DOWN, not just grow slowly.
+# Plateau gates: threads, staging bytes and WAL bytes must come back DOWN, not just grow slowly.
+if [ "${th_delta:-0}" -gt "$THREAD_PLATEAU_MIN" ] 2>/dev/null; then
+  GATE_FAIL="$GATE_FAIL thread_monotonic(min_late=${th_minlate}>max_mid=${th_maxmid})"
+fi
 if [ "${stg_delta:-0}" -gt "$STAGING_LEAK_MIN_BYTES" ] 2>/dev/null; then
   GATE_FAIL="$GATE_FAIL staging_monotonic(min_late=${stg_minlate}>max_mid=${stg_maxmid})"
 fi
@@ -437,10 +447,11 @@ printf '  %-16s %12s %12s %9s%% %14s\n' "RSS (KiB)" "$rss_mid" "$rss_late" "$rss
   ">${RSS_LEAK_PCT}% & +${RSS_LEAK_MIN_KIB}"
 printf '  %-16s %12s %12s %9s%% %14s\n' "open fds" "$fd_mid" "$fd_late" "$fd_pct" \
   ">${FD_LEAK_PCT}% & +${FD_LEAK_MIN}"
-printf '  %-16s %12s %12s %9s%% %14s\n' "threads" "$th_mid" "$th_late" "$th_pct" \
-  ">${THREAD_LEAK_PCT}% & +${THREAD_LEAK_MIN}"
+printf '  %-16s %12s %12s %9s%% %14s\n' "threads" "$th_mid" "$th_late" "$th_pct" "plateau"
 printf '  %-16s %12s %12s %9s%% %14s\n' "WAL bytes" "$wal_mid" "$wal_late" "$wal_pct" "plateau"
 printf '  %-16s %12s %12s %9s%% %14s\n' "staging bytes" "$stg_mid" "$stg_late" "$stg_pct" "plateau"
+printf '  plateau check — threads: last-third min %s vs middle-third max %s (delta %s, gate >%s)\n' \
+  "$th_minlate" "$th_maxmid" "$th_delta" "$THREAD_PLATEAU_MIN"
 printf '  plateau check — staging: last-third min %s vs middle-third max %s (delta %s, gate >%s)\n' \
   "$stg_minlate" "$stg_maxmid" "$stg_delta" "$STAGING_LEAK_MIN_BYTES"
 printf '  plateau check — WAL:     last-third min %s vs middle-third max %s (delta %s, gate >%s)\n' \
@@ -485,6 +496,7 @@ if [ -n "${SOAK_OUT:-}" ]; then
       "${rss_mid:-0}" "${rss_late:-0}" "${rss_pct:-0}" "${rss_peak:-0}" \
       "${fd_mid:-0}" "${fd_late:-0}" "${fd_pct:-0}" "${fd_peak:-0}" \
       "${th_mid:-0}" "${th_late:-0}" "${th_pct:-0}" "${thread_peak:-0}" \
+      "${th_minlate:-0}" "${th_maxmid:-0}" \
       "${wal_mid:-0}" "${wal_late:-0}" "${wal_pct:-0}" "${wal_peak:-0}" \
       "${wal_minlate:-0}" "${wal_maxmid:-0}" \
       "${stg_mid:-0}" "${stg_late:-0}" "${stg_pct:-0}" "${staging_peak:-0}" \
@@ -514,6 +526,7 @@ a = sys.argv
 keys = ["rss_mid_kib", "rss_late_kib", "rss_climb_pct", "rss_peak_kib",
         "fd_mid", "fd_late", "fd_climb_pct", "fd_peak",
         "thread_mid", "thread_late", "thread_climb_pct", "thread_peak",
+        "thread_min_late", "thread_max_mid",
         "wal_mid_bytes", "wal_late_bytes", "wal_climb_pct", "wal_peak_bytes",
         "wal_min_late", "wal_max_mid",
         "staging_mid_bytes", "staging_late_bytes", "staging_climb_pct", "staging_peak_bytes",
