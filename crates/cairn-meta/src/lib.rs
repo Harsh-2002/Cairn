@@ -154,7 +154,9 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // an operator watching startup can tell a slow migration from a stalled one, and a free-space
     // shortfall is visible before the transaction fails closed.
     let db_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-    let available_bytes = available_space(db_path);
+    // The database file does not exist yet on a fresh store; statvfs the containing filesystem.
+    let space_path = db_path.parent().unwrap_or(db_path);
+    let available_bytes = available_space(space_path);
     if let Some(available) = available_bytes {
         let needed = db_bytes.saturating_mul(3);
         if needed > available {
@@ -180,7 +182,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     tracing::info!(
         elapsed_seconds,
         wal_bytes,
-        available_bytes = available_space(db_path).unwrap_or(0),
+        available_bytes = available_space(space_path).unwrap_or(0),
         "metadata schema migration complete"
     );
     let writer = Writer::spawn(write_conn, opts.group_commit_linger, opts.synchronous_full);
