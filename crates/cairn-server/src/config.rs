@@ -146,6 +146,12 @@ pub struct Config {
     /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH 8.4). `0` disables the
     /// size-based trigger, leaving only the interval. Default 64 MiB.
     pub wal_checkpoint_size_bytes: u64,
+    /// WAL size, in bytes, above which new metadata mutations wait for the checkpointer to drain
+    /// the log (`CAIRN_WAL_BACKPRESSURE_BYTES`, ARCH 8.4/26.2). This is the hard bound for a log
+    /// that a long-lived reader prevents from truncating: the trigger above asks the checkpointer
+    /// to act, while this gate stops writers from outrunning it. Writes resume once the WAL falls
+    /// to a quarter of this value. `0` disables the gate. Default 256 MiB.
+    pub wal_backpressure_bytes: u64,
     /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `full` (default) or `normal` (ARCH 30).
     /// The default `full` runs `PRAGMA synchronous=FULL` under WAL: an acknowledged write is durable
     /// — it survives power loss — at the cost of a per-commit fsync that the group-commit writer
@@ -489,6 +495,7 @@ impl Default for Config {
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
             wal_checkpoint_size_bytes: 64 * 1024 * 1024,
+            wal_backpressure_bytes: 256 * 1024 * 1024,
             meta_synchronous: "full".to_owned(),
             meta_group_commit_linger_micros: 0,
             // Scale read concurrency with the host; floor 8 so a small box still parallelizes
@@ -1018,6 +1025,13 @@ impl Config {
         if self.wal_checkpoint_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "wal_checkpoint_interval_secs must be positive".into(),
+            ));
+        }
+        // A tiny WAL gate would pin writers almost permanently; require a meaningful threshold when
+        // the feature is enabled. Zero is the explicit off switch.
+        if self.wal_backpressure_bytes != 0 && self.wal_backpressure_bytes < 16 * 1024 * 1024 {
+            return Err(ConfigError::Invalid(
+                "wal_backpressure_bytes must be at least 16 MiB, or 0 to disable it".into(),
             ));
         }
         // The replication drain cadence was previously unvalidated; a `0` would busy-spin the worker.
@@ -1935,6 +1949,17 @@ mod tests {
         t.wal_checkpoint_size_bytes = 0;
         t.wal_checkpoint_interval_secs = 3600;
         assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn wal_backpressure_threshold_is_validated() {
+        let mut c = base();
+        c.wal_backpressure_bytes = 0;
+        assert!(c.validate().is_ok());
+        c.wal_backpressure_bytes = 16 * 1024 * 1024;
+        assert!(c.validate().is_ok());
+        c.wal_backpressure_bytes = 16 * 1024 * 1024 - 1;
+        assert!(c.validate().is_err());
     }
 
     #[test]

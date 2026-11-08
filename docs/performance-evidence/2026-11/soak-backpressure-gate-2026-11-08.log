@@ -1,0 +1,74 @@
+2026-11-08T07:06:24.997767Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=19598872 threshold=16777216
+2026-11-08T07:06:25.138523Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:29.143680Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18317552 threshold=16777216
+2026-11-08T07:06:29.198542Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:32.203739Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21687712 threshold=16777216
+2026-11-08T07:06:32.233374Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:35.237175Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21864872 threshold=16777216
+2026-11-08T07:06:35.334300Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:38.336896Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=20303392 threshold=16777216
+2026-11-08T07:06:38.413734Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:41.418628Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22598232 threshold=16777216
+2026-11-08T07:06:41.503731Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:44.508681Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21860752 threshold=16777216
+2026-11-08T07:06:44.574570Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:47.577992Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=23545832 threshold=16777216
+2026-11-08T07:06:47.605179Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:49.606746Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18890232 threshold=16777216
+2026-11-08T07:06:49.644081Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:52.647323Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22470512 threshold=16777216
+2026-11-08T07:06:52.713815Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:54.717475Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18391712 threshold=16777216
+2026-11-08T07:06:54.837844Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:06:57.842458Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22338672 threshold=16777216
+2026-11-08T07:06:57.882244Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:00.885428Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=20958472 threshold=16777216
+2026-11-08T07:07:00.941793Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:02.945169Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17365832 threshold=16777216
+2026-11-08T07:07:02.966123Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:05.969025Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22363392 threshold=16777216
+2026-11-08T07:07:06.013215Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:09.017556Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22194472 threshold=16777216
+2026-11-08T07:07:09.155784Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:12.159202Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21761872 threshold=16777216
+2026-11-08T07:07:12.205738Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:15.209301Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22874272 threshold=16777216
+2026-11-08T07:07:15.258742Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:18.262310Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21131512 threshold=16777216
+2026-11-08T07:07:18.303318Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:21.307056Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17353472 threshold=16777216
+2026-11-08T07:07:21.354531Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:24.357390Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=20262192 threshold=16777216
+2026-11-08T07:07:24.430203Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:27.434418Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18680112 threshold=16777216
+2026-11-08T07:07:27.597018Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:30.600745Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17085672 threshold=16777216
+2026-11-08T07:07:30.927609Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:33.931574Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18729552 threshold=16777216
+2026-11-08T07:07:34.033489Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:38.039540Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=21642392 threshold=16777216
+2026-11-08T07:07:38.076018Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:42.081820Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=22820712 threshold=16777216
+2026-11-08T07:07:42.161887Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:46.166775Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=19710112 threshold=16777216
+2026-11-08T07:07:46.350171Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:49.354002Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=19532952 threshold=16777216
+2026-11-08T07:07:49.375906Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:53.380416Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=23908392 threshold=16777216
+2026-11-08T07:07:53.457401Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:56.459990Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18391712 threshold=16777216
+2026-11-08T07:07:56.560755Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:07:59.563813Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17102152 threshold=16777216
+2026-11-08T07:07:59.693842Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:02.696722Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18078592 threshold=16777216
+2026-11-08T07:08:02.829158Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:05.833802Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=19833712 threshold=16777216
+2026-11-08T07:08:05.944079Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:08.947038Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=18655392 threshold=16777216
+2026-11-08T07:08:08.999294Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:13.003942Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=19734832 threshold=16777216
+2026-11-08T07:08:13.151594Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:16.155744Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17246352 threshold=16777216
+2026-11-08T07:08:16.472035Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304
+2026-11-08T07:08:19.475109Z  WARN cairn::background: WAL backpressure high-water mark reached; pausing new metadata writes wal_bytes=17806672 threshold=16777216
+2026-11-08T07:08:19.542141Z  INFO cairn::background: WAL backpressure drained; resuming metadata writes wal_bytes=0 resume_at=4194304

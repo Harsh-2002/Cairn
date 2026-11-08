@@ -435,6 +435,7 @@ pub(crate) fn spawn(
                 stack.clone(),
                 checkpoint_interval,
                 cfg.wal_checkpoint_size_bytes,
+                cfg.wal_backpressure_bytes,
                 shutdown.clone(),
             ),
         );
@@ -1446,6 +1447,7 @@ async fn checkpoint_loop(
     stack: Arc<AppStack>,
     interval: Duration,
     size_threshold_bytes: u64,
+    backpressure_bytes: u64,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // Only spawned when there is at least one sqlite shard handle; bind them once. Under sharding
@@ -1471,7 +1473,11 @@ async fn checkpoint_loop(
     // A ten-second size probe allowed a busy single-node WAL to overshoot the 64-MiB trigger by
     // hundreds of MiB between observations. Keep the size trigger responsive without adding a
     // new worker: one off-writer sidecar stat per shard per second, capped by the interval.
-    let poll = checkpoint_poll_interval(interval, size_threshold_bytes);
+    let poll = checkpoint_poll_interval(interval, size_threshold_bytes.max(backpressure_bytes));
+    // Resume below a quarter of the high-water mark. The hysteresis keeps the gate from opening
+    // and closing on the same checkpoint boundary.
+    let resume_bytes = backpressure_bytes / 4;
+    let mut writes_paused = false;
     let mut elapsed = Duration::ZERO;
     while wait_for_interval_or_shutdown(poll, &mut shutdown).await {
         elapsed += poll;
@@ -1480,12 +1486,40 @@ async fn checkpoint_loop(
         let wal_bytes = total_wal_bytes(&stores).await;
         metrics::gauge!("cairn_wal_bytes").set(wal_bytes as f64);
 
-        // Checkpoint when the interval has elapsed OR the combined WAL has grown past the configured
-        // size threshold (ARCH 8.4) — the latter bounds `-wal` growth under sustained writes with a
-        // long-lived reader rather than waiting out the whole interval.
+        // The size trigger asks the checkpointer to act; this gate is the hard bound when it cannot.
+        // Pausing admission is the only safe response to a reader that pins the log for longer than
+        // a checkpoint can wait: the WAL cannot be allowed to grow without limit, and dropping the
+        // write would be worse than delaying it. In-flight mutations still finish.
+        if backpressure_bytes > 0 && wal_bytes >= backpressure_bytes && !writes_paused {
+            for store in &stores {
+                store.set_writes_paused(true);
+            }
+            writes_paused = true;
+            metrics::gauge!("cairn_wal_write_paused").set(1.0);
+            tracing::warn!(
+                wal_bytes,
+                threshold = backpressure_bytes,
+                "WAL backpressure high-water mark reached; pausing new metadata writes"
+            );
+        } else if writes_paused && wal_bytes <= resume_bytes {
+            for store in &stores {
+                store.set_writes_paused(false);
+            }
+            writes_paused = false;
+            metrics::gauge!("cairn_wal_write_paused").set(0.0);
+            tracing::info!(
+                wal_bytes,
+                resume_at = resume_bytes,
+                "WAL backpressure drained; resuming metadata writes"
+            );
+        }
+
+        // Checkpoint when the interval has elapsed, the combined WAL has grown past the configured
+        // size threshold (ARCH 8.4), or the backpressure gate is holding writers. The last case
+        // retries every tick so a reader gap is taken as soon as it appears.
         let interval_due = elapsed >= interval;
         let size_due = size_threshold_bytes > 0 && wal_bytes >= size_threshold_bytes;
-        if !interval_due && !size_due {
+        if !interval_due && !size_due && !writes_paused {
             continue;
         }
         if size_due && !interval_due {
@@ -1518,12 +1552,36 @@ async fn checkpoint_loop(
             }
         }
         // Refresh the gauge post-checkpoint so a truncating checkpoint's effect is visible.
-        metrics::gauge!("cairn_wal_bytes").set(total_wal_bytes(&stores).await as f64);
+        let after = total_wal_bytes(&stores).await;
+        metrics::gauge!("cairn_wal_bytes").set(after as f64);
+        if writes_paused && after <= resume_bytes {
+            for store in &stores {
+                store.set_writes_paused(false);
+            }
+            writes_paused = false;
+            metrics::gauge!("cairn_wal_write_paused").set(0.0);
+            tracing::info!(
+                wal_bytes = after,
+                resume_at = resume_bytes,
+                "WAL backpressure drained; resuming metadata writes"
+            );
+        }
+    }
+    // Never leave admission closed when the loop exits (including shutdown). In-flight requests
+    // waiting behind the gate must be able to finish their drain.
+    if writes_paused {
+        for store in &stores {
+            store.set_writes_paused(false);
+        }
+        metrics::gauge!("cairn_wal_write_paused").set(0.0);
     }
 }
 
-fn checkpoint_poll_interval(interval: Duration, size_threshold_bytes: u64) -> Duration {
-    if size_threshold_bytes > 0 {
+/// Probe once a second whenever either WAL bound is enabled: the size trigger needs a recent
+/// reading, and the backpressure gate must see the high-water mark promptly even when the size
+/// trigger is disabled.
+fn checkpoint_poll_interval(interval: Duration, bounded_bytes: u64) -> Duration {
+    if bounded_bytes > 0 {
         interval.min(Duration::from_secs(1))
     } else {
         interval
