@@ -6,7 +6,7 @@
 
 ### 26.1 Tracing and logging
 
-The system is instrumented with structured tracing throughout, with one span per request that carries the method, the route, the bucket and key, the principal, the request identifier, the resulting status, and the duration, and with structured logs that can be emitted as human-readable text or as machine-readable JSON depending on configuration, filtered by a configurable level. Errors are logged at the boundary with their request identifier so they correlate with the client-visible identifier and with the trace. This is the baseline of being able to see what the server is doing, which Cairn provides in full.
+The system is instrumented with structured tracing throughout, with one span per request that carries the method, the route, the bucket and key, the principal, the request identifier, the resulting status, and the duration, and with structured logs that can be emitted as human-readable text or as machine-readable JSON depending on configuration, filtered by a configurable level. A failed log write is dropped: the subscriber does not fall back to writing the error onto the same broken stream, so a full log volume cannot abort or stall the server. Errors are logged at the boundary with their request identifier so they correlate with the client-visible identifier and with the trace. This is the baseline of being able to see what the server is doing, which Cairn provides in full.
 
 ### 26.2 Metrics
 
