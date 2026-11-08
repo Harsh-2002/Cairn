@@ -11,10 +11,22 @@ fn filter(level: &str) -> EnvFilter {
 }
 
 /// Initialise the global tracing subscriber. Call exactly once, before serving.
+///
+/// Internal formatter/writer failures are dropped rather than reported with `eprintln!`. The
+/// fallback itself writes to stderr, which may be the very stream that failed (a full disk, a
+/// closed log pipe). That fallback panics on a failed write — and with `panic = "abort"` it would
+/// turn a full log volume into a process abort. Logging must never be able to stop the server.
 pub fn init_tracing(level: &str, format: LogFormat) {
     match format {
-        LogFormat::Json => fmt().with_env_filter(filter(level)).json().init(),
-        LogFormat::Text => fmt().with_env_filter(filter(level)).init(),
+        LogFormat::Json => fmt()
+            .with_env_filter(filter(level))
+            .log_internal_errors(false)
+            .json()
+            .init(),
+        LogFormat::Text => fmt()
+            .with_env_filter(filter(level))
+            .log_internal_errors(false)
+            .init(),
     }
 }
 
