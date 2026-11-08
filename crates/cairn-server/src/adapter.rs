@@ -615,13 +615,22 @@ pub async fn handle(
     // The control listener serves only the root shell and concrete embedded assets. Unknown paths
     // were rejected above and can never fall through into S3.
     if route == ListenerRoute::ConsoleAsset {
+        // The console fetches presigned S3 URLs from the data listener, which is a different
+        // origin whenever the API and console ports differ. Name the configured public API origin
+        // so CSP does not block those uploads; without an explicit public URL, keep the browser
+        // usable on both schemes while script execution remains same-origin only.
+        let api_origin = stack
+            .endpoints
+            .api_public_url
+            .as_ref()
+            .map(ToString::to_string);
         if raw_path == "/" {
             let (content_type, bytes) = cairn_web::spa_shell();
-            return web_asset_response(content_type, bytes.into_owned());
+            return web_asset_response(content_type, bytes.into_owned(), api_origin.as_deref());
         }
         if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty()) {
             if let Some((content_type, bytes)) = cairn_web::asset(rel) {
-                return web_asset_response(content_type, bytes.into_owned());
+                return web_asset_response(content_type, bytes.into_owned(), api_origin.as_deref());
             }
         }
         // The classifier checked the same immutable embedded bundle; keep a fail-closed fallback in
@@ -815,7 +824,20 @@ fn sts_response(resp: crate::sts::StsHttpResponse, request_id: &str) -> Response
 }
 
 /// Build a 200 response for an embedded web console asset with its content type.
-fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<ResponseBody> {
+fn web_asset_response(
+    content_type: String,
+    bytes: Vec<u8>,
+    api_origin: Option<&str>,
+) -> Response<ResponseBody> {
+    let connect_src = match api_origin {
+        Some(origin) => format!("connect-src 'self' {origin}"),
+        None => "connect-src 'self' https: http:".to_owned(),
+    };
+    let csp = format!(
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
+         form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; font-src 'self' data:; {connect_src}"
+    );
     Response::builder()
         .status(200)
         .header("content-type", content_type)
@@ -823,12 +845,7 @@ fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<Response
         // framing so it cannot place the authenticated administrator console under decoy controls
         // and turn real same-origin console clicks into privileged mutations. The rest of the
         // policy keeps the console's own scripts/styles same-origin; the SPA ships no inline script.
-        .header(
-            "content-security-policy",
-            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
-             form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'",
-        )
+        .header("content-security-policy", csp)
         .header("x-frame-options", "DENY")
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
@@ -2893,7 +2910,7 @@ mod tests {
 
     #[test]
     fn console_assets_refuse_framing_and_harden_the_browser_boundary() {
-        let response = web_asset_response("text/html".to_owned(), b"console".to_vec());
+        let response = web_asset_response("text/html".to_owned(), b"console".to_vec(), None);
         let csp = response
             .headers()
             .get("content-security-policy")
