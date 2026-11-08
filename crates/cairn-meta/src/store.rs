@@ -691,7 +691,7 @@ pub struct KeyRingStateRow {
 }
 
 /// SQLite names the write-ahead log sidecar `<database>-wal`; build that path.
-fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
     let mut name = db_path.as_os_str().to_owned();
     name.push("-wal");
     std::path::PathBuf::from(name)

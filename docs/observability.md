@@ -63,7 +63,7 @@ Storage protocol 3 exports its own signals. The acknowledged-write overlay publi
 `cairn_overlay_fold_seconds`, the acknowledgement-to-index latency of a folded row; and
 `cairn_overlay_fold_failures_total`, folds that exhausted their retries and remain in the overlay
 (a non-zero value means a `drain` reports the index as incomplete rather than pretending it caught
-up). Startup logs one info line, `object index rebuilt from metadata files`, carrying `scanned`,
+up). Startup logs `metadata schema migration starting`/`complete` with the database size, free bytes, elapsed seconds and WAL size, so a long table rebuild is visible before the node becomes ready. It also logs one info line, `object index rebuilt from metadata files`, carrying `scanned`,
 `inserted`, `already_indexed`, `skipped` and `failed`, and emits the same counts as
 `cairn_index_rebuild_rows_total{result}`. A rising pending gauge with flat insert throughput is the
 signature of a fold that cannot keep up; a slow fold otherwise shows up as PUT latency and in the
