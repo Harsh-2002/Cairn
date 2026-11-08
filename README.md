@@ -111,11 +111,12 @@ The [engineering specification](docs/CLAUDE.md) describes the architecture and i
 
 [Benchmarks and reproduction commands](docs/benchmarks.md) include workload, hardware and
 measurement limits. At strict durability on the shared reference host, interleaved paired runs put
-Cairn at 2.24× RustFS on 4 KiB PUT, 1.14× on 1 MiB PUT, 1.92× on 1 MiB GET, 5.33× on a 1,000-key
-LIST, 1.07× on the scored multipart upload, and 5.17× on the equal-durability versioned DELETE.
-The unversioned DELETE row is as-configured and is not an equal-durability comparison. The host is
-shared, so the ratio is the signal; see
-[the current scoreboard](docs/benchmarks.md#15-full-scoreboard-after-blake3-and-reflink-2026-11-05).
+Cairn at 1.73× RustFS on 4 KiB PUT, 1.07× on 1 MiB PUT (parity), 1.64× on 1 MiB GET, 5.13× on a
+1,000-key LIST, 1.08× on the scored multipart upload, 19.95× on the bulk unversioned DELETE, 16.53×
+on the single-key unversioned DELETE and 32.49× on the equal-durability versioned DELETE. RustFS
+1.0.2+ journals deletes under strict mode, so the delete rows are no longer the 1.0.0
+as-configured case. The host is shared, so the ratio is the signal; see
+[the RustFS 1.0.4 scoreboard](docs/benchmarks.md#156-rustfs-104-paired-scoreboard-2026-11-08).
 Optional io_uring writes, plaintext sendfile and kTLS encryption offload are experimental and
 disabled in standard builds; see
 [the I/O reference](docs/data-plane.md#76-the-read-data-path-and-zero-copy).

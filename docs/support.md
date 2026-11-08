@@ -56,9 +56,10 @@ third-party certification. The measured evidence is in
   delete path, so those comparisons are as-configured throughput, not equal durability. From 1.0.2
   through 1.0.4 a user-bucket unversioned delete commits a strict-gated recovery journal and quorum
   receipt before success (the `xl.meta` unlink itself is still not directory-synced), so an
-  unversioned DELETE ratio must name the RustFS version; every recorded row is 1.0.0. Quote the
-  versioned delete-marker arm for equal durability, and re-run the unversioned row against 1.0.4
-  before publishing it.
+  unversioned DELETE ratio must name the RustFS version. The 1.0.4 rows are measured: Cairn wins
+  the bulk **19.95×**, single-key **16.53×** and versioned **32.49×** arms (`benchmarks.md` §15.6).
+  The 1.0.0 rows remain historical and must not be quoted as current. Quote the versioned
+  delete-marker arm for the strictest equal-durability number.
 - **Replication throughput on a remote target.** The controlled benchmark runs both nodes on one
   host, which is a worst-case contention measurement. A remote target changes the network and disk
   contention; measure it for the deployment. The worker count is tunable

@@ -359,13 +359,15 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   assertion that the bucket is empty. Records client CPU and per-pair ratios. Cairn pins FULL
   metadata durability; RustFS 1.0.0/1.0.1 `strict` is **write-path only** — its unversioned DELETE
   path is not fsynced — so that ratio is as-configured, not equal-durability. RustFS 1.0.2+ journals
-  the delete under strict (see `docs/benchmarks.md` §15.5), so name the version. **NOT a gate.**
+  the delete under strict; the 1.0.4 arm measured 16.53x in Cairn's favour. Name the version. **NOT a
+  gate.**
 - `delete_versioned_single_key.py` — **the durability-equivalent single-key DELETE arm**: the same
   fresh-store/12,000 × 4 KiB/c16 shape, but versioning is enabled first, so every DELETE creates a
   delete marker and RustFS strict commits the marker `xl.meta`. Gates on `x-amz-delete-marker: true`
   for every DELETE, 404 + marker header on sampled HEADs, an empty current listing, a fully paged
   `?versions` audit (12,000 versions + 12,000 markers over the exact key set), and RustFS's strict
-  readback. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
+  readback. RustFS 1.0.4 measured 32.49x in Cairn's favour (26/s vs ~850/s); the 1.0.0 arm was
+  3.55-5.17x. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
   ratios. **NOT a gate.**
 - `upgrade_drill.py` — **published-release to current-schema upgrade and snapshot rollback**: runs
   the pinned old binary, writes plaintext/SSE-S3/multipart objects plus a GOVERNANCE-retained,

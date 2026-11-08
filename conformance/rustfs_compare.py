@@ -42,8 +42,9 @@ CASES = (
     ("get_1m", "get", "1MiB", 16, ("--objects", "64")),
     ("head_4k", "stat", "4KiB", 16, ("--objects", "1000")),
     ("list_4k", "list", "4KiB", 16, ("--objects", "1000")),
-    # RustFS 1.0.0 strict does not fsync the unversioned DELETE path, so this row is
-    # as-configured throughput, not an equal-durability capacity ratio.
+    # RustFS 1.0.0/1.0.1 strict did not fsync the unversioned DELETE path; 1.0.2+ journals it and
+    # quorum-fsyncs before success. The row is version-bound: the 1.0.4 arm measured 19.95x in
+    # Cairn's favour, while the 1.0.0 rows are as-configured throughput.
     ("delete_4k", "delete-existing", "4KiB", 16,
      ("--objects", "100000", "--batch", "100", "--list-existing", "--noclear")),
     ("mixed_1m", "mixed", "1MiB", 16, ("--objects", "100", "--get-distrib", "45",

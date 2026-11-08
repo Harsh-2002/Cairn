@@ -1,0 +1,434 @@
+{
+  "schema": 1,
+  "case": "delete_single_key",
+  "method": "exact pool of distinct 4 KiB keys; one signed S3 DELETE per key with bounded concurrency; prefill and scored delete are separate intervals",
+  "pairs": 3,
+  "pool_objects": 12000,
+  "key_bytes": 4096,
+  "concurrency": 16,
+  "arm_timeout_seconds": 900,
+  "strict_settings": {
+    "cairn": {
+      "CAIRN_META_SYNCHRONOUS": "full",
+      "CAIRN_META_SHARDS": "1",
+      "CAIRN_META_GROUP_COMMIT_LINGER_MICROS": "0"
+    },
+    "rustfs": {
+      "RUSTFS_DURABILITY_MODE": "strict",
+      "RUSTFS_NEW_BUCKET_DURABILITY_MODE": "strict",
+      "RUSTFS_DRIVE_SYNC_ENABLE": "true"
+    }
+  },
+  "binary_sha256": {
+    "cairn": "f885b5a9c7d7eeaab27e9a1290b2f54d7f4b6c6906d49d6c74653061cf0ca562",
+    "rustfs": "2a843ec9a0a6139a8203a2c67265fedfdd003bd3390bf03811ae37ae5b9e2cdf"
+  },
+  "arms": [
+    {
+      "pair": 1,
+      "ordinal": 1,
+      "engine": "cairn",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 614.9303810704937,
+      "wall_seconds": 19.514404181998543,
+      "prefill_seconds": 27.157299264999892,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 25.998002125503564,
+        "p50_ms": 18.42631800172967,
+        "p90_ms": 44.51368700028979,
+        "p99_ms": 151.01007799967192,
+        "max_ms": 338.63846700114664
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 4.205159051,
+      "client_cpu_per_object": 0.00035042992091666663,
+      "server_cpu_seconds": 15.98,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 43941888,
+      "peak_bytes": 167587840,
+      "peak_inodes": 12017,
+      "status": "PASS"
+    },
+    {
+      "pair": 1,
+      "ordinal": 2,
+      "engine": "rustfs",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 37.77319722553786,
+      "wall_seconds": 317.68557817200053,
+      "prefill_seconds": 60.27163559899782,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 422.63404727141216,
+        "p50_ms": 339.7728260024451,
+        "p90_ms": 772.257772001467,
+        "p99_ms": 1465.8005780001986,
+        "max_ms": 1876.527401000203
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 40.439184024,
+      "client_cpu_per_object": 0.003369932002,
+      "server_cpu_seconds": 141.46,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 375255040,
+      "peak_bytes": 110546944,
+      "peak_inodes": 24053,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "pair": 2,
+      "ordinal": 3,
+      "engine": "rustfs",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 39.076403718602506,
+      "wall_seconds": 307.0906956129984,
+      "prefill_seconds": 51.85044929899959,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 409.01262905397687,
+        "p50_ms": 337.4673390026146,
+        "p90_ms": 687.8920320014004,
+        "p99_ms": 1581.9829690008191,
+        "max_ms": 2672.486397001194
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 39.771530129,
+      "client_cpu_per_object": 0.0033142941774166666,
+      "server_cpu_seconds": 140.2,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 437911552,
+      "peak_bytes": 109355008,
+      "peak_inodes": 24053,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    },
+    {
+      "pair": 2,
+      "ordinal": 4,
+      "engine": "cairn",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 713.4862314313656,
+      "wall_seconds": 16.818824907000817,
+      "prefill_seconds": 25.524501152001903,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 22.313553701006942,
+        "p50_ms": 17.84334599869908,
+        "p90_ms": 34.59949099851656,
+        "p99_ms": 103.90175500288024,
+        "max_ms": 706.9674349986599
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 4.124957549999991,
+      "client_cpu_per_object": 0.0003437464624999992,
+      "server_cpu_seconds": 15.63,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 43401216,
+      "peak_bytes": 227553280,
+      "peak_inodes": 12017,
+      "status": "PASS"
+    },
+    {
+      "pair": 3,
+      "ordinal": 5,
+      "engine": "cairn",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 592.416186294183,
+      "wall_seconds": 20.25602992900167,
+      "prefill_seconds": 29.841992698999093,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 26.980629467157694,
+        "p50_ms": 18.7807160000375,
+        "p90_ms": 39.83044299820904,
+        "p99_ms": 194.45158099915716,
+        "max_ms": 469.53790900079184
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "full-metadata"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 4.252812681999998,
+      "client_cpu_per_object": 0.0003544010568333332,
+      "server_cpu_seconds": 15.7,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 43515904,
+      "peak_bytes": 228724736,
+      "peak_inodes": 12017,
+      "status": "PASS"
+    },
+    {
+      "pair": 3,
+      "ordinal": 6,
+      "engine": "rustfs",
+      "pool_objects": 12000,
+      "key_bytes": 4096,
+      "concurrency": 16,
+      "successful_operations": 12000,
+      "errors": 0,
+      "error_details": [],
+      "objects_per_second": 39.36909889985963,
+      "wall_seconds": 304.80758603399954,
+      "prefill_seconds": 57.33732169799987,
+      "latency": {
+        "count": 12000,
+        "mean_ms": 405.85530743657637,
+        "p50_ms": 332.34334499866236,
+        "p90_ms": 701.7640810008743,
+        "p99_ms": 1346.4859560008335,
+        "max_ms": 2195.965251998132
+      },
+      "durability": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "deletion_spot_check": [
+        {
+          "key": "single-000000000",
+          "status": 404
+        },
+        {
+          "key": "single-000006000",
+          "status": 404
+        },
+        {
+          "key": "single-000011999",
+          "status": 404
+        }
+      ],
+      "bucket_empty": {
+        "status": 200,
+        "empty": true,
+        "body_prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>cairn-benchmark</Name><Prefix></Prefix><MaxKeys>1</MaxKeys><KeyCount>0</KeyCount><IsTrunca"
+      },
+      "client_cpu_seconds": 39.373043846,
+      "client_cpu_per_object": 0.003281086987166667,
+      "server_cpu_seconds": 139.71,
+      "host_capacity_before": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "host_capacity_after": {
+        "memtotal_kib": 32659144,
+        "swaptotal_kib": 8388604,
+        "logical_cpus": 6
+      },
+      "server_peak_rss": 387321856,
+      "peak_bytes": 103612416,
+      "peak_inodes": 24061,
+      "durability_after": {
+        "bucket": "cairn-benchmark",
+        "mode": "strict"
+      },
+      "status": "PASS"
+    }
+  ],
+  "pair_ratios": [
+    {
+      "pair": 1,
+      "cairn_objects_per_second": 614.9303810704937,
+      "rustfs_objects_per_second": 37.77319722553786,
+      "cairn_over_rustfs": 16.2795428038257
+    },
+    {
+      "pair": 2,
+      "cairn_objects_per_second": 713.4862314313656,
+      "rustfs_objects_per_second": 39.076403718602506,
+      "cairn_over_rustfs": 18.25874859337957
+    },
+    {
+      "pair": 3,
+      "cairn_objects_per_second": 592.416186294183,
+      "rustfs_objects_per_second": 39.36909889985963,
+      "cairn_over_rustfs": 15.047745639316506
+    }
+  ],
+  "elapsed_seconds": 1244.0804973880004,
+  "mean_cairn_over_rustfs": 16.528679012173924
+}
