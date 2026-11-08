@@ -97,6 +97,13 @@ case "${1:?CI task required}" in
       fi
     done
     ;;
+  codeql-bundle)
+    set -euo pipefail
+    name=codeql-bundle-linux64.tar.zst
+    archive="${RUNNER_TEMP}/${name}"
+    gh release download codeql-bundle-v2.26.4 --repo github/codeql-action --pattern "$name" --dir "$RUNNER_TEMP" --clobber
+    printf '%s  %s\n' a9872c9075f85374a8d03546263c6dc01fde50a29baea9fc08dcc6b25cc2efd5 "$archive" | sha256sum -c -
+    ;;
   actionlint)
     # GitHub's unauthenticated release-asset CDN has been returning intermittent 504s; the
     # authenticated release API is both pinned by this checksum and independent of that path.
