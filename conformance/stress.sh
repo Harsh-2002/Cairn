@@ -33,6 +33,8 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=conformance/fetch_github_release.sh
+. "$(dirname "$0")/fetch_github_release.sh"
 BIN="${BIN:-$ROOT/target/release/cairn}"
 PORT="${PORT:-9090}"
 REGION="${REGION:-us-east-1}"
@@ -101,7 +103,8 @@ if [ -z "$WARP" ]; then
     if [ ! -x "$WARP" ]; then
       note "downloading warp v$WARP_VERSION"
       mkdir -p "$WARP_CACHE"; tgz="$WARP_CACHE/warp.tar.gz"
-      curl -fsSL -o "$tgz" "$WARP_URL" || fail "could not download warp from $WARP_URL"
+      fetch_github_release minio/warp "v$WARP_VERSION" "warp_Linux_x86_64.tar.gz" "$tgz" \
+        || fail "could not download warp from $WARP_URL"
       tar -xzf "$tgz" -C "$WARP_CACHE" warp || fail "warp tarball had no 'warp' binary"
       chmod +x "$WARP"; rm -f "$tgz"
     fi
