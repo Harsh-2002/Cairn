@@ -71,8 +71,11 @@ third-party certification. The measured evidence is in
   completed replication-outbox rows scanned by the metrics tick; #215 restricts the active counts to
   pending/claimed/failed and counts completed on the status index. A 2-hour run on the fixed binary
   with a 15-minute idle passed with **140,653 PUTs, 0 errors, 0 mismatches and anonymous RSS
-  155.6 → 153.5 MiB (−1.3%)**. The owner accepted the 2-hour memory gate. Power-loss testing remains
-  site-specific; measure your own object mix.
+  155.6 → 153.5 MiB (−1.3%)**. The same gate was re-run on the v44 release binary: **137,831 PUTs,
+  0 errors, 0 mismatches, 11,496 verified reads and anonymous RSS 162.4 → 154.1 MiB (−5.2%)**. The
+  owner accepted the 2-hour memory gate. Long runs create their data under `TMPDIR`; point it at a
+  disk-backed directory (the reference host's `/tmp` is a 16 GB tmpfs and a two-node soak fills it).
+  Power-loss testing remains site-specific; measure your own object mix.
 - **Third-party audit.** The security/architecture review is internal. It is not a certification.
 
 ## Operational checklist
