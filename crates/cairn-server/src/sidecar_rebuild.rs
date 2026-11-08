@@ -519,10 +519,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_restores_a_multipart_row_and_its_part_layout_end_to_end() {
+    async fn rebuild_restores_a_multipart_row_part_layout_and_object_lock() {
         use cairn_types::object::{
             ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag,
-            ExplicitObjectLockIntent, MultipartPartRecord, StorageClass,
+            ExplicitObjectLockIntent, MultipartPartRecord, ObjectLockMode, ObjectLockState,
+            ObjectRetention, StorageClass,
         };
         use cairn_types::storage::{ObjectMetadataRecord, ObjectMetadataSeed};
         use cairn_types::testing::InMemoryMetadataStore;
@@ -535,13 +536,13 @@ mod tests {
             name: BucketName::parse("rebuilt-bucket").unwrap(),
             owner_id: UserId("owner".to_owned()),
             created_at: Timestamp(0),
-            versioning: VersioningState::Unversioned,
+            versioning: VersioningState::Enabled,
             ownership_mode: OwnershipMode::BucketOwnerEnforced,
             region: "us-east-1".to_owned(),
             compression: None,
         };
         let meta = InMemoryMetadataStore::new();
-        meta.submit(Mutation::CreateBucket(Box::new(bucket.clone())))
+        meta.submit(Mutation::CreateObjectLockBucket(Box::new(bucket.clone())))
             .await
             .unwrap();
         let generation = StorageToken::generate();
@@ -600,7 +601,13 @@ mod tests {
             created_at: Timestamp(1),
             updated_at: Timestamp(2),
             tags: Vec::new(),
-            lock_intent: ExplicitObjectLockIntent::default(),
+            lock_intent: ExplicitObjectLockIntent {
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until: Timestamp(100),
+                }),
+                legal_hold: Some(true),
+            },
         };
         let staged = cairn_types::StagedBlob {
             storage_path: storage_path.clone(),
@@ -636,6 +643,21 @@ mod tests {
         assert_eq!(row.etag, record.etag);
         assert_eq!(row.multipart_parts.as_deref(), Some(parts.as_slice()));
         assert_eq!(row.checksums, checksums);
+        let lock = meta
+            .get_object_lock(&bucket.name, &key, &version_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock,
+            ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until: Timestamp(100),
+                }),
+                legal_hold: true,
+            },
+            "a file-loss rebuild must restore the sidecar's exact lock intent"
+        );
     }
 
     #[test]
