@@ -821,9 +821,25 @@ fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<Response
         .header("content-type", content_type)
         // Active object content lives on a distinct but potentially same-site data origin. Refuse
         // framing so it cannot place the authenticated administrator console under decoy controls
-        // and turn real same-origin console clicks into privileged mutations.
-        .header("content-security-policy", "frame-ancestors 'none'")
+        // and turn real same-origin console clicks into privileged mutations. The rest of the
+        // policy keeps the console's own scripts/styles same-origin; the SPA ships no inline script.
+        .header(
+            "content-security-policy",
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
+             form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'",
+        )
         .header("x-frame-options", "DENY")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-embedder-policy", "require-corp")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000")
         .body(full_body(Bytes::from(bytes)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
@@ -832,7 +848,16 @@ fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<Response
 fn render_control_response(resp: cairn_control::ControlResponse) -> Response<ResponseBody> {
     let mut builder = Response::builder()
         .status(resp.status)
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000");
     if let Ok(value) = http::HeaderValue::from_str(&resp.request_id) {
         builder = builder.header("x-amz-request-id", value);
     }
@@ -846,6 +871,15 @@ fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000")
         .body(full_body(Bytes::from(body.to_owned())))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
@@ -858,7 +892,16 @@ fn json_status_with_headers(
 ) -> Response<ResponseBody> {
     let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000");
     for (k, v) in extra {
         builder = builder.header(*k, v.as_str());
     }
@@ -2849,13 +2892,104 @@ mod tests {
     }
 
     #[test]
-    fn console_assets_refuse_every_framing_context() {
+    fn console_assets_refuse_framing_and_harden_the_browser_boundary() {
         let response = web_asset_response("text/html".to_owned(), b"console".to_vec());
-        assert_eq!(
-            response.headers().get("content-security-policy").unwrap(),
-            "frame-ancestors 'none'"
-        );
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for directive in [
+            "frame-ancestors 'none'",
+            "script-src 'self'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'self'",
+        ] {
+            assert!(csp.contains(directive), "missing {directive}: {csp}");
+        }
         assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-opener-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-embedder-policy")
+                .unwrap(),
+            "require-corp"
+        );
+        assert!(response.headers().get("permissions-policy").is_some());
+    }
+
+    #[test]
+    fn control_responses_carry_browser_hardening_headers() {
+        let response = render_control_response(cairn_control::ControlResponse {
+            status: http::StatusCode::OK,
+            body: br#"{"ok":true}"#.to_vec(),
+            request_id: String::new(),
+        });
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        assert!(response.headers().get("permissions-policy").is_some());
+    }
+
+    #[test]
+    fn early_json_errors_carry_browser_hardening_headers() {
+        let response = json_status(401, r#"{"error":"unauthorized"}"#);
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
     }
 
     fn console_presign_query(origin: &str) -> String {

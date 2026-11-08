@@ -1,0 +1,140 @@
+# Nmap 7.98 scan initiated Sun Nov  8 14:25:35 2026 as: /usr/bin/nmap -sV -sC -p9443,9444 -oX /out/nmap.xml -oN /out/nmap.txt 127.0.0.1
+Nmap scan report for localhost (127.0.0.1)
+Host is up (0.000071s latency).
+
+PORT     STATE SERVICE              VERSION
+9443/tcp open  ssl/tungsten-https?
+| ssl-cert: Subject: commonName=localhost
+| Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1
+| Not valid before: 2026-11-08T14:24:09
+|_Not valid after:  2026-11-10T14:24:09
+| fingerprint-strings: 
+|   DNSStatusRequestTCP, DNSVersionBindReqTCP, Help, RPCCheck, RTSPRequest, SSLSessionReq: 
+|     HTTP/1.1 400 Bad Request
+|     connection: close
+|     content-length: 0
+|     date: Sun, 08 Nov 2026 14:25:52 GMT
+|   GetRequest: 
+|     HTTP/1.0 403 Forbidden
+|     content-type: application/xml
+|     x-amz-request-id: 80431e28625179c1000000000000001a
+|     vary: accept, sec-fetch-dest, upgrade-insecure-requests
+|     content-length: 187
+|     date: Sun, 08 Nov 2026 14:25:47 GMT
+|     <?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>access denied</Message><Resource>/</Resource><RequestId>80431e28625179c1000000000000001a</RequestId></Error>
+|   HTTPOptions: 
+|     HTTP/1.0 403 Forbidden
+|     content-type: application/xml
+|     x-amz-request-id: 80431e28625179c1000000000000001b
+|     vary: accept, sec-fetch-dest, upgrade-insecure-requests
+|     content-length: 187
+|     date: Sun, 08 Nov 2026 14:25:52 GMT
+|_    <?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>access denied</Message><Resource>/</Resource><RequestId>80431e28625179c1000000000000001b</RequestId></Error>
+|_ssl-date: TLS randomness does not represent time
+9444/tcp open  ssl/wso2esb-console?
+| fingerprint-strings: 
+|   DNSVersionBindReqTCP, RPCCheck, RTSPRequest: 
+|     HTTP/1.1 400 Bad Request
+|     connection: close
+|     content-length: 0
+|     date: Sun, 08 Nov 2026 14:26:11 GMT
+|   GetRequest: 
+|     HTTP/1.0 200 OK
+|     content-type: text/html
+|     content-security-policy: frame-ancestors 'none'
+|     x-frame-options: DENY
+|     x-amz-request-id: 80431e28625179c1000000000000001d
+|     content-length: 1139
+|     date: Sun, 08 Nov 2026 14:26:11 GMT
+|     <!doctype html>
+|     <html lang="en">
+|     <head>
+|     <meta charset="utf-8" />
+|     <meta name="viewport" content="width=device-width, initial-scale=1" />
+|     <meta name="color-scheme" content="light dark" />
+|     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+|     <title>Cairn 
+|     Console</title>
+|     <script type="module" crossorigin src="./assets/index-Da4f1ant.js"></script>
+|     <link rel="modulepreload" crossorigin href="./assets/utils-BZuXOkQX.js">
+|     <link rel="modulepreload" crossorigin href="./assets/react-dom-DcQwUiVd.js">
+|     <link rel="modulepreload" crossorigin href="./assets/hooks-DjTH693o.js">
+|     <link rel="modulepreload" crossorigin href="./asse
+|   HTTPOptions: 
+|     HTTP/1.0 404 Not Found
+|     content-type: application/json
+|     x-amz-request-id: 80431e28625179c1000000000000001e
+|     content-length: 21
+|     date: Sun, 08 Nov 2026 14:26:11 GMT
+|_    {"error":"not found"}
+|_ssl-date: TLS randomness does not represent time
+| ssl-cert: Subject: commonName=localhost
+| Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1
+| Not valid before: 2026-11-08T14:24:09
+|_Not valid after:  2026-11-10T14:24:09
+2 services unrecognized despite returning data. If you know the service/version, please submit the following fingerprints at https://nmap.org/cgi-bin/submit.cgi?new-service :
+==============NEXT SERVICE FINGERPRINT (SUBMIT INDIVIDUALLY)==============
+SF-Port9443-TCP:V=7.98%T=SSL%I=7%D=11/8%Time=6AF0866B%P=x86_64-unknown-lin
+SF:ux-gnu%r(GetRequest,19B,"HTTP/1\.0\x20403\x20Forbidden\r\ncontent-type:
+SF:\x20application/xml\r\nx-amz-request-id:\x2080431e28625179c100000000000
+SF:0001a\r\nvary:\x20accept,\x20sec-fetch-dest,\x20upgrade-insecure-reques
+SF:ts\r\ncontent-length:\x20187\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x201
+SF:4:25:47\x20GMT\r\n\r\n<\?xml\x20version=\"1\.0\"\x20encoding=\"UTF-8\"\
+SF:?><Error><Code>AccessDenied</Code><Message>access\x20denied</Message><R
+SF:esource>/</Resource><RequestId>80431e28625179c1000000000000001a</Reques
+SF:tId></Error>")%r(HTTPOptions,19B,"HTTP/1\.0\x20403\x20Forbidden\r\ncont
+SF:ent-type:\x20application/xml\r\nx-amz-request-id:\x2080431e28625179c100
+SF:0000000000001b\r\nvary:\x20accept,\x20sec-fetch-dest,\x20upgrade-insecu
+SF:re-requests\r\ncontent-length:\x20187\r\ndate:\x20Sun,\x2008\x20Nov\x20
+SF:2026\x2014:25:52\x20GMT\r\n\r\n<\?xml\x20version=\"1\.0\"\x20encoding=\
+SF:"UTF-8\"\?><Error><Code>AccessDenied</Code><Message>access\x20denied</M
+SF:essage><Resource>/</Resource><RequestId>80431e28625179c1000000000000001
+SF:b</RequestId></Error>")%r(RTSPRequest,67,"HTTP/1\.1\x20400\x20Bad\x20Re
+SF:quest\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\
+SF:x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n")%r(RPCCheck,67,"HTTP/1
+SF:\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:
+SF:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n"
+SF:)%r(DNSVersionBindReqTCP,67,"HTTP/1\.1\x20400\x20Bad\x20Request\r\nconn
+SF:ection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\
+SF:x202026\x2014:25:52\x20GMT\r\n\r\n")%r(DNSStatusRequestTCP,67,"HTTP/1\.
+SF:1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x
+SF:200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n")%
+SF:r(Help,67,"HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r
+SF:\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:25:5
+SF:2\x20GMT\r\n\r\n")%r(SSLSessionReq,67,"HTTP/1\.1\x20400\x20Bad\x20Reque
+SF:st\r\nconnection:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x20
+SF:08\x20Nov\x202026\x2014:25:52\x20GMT\r\n\r\n");
+==============NEXT SERVICE FINGERPRINT (SUBMIT INDIVIDUALLY)==============
+SF-Port9444-TCP:V=7.98%T=SSL%I=7%D=11/8%Time=6AF08683%P=x86_64-unknown-lin
+SF:ux-gnu%r(GetRequest,556,"HTTP/1\.0\x20200\x20OK\r\ncontent-type:\x20tex
+SF:t/html\r\ncontent-security-policy:\x20frame-ancestors\x20'none'\r\nx-fr
+SF:ame-options:\x20DENY\r\nx-amz-request-id:\x2080431e28625179c10000000000
+SF:00001d\r\ncontent-length:\x201139\r\ndate:\x20Sun,\x2008\x20Nov\x202026
+SF:\x2014:26:11\x20GMT\r\n\r\n<!doctype\x20html>\n<html\x20lang=\"en\">\n\
+SF:x20\x20<head>\n\x20\x20\x20\x20<meta\x20charset=\"utf-8\"\x20/>\n\x20\x
+SF:20\x20\x20<meta\x20name=\"viewport\"\x20content=\"width=device-width,\x
+SF:20initial-scale=1\"\x20/>\n\x20\x20\x20\x20<meta\x20name=\"color-scheme
+SF:\"\x20content=\"light\x20dark\"\x20/>\n\x20\x20\x20\x20<link\x20rel=\"i
+SF:con\"\x20type=\"image/svg\+xml\"\x20href=\"\./favicon\.svg\"\x20/>\n\x2
+SF:0\x20\x20\x20<title>Cairn\x20\xe2\x80\x94\x20Console</title>\n\x20\x20\
+SF:x20\x20<script\x20type=\"module\"\x20crossorigin\x20src=\"\./assets/ind
+SF:ex-Da4f1ant\.js\"></script>\n\x20\x20\x20\x20<link\x20rel=\"moduleprelo
+SF:ad\"\x20crossorigin\x20href=\"\./assets/utils-BZuXOkQX\.js\">\n\x20\x20
+SF:\x20\x20<link\x20rel=\"modulepreload\"\x20crossorigin\x20href=\"\./asse
+SF:ts/react-dom-DcQwUiVd\.js\">\n\x20\x20\x20\x20<link\x20rel=\"moduleprel
+SF:oad\"\x20crossorigin\x20href=\"\./assets/hooks-DjTH693o\.js\">\n\x20\x2
+SF:0\x20\x20<link\x20rel=\"modulepreload\"\x20crossorigin\x20href=\"\./ass
+SF:e")%r(HTTPOptions,BC,"HTTP/1\.0\x20404\x20Not\x20Found\r\ncontent-type:
+SF:\x20application/json\r\nx-amz-request-id:\x2080431e28625179c10000000000
+SF:00001e\r\ncontent-length:\x2021\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x
+SF:2014:26:11\x20GMT\r\n\r\n{\"error\":\"not\x20found\"}")%r(RTSPRequest,6
+SF:7,"HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnection:\x20close\r\nconten
+SF:t-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT
+SF:\r\n\r\n")%r(RPCCheck,67,"HTTP/1\.1\x20400\x20Bad\x20Request\r\nconnect
+SF:ion:\x20close\r\ncontent-length:\x200\r\ndate:\x20Sun,\x2008\x20Nov\x20
+SF:2026\x2014:26:11\x20GMT\r\n\r\n")%r(DNSVersionBindReqTCP,67,"HTTP/1\.1\
+SF:x20400\x20Bad\x20Request\r\nconnection:\x20close\r\ncontent-length:\x20
+SF:0\r\ndate:\x20Sun,\x2008\x20Nov\x202026\x2014:26:11\x20GMT\r\n\r\n");
+
+Service detection performed. Please report any incorrect results at https://nmap.org/submit/ .
+# Nmap done at Sun Nov  8 14:26:18 2026 -- 1 IP address (1 host up) scanned in 42.98 seconds

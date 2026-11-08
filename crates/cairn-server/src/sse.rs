@@ -47,6 +47,11 @@ fn json(status: StatusCode, body: Vec<u8>) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000")
         .body(full_body(Bytes::from(body)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
@@ -174,6 +179,11 @@ pub fn events_stream(
         .header("cache-control", "no-cache")
         // Defeat proxy/buffering so events arrive promptly.
         .header("x-accel-buffering", "no")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("strict-transport-security", "max-age=31536000")
         .body(BodyExt::boxed_unsync(StreamBody::new(stream)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
@@ -199,6 +209,29 @@ mod tests {
             user_policy: None,
             is_session: false,
         }
+    }
+
+    #[test]
+    fn sse_error_responses_carry_browser_hardening_headers() {
+        let response = json(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"ticket required"}"#.to_vec(),
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
     }
 
     #[test]

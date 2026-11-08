@@ -76,7 +76,10 @@ third-party certification. The measured evidence is in
   owner accepted the 2-hour memory gate. Long runs create their data under `TMPDIR`; point it at a
   disk-backed directory (the reference host's `/tmp` is a 16 GB tmpfs and a two-node soak fills it).
   Power-loss testing remains site-specific; measure your own object mix.
-- **Third-party audit.** The security/architecture review is internal. It is not a certification.
+- **Independent assurance.** The security/architecture review is internal, supplemented by the
+  2026-11-08 automated open-source pentest (ZAP, Nuclei, testssl.sh, nmap, ffuf and a SigV4
+  authorization matrix). It is **not** a human third-party audit or a certification; see
+  [`security-pentest-2026-11.md`](security-pentest-2026-11.md).
 
 ## Operational checklist
 
