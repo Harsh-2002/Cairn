@@ -259,6 +259,11 @@ impl Writer {
     /// Wait until the checkpointer has cleared the high-water pause. A closed watch (writer
     /// shutting down) releases the waiter so `submit` can surface `WriterClosed` naturally.
     async fn wait_for_admission(&self) {
+        // Fast path: an ordinary write must not pay for a watch subscription. The sender's current
+        // value is a cheap borrow; only a paused writer subscribes to wait for the resume signal.
+        if !*self.writes_paused.borrow() {
+            return;
+        }
         let mut paused = self.writes_paused.subscribe();
         while *paused.borrow() && paused.changed().await.is_ok() {}
     }
