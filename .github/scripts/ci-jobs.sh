@@ -97,8 +97,11 @@ case "${1:?CI task required}" in
     done
     ;;
   actionlint)
-    archive="${RUNNER_TEMP}/actionlint.tar.gz"
-    curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+    # GitHub's unauthenticated release-asset CDN has been returning intermittent 504s; the
+    # authenticated release API is both pinned by this checksum and independent of that path.
+    name=actionlint_1.7.12_linux_amd64.tar.gz
+    archive="${RUNNER_TEMP}/${name}"
+    gh release download v1.7.12 --repo rhysd/actionlint --pattern "$name" --dir "$RUNNER_TEMP" --clobber
     printf '%s  %s\n' 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$archive" | sha256sum -c -
     tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
     "$RUNNER_TEMP/actionlint"
