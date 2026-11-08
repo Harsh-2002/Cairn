@@ -1,10 +1,12 @@
 # Unversioned-delete write amplification: remaining plan (2026-11-08)
 
-**Status: v44 implemented; the delete gap is closed against RustFS 1.0.4.** The clustered
-`object_versions` table ships (schema v44) and measures 1,447.3 obj/s on the earlier session and
-2,400+ on the quieter 1.0.4 session. Against RustFS 1.0.4, Cairn wins the bulk (19.95x), single
-(16.53x) and versioned (32.49x) delete arms; the optional `id`-index removal is no longer needed
-for the scoreboard and remains a documented option only.
+**Status: v44 implemented; the delete gap is closed against RustFS 1.0.4, and the optional
+`id`-index removal is stopped.** The clustered `object_versions` table ships (schema v44) and
+measures 1,447.3 obj/s on the earlier session and 2,400+ on the quieter 1.0.4 session. Against
+RustFS 1.0.4, Cairn wins the bulk (19.95x), single (16.53x) and versioned (32.49x) delete arms. The
+owner stopped the refactor on 2026-11-08: its estimated 1,600–1,900 obj/s is below the measured
+2,400+, and it would touch the storage-authority cursor and SSE re-wrap for no release benefit.
+Reopen only if a power-loss-protected NVMe paired run shows the indexed `id` is the remaining cap.
 
 ## Where the row stands
 
