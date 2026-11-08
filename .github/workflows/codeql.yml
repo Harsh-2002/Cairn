@@ -26,11 +26,15 @@ jobs:
       with:
         ref: ${{ inputs.revision }}
         persist-credentials: false
+    - name: Fetch pinned CodeQL bundle
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" codeql-bundle
     - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938
       with:
         languages: ${{ matrix.language }}
         build-mode: none
-        tools: linked
+        tools: ${{ runner.temp }}/codeql-bundle-linux64.tar.zst
     - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938
       with:
         category: /language:${{ matrix.language }}

@@ -37,6 +37,8 @@ jobs:
     - run: python3 -m unittest discover -s tests -p test_ci.py -v
     - run: shellcheck -s bash .github/scripts/ci-jobs.sh
     - run: bash .github/scripts/ci-jobs.sh actionlint
+      env:
+        GH_TOKEN: ${{ github.token }}
   docs:
     name: documentation
     runs-on: ubuntu-24.04
@@ -146,8 +148,8 @@ jobs:
         persist-credentials: false
     - name: Install pinned cargo-audit
       env:
-        AUDIT_URL: https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
         AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        GH_TOKEN: ${{ github.token }}
       run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-1
     - run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-jobs.sh" rust-audit-2
     if: ${{ inputs.profile == 'full' }}
@@ -259,7 +261,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
       run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
@@ -281,7 +283,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: An unparseable bucket/key must never re-route to the bucket or root handler
       run: BIN=target/debug/cairn PY=python3 bash conformance/routing.sh
@@ -303,7 +305,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Delimiter/CommonPrefixes, real token-fed pagination loops, delete markers + undelete
       run: BIN=target/debug/cairn PY=python3 bash conformance/listing.sh
@@ -325,7 +327,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: "Low-level create/upload-part/complete \u2014 exact NoSuchUpload/InvalidPart/InvalidPartOrder/EntityTooSmall, and a terminating ListMultipartUploads loop"
       run: BIN=target/debug/cairn PY=python3 bash conformance/multipart.sh
@@ -347,7 +349,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: System headers + aws-chunked normalization, copy directives, exact 206/416 ranges, encoded keys, DeleteObjects
       run: BIN=target/debug/cairn PY=python3 bash conformance/objects.sh
@@ -369,7 +371,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Name validation, DeleteBucket 204/409/404, every subresource PUT->GET->DELETE (bucket survives), real CORS preflight
       run: BIN=target/debug/cairn PY=python3 bash conformance/buckets.sh
@@ -391,7 +393,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Cross-tenant AccessDenied (before NoSuchKey), SigV4 failure modes, presigned expiry, Block Public Access
       run: BIN=target/debug/cairn PY=python3 bash conformance/authz.sh
@@ -413,7 +415,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: "Prove the scanner ACTS \u2014 expires only matching keys, stays in its bucket, ignores Disabled, delete-marker on versioned"
       run: BIN=target/debug/cairn PY=python3 bash conformance/lifecycle.sh
@@ -435,7 +437,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Assert checksums are computed, stored, and echoed on PUT/GET/HEAD (ARCH 21.1)
       run: BIN=target/debug/cairn PY=python3 bash conformance/checksums.sh
@@ -457,7 +459,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Assert SSE-S3/aws:kms/at-rest/mandatory/multipart wire contract + on-disk ciphertext + fail-closed (ARCH 27)
       run: BIN=target/debug/cairn PY=python3 bash conformance/encryption.sh
@@ -479,7 +481,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Corrupt a blob (plaintext / at-rest / SSE-S3 / compressed); assert the scrub detects each
       run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
@@ -501,7 +503,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: COMPLIANCE/GOVERNANCE retention + legal hold enforced via the AWS SDK
       run: BIN=target/debug/cairn PY=python3 bash conformance/object_lock.sh
@@ -523,7 +525,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Event-notification delivery + HMAC signing (management web console listener on)
       run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
@@ -545,7 +547,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Mint + enforce scoped session credentials over a real SDK (management web console listener on)
       run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
@@ -567,7 +569,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: A real SDK STS client mints + consumes creds via the AWS-STS XML form POST
       run: BIN=target/debug/cairn PY=python3 bash conformance/sts_xml.sh
@@ -614,7 +616,7 @@ jobs:
     - run: npm ci --prefix web
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - run: bash .github/scripts/ci-jobs.sh console-browser
     if: ${{ inputs.profile == 'full' }}
@@ -677,7 +679,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Upgrade to v44, assert clustered shape/locks, refusal and rollback
       env:
@@ -697,7 +699,7 @@ jobs:
         web-artifact: web-dist
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - run: cargo build --bin cairn --features fast-io
     - name: Full boto3 lifecycle through the sendfile fast path
@@ -745,7 +747,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
       run: BIN=target/debug/cairn PY=python3 bash conformance/rotation.sh
     if: ${{ inputs.profile == 'full' }}
@@ -768,7 +770,7 @@ jobs:
       run: BIN=target/debug/cairn bash conformance/share.sh
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Download filenames, GET/HEAD overrides and encrypted byte preservation
       run: BIN=target/debug/cairn python3 conformance/downloads.py
@@ -790,7 +792,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
       run: BIN=target/debug/cairn PY=python3 N=32 bash conformance/concurrency.sh
     if: ${{ inputs.profile == 'full' }}
@@ -824,7 +826,7 @@ jobs:
         web-artifact: web-dist
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - name: Crash at every blob-commit seam (PutObject + multipart); assert reconcile reclaims each orphan
       run: BIN=target/debug/cairn PY=python3 bash conformance/crash_multipoint.sh
     if: ${{ inputs.profile == 'full' }}
@@ -848,7 +850,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: "Two-node replication soak \u2014 sustained PUTs, byte-identical verify, RSS leak check"
       run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
@@ -871,7 +873,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Break replication on purpose (target down, source SIGKILL, rapid overwrite); assert no data loss
       run: BIN=target/debug/cairn PY=python3 bash conformance/replication_chaos.sh
@@ -894,6 +896,8 @@ jobs:
     - run: chmod +x target/debug/cairn
     - name: Drive warp + concurrency ramp; assert zero errors, alive, no RSS leak
       run: BIN=target/debug/cairn DURATION=8s LEVELS="8 32 128 256" ESC_DURATION=6s LEAK_PCT=50 bash conformance/stress.sh
+      env:
+        GH_TOKEN: ${{ github.token }}
     if: ${{ inputs.profile == 'full' }}
   stress-encrypted:
     name: encrypted-path stress (A/B plaintext vs at-rest)
@@ -913,10 +917,12 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: A/B plaintext vs encrypted under warp; assert byte-exact crypto + stability
       run: BIN=target/debug/cairn PY=python3 DURATION=8s CONCURRENT=8 bash conformance/stress_encrypted.sh
+      env:
+        GH_TOKEN: ${{ github.token }}
     if: ${{ inputs.profile == 'full' }}
   stress-multipart:
     name: concurrent multipart stress (barrier Complete, fail-closed, races)
@@ -936,7 +942,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Barrier-fire concurrent multipart Completes; assert byte-exact + fail-closed + races
       run: BIN=target/debug/cairn PY=python3 bash conformance/stress_multipart.sh
@@ -959,7 +965,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Drive the limit + abuse paths concurrently; assert exact codes and no bypass
       run: BIN=target/debug/cairn PY=python3 bash conformance/stress_adversarial.sh
@@ -982,7 +988,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Replicate under constant load across a master-key boundary; assert byte-exact + drain
       run: BIN=target/debug/cairn PY=python3 bash conformance/stress_replication.sh
@@ -1005,7 +1011,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
     - name: Hold a mixed-feature workload constant; assert correctness + no steady-state climb
       run: BIN=target/debug/cairn PY=python3 bash conformance/soak_features.sh
@@ -1028,7 +1034,7 @@ jobs:
     - run: chmod +x target/debug/cairn
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
-        python-version: 3.13.14
+        python-version: 3.13.18
     - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
       run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
     if: ${{ inputs.profile == 'full' }}
@@ -1180,6 +1186,8 @@ jobs:
         web-artifact: web-dist
     - run: cargo build --release --bin cairn
     - name: Real encrypted >2 GiB and >5 GiB replication to Cairn and MinIO
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: BIN=target/release/cairn LARGE_ENCRYPT=true bash conformance/replication_large.sh
     if: ${{ inputs.profile == 'full' }}
     needs:
