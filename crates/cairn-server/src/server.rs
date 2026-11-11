@@ -1017,10 +1017,10 @@ async fn handle(
             // S3 traffic (reads, the deletes that emptied it) would flush after the delete and
             // resurrect a per-bucket series. Both delete paths reach this shared handler, so one
             // check here covers console, CLI, bulk, and S3 uniformly.
-            if status.is_success() {
-                if let Some(deleted) = deleted_bucket_label(&method, &path) {
-                    state.stack.request_metrics.forget_bucket(deleted);
-                }
+            if status.is_success()
+                && let Some(deleted) = deleted_bucket_label(&method, &path)
+            {
+                state.stack.request_metrics.forget_bucket(deleted);
             }
             if let Some((op, mut bucket)) = classify_operation(role, &method, &path, &query) {
                 // The raw S3 DeleteBucket request itself: attribute it to the non-bucket sentinel so

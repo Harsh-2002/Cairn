@@ -67,7 +67,9 @@ pub(crate) struct PutTimings {
 
 impl PutTimings {
     pub(crate) fn sample(&self) -> bool {
-        self.next.fetch_add(1, Ordering::Relaxed) % SAMPLE_EVERY == 0
+        self.next
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(SAMPLE_EVERY)
     }
 
     pub(crate) fn start(&self, stage: PutStage) -> PutTimer<'_> {

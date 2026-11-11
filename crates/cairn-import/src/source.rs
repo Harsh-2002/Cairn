@@ -320,10 +320,10 @@ impl SourceReader for HttpS3Source {
         let mut user_metadata = Vec::new();
         for (name, value) in headers.iter() {
             let n = name.as_str();
-            if let Some(meta_key) = n.strip_prefix("x-amz-meta-") {
-                if let Ok(v) = value.to_str() {
-                    user_metadata.push((meta_key.to_owned(), v.to_owned()));
-                }
+            if let Some(meta_key) = n.strip_prefix("x-amz-meta-")
+                && let Ok(v) = value.to_str()
+            {
+                user_metadata.push((meta_key.to_owned(), v.to_owned()));
             }
         }
 

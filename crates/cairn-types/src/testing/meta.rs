@@ -327,10 +327,10 @@ impl State {
                     }
                 }
                 IfNoneMatch::ETag(e) => {
-                    if let Some(r) = current {
-                        if r.etag == *e {
-                            return Err(MetaError::PreconditionFailed);
-                        }
+                    if let Some(r) = current
+                        && r.etag == *e
+                    {
+                        return Err(MetaError::PreconditionFailed);
                     }
                 }
             }
@@ -2529,15 +2529,15 @@ impl State {
                 // Compare-and-delete guards (mirrors the SQL engines): lifecycle must still name
                 // the exact metadata row it enumerated. The row id closes the same-version,
                 // same-timestamp sentinel-overwrite gap; the timestamp remains defense in depth.
-                if let Some(expected) = expected_row_id {
-                    if st.versions.get(&vk).map(|r| r.id.as_str()) != Some(expected.as_str()) {
-                        return Ok(MutationOutcome::DeleteNotApplied);
-                    }
+                if let Some(expected) = expected_row_id
+                    && st.versions.get(&vk).map(|r| r.id.as_str()) != Some(expected.as_str())
+                {
+                    return Ok(MutationOutcome::DeleteNotApplied);
                 }
-                if let Some(expected) = expected_updated_at {
-                    if st.versions.get(&vk).map(|r| r.updated_at) != Some(expected) {
-                        return Ok(MutationOutcome::DeleteNotApplied);
-                    }
+                if let Some(expected) = expected_updated_at
+                    && st.versions.get(&vk).map(|r| r.updated_at) != Some(expected)
+                {
+                    return Ok(MutationOutcome::DeleteNotApplied);
                 }
                 if require_sole_key_version {
                     let key_versions = st
@@ -2577,18 +2577,17 @@ impl State {
                 }
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;
-                if was_latest {
-                    if let Some(next) = st
+                if was_latest
+                    && let Some(next) = st
                         .versions
                         .values_mut()
                         .filter(|r| {
                             r.bucket.as_str() == bucket.as_str() && r.key.as_str() == key.as_str()
                         })
                         .max_by(|a, b| a.version_id.as_str().cmp(b.version_id.as_str()))
-                    {
-                        next.is_latest = true;
-                        promoted = true;
-                    }
+                {
+                    next.is_latest = true;
+                    promoted = true;
                 }
                 Ok(MutationOutcome::Deleted {
                     freed,
@@ -3519,21 +3518,20 @@ impl State {
                 // Stamp the version's replication_status too, mirroring the SQL engines' targeted
                 // UPDATE inside MarkReplicationDone (audit 2026-07: the double previously updated only
                 // the outbox entry, so object_replication_status diverged from the reference engine).
-                if let Some((b, k, v)) = coords {
-                    if let Some(r) = st
+                if let Some((b, k, v)) = coords
+                    && let Some(r) = st
                         .versions
                         .values_mut()
                         .find(|r| r.bucket == b && r.key == k && r.version_id == v)
-                    {
-                        // Preserve a Replica marker for loop prevention (mirrors the SQL engines'
-                        // `replication_status IS NOT 'replica'` guard).
-                        if r.replication_status != Some(ReplicationStatus::Replica) {
-                            r.replication_status = Some(ReplicationStatus::Completed);
-                            // `replicated_at` moves in the same step as the status in both engines
-                            // (schema v23) — it is what lets the replication audit tell a
-                            // successful repair from a pre-fix ship.
-                            r.replicated_at = Some(now);
-                        }
+                {
+                    // Preserve a Replica marker for loop prevention (mirrors the SQL engines'
+                    // `replication_status IS NOT 'replica'` guard).
+                    if r.replication_status != Some(ReplicationStatus::Replica) {
+                        r.replication_status = Some(ReplicationStatus::Completed);
+                        // `replicated_at` moves in the same step as the status in both engines
+                        // (schema v23) — it is what lets the replication audit tell a
+                        // successful repair from a pre-fix ship.
+                        r.replicated_at = Some(now);
                     }
                 }
                 Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
@@ -3578,16 +3576,14 @@ impl State {
                 }
                 // On a terminal failure, stamp the version failed via a targeted update (mirrors the
                 // SQL engines; audit 2026-07).
-                if let Some((b, k, v)) = terminal_coords {
-                    if let Some(r) = st
+                if let Some((b, k, v)) = terminal_coords
+                    && let Some(r) = st
                         .versions
                         .values_mut()
                         .find(|r| r.bucket == b && r.key == k && r.version_id == v)
-                    {
-                        if r.replication_status != Some(ReplicationStatus::Replica) {
-                            r.replication_status = Some(ReplicationStatus::Failed);
-                        }
-                    }
+                    && r.replication_status != Some(ReplicationStatus::Replica)
+                {
+                    r.replication_status = Some(ReplicationStatus::Failed);
                 }
                 Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
             }
@@ -3737,10 +3733,10 @@ impl State {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::RevokeShare { id, now } => {
-                if let Some(s) = st.shares.get_mut(&id) {
-                    if s.revoked_at.is_none() {
-                        s.revoked_at = Some(now);
-                    }
+                if let Some(s) = st.shares.get_mut(&id)
+                    && s.revoked_at.is_none()
+                {
+                    s.revoked_at = Some(now);
                 }
                 Ok(MutationOutcome::Ack)
             }

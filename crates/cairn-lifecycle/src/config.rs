@@ -58,20 +58,20 @@ impl Filter {
     /// Whether an object with the given key, size, and tag set matches this filter.
     #[must_use]
     pub fn matches(&self, key: &str, size: u64, tags: &[(String, String)]) -> bool {
-        if let Some(p) = &self.prefix {
-            if !key.starts_with(p.as_str()) {
-                return false;
-            }
+        if let Some(p) = &self.prefix
+            && !key.starts_with(p.as_str())
+        {
+            return false;
         }
-        if let Some(gt) = self.object_size_greater_than {
-            if size <= gt {
-                return false;
-            }
+        if let Some(gt) = self.object_size_greater_than
+            && size <= gt
+        {
+            return false;
         }
-        if let Some(lt) = self.object_size_less_than {
-            if size >= lt {
-                return false;
-            }
+        if let Some(lt) = self.object_size_less_than
+            && size >= lt
+        {
+            return false;
         }
         for (k, v) in &self.tags {
             if !tags.iter().any(|(tk, tv)| tk == k && tv == v) {

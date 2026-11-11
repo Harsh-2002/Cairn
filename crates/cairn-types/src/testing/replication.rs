@@ -141,10 +141,10 @@ impl ReplicationClaims {
         id: &str,
         now: crate::Timestamp,
     ) -> crate::id::ReplicationClaimToken {
-        if let Some((token, until)) = self.0.remove(id) {
-            if until >= now {
-                return token;
-            }
+        if let Some((token, until)) = self.0.remove(id)
+            && until >= now
+        {
+            return token;
         }
         let entries = meta
             .claim_replication_batch(1000, now)

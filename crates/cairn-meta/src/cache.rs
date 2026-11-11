@@ -614,11 +614,12 @@ impl MetadataStore for CachedMetadataStore {
             // Lock-free load of the packed value; serve only while its generation is still current,
             // so a stale install (carrying an older generation) is never served.
             let packed = self.account_bpa.load(Ordering::Acquire);
-            if packed != 0 && (packed >> 8) == self.account_bpa_gen.load(Ordering::Acquire) {
-                if let Some(cached) = decode_bpa((packed & 0xff) as u8) {
-                    self.hit();
-                    return Ok(cached);
-                }
+            if packed != 0
+                && (packed >> 8) == self.account_bpa_gen.load(Ordering::Acquire)
+                && let Some(cached) = decode_bpa((packed & 0xff) as u8)
+            {
+                self.hit();
+                return Ok(cached);
             }
         }
         self.miss();

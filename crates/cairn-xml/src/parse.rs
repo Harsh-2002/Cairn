@@ -158,14 +158,11 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u16, String)>, Error
                 }
             }
             Sax::Text(text) => {
-                if in_part {
-                    if let Some(field) = &cur_field {
-                        if field == b"PartNumber" {
-                            part_number =
-                                Some(text.trim().parse::<u16>().map_err(|_| malformed())?);
-                        } else if field == b"ETag" {
-                            etag = Some(unquote(text.trim()));
-                        }
+                if in_part && let Some(field) = &cur_field {
+                    if field == b"PartNumber" {
+                        part_number = Some(text.trim().parse::<u16>().map_err(|_| malformed())?);
+                    } else if field == b"ETag" {
+                        etag = Some(unquote(text.trim()));
                     }
                 }
             }
@@ -275,12 +272,11 @@ pub fn parse_list_all_my_buckets(body: &[u8]) -> Result<Vec<String>, Error> {
                 }
             }
             Sax::Text(text) => {
-                if in_bucket {
-                    if let Some(f) = &cur_field {
-                        if f == b"Name" {
-                            name = Some(text.into_owned());
-                        }
-                    }
+                if in_bucket
+                    && let Some(f) = &cur_field
+                    && f == b"Name"
+                {
+                    name = Some(text.into_owned());
                 }
             }
             Sax::Close(n) => {
@@ -384,13 +380,11 @@ pub fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, Error> {
                 }
             }
             Sax::Text(text) => {
-                if in_tag {
-                    if let Some(field) = &cur_field {
-                        if field == b"Key" {
-                            key = Some(text.into_owned());
-                        } else if field == b"Value" {
-                            value = Some(text.into_owned());
-                        }
+                if in_tag && let Some(field) = &cur_field {
+                    if field == b"Key" {
+                        key = Some(text.into_owned());
+                    } else if field == b"Value" {
+                        value = Some(text.into_owned());
                     }
                 }
             }
@@ -732,19 +726,17 @@ pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, Error> {
                 }
             }
             Sax::Text(text) => {
-                if in_rule {
-                    if let Some(field) = &cur_field {
-                        match field.as_slice() {
-                            b"AllowedOrigin" => rule.allowed_origins.push(text.into_owned()),
-                            b"AllowedMethod" => rule.allowed_methods.push(text.into_owned()),
-                            b"AllowedHeader" => rule.allowed_headers.push(text.into_owned()),
-                            b"ExposeHeader" => rule.expose_headers.push(text.into_owned()),
-                            b"MaxAgeSeconds" => {
-                                rule.max_age_seconds =
-                                    Some(text.trim().parse::<u32>().map_err(|_| malformed())?);
-                            }
-                            _ => {}
+                if in_rule && let Some(field) = &cur_field {
+                    match field.as_slice() {
+                        b"AllowedOrigin" => rule.allowed_origins.push(text.into_owned()),
+                        b"AllowedMethod" => rule.allowed_methods.push(text.into_owned()),
+                        b"AllowedHeader" => rule.allowed_headers.push(text.into_owned()),
+                        b"ExposeHeader" => rule.expose_headers.push(text.into_owned()),
+                        b"MaxAgeSeconds" => {
+                            rule.max_age_seconds =
+                                Some(text.trim().parse::<u32>().map_err(|_| malformed())?);
                         }
+                        _ => {}
                     }
                 }
             }

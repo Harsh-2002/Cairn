@@ -389,13 +389,12 @@ impl ReplicationEngine {
                         })?
                         .iter()
                         .any(|claim| claim.id == entry.id)
+                        && let Err(error) = self.check_claim_update(outcome)
                     {
-                        if let Err(error) = self.check_claim_update(outcome) {
-                            self.claim_failures
-                                .renewal
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Err(error);
-                        }
+                        self.claim_failures
+                            .renewal
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(error);
                     }
                 }
             }

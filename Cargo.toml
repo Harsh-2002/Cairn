@@ -6,7 +6,7 @@ exclude = ["reference", "web"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/Harsh-2002/Cairn"
 authors = ["The Cairn authors"]
@@ -54,9 +54,9 @@ rustls-pemfile = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "aws-lc-rs", "webpki-roots"] }
 
 # --- storage ---
-rusqlite = { version = "0.32" }
+rusqlite = { version = "0.41", features = ["fallible_uint"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.25"
+r2d2_sqlite = "0.36"
 
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }

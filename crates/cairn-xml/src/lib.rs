@@ -434,10 +434,10 @@ pub fn list_objects_v1(
             // In the V1 form, NextMarker is only meaningful when a delimiter is present, but
             // S3 emits it whenever the result is truncated; mirror that. It is a plain object
             // key (not an opaque token), so it is encoded along with the other key fields.
-            if page.truncated {
-                if let Some(next) = &page.next_cursor {
-                    leaf_enc(w, "NextMarker", next, encoding);
-                }
+            if page.truncated
+                && let Some(next) = &page.next_cursor
+            {
+                leaf_enc(w, "NextMarker", next, encoding);
             }
             for item in &page.items {
                 write_contents(w, item, encoding);
@@ -876,29 +876,29 @@ pub fn get_object_attributes(
                     Ok(())
                 })?;
             }
-            if selection.object_parts {
-                if let Some(page) = parts {
-                    w.create_element("ObjectParts").write_inner_content(|w| {
-                        leaf(w, "IsTruncated", &page.is_truncated.to_string());
-                        leaf(w, "MaxParts", &page.max_parts.to_string());
-                        if let Some(next) = page.next_marker {
-                            leaf(w, "NextPartNumberMarker", &next.to_string());
-                        }
-                        if page.marker > 0 {
-                            leaf(w, "PartNumberMarker", &page.marker.to_string());
-                        }
-                        leaf(w, "PartsCount", &page.parts.len().to_string());
-                        leaf(w, "TotalPartsCount", &page.total.to_string());
-                        for (number, size) in page.parts {
-                            w.create_element("Part").write_inner_content(|w| {
-                                leaf(w, "PartNumber", &number.to_string());
-                                leaf(w, "Size", &size.to_string());
-                                Ok(())
-                            })?;
-                        }
-                        Ok(())
-                    })?;
-                }
+            if selection.object_parts
+                && let Some(page) = parts
+            {
+                w.create_element("ObjectParts").write_inner_content(|w| {
+                    leaf(w, "IsTruncated", &page.is_truncated.to_string());
+                    leaf(w, "MaxParts", &page.max_parts.to_string());
+                    if let Some(next) = page.next_marker {
+                        leaf(w, "NextPartNumberMarker", &next.to_string());
+                    }
+                    if page.marker > 0 {
+                        leaf(w, "PartNumberMarker", &page.marker.to_string());
+                    }
+                    leaf(w, "PartsCount", &page.parts.len().to_string());
+                    leaf(w, "TotalPartsCount", &page.total.to_string());
+                    for (number, size) in page.parts {
+                        w.create_element("Part").write_inner_content(|w| {
+                            leaf(w, "PartNumber", &number.to_string());
+                            leaf(w, "Size", &size.to_string());
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })?;
             }
             if selection.storage_class {
                 leaf(w, "StorageClass", storage_class_str(storage_class));

@@ -306,10 +306,11 @@ pub async fn handle(
     // A browser preflights the exact presigned data URL with OPTIONS, which cannot itself verify a
     // signature minted for the eventual GET/PUT/etc. The signed console-origin query marker grants
     // only CORS metadata (never S3 authorization), so answer this narrow preflight before auth.
-    if route == ListenerRoute::S3 && method == Method::OPTIONS {
-        if let Some(response) = console_presign_preflight(&raw_path, &query_str, &headers) {
-            return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
-        }
+    if route == ListenerRoute::S3
+        && method == Method::OPTIONS
+        && let Some(response) = console_presign_preflight(&raw_path, &query_str, &headers)
+    {
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
 
     // Persistent public-read ("share") URLs: GET|HEAD /share/{token} — unauthenticated, resolved by
@@ -361,12 +362,13 @@ pub async fn handle(
         return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
     let mut authenticated_from_cookie = false;
-    if listener_role.is_console() && !is_login && !headers.iter().any(|(k, _)| k == "authorization")
+    if listener_role.is_console()
+        && !is_login
+        && !headers.iter().any(|(k, _)| k == "authorization")
+        && let Some(token) = session_cookie_token(&headers)
     {
-        if let Some(token) = session_cookie_token(&headers) {
-            headers.push(("authorization".to_owned(), format!("Bearer {token}")));
-            authenticated_from_cookie = true;
-        }
+        headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+        authenticated_from_cookie = true;
     }
 
     // SameSite is a SITE boundary, not an ORIGIN boundary: the data and control listeners on two
@@ -596,15 +598,14 @@ pub async fn handle(
         // Console operations that page or delete object rows read the index directly. Fold any
         // acknowledged write that is still in flight first, so a just-written object is listed and
         // a force-empty cannot miss a row that has not landed yet.
-        if control_observes_objects(&method, subpath) {
-            if let Some(overlay) = &stack.overlay {
-                if let Err(error) = overlay.drain().await {
-                    return render_control_response(cairn_control::ControlResponse::error(
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("object index is catching up: {error}"),
-                    ));
-                }
-            }
+        if control_observes_objects(&method, subpath)
+            && let Some(overlay) = &stack.overlay
+            && let Err(error) = overlay.drain().await
+        {
+            return render_control_response(cairn_control::ControlResponse::error(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                &format!("object index is catching up: {error}"),
+            ));
         }
         let resp = stack
             .control
@@ -628,10 +629,10 @@ pub async fn handle(
             let (content_type, bytes) = cairn_web::spa_shell();
             return web_asset_response(content_type, bytes.into_owned(), api_origin.as_deref());
         }
-        if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty()) {
-            if let Some((content_type, bytes)) = cairn_web::asset(rel) {
-                return web_asset_response(content_type, bytes.into_owned(), api_origin.as_deref());
-            }
+        if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty())
+            && let Some((content_type, bytes)) = cairn_web::asset(rel)
+        {
+            return web_asset_response(content_type, bytes.into_owned(), api_origin.as_deref());
         }
         // The classifier checked the same immutable embedded bundle; keep a fail-closed fallback in
         // case that invariant ever changes.
@@ -1497,16 +1498,16 @@ async fn presign(
         }
         extra_signed_headers.push((name, value));
     }
-    if http_method == "PUT" {
-        if let Some(ct) = &req.content_type {
-            if extra_signed_headers
-                .iter()
-                .any(|(name, _)| name == "content-type")
-            {
-                return json_status(400, r#"{"error":"duplicate content-type header"}"#);
-            }
-            extra_signed_headers.push(("content-type".to_owned(), ct.clone()));
+    if http_method == "PUT"
+        && let Some(ct) = &req.content_type
+    {
+        if extra_signed_headers
+            .iter()
+            .any(|(name, _)| name == "content-type")
+        {
+            return json_status(400, r#"{"error":"duplicate content-type header"}"#);
         }
+        extra_signed_headers.push(("content-type".to_owned(), ct.clone()));
     }
 
     let api = match stack
@@ -1963,10 +1964,10 @@ async fn serve_share(stack: &AppStack, token: &str, read: ShareRead<'_>) -> Resp
     if row.revoked_at.is_some() {
         return share_err(410, r#"{"error":"this share has been revoked"}"#);
     }
-    if let Some(exp) = row.expires_at {
-        if SystemClock::new().now().as_millis() > exp.0 {
-            return share_err(410, r#"{"error":"this share has expired"}"#);
-        }
+    if let Some(exp) = row.expires_at
+        && SystemClock::new().now().as_millis() > exp.0
+    {
+        return share_err(410, r#"{"error":"this share has expired"}"#);
     }
 
     // A least-privilege synthetic principal: a member whose ONLY grant is reading this one key. As
@@ -2178,17 +2179,16 @@ pub(crate) fn route_request(
     host: &str,
     raw_path: &str,
 ) -> Result<(Option<BucketName>, Option<ObjectKey>), Error> {
-    if let Some(domain) = s3_domain {
-        if let Some(bucket) = vhost_bucket(host, domain) {
-            if let Ok(b) = BucketName::parse(&bucket) {
-                let key = raw_path.strip_prefix('/').unwrap_or(raw_path);
-                let key = match (!key.is_empty()).then_some(key) {
-                    Some(k) => Some(parse_key(&pct_decode(k))?),
-                    None => None,
-                };
-                return Ok((Some(b), key));
-            }
-        }
+    if let Some(domain) = s3_domain
+        && let Some(bucket) = vhost_bucket(host, domain)
+        && let Ok(b) = BucketName::parse(&bucket)
+    {
+        let key = raw_path.strip_prefix('/').unwrap_or(raw_path);
+        let key = match (!key.is_empty()).then_some(key) {
+            Some(k) => Some(parse_key(&pct_decode(k))?),
+            None => None,
+        };
+        return Ok((Some(b), key));
     }
     route_path(raw_path)
 }
@@ -2539,12 +2539,13 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;

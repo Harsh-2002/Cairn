@@ -401,11 +401,11 @@ fn writer_loop(
         drain_available(&mut rx, &mut batch, &mut deferred, queue_depth);
 
         // Optional linger to enlarge the batch under bursty load.
-        if let Some(d) = linger {
-            if batch.len() < MAX_BATCH {
-                std::thread::sleep(d);
-                drain_available(&mut rx, &mut batch, &mut deferred, queue_depth);
-            }
+        if let Some(d) = linger
+            && batch.len() < MAX_BATCH
+        {
+            std::thread::sleep(d);
+            drain_available(&mut rx, &mut batch, &mut deferred, queue_depth);
         }
 
         commit_batch(

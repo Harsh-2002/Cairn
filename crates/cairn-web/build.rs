@@ -22,13 +22,12 @@ fn main() {
     let dist = Path::new(&manifest).join("../../web/dist");
     let index = dist.join("index.html");
 
-    if !index.exists() {
-        if let Err(e) =
+    if !index.exists()
+        && let Err(e) =
             std::fs::create_dir_all(&dist).and_then(|()| std::fs::write(&index, PLACEHOLDER))
-        {
-            // Don't fail the build on a read-only tree; rust_embed will surface the real error.
-            println!("cargo:warning=cairn-web: could not scaffold placeholder web/dist: {e}");
-        }
+    {
+        // Don't fail the build on a read-only tree; rust_embed will surface the real error.
+        println!("cargo:warning=cairn-web: could not scaffold placeholder web/dist: {e}");
     }
 
     // Re-embed whenever the bundle changes (e.g. a later `npm run build` replaces the placeholder).

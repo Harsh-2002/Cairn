@@ -93,7 +93,9 @@ pub(crate) struct ObjectWriteTimings {
 
 impl ObjectWriteTimings {
     pub(crate) fn sample(&self) -> bool {
-        self.next.fetch_add(1, Ordering::Relaxed) % OBJECT_WRITE_SAMPLE_EVERY == 0
+        self.next
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(OBJECT_WRITE_SAMPLE_EVERY)
     }
 
     pub(crate) fn start(&self, stage: ObjectWriteStage) -> ObjectWriteTimer<'_> {

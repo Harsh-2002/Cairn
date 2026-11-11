@@ -361,17 +361,15 @@ pub fn reserve(
     }
     if let StorageWriteTarget::Part { upload_id, .. }
     | StorageWriteTarget::Completion { upload_id, .. } = &plan.target
-    {
-        if let Some(row) = q(
+        && let Some(row) = q(
             db,
             "SELECT bucket_name FROM multipart_uploads WHERE id=?1",
             vec![text(upload_id.as_str())],
         )?
         .first()
-            && string(row, 0)? != bucket.as_str()
-        {
-            return Err(invalid("storage multipart routing mismatch"));
-        }
+        && string(row, 0)? != bucket.as_str()
+    {
+        return Err(invalid("storage multipart routing mismatch"));
     }
     for path in &plan.paths {
         if referenced(db, &path.path)? || !q(db,

@@ -1461,8 +1461,8 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // version row for this (the old stamp_version_status did), because that forces is_latest
             // and would demote a newer version written during the ship window or resurrect one
             // deleted meanwhile (audit 2026-07).
-            if next_attempt_at.is_none() {
-                if let Some((bucket, key, version)) = conn
+            if next_attempt_at.is_none()
+                && let Some((bucket, key, version)) = conn
                     .query_row(
                         "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
                         params![id],
@@ -1476,14 +1476,13 @@ fn apply_inner(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     )
                     .optional()
                     .map_err(engine_err)?
-                {
-                    conn.execute(
+            {
+                conn.execute(
                         "UPDATE object_versions SET replication_status=?4 \
                          WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
                         params![bucket, key, version, repl_status_str(cairn_types::meta::ReplicationStatus::Failed)],
                     )
                     .map_err(engine_err)?;
-                }
             }
             Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }

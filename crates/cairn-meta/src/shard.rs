@@ -409,19 +409,17 @@ impl MetadataStore for ShardedMetadataStore {
                 | Mutation::ReleaseMultipartCleanup { .. }
                 | Mutation::ReleaseMultipartUploadCleanups { .. }
                 | Mutation::RecoverMultipartStagingAccounting { .. }
-        ) {
-            if let Some(state) = self
-                .storage_baseline_states()
-                .await?
-                .into_iter()
-                .find(|state| state.legacy_accounting_hold)
-            {
-                return Ok(MutationOutcome::MultipartAccountingHeld {
-                    baseline_id: state.baseline_id.ok_or_else(|| {
-                        MetaError::Engine("held baseline identity missing".into())
-                    })?,
-                });
-            }
+        ) && let Some(state) = self
+            .storage_baseline_states()
+            .await?
+            .into_iter()
+            .find(|state| state.legacy_accounting_hold)
+        {
+            return Ok(MutationOutcome::MultipartAccountingHeld {
+                baseline_id: state
+                    .baseline_id
+                    .ok_or_else(|| MetaError::Engine("held baseline identity missing".into()))?,
+            });
         }
         if matches!(
             &mutation,
