@@ -2424,12 +2424,10 @@ async fn lifecycle_loop(
                 .meta
                 .get_bucket_config(&b.name, ConfigAspect::Lifecycle)
                 .await
+                && let Ok(rules) = cairn_lifecycle::parse_lifecycle(doc.0.as_bytes())
+                && !rules.is_empty()
             {
-                if let Ok(rules) = cairn_lifecycle::parse_lifecycle(doc.0.as_bytes()) {
-                    if !rules.is_empty() {
-                        configs.push(BucketLifecycle::new(b.name, rules));
-                    }
-                }
+                configs.push(BucketLifecycle::new(b.name, rules));
             }
         }
         if configs.is_empty() {
@@ -2476,12 +2474,10 @@ async fn ttl_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watch:
                 .meta
                 .get_bucket_config(&bucket.name, ConfigAspect::ObjectTtl)
                 .await
-            {
-                if serde_json::from_str::<ObjectTtlConfig>(&doc.0)
+                && serde_json::from_str::<ObjectTtlConfig>(&doc.0)
                     .is_ok_and(|config| config.enabled)
-                {
-                    ttl_buckets.push(bucket.name);
-                }
+            {
+                ttl_buckets.push(bucket.name);
             }
         }
         if ttl_buckets.is_empty() {

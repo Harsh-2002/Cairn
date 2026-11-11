@@ -310,24 +310,19 @@ impl S3Service {
             Ok(resp) => resp,
             Err(e) => error_response(&e, &resource, &request_id),
         };
-        if let Some((origin, method, bucket)) = cors_ctx {
-            if let Ok(Some(doc)) = self
+        if let Some((origin, method, bucket)) = cors_ctx
+            && let Ok(Some(doc)) = self
                 .meta
                 .get_bucket_config(&bucket, ConfigAspect::Cors)
                 .await
-            {
-                if let Ok(rules) = cairn_xml::parse_cors_configuration(doc.0.as_bytes()) {
-                    if let Some((allow_origin, expose)) =
-                        cors_actual_headers(&rules, &origin, &method)
-                    {
-                        resp = resp
-                            .with_header("access-control-allow-origin", allow_origin)
-                            .with_header("vary", "Origin");
-                        if let Some(expose) = expose {
-                            resp = resp.with_header("access-control-expose-headers", expose);
-                        }
-                    }
-                }
+            && let Ok(rules) = cairn_xml::parse_cors_configuration(doc.0.as_bytes())
+            && let Some((allow_origin, expose)) = cors_actual_headers(&rules, &origin, &method)
+        {
+            resp = resp
+                .with_header("access-control-allow-origin", allow_origin)
+                .with_header("vary", "Origin");
+            if let Some(expose) = expose {
+                resp = resp.with_header("access-control-expose-headers", expose);
             }
         }
         resp
@@ -866,10 +861,9 @@ impl S3Service {
         if let Some(cl) = req
             .header("content-length")
             .and_then(|s| s.parse::<u64>().ok())
+            && cl > self.max_object_size
         {
-            if cl > self.max_object_size {
-                return Err(Error::EntityTooLarge);
-            }
+            return Err(Error::EntityTooLarge);
         }
         let content_type = req
             .header("content-type")
@@ -1058,10 +1052,10 @@ impl S3Service {
                 },
             )
             .await;
-        if admitted.is_ok() {
-            if let Some(timer) = admission_timer {
-                timer.complete();
-            }
+        if admitted.is_ok()
+            && let Some(timer) = admission_timer
+        {
+            timer.complete();
         }
         let (creation, mut write_guard) = admitted?;
         let blob_timer = sampled.then(|| self.put_timings.start(PutStage::BlobStage));
@@ -1070,10 +1064,10 @@ impl S3Service {
             .stage(creation, body, opts)
             .await
             .map_err(map_stage_err);
-        if staged_result.is_ok() {
-            if let Some(timer) = blob_timer {
-                timer.complete();
-            }
+        if staged_result.is_ok()
+            && let Some(timer) = blob_timer
+        {
+            timer.complete();
         }
         let mut staged = staged_result?;
         let prep_timer = sampled.then(|| self.put_timings.start(PutStage::PublicationPrep));
@@ -1287,10 +1281,10 @@ impl S3Service {
         } else {
             self.meta.submit(mutation).await
         };
-        if matches!(&publication, Ok(MutationOutcome::Put { .. })) {
-            if let Some(timer) = publication_timer {
-                timer.complete();
-            }
+        if matches!(&publication, Ok(MutationOutcome::Put { .. }))
+            && let Some(timer) = publication_timer
+        {
+            timer.complete();
         }
         match publication {
             Ok(MutationOutcome::Put { version_id, .. }) => {
@@ -6388,12 +6382,12 @@ fn requested_sse(req: &S3Request) -> Result<SseRequest> {
     // response headers, so cap the length (2048 covers any real KMS key id / alias / ARN) and reject
     // control characters — defence-in-depth against a pathological id bloating rows or injecting into
     // a header.
-    if let Some(id) = &key_id {
-        if id.len() > 2048 || id.chars().any(char::is_control) {
-            return Err(Error::InvalidArgument(
-                "x-amz-server-side-encryption-aws-kms-key-id is malformed".to_owned(),
-            ));
-        }
+    if let Some(id) = &key_id
+        && (id.len() > 2048 || id.chars().any(char::is_control))
+    {
+        return Err(Error::InvalidArgument(
+            "x-amz-server-side-encryption-aws-kms-key-id is malformed".to_owned(),
+        ));
     }
     let bucket_key_enabled = req
         .header("x-amz-server-side-encryption-bucket-key-enabled")
@@ -6815,31 +6809,30 @@ fn check_copy_source_conditions(req: &S3Request, src: &ObjectVersionRow) -> Resu
     let etag = src.etag.as_str();
     let last_modified = src.updated_at;
 
-    if let Some(im) = req.header("x-amz-copy-source-if-match") {
-        if im.trim() != "*" && !im.split(',').any(|t| t.trim().trim_matches('"') == etag) {
-            return Err(Error::PreconditionFailed);
-        }
+    if let Some(im) = req.header("x-amz-copy-source-if-match")
+        && im.trim() != "*"
+        && !im.split(',').any(|t| t.trim().trim_matches('"') == etag)
+    {
+        return Err(Error::PreconditionFailed);
     }
-    if let Some(inm) = req.header("x-amz-copy-source-if-none-match") {
-        if inm.trim() == "*" || inm.split(',').any(|t| t.trim().trim_matches('"') == etag) {
-            return Err(Error::PreconditionFailed);
-        }
+    if let Some(inm) = req.header("x-amz-copy-source-if-none-match")
+        && (inm.trim() == "*" || inm.split(',').any(|t| t.trim().trim_matches('"') == etag))
+    {
+        return Err(Error::PreconditionFailed);
     }
     if let Some(date) = req
         .header("x-amz-copy-source-if-unmodified-since")
         .and_then(parse_http_date)
+        && last_modified.as_secs() > date.as_secs()
     {
-        if last_modified.as_secs() > date.as_secs() {
-            return Err(Error::PreconditionFailed);
-        }
+        return Err(Error::PreconditionFailed);
     }
     if let Some(date) = req
         .header("x-amz-copy-source-if-modified-since")
         .and_then(parse_http_date)
+        && last_modified.as_secs() <= date.as_secs()
     {
-        if last_modified.as_secs() <= date.as_secs() {
-            return Err(Error::PreconditionFailed);
-        }
+        return Err(Error::PreconditionFailed);
     }
     Ok(())
 }
@@ -7187,10 +7180,10 @@ fn delete_objects_error_fields(
 /// reclaimed by the stager when its body stream errors).
 fn map_stage_err(e: cairn_types::error::BlobError) -> Error {
     use cairn_types::error::{BlobError, BodyError};
-    if let BlobError::Body(BodyError::Transport(msg)) = &e {
-        if crate::chunked::is_signature_failure(msg) {
-            return Error::SignatureDoesNotMatch;
-        }
+    if let BlobError::Body(BodyError::Transport(msg)) = &e
+        && crate::chunked::is_signature_failure(msg)
+    {
+        return Error::SignatureDoesNotMatch;
     }
     e.into()
 }
@@ -7235,18 +7228,17 @@ fn streaming_body(
 
 fn requested_checksums(req: &S3Request) -> ChecksumSet {
     let mut algos = Vec::new();
-    if let Some(a) = req.header("x-amz-sdk-checksum-algorithm") {
-        if let Some(alg) = checksum_algo(a) {
-            algos.push(alg);
-        }
+    if let Some(a) = req.header("x-amz-sdk-checksum-algorithm")
+        && let Some(alg) = checksum_algo(a)
+    {
+        algos.push(alg);
     }
     for (k, _) in &req.headers {
-        if let Some(name) = k.strip_prefix("x-amz-checksum-") {
-            if let Some(alg) = checksum_algo(name) {
-                if !algos.contains(&alg) {
-                    algos.push(alg);
-                }
-            }
+        if let Some(name) = k.strip_prefix("x-amz-checksum-")
+            && let Some(alg) = checksum_algo(name)
+            && !algos.contains(&alg)
+        {
+            algos.push(alg);
         }
     }
     ChecksumSet(algos)
@@ -7372,13 +7364,12 @@ fn cors_origin_match(pattern: &str, origin: &str) -> Option<String> {
     if pattern == origin {
         return Some(origin.to_owned());
     }
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        if origin.len() >= prefix.len() + suffix.len()
-            && origin.starts_with(prefix)
-            && origin.ends_with(suffix)
-        {
-            return Some(origin.to_owned());
-        }
+    if let Some((prefix, suffix)) = pattern.split_once('*')
+        && origin.len() >= prefix.len() + suffix.len()
+        && origin.starts_with(prefix)
+        && origin.ends_with(suffix)
+    {
+        return Some(origin.to_owned());
     }
     None
 }
@@ -7591,10 +7582,10 @@ fn plan_multipart_checksum(
     // If the client sent the composite value on Complete, a mismatch means our composition disagrees
     // with what the SDK will validate on GET — surface it now as a BadDigest rather than storing a
     // value the SDK will later reject.
-    if let Some(expected) = client_value {
-        if expected != value {
-            return Err(Error::BadDigest);
-        }
+    if let Some(expected) = client_value
+        && expected != value
+    {
+        return Err(Error::BadDigest);
     }
     Ok(ChecksumPlan::Composite(ChecksumValue {
         algorithm: algo,
@@ -7917,13 +7908,13 @@ fn declared_multipart_size(req: &S3Request, ceiling: u64) -> Result<u64> {
             Error::InvalidRequest("UploadPart requires an exact Content-Length".to_owned())
         })?;
         let content = parse_length(content)?;
-        if let Some(decoded) = req.header("x-amz-decoded-content-length") {
-            if parse_length(decoded)? != content {
-                return Err(Error::InvalidRequest(
+        if let Some(decoded) = req.header("x-amz-decoded-content-length")
+            && parse_length(decoded)? != content
+        {
+            return Err(Error::InvalidRequest(
                     "x-amz-decoded-content-length conflicts with Content-Length on a non-streaming UploadPart"
                         .to_owned(),
                 ));
-            }
         }
         content
     };

@@ -1472,10 +1472,10 @@ impl BlobStore for LocalBlobStore {
             false,
         )
         .await;
-        if let Some(timer) = timer {
-            if outcome.is_ok() {
-                timer.complete();
-            }
+        if let Some(timer) = timer
+            && outcome.is_ok()
+        {
+            timer.complete();
         }
         drop(raw_body_breakdown);
         let write = match outcome {

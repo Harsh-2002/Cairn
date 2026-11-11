@@ -8799,12 +8799,11 @@ impl cairn_types::traits::AuthorizationEngine for DenyKey {
             input.action,
             Action::DeleteObject | Action::DeleteObjectVersion
         );
-        if is_delete {
-            if let Resource::Object { key, .. } = &input.resource {
-                if key.as_str() == self.0 {
-                    return Decision::Deny(DenyReason::DefaultDeny);
-                }
-            }
+        if is_delete
+            && let Resource::Object { key, .. } = &input.resource
+            && key.as_str() == self.0
+        {
+            return Decision::Deny(DenyReason::DefaultDeny);
         }
         Decision::Allow
     }

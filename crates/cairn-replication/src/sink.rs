@@ -1009,13 +1009,13 @@ impl HttpS3Sink {
         // destination reproduces the source's grants. Absent when there is no ACL (and never on the
         // delete-marker path). Serialization cannot realistically fail for an `Acl`; if it somehow
         // did we simply omit the header (the destination then keeps its default ownership).
-        if let Some(acl) = &object.acl {
-            if let Ok(json) = serde_json::to_vec(acl) {
-                user_headers.push((
-                    format!("x-amz-meta-{REPLICA_ACL_KEY}"),
-                    base64::engine::general_purpose::STANDARD.encode(json),
-                ));
-            }
+        if let Some(acl) = &object.acl
+            && let Ok(json) = serde_json::to_vec(acl)
+        {
+            user_headers.push((
+                format!("x-amz-meta-{REPLICA_ACL_KEY}"),
+                base64::engine::general_purpose::STANDARD.encode(json),
+            ));
         }
 
         // Replicate the stored system response headers so the destination serves identical headers —

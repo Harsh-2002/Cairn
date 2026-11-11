@@ -212,15 +212,40 @@ async fn sqlite_full_scan_protects_intents_and_claimed_debt() {
 }
 
 #[cfg(feature = "meta-async")]
-#[tokio::test]
-async fn libsql_full_scan_protects_intents_and_claimed_debt() {
-    let store = cairn_meta_async::open_libsql_in_memory().await.unwrap();
-    assert_full_scan_protects_journal(
-        &store,
-        &store.reconcile_oracle(),
-        BucketName::parse("journal-oracle").unwrap(),
-    )
-    .await;
+#[test]
+fn libsql_full_scan_protects_intents_and_claimed_debt() {
+    // libSQL and rusqlite both bundle SQLite and share its C symbols in this all-features test
+    // binary. libSQL requires `sqlite3_config(SERIALIZED)` before SQLite is initialized; another
+    // test initializing rusqlite first makes that assertion fail. Run this one test in a fresh
+    // process so libSQL is the first SQLite user.
+    const CHILD_ENV: &str = "CAIRN_LIBSQL_FULL_SCAN_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage_recovery_tests::libsql_full_scan_protects_intents_and_claimed_debt",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn isolated libSQL test process");
+        assert!(status.success(), "isolated libSQL test failed: {status}");
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = cairn_meta_async::open_libsql_in_memory().await.unwrap();
+        assert_full_scan_protects_journal(
+            &store,
+            &store.reconcile_oracle(),
+            BucketName::parse("journal-oracle").unwrap(),
+        )
+        .await;
+    });
 }
 
 #[cfg(feature = "meta-async")]

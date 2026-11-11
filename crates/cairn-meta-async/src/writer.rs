@@ -70,11 +70,11 @@ async fn writer_loop(
         drain_available(&mut rx, &mut batch);
 
         // Optional linger to enlarge the batch under bursty load.
-        if let Some(d) = linger {
-            if batch.len() < MAX_BATCH {
-                tokio::time::sleep(d).await;
-                drain_available(&mut rx, &mut batch);
-            }
+        if let Some(d) = linger
+            && batch.len() < MAX_BATCH
+        {
+            tokio::time::sleep(d).await;
+            drain_available(&mut rx, &mut batch);
         }
 
         commit_batch(driver.as_ref(), batch).await;

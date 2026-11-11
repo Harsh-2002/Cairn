@@ -128,14 +128,13 @@ impl AsyncMetadataStore {
 /// a rolled-up CommonPrefix resumes PAST the whole group. Ported from
 /// `cairn-meta/src/store.rs::seek_after` — read the rationale there.
 fn seek_after(prefix: &str, delimiter: Option<&str>, marker: &str) -> Option<String> {
-    if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
-        if let Some(rest) = marker.strip_prefix(prefix) {
-            if let Some(idx) = rest.find(delim) {
-                let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
-                if cp == marker {
-                    return prefix_upper_bound(marker);
-                }
-            }
+    if let Some(delim) = delimiter.filter(|d| !d.is_empty())
+        && let Some(rest) = marker.strip_prefix(prefix)
+        && let Some(idx) = rest.find(delim)
+    {
+        let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
+        if cp == marker {
+            return prefix_upper_bound(marker);
         }
     }
     Some(successor(marker))
@@ -157,10 +156,10 @@ async fn list_impl(
 
     // Inclusive lower bound = max(prefix, cursor, exclusive-start(start_after)).
     let mut seek = prefix.clone();
-    if let Some(c) = &query.cursor {
-        if c.as_str() > seek.as_str() {
-            seek = c.clone();
-        }
+    if let Some(c) = &query.cursor
+        && c.as_str() > seek.as_str()
+    {
+        seek = c.clone();
     }
     if let Some(sa) = &query.start_after {
         match seek_after(&prefix, query.delimiter.as_deref(), sa) {

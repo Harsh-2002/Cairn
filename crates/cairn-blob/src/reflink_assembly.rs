@@ -94,7 +94,7 @@ pub(crate) fn place(
                 "part length does not match metadata".into(),
             ));
         }
-        let aligned = offset % REFLINK_ALIGN == 0 && part.size % REFLINK_ALIGN == 0;
+        let aligned = offset.is_multiple_of(REFLINK_ALIGN) && part.size % REFLINK_ALIGN == 0;
         if aligned {
             hash_part(&source, &mut hashers, part.size, &mut buffer)?;
             // Hashing succeeded, so a failed clone can fall back to a plain copy of the same

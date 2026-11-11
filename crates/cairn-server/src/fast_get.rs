@@ -640,8 +640,8 @@ fn record_request_metrics(
     if resp_bytes > 0 {
         metrics::counter!("cairn_bytes_sent_total").increment(resp_bytes);
     }
-    if request_metrics_enabled {
-        if let Some((op, bucket)) =
+    if request_metrics_enabled
+        && let Some((op, bucket)) =
             // The sendfile fast path is data-plane only (S3 object GET), never the console listener.
             crate::server::classify_operation(
                 FAST_PATH_LISTENER_ROLE,
@@ -649,20 +649,19 @@ fn record_request_metrics(
                 path,
                 query,
             )
-        {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            stack.request_metrics.record(
-                &op,
-                &bucket,
-                status_code,
-                elapsed.as_millis() as u64,
-                0,
-                resp_bytes,
-                now_secs,
-            );
-        }
+    {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        stack.request_metrics.record(
+            &op,
+            &bucket,
+            status_code,
+            elapsed.as_millis() as u64,
+            0,
+            resp_bytes,
+            now_secs,
+        );
     }
 }
 

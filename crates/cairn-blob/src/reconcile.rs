@@ -190,10 +190,10 @@ pub(super) async fn run(
                 now,
                 &lease,
             ));
-            if inflight.len() >= opts.parallelism.max(1) {
-                if let Some(part) = inflight.next().await {
-                    merge_report(&mut report, part?);
-                }
+            if inflight.len() >= opts.parallelism.max(1)
+                && let Some(part) = inflight.next().await
+            {
+                merge_report(&mut report, part?);
             }
         }
     }

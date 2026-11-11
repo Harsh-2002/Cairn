@@ -80,13 +80,13 @@ impl SourceReader for FakeSource {
     async fn get_object(&self, bucket: &str, key: &str) -> Result<SourceObject, ImportError> {
         {
             let mut fails = self.fail_get.lock().unwrap();
-            if let Some(n) = fails.get_mut(key) {
-                if *n > 0 {
-                    *n -= 1;
-                    return Err(ImportError::Retryable(
-                        "scripted transient failure".to_owned(),
-                    ));
-                }
+            if let Some(n) = fails.get_mut(key)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(ImportError::Retryable(
+                    "scripted transient failure".to_owned(),
+                ));
             }
         }
         let objs = self.data.get(bucket).unwrap();

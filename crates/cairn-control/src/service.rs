@@ -140,19 +140,18 @@ impl ControlResponse {
         // Only error envelopes carry a `request_id` in the body. Detect one structurally rather
         // than by status so a non-2xx success (e.g. 204) is never mis-rewritten: an error body is
         // a JSON object with an `error` string and an (empty) `request_id` placeholder.
-        if !self.body.is_empty() {
-            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&self.body) {
-                if let Some(obj) = v.as_object_mut() {
-                    if obj.contains_key("error") && obj.contains_key("request_id") {
-                        obj.insert(
-                            "request_id".to_owned(),
-                            serde_json::Value::String(id.to_owned()),
-                        );
-                        if let Ok(bytes) = serde_json::to_vec(&v) {
-                            self.body = bytes;
-                        }
-                    }
-                }
+        if !self.body.is_empty()
+            && let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&self.body)
+            && let Some(obj) = v.as_object_mut()
+            && obj.contains_key("error")
+            && obj.contains_key("request_id")
+        {
+            obj.insert(
+                "request_id".to_owned(),
+                serde_json::Value::String(id.to_owned()),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&v) {
+                self.body = bytes;
             }
         }
         self
@@ -2074,17 +2073,16 @@ impl ControlService {
         // Attach the canned replication identity policy when requested, so the dedicated
         // destination credential is minted ready to receive replicated writes (ARCH 20.5). The
         // policy JSON was validated above before any state was touched.
-        if let Some(policy) = replication_policy {
-            if let Err(e) = self
+        if let Some(policy) = replication_policy
+            && let Err(e) = self
                 .meta
                 .submit(Mutation::SetUserPolicy {
                     user_id: user_id.clone(),
                     policy: Some(policy),
                 })
                 .await
-            {
-                return ControlResponse::error_internal(&e.to_string());
-            }
+        {
+            return ControlResponse::error_internal(&e.to_string());
         }
 
         self.record_activity("CreateUser", None, None, principal)
@@ -3824,10 +3822,10 @@ async fn backfill_replication(
         // Wake the worker as each page lands so a large backfill starts draining while it is still
         // enumerating, rather than waiting out the heartbeat (best-effort; the heartbeat is the
         // safety net).
-        if enqueued > 0 {
-            if let Some(w) = &wake {
-                w();
-            }
+        if enqueued > 0
+            && let Some(w) = &wake
+        {
+            w();
         }
         match page.next_cursor {
             Some(c) => cursor = Some(c),

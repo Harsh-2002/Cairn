@@ -63,10 +63,10 @@ fn ipv6_is_internal(ip: Ipv6Addr) -> bool {
     // Unwrap IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible (`::a.b.c.d`) forms
     // and re-check as IPv4 — otherwise `::ffff:169.254.169.254` would sail past the v6 range checks
     // and reach the metadata service. `to_ipv4()` also covers the compatible range.
-    if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4()) {
-        if ipv4_is_internal(v4) {
-            return true;
-        }
+    if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
+        && ipv4_is_internal(v4)
+    {
+        return true;
     }
     ip.is_loopback()                        // ::1
         || ip.is_unspecified()              // ::

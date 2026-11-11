@@ -1232,10 +1232,12 @@ pub(crate) async fn ensure_root_admin(
         .map_err(|e| format!("root admin lookup: {e}"))?;
 
     // Already present, active, admin, and the secret matches the env — nothing to do.
-    if let Some(ub) = &existing {
-        if ub.user.is_active && ub.user.role == Role::Administrator && ub.secret_hash == want_hash {
-            return Ok(());
-        }
+    if let Some(ub) = &existing
+        && ub.user.is_active
+        && ub.user.role == Role::Administrator
+        && ub.secret_hash == want_hash
+    {
+        return Ok(());
     }
 
     let now = clock.now();

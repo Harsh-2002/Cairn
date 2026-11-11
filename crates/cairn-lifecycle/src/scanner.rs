@@ -652,10 +652,10 @@ impl LifecycleScanner {
         for rule in rules {
             // Only the prefix portion of the filter is meaningful for an in-flight upload; it
             // has no committed size or tags yet.
-            if let Some(p) = &rule.filter.prefix {
-                if !session.key.as_str().starts_with(p.as_str()) {
-                    continue;
-                }
+            if let Some(p) = &rule.filter.prefix
+                && !session.key.as_str().starts_with(p.as_str())
+            {
+                continue;
             }
             for action in &rule.actions {
                 if let Action::AbortIncompleteMultipartUpload {
@@ -856,10 +856,10 @@ impl LifecycleScanner {
 /// Filter match for a delete marker: a marker carries no committed size, so size bounds are
 /// ignored and only the prefix (and any tags, which a marker lacks) are honoured.
 fn filter_matches_marker(filter: &Filter, obj: &ObjectSummary, tags: &[(String, String)]) -> bool {
-    if let Some(p) = &filter.prefix {
-        if !obj.key.as_str().starts_with(p.as_str()) {
-            return false;
-        }
+    if let Some(p) = &filter.prefix
+        && !obj.key.as_str().starts_with(p.as_str())
+    {
+        return false;
     }
     for (k, v) in &filter.tags {
         if !tags.iter().any(|(tk, tv)| tk == k && tv == v) {

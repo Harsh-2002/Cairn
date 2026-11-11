@@ -926,13 +926,12 @@ impl Config {
                 )));
             }
         }
-        if let (Some(api), Some(console)) = (&self.api_public_url, &self.console_public_url) {
-            if crate::endpoints::Origin::parse(api) == crate::endpoints::Origin::parse(console) {
-                return Err(ConfigError::Invalid(
-                    "CAIRN_API_PUBLIC_URL and CAIRN_CONSOLE_PUBLIC_URL must be distinct origins"
-                        .into(),
-                ));
-            }
+        if let (Some(api), Some(console)) = (&self.api_public_url, &self.console_public_url)
+            && crate::endpoints::Origin::parse(api) == crate::endpoints::Origin::parse(console)
+        {
+            return Err(ConfigError::Invalid(
+                "CAIRN_API_PUBLIC_URL and CAIRN_CONSOLE_PUBLIC_URL must be distinct origins".into(),
+            ));
         }
         match (&self.tls_cert_path, &self.tls_key_path) {
             (Some(_), None) | (None, Some(_)) => {
@@ -1116,12 +1115,12 @@ impl Config {
         // Fail fast on an unparseable audit cutoff. The value is only consumed by a background loop
         // that first ticks minutes after startup, so without this check a typo would look like a
         // clean boot and then silently produce no gauges at all.
-        if let Some(raw) = self.replication_audit_before.as_deref() {
-            if let Err(e) = crate::replication_audit::parse_cutoff(raw) {
-                return Err(ConfigError::Invalid(format!(
-                    "replication_audit_before: {e}"
-                )));
-            }
+        if let Some(raw) = self.replication_audit_before.as_deref()
+            && let Err(e) = crate::replication_audit::parse_cutoff(raw)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "replication_audit_before: {e}"
+            )));
         }
         if self.events_outbox_retention_secs == 0 {
             return Err(ConfigError::Invalid(
@@ -1223,12 +1222,12 @@ impl Config {
                     )));
                 }
             }
-        } else if let Some(mk) = &self.master_key {
-            if mk.len() != 64 || !mk.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ConfigError::Invalid(
-                    "master_key must be 64 hex characters (a 32-byte key)".into(),
-                ));
-            }
+        } else if let Some(mk) = &self.master_key
+            && (mk.len() != 64 || !mk.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(ConfigError::Invalid(
+                "master_key must be 64 hex characters (a 32-byte key)".into(),
+            ));
         }
         // Validate every environment-configured outbound endpoint before either listener binds.
         // The connector repeats the literal check at every dial (and guards DNS results), but this
@@ -1265,13 +1264,12 @@ impl Config {
         }
         // Validate (but don't bind) the web-console listener address.
         let web = self.console_listen_addr()?;
-        if let Some(web) = web {
-            if web == self.api_addr {
-                return Err(ConfigError::Invalid(
-                    "CAIRN_CONSOLE_ADDR must differ from the S3 API listener (CAIRN_API_ADDR)"
-                        .into(),
-                ));
-            }
+        if let Some(web) = web
+            && web == self.api_addr
+        {
+            return Err(ConfigError::Invalid(
+                "CAIRN_CONSOLE_ADDR must differ from the S3 API listener (CAIRN_API_ADDR)".into(),
+            ));
         }
         Ok(())
     }

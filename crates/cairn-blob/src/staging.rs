@@ -197,10 +197,10 @@ impl Staging {
                         } else {
                             staging.rename_to(&destination)
                         };
-                        if result.is_ok() {
-                            if let Some(timer) = rename_timer {
-                                timer.complete();
-                            }
+                        if result.is_ok()
+                            && let Some(timer) = rename_timer
+                        {
+                            timer.complete();
                         }
                         result
                     })
