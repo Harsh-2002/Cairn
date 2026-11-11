@@ -72,10 +72,13 @@ third-party certification. The measured evidence is in
   pending/claimed/failed and counts completed on the status index. A 2-hour run on the fixed binary
   with a 15-minute idle passed with **140,653 PUTs, 0 errors, 0 mismatches and anonymous RSS
   155.6 → 153.5 MiB (−1.3%)**. The same gate was re-run on the v44 release binary: **137,831 PUTs,
-  0 errors, 0 mismatches, 11,496 verified reads and anonymous RSS 162.4 → 154.1 MiB (−5.2%)**. The
-  owner accepted the 2-hour memory gate. Long runs create their data under `TMPDIR`; point it at a
-  disk-backed directory (the reference host's `/tmp` is a 16 GB tmpfs and a two-node soak fills it).
-  Power-loss testing remains site-specific; measure your own object mix.
+  0 errors, 0 mismatches, 11,496 verified reads and anonymous RSS 162.4 → 154.1 MiB (−5.2%)**.
+  The v44 **24-hour** run then passed with **1,734,228 PUTs, 0 errors, 0 replication mismatches,
+  137,487 verified reads and anonymous RSS 1,368.2 → 1,357.3 MiB (−0.8%)**. The owner accepted the
+  2-hour memory gate; the 24-hour run closes the post-v44 long-duration gate. Long runs create their
+  data under `TMPDIR`; point it at a disk-backed directory (the reference host's `/tmp` is a 16 GB
+  tmpfs and a two-node soak fills it). Power-loss testing remains site-specific; measure your own
+  object mix.
 - **Independent assurance.** The security/architecture review is internal, supplemented by the
   2026-11-08 automated open-source pentest (ZAP, Nuclei, testssl.sh, nmap, ffuf and a SigV4
   authorization matrix). It is **not** a human third-party audit or a certification; see
