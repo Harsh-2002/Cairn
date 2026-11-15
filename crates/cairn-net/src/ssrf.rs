@@ -31,7 +31,8 @@ impl GuardConfig {
 }
 
 /// Whether `ip` is an address Cairn refuses to dial (loopback, private, link-local, ULA,
-/// unspecified, multicast, and IPv4-mapped/compatible/NAT64 forms of those). Returns `false` for
+/// unspecified, multicast, reserved/benchmarking IPv4, site-local, Teredo, documentation, and
+/// IPv4-mapped/compatible/NAT64/6to4 forms of those). Returns `false` for
 /// every address when [`GuardConfig::allow_internal`] is set.
 ///
 /// This is the single source of truth for "internal"; both the connect-time [`GuardedResolver`] and
@@ -54,6 +55,8 @@ fn ipv4_is_internal(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()    // 255.255.255.255
         || ip.is_documentation()// 192.0.2/24, 198.51.100/24, 203.0.113/24 (not real hosts)
         || ip.is_multicast()    // 224.0.0.0/4
+        || v4_in(ip, [240, 0, 0, 0], 4) // 240.0.0.0/4 reserved (future use; includes broadcast)
+        || v4_in(ip, [198, 18, 0, 0], 15) // 198.18.0.0/15 benchmarking
         || ip.octets()[0] == 0  // 0.0.0.0/8 "this network" (includes 0.0.0.0 unspecified)
         || v4_in(ip, [100, 64, 0, 0], 10) // 100.64.0.0/10 carrier-grade NAT
         || v4_in(ip, [192, 0, 0, 0], 24) // 192.0.0.0/24 IETF protocol assignments
@@ -74,6 +77,22 @@ fn ipv6_is_internal(ip: Ipv6Addr) -> bool {
         || v6_in(ip, 0xfc00_u128 << 112, 7) // fc00::/7 unique local
         || v6_in(ip, 0xfe80_u128 << 112, 10) // fe80::/10 link-local
         || nat64_embeds_internal(ip) // 64:ff9b::/96 -> check the embedded IPv4
+        || v6_in(ip, 0x0064_ff9b_0001_u128 << 80, 48) // 64:ff9b:1::/48 local-use NAT64
+        || v6_in(ip, 0, 96)                 // ::/96 deprecated IPv4-compatible (and :: / ::1)
+        || v6_in(ip, 0xfec0_u128 << 112, 10) // fec0::/10 deprecated site-local
+        || v6_in(ip, 0x2001_0000_u128 << 96, 32) // 2001::/32 Teredo (tunnels to arbitrary v4)
+        || v6_in(ip, 0x2001_0db8_u128 << 96, 32) // 2001:db8::/32 documentation
+        || sixtofour_embeds_internal(ip) // 2002::/16 -> check the embedded IPv4
+}
+
+/// 2002::/16 (RFC 3056 6to4) embeds an IPv4 address in bits 16..48; a 6to4 address wrapping an
+/// internal v4 is the same bypass as an IPv4-mapped one, so check the embedded octets.
+fn sixtofour_embeds_internal(ip: Ipv6Addr) -> bool {
+    if !v6_in(ip, 0x2002_u128 << 112, 16) {
+        return false;
+    }
+    let v4 = Ipv4Addr::from(((u128::from(ip) >> 80) & 0xffff_ffff) as u32);
+    ipv4_is_internal(v4)
 }
 
 /// 64:ff9b::/96 (RFC 6052 NAT64) embeds an IPv4 address in its low 32 bits; a NAT64 prefix pointing
@@ -320,7 +339,11 @@ mod tests {
             "100.64.0.1", // CGNAT
             "192.0.0.1",  // IETF protocol
             "255.255.255.255",
-            "224.0.0.1", // multicast
+            "224.0.0.1",  // multicast
+            "198.18.0.1", // benchmarking 198.18.0.0/15
+            "198.19.255.254",
+            "240.0.0.1", // reserved 240.0.0.0/4
+            "250.1.2.3",
         ] {
             assert!(internal(s), "{s} should be blocked");
         }
@@ -335,6 +358,8 @@ mod tests {
             "93.184.216.34",
             "172.15.0.1",
             "172.32.0.1",
+            "198.17.255.255", // just below 198.18.0.0/15
+            "198.20.0.1",     // just above 198.18.0.0/15
         ] {
             assert!(!internal(s), "{s} should be allowed");
         }
@@ -343,17 +368,26 @@ mod tests {
     #[test]
     fn blocks_ipv6_internal_and_mapped_forms() {
         for s in [
-            "::1",                    // loopback
-            "::",                     // unspecified
-            "fc00::1",                // ULA
-            "fd12:3456::1",           // ULA
-            "fe80::1",                // link-local
-            "ff02::1",                // multicast
-            "::ffff:127.0.0.1",       // IPv4-mapped loopback
-            "::ffff:169.254.169.254", // IPv4-mapped metadata — the classic bypass
-            "::ffff:10.0.0.1",        // IPv4-mapped private
-            "64:ff9b::7f00:1",        // NAT64 embedding 127.0.0.1
-            "64:ff9b::a9fe:a9fe",     // NAT64 embedding 169.254.169.254
+            "::1",                                  // loopback
+            "::",                                   // unspecified
+            "fc00::1",                              // ULA
+            "fd12:3456::1",                         // ULA
+            "fe80::1",                              // link-local
+            "ff02::1",                              // multicast
+            "::ffff:127.0.0.1",                     // IPv4-mapped loopback
+            "::ffff:169.254.169.254",               // IPv4-mapped metadata — the classic bypass
+            "::ffff:10.0.0.1",                      // IPv4-mapped private
+            "64:ff9b::7f00:1",                      // NAT64 embedding 127.0.0.1
+            "64:ff9b::a9fe:a9fe",                   // NAT64 embedding 169.254.169.254
+            "64:ff9b:1::808:808",                   // local-use NAT64, blocked outright
+            "2002:7f00:1::",                        // 6to4 embedding 127.0.0.1
+            "2002:a9fe:a9fe::1",                    // 6to4 embedding 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+            "fec0::1",                              // deprecated site-local
+            "feff::1",                              // top of fec0::/10
+            "2001:db8::1",                          // documentation
+            "::8.8.8.8",                            // deprecated IPv4-compatible, blocked outright
+            "::808:808",                            // same, compact form
         ] {
             assert!(internal(s), "{s} should be blocked");
         }
@@ -366,6 +400,11 @@ mod tests {
             "2001:4860:4860::8888", // public (Google)
             "::ffff:8.8.8.8",       // IPv4-mapped public
             "64:ff9b::8080:8080",   // NAT64 embedding 128.128.128.128 (public)
+            "2002:0808:0808::",     // 6to4 embedding 8.8.8.8 (public)
+            "2001:1::1",            // just outside Teredo 2001::/32
+            "2001:db9::1",          // just outside the documentation prefix
+            "64:ff9b:2::1",         // just outside the local-use NAT64 /48
+            "fe00::1",              // outside fec0::/10 (and fe80::/10)
         ] {
             assert!(!internal(s), "{s} should be allowed");
         }
