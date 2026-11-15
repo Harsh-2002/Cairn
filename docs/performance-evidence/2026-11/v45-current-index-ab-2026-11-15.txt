@@ -1,0 +1,31 @@
+# Schema v45 slim current-version index: v44 vs v45 A/B (2026-11-15)
+# Host: 6-core i5-9400T, shared homelab (load average 10-21 during runs). Warp v1.8.2 RDMA build sha256 118c359e4bafa292a61712b22141d0283855f38686a96a4aa4b95f7a9e59b488.
+# Cairn v44 = origin/main 9e7a95f sha256 1339e9c8d1faf16fe689e4dec9d9716301532f41ed9c58044f713168a09bd482
+# Cairn v45 = perf/v45-latest-index 9f2509f sha256 201d25e303dc8307d1451e6df2bda7b47a7609311362faea644d347e24d1be80
+# Harness: conformance/rustfs_compare.py --engine cairn --pairs 1 --duration 12, strict settings (CAIRN_META_SYNCHRONOUS=full, shards=1, linger=0). Unversioned bucket.
+
+## delete_4k (100,000-object prefill, --list-existing), obj/s, errors=0 in every arm
+v44-delete_4k-r1 Average: 2167.12
+v45-delete_4k-r1 Average: 2257.21
+v45-delete_4k-r2 Average: 1729.04
+v44-delete_4k-r2 Average: 1946.92
+
+## list_4k, round 1-2 (obj/s)
+v44-list_4k-r1 Average: 142928.91
+v45-list_4k-r1 Average: 118143.07
+v45-list_4k-r2 Average: 105223.02
+v44-list_4k-r2 Average: 111953.15
+
+## list_4k, six alternating pairs (obj/s)
+v44 1 Average: 112089.86
+v45 1 Average: 118609.85
+v45 2 Average: 125593.82
+v44 2 Average: 115733.35
+v44 3 Average: 95755.08
+v45 3 Average: 112298.76
+v45 4 Average: 112990.27
+v44 4 Average: 141817.12
+v44 5 Average: 123347.62
+v45 5 Average: 108434.27
+v45 6 Average: 109751.16
+v44 6 Average: 113573.54
