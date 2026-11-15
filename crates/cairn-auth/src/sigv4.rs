@@ -208,9 +208,13 @@ fn signed_header_pairs(view: &RequestView<'_>, names: &[String]) -> Vec<(String,
     pairs
 }
 
-/// The streaming-payload sentinel: the body is an `aws-chunked` stream whose per-chunk signature
-/// chain is seeded by this request's header signature (ARCH 14.3, 21.7).
-const STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+/// The signed streaming-payload sentinels: the body is an `aws-chunked` stream whose per-chunk
+/// signature chain is seeded by this request's header signature (ARCH 14.3, 21.7). The `-TRAILER`
+/// form uses the identical chunk chain and adds trailer lines after the zero-size chunk.
+const STREAMING_SENTINELS: [&str; 2] = [
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+];
 
 /// The outcome of a successful header-form SigV4 verification: the auth method and, when the
 /// body is a signed chunk stream, the context the ingest decoder seeds its chain from.
@@ -224,7 +228,7 @@ pub struct HeaderAuth {
 
 /// Verify a header-form SigV4 request, given the (decrypted) secret. Returns the established
 /// auth method on success, plus a signed-streaming context when the request body is a
-/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` chunk stream.
+/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` chunk stream.
 ///
 /// The S3 data plane's verification path — a thin wrapper over [`verify_header_with_service`] that
 /// fixes the credential-scope service to `s3` and derives the payload hash from the
@@ -294,12 +298,18 @@ pub fn verify_header_with_service(
     {
         // For the signed-streaming sentinel, hand the ingest decoder the seed signature and the
         // derived streaming signing key so it can verify the rolling per-chunk chain.
-        let chunk_signing = (payload_hash == STREAMING_SENTINEL).then(|| ChunkSigningContext {
-            seed_signature: expected,
-            signing_key: crate::streaming_signing_key(secret, &parsed.scope_date, &parsed.region),
-            amz_date: amzdate.to_owned(),
-            scope: parsed.scope(),
-        });
+        let chunk_signing = STREAMING_SENTINELS
+            .contains(&payload_hash.as_str())
+            .then(|| ChunkSigningContext {
+                seed_signature: expected,
+                signing_key: crate::streaming_signing_key(
+                    secret,
+                    &parsed.scope_date,
+                    &parsed.region,
+                ),
+                amz_date: amzdate.to_owned(),
+                scope: parsed.scope(),
+            });
         Ok(HeaderAuth {
             method: AuthMethod::SigV4Header,
             chunk_signing,

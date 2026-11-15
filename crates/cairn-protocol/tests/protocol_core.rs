@@ -1855,6 +1855,158 @@ async fn signed_streaming_put_with_wrong_chunk_signature_is_rejected() {
     );
 }
 
+const SIGNED_TRAILER_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+/// Turn a `signed_streaming` body into its `-TRAILER` form: replace the empty trailer section
+/// after the signed zero-size chunk with a checksum trailer line and a trailer signature line.
+fn with_signed_trailer(mut body: Vec<u8>) -> Vec<u8> {
+    assert!(body.ends_with(b"\r\n\r\n"));
+    body.truncate(body.len() - 4);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(b"x-amz-checksum-crc32:AAAAAA==\r\n");
+    body.extend_from_slice(
+        b"x-amz-trailer-signature:0000000000000000000000000000000000000000000000000000000000000000\r\n\r\n",
+    );
+    body
+}
+
+async fn put_signed_trailer(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    ctx: cairn_types::ChunkSigningContext,
+    sentinel: &str,
+) -> StatusCode {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let put = req_with_principal(
+        Method::PUT,
+        Some(bucket),
+        Some(key),
+        &[],
+        &[
+            ("x-amz-content-sha256", sentinel),
+            ("content-type", "application/octet-stream"),
+        ],
+        body,
+        signed_streaming_principal(ctx),
+    );
+    drain(send(&h.svc, put).await).await.0
+}
+
+async fn get_status(h: &Harness, bucket: &str, key: &str) -> (StatusCode, Vec<u8>) {
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some(bucket), Some(key), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    (st, got)
+}
+
+#[tokio::test]
+async fn signed_trailer_streaming_put_with_valid_chain_succeeds() {
+    let h = harness().await;
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let (body, ctx) = signed_streaming(&[payload], false);
+    let st = put_signed_trailer(
+        &h,
+        "sgt",
+        "ok",
+        with_signed_trailer(body),
+        ctx,
+        SIGNED_TRAILER_SENTINEL,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "valid signed-trailer chain accepted");
+    let (st, got) = get_status(&h, "sgt", "ok").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        got, payload,
+        "exact payload stored, framing and trailer gone"
+    );
+}
+
+#[tokio::test]
+async fn signed_trailer_streaming_put_with_tampered_payload_is_rejected() {
+    let h = harness().await;
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let (body, ctx) = signed_streaming(&[payload], true);
+    let st = put_signed_trailer(
+        &h,
+        "sgtp",
+        "bad",
+        with_signed_trailer(body),
+        ctx,
+        SIGNED_TRAILER_SENTINEL,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "tampered payload must be rejected"
+    );
+    assert_eq!(get_status(&h, "sgtp", "bad").await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn signed_trailer_streaming_put_with_tampered_chunk_signature_is_rejected() {
+    let h = harness().await;
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let (mut body, ctx) = signed_streaming(&[payload], false);
+    // Corrupt the first hex digit of the first chunk's signature, leaving the payload intact.
+    let pos = body
+        .windows(b";chunk-signature=".len())
+        .position(|w| w == b";chunk-signature=")
+        .map(|p| p + b";chunk-signature=".len())
+        .unwrap();
+    body[pos] = if body[pos] == b'0' { b'1' } else { b'0' };
+    let st = put_signed_trailer(
+        &h,
+        "sgts",
+        "bad",
+        with_signed_trailer(body),
+        ctx,
+        SIGNED_TRAILER_SENTINEL,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "bad chunk signature rejected");
+    assert_eq!(get_status(&h, "sgts", "bad").await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_streaming_sentinel_is_rejected_before_staging() {
+    let h = harness().await;
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    for (i, sentinel) in [
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-BOGUS",
+        "STREAMING-FOO",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bucket = format!("unk{i}");
+        let (body, ctx) = signed_streaming(&[payload], false);
+        let st = put_signed_trailer(&h, &bucket, "obj", body, ctx, sentinel).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{sentinel} must fail closed");
+        assert_eq!(
+            get_status(&h, &bucket, "obj").await.0,
+            StatusCode::NOT_FOUND,
+            "{sentinel} must not store anything"
+        );
+    }
+}
+
 #[tokio::test]
 async fn signed_streaming_sentinel_without_context_is_rejected() {
     let h = harness().await;

@@ -7119,9 +7119,20 @@ fn parse_copy_source_range(header: Option<&str>, total: u64) -> Result<Option<By
     }))
 }
 
-/// The SigV4 signed-streaming sentinel: the body is an `aws-chunked` stream whose per-chunk
-/// signature chain must be verified.
-const SIGNED_STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+/// The SigV4 signed-streaming sentinels: the body is an `aws-chunked` stream whose per-chunk
+/// signature chain must be verified. The `-TRAILER` form carries the same chunk chain followed by
+/// trailer lines after the signed zero-size chunk.
+const SIGNED_STREAMING_SENTINELS: [&str; 2] = [
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+];
+
+/// The unsigned streaming sentinels: de-framed without a per-chunk signature chain (the body is
+/// protected by the transport; the checksum is recomputed server-side).
+const UNSIGNED_STREAMING_SENTINELS: [&str; 2] = [
+    "STREAMING-UNSIGNED-PAYLOAD",
+    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+];
 
 /// Translate an Object-Lock-aware object commit failure without conflating corrupt durable state
 /// with a request whose explicit deadline elapsed while its bytes were being staged.
@@ -7190,9 +7201,16 @@ fn map_stage_err(e: cairn_types::error::BlobError) -> Error {
 
 /// Select the body decoder for a (possibly streaming) upload (the F-5 fix). For the signed
 /// sentinel, build a signature-verifying decoder seeded from the principal's signed-streaming
-/// context — a signed sentinel with no SigV4 streaming context is invalid and is rejected. Other
-/// `STREAMING-*` sentinels (`STREAMING-UNSIGNED-PAYLOAD[-TRAILER]`) de-frame without verifying.
+/// context — a signed sentinel with no SigV4 streaming context is invalid and is rejected. The
+/// `STREAMING-UNSIGNED-PAYLOAD[-TRAILER]` sentinels de-frame without verifying. Any other
+/// `STREAMING-*` value (for example the unsupported SigV4A `STREAMING-AWS4-ECDSA-P256-SHA256-*`
+/// forms) fails closed here, before anything is staged, rather than being de-framed unverified.
 /// Non-streaming bodies pass through unchanged.
+///
+/// The `x-amz-trailer-signature` line of the signed `-TRAILER` form is not verified: the trailer
+/// only carries a client checksum that is not trusted (the stored checksum is recomputed
+/// server-side over the de-framed bytes), and every payload byte is already covered by the
+/// verified per-chunk chain.
 fn streaming_body(
     req: &S3Request,
     raw_body: cairn_types::BodyStream,
@@ -7203,7 +7221,8 @@ fn streaming_body(
     if !streaming {
         return Ok(raw_body);
     }
-    if sentinel == Some(SIGNED_STREAMING_SENTINEL) {
+    let sentinel = sentinel.unwrap_or_default();
+    if SIGNED_STREAMING_SENTINELS.contains(&sentinel) {
         // Signed streaming: the per-chunk chain is seeded by the request signature carried on the
         // principal. Without that context the signed sentinel cannot be verified, so refuse it.
         let ctx = req
@@ -7221,8 +7240,12 @@ fn streaming_body(
             raw_body,
             ChunkDecoder::signed(max_payload, verifier),
         ))
-    } else {
+    } else if UNSIGNED_STREAMING_SENTINELS.contains(&sentinel) {
         Ok(decode_stream(raw_body, ChunkDecoder::unsigned(max_payload)))
+    } else {
+        Err(Error::InvalidArgument(
+            "unsupported x-amz-content-sha256 streaming value".to_owned(),
+        ))
     }
 }
 

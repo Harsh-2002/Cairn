@@ -268,6 +268,39 @@ async fn sigv4_streaming_header_populates_chunk_signing_context() {
     }
 }
 
+/// The signed-trailer streaming sentinel carries the same chunk chain, so it must populate the
+/// chunk-signing context too; the unsigned and unknown streaming values must not.
+#[tokio::test]
+async fn sigv4_streaming_trailer_sentinel_populates_chunk_signing_context() {
+    let (chain, _) = setup().await;
+    let host = "s3.example.com";
+    for (sentinel, expect_ctx) in [
+        ("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", true),
+        ("STREAMING-UNSIGNED-PAYLOAD-TRAILER", false),
+        ("STREAMING-FOO", false),
+    ] {
+        let base = vec![
+            ("host".to_owned(), host.to_owned()),
+            ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+            ("x-amz-content-sha256".to_owned(), sentinel.to_owned()),
+        ];
+        let auth = sign("PUT", "/bucket/key", &base, sentinel);
+        let mut headers = base.clone();
+        headers.push(("authorization".to_owned(), auth.clone()));
+        let mut v = view(&headers, host);
+        v.method = "PUT";
+        match chain.authenticate(&v).await {
+            AuthOutcome::Authenticated(p) => {
+                assert_eq!(p.chunk_signing.is_some(), expect_ctx, "{sentinel}");
+                if let Some(ctx) = p.chunk_signing {
+                    assert!(auth.ends_with(&format!("Signature={}", ctx.seed_signature)));
+                }
+            }
+            other => panic!("expected authenticated for {sentinel}, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn tampered_signature_is_denied() {
     let (chain, _) = setup().await;
