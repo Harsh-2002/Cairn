@@ -2283,7 +2283,7 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
 // Capture visibility by indexed key, never scanning the bucket or its historical versions.
 fn current_visibility(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<i64> {
     conn.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM object_versions
+        "SELECT EXISTS(SELECT 1 FROM object_versions INDEXED BY idx_object_versions_current
          WHERE bucket_name=?1 AND key=?2 AND is_latest=1 AND is_delete_marker=0)",
     )
     .map_err(engine_err)?
@@ -2391,7 +2391,8 @@ fn upsert_version_inner(conn: &Connection, mut row: ObjectVersionRow) -> R<Optio
 
 fn demote_latest(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<()> {
     conn.prepare_cached(
-        "UPDATE object_versions SET is_latest=0 WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
+        "UPDATE object_versions INDEXED BY idx_object_versions_current SET is_latest=0
+         WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
     )
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str()])
@@ -3124,7 +3125,7 @@ fn check_precondition(
     }
     let current: Option<String> = conn
         .prepare_cached(
-            "SELECT etag FROM object_versions
+            "SELECT etag FROM object_versions INDEXED BY idx_object_versions_current
              WHERE bucket_name=?1 AND key=?2 AND is_latest=1 AND is_delete_marker=0",
         )
         .map_err(engine_err)?

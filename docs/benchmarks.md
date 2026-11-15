@@ -1517,6 +1517,30 @@ key re-wrap to use the natural key; the plan and acceptance threshold are in
 Evidence: [`delete-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/delete-v44-clustered-2026-11-08.json)
 and [`list-v44-clustered-2026-11-08.json`](performance-evidence/2026-11/list-v44-clustered-2026-11-08.json).
 
+**Schema v45 (2026-11-15)** restores O(1) current-version access on versioned buckets. v44 dropped
+the partial `latest_cover` index, so a key with deep history made every current-version lookup scan
+all of its versions in the clustered table. A SQLite 3.46 reproduction of the v44 shape (one key
+with 20,000 versions plus 2,000 keys with 50 versions each) measured the current-version lookup at
+5.6 ms without a partial index and 0.011 ms with one, and a 1,000-key current listing at 12.6 ms
+versus 3.5 ms. v45 adds a slim partial index on `(bucket_name, key) WHERE is_latest = 1` (each entry
+is only the primary key on a `WITHOUT ROWID` table), pins the point lookups and the PUT demote to it
+with `INDEXED BY`, and uses it for current listings only on buckets that are or were versioned. The
+published unversioned rows are not on that path; the A/B below shows no measurable change to them.
+This is a same-host, same-harness comparison of the v44 (`9e7a95f`) and v45 (`9f2509f`) release
+binaries, Cairn only, on a shared host whose load average was 10-21:
+
+| Arm | v44 | v45 | v45 / v44 |
+|---|---:|---:|---:|
+| `delete_4k`, mean of 2 alternating arms (obj/s) | 2,057 | 1,993 | 0.97 |
+| `list_4k`, mean of 8 alternating arms (obj/s) | 119,650 | 113,881 | 0.95 |
+| `list_4k`, the six-pair subset only (obj/s) | 117,053 | 114,613 | 0.98 |
+
+Run-to-run spread inside one version was 1,729-2,257 obj/s for delete and 95,755-142,929 obj/s for
+LIST, so differences of this size are inside the noise; neither arm shows a regression, but a 2-5% effect on unversioned LIST cannot be excluded at this sample size (the only added work there is one cached `versioning_state` lookup per list call). The absolute rates are not
+comparable to the 1,447 / 171,764 published above, which were measured on a quieter host.
+
+Evidence: [`v45-current-index-ab-2026-11-15.txt`](performance-evidence/2026-11/v45-current-index-ab-2026-11-15.txt).
+
 ### 15.5 RustFS delete durability changed after 1.0.1 (2026-11-08)
 
 Every row above measures **RustFS 1.0.0**, the pinned comparator. A source review of the later
