@@ -1092,6 +1092,22 @@ SELECT bucket_name, key, version_id, lock_mode, retain_until, legal_hold FROM ob
 DROP TABLE object_locks_v44;
 "#,
     },
+    Migration {
+        version: 45,
+        name: "slim current-version index",
+        sql: r#"
+-- v44 dropped the partial latest_cover index, so on a versioned bucket every current-version
+-- lookup (GET, HEAD, the PUT demote, conditional checks) and every current listing scanned all of a
+-- key's versions in the clustered table: O(versions) per request. This index restores the
+-- O(1) seek with the smallest possible entry. A secondary index on a WITHOUT ROWID table stores
+-- the primary key, so each entry is just (bucket_name, key, version_id) for the one current row
+-- of a key. It carries none of latest_cover's response columns, which kept that index's page
+-- writes high. Point lookups name it with INDEXED BY: without sqlite_stat1 the planner prefers
+-- the covering clustered key even when the partial index would read one row.
+CREATE INDEX idx_object_versions_current ON object_versions (bucket_name, key)
+    WHERE is_latest = 1;
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1467,6 +1483,96 @@ mod tests {
                 "query must use the unique auto-index, got: {plan}"
             );
         }
+    }
+
+    #[test]
+    fn v45_current_version_lookups_seek_the_slim_partial_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_fixture_through(&conn, 44);
+        // One key with deep history: only the newest version is current.
+        for v in 0..200 {
+            conn.execute(
+                "INSERT INTO object_versions
+                 (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,
+                  size_physical,etag,content_type,compression,storage_class,owner_id,
+                  user_metadata,checksums,created_at,updated_at)
+                 VALUES (?1,'b','k',?2,?3,0,4,4,'e','text/plain','Uncompressed','Standard',
+                         'owner','[]','[]',1,1)",
+                rusqlite::params![format!("row-{v}"), format!("v{v:04}"), i64::from(v == 199)],
+            )
+            .unwrap();
+        }
+
+        run_migrations(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index'
+                 AND name='idx_object_versions_current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("(bucket_name, key)") && sql.contains("WHERE is_latest = 1"),
+            "the index must be slim and partial on current rows, got: {sql}"
+        );
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions INDEXED BY idx_object_versions_current
+                 WHERE bucket_name='b' AND key='k' AND is_latest=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entries, 1,
+            "the backfilled index holds only the current row"
+        );
+        let current: String = conn
+            .query_row(
+                "SELECT version_id FROM object_versions INDEXED BY idx_object_versions_current
+                 WHERE bucket_name='b' AND key='k' AND is_latest=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, "v0199");
+
+        // The exact statement shapes the store and writer pin to the index.
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT * FROM object_versions INDEXED BY \
+             idx_object_versions_current WHERE bucket_name='b' AND key='k' AND is_latest=1",
+            "EXPLAIN QUERY PLAN UPDATE object_versions INDEXED BY idx_object_versions_current \
+             SET is_latest=0 WHERE bucket_name='b' AND key='k' AND is_latest=1",
+            "EXPLAIN QUERY PLAN SELECT key FROM object_versions INDEXED BY \
+             idx_object_versions_current WHERE bucket_name='b' AND key >= '' \
+             AND is_latest = 1 AND is_delete_marker = 0 \
+             AND (expire_at IS NULL OR expire_at > 0) ORDER BY key ASC LIMIT 10",
+        ] {
+            let plan: String = conn
+                .query_row(sql, [], |row| row.get(3))
+                .unwrap_or_else(|error| panic!("plan failed for {sql}: {error}"));
+            assert!(
+                plan.contains("idx_object_versions_current"),
+                "query must seek the current-version index, got: {plan}"
+            );
+        }
+        let ordered: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key FROM object_versions INDEXED BY \
+                 idx_object_versions_current WHERE bucket_name='b' AND key >= '' \
+                 AND is_latest = 1 ORDER BY key ASC LIMIT 10",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !ordered.iter().any(|step| step.contains("TEMP B-TREE")),
+            "the index already yields key order; a sort would defeat LIMIT: {ordered:?}"
+        );
     }
 
     #[test]

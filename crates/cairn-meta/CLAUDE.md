@@ -35,7 +35,7 @@ metadata commit is **the single linearization point of control-plane and multipa
   quiescence resolution, bounded intent recovery and leased cleanup. Validate the normalized
   path/upload/reservation index against each persisted plan; mirror SQL and typed outcomes across
   both metadata crates and the in-memory double.
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 41 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 45 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only

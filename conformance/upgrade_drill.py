@@ -4,7 +4,7 @@
 Runs the last published release, writes plaintext/multipart/encrypted objects,
 stops it, snapshots the whole data directory, starts the current binary on the
 same data, and verifies:
-  * schema v44 and storage-protocol floor 3,
+  * schema v44 or later (currently v45) and storage-protocol floor 3,
   * a clustered object_versions table (WITHOUT ROWID), the id index present and the
     partial latest_cover index absent, with zero foreign-key violations,
   * Object Lock retention and legal hold written by the old binary survive the rebuild,
@@ -332,12 +332,16 @@ def main():
     assert "WITHOUT ROWID" in state["table_sql"], "object_versions is not clustered"
     assert "idx_object_versions_id" in state["indexes"], "the id index is missing"
     assert "idx_ov_latest_cover" not in state["indexes"], "the partial cover should be dropped"
+    if state["schema"] >= 45:
+        assert "idx_object_versions_current" in state["indexes"], (
+            "the v45 slim current-version index is missing"
+        )
     assert not state["fk_violations"], f"foreign-key violations: {state['fk_violations']}"
     assert state["locks"] == old_state["locks"], (
         "Object Lock rows changed across the rebuild: "
         f"{old_state['locks']} -> {state['locks']}"
     )
-    log("  v44 shape: clustered table, id index, no partial cover, 0 FK violations")
+    log("  clustered shape: WITHOUT ROWID table, id index, no partial cover, current index, 0 FK violations")
     log(f"  legacy multipart layout after upgrade: {state['parts']!r} (absent is expected for this release)")
     for key_name, has_sha, has_blake3 in state["rows"]:
         assert has_sha and not has_blake3, f"legacy row {key_name} changed baseline: {has_sha}/{has_blake3}"
@@ -416,7 +420,7 @@ def main():
     stop(proc)
     log("  rollback read every pre-upgrade object exactly")
 
-    log("PASS: release -> v44 upgrade, lock preservation, old-binary refusal, and snapshot rollback")
+    log("PASS: release -> current-schema upgrade, lock preservation, old-binary refusal, and snapshot rollback")
 
 
 if __name__ == "__main__":

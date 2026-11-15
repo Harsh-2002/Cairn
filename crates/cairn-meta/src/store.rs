@@ -781,6 +781,12 @@ fn list_impl(
             .map(|(vid, key)| (key.to_owned(), vid.to_owned()))
     };
 
+    // A current listing of a bucket that has ever held versions seeks the slim current-version
+    // index (v45) so it reads one row per key rather than every historical version. An
+    // unversioned bucket holds exactly one row per key, where the clustered scan is already one
+    // read per row and the index would only add a lookup.
+    let current_index = latest_only && bucket_has_history(conn, bucket)?;
+
     let mut page: ListPage<ObjectSummary> = ListPage::default();
     let mut seen_cp = std::collections::HashSet::new();
 
@@ -801,6 +807,7 @@ fn list_impl(
             &seek,
             upper.as_deref(),
             latest_only,
+            current_index,
             vid_marker
                 .as_ref()
                 .map(|(key, version)| (key.as_str(), version.as_str())),
@@ -888,6 +895,7 @@ fn fetch_rows(
     seek: &str,
     upper: Option<&str>,
     latest_only: bool,
+    current_index: bool,
     version_marker: Option<(&str, &str)>,
     visible_at: Option<Timestamp>,
     limit: usize,
@@ -895,8 +903,12 @@ fn fetch_rows(
     let visible_at = visible_at.map_or(i64::MAX, Timestamp::as_millis);
     let mut sql = String::from(
         "SELECT key, version_id, is_latest, is_delete_marker, etag, size_logical, updated_at, \
-         storage_class, owner_id, id, expire_at FROM object_versions WHERE bucket_name = ?1 AND key >= ?2",
+         storage_class, owner_id, id, expire_at FROM object_versions",
     );
+    if current_index {
+        sql.push_str(" INDEXED BY idx_object_versions_current");
+    }
+    sql.push_str(" WHERE bucket_name = ?1 AND key >= ?2");
     if latest_only {
         sql.push_str(" AND is_latest = 1 AND is_delete_marker = 0");
     }
@@ -949,6 +961,18 @@ fn fetch_rows(
     .map_err(engine_err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(engine_err)
+}
+
+/// Whether a bucket is, or has been, versioned, so a key may carry historical versions. A
+/// suspended bucket keeps the versions written while it was enabled. A bucket that no longer
+/// exists lists nothing either way.
+fn bucket_has_history(conn: &Connection, bucket: &str) -> Result<bool, MetaError> {
+    conn.prepare_cached("SELECT versioning_state FROM buckets WHERE name = ?1")
+        .map_err(engine_err)?
+        .query_row(params![bucket], |r| r.get::<_, String>(0))
+        .optional()
+        .map_err(engine_err)
+        .map(|state| state.is_some_and(|state| state != "unversioned"))
 }
 
 #[async_trait::async_trait]
@@ -1140,7 +1164,8 @@ impl MetadataStore for SqliteMetadataStore {
         let (b, k) = (bucket.as_str().to_owned(), key.as_str().to_owned());
         self.with_read(move |conn| {
             conn.prepare_cached(
-                "SELECT * FROM object_versions WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
+                "SELECT * FROM object_versions INDEXED BY idx_object_versions_current
+                 WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
             )
             .map_err(engine_err)?
             .query_row(params![b, k], model::object_version_from_row)
@@ -2600,6 +2625,76 @@ mod listing_batch_tests {
         assert_eq!(list_batch_size(usize::MAX), LIST_BATCH);
         // A page already filled by a delimiter collapse still probes one row for truncation.
         assert_eq!(list_batch_size(0), 1);
+    }
+
+    /// v45 regression: on a versioned bucket every key keeps its history, and the current-version
+    /// lookup and the current listing must still return exactly the newest version of each key
+    /// through the slim current-version index, at every page size.
+    #[tokio::test]
+    async fn deep_version_history_lists_and_reads_only_current_versions() {
+        let keys: Vec<String> = (0..12).map(|i| format!("deep-{i:02}")).collect();
+        let (store, bucket) = seeded_store(&[]).await;
+        let fixture = store.begin_fixture().await.unwrap();
+        let mut newest = std::collections::BTreeMap::new();
+        for round in 0..40 {
+            for key in &keys {
+                let mut version = row(&bucket, key);
+                version.version_id = VersionId::generate();
+                version.updated_at = Timestamp(round + 2);
+                newest.insert(key.clone(), version.version_id.as_str().to_owned());
+                store
+                    .submit_fixture(
+                        &fixture,
+                        Mutation::PutObjectVersion {
+                            row: Box::new(version),
+                            precondition: Precondition::default(),
+                            initial_state: InitialObjectState::default(),
+                            replication: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        for key in &keys {
+            let current = store
+                .current_version(&bucket, &ObjectKey::parse(key).unwrap())
+                .await
+                .unwrap()
+                .expect("every key has a current version");
+            assert_eq!(current.version_id.as_str(), newest[key]);
+            assert!(current.is_latest);
+        }
+        for limit in [1, 5, 1000] {
+            let (items, prefixes, _) = drain(&store, &bucket, None, limit).await;
+            assert_eq!(items, keys, "one entry per key at limit {limit}");
+            assert!(prefixes.is_empty());
+        }
+        let page = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    limit: 1000,
+                    ..ListQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        for item in &page.items {
+            assert_eq!(item.version_id.as_str(), newest[item.key.as_str()]);
+        }
+        let versions = store
+            .list_versions(
+                &bucket,
+                &ListQuery {
+                    limit: 1000,
+                    ..ListQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.items.len(), keys.len() * 40, "history is retained");
     }
 
     #[tokio::test]
