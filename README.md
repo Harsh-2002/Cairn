@@ -123,9 +123,10 @@ disabled in standard builds; see
 
 ## Stability
 
-Current status: **1.0** for a single node with backups. The 24-hour correctness run passed with
-1,697,128 PUTs, 0 errors and 0 replication mismatches; after the replication-metrics fix, the 2-hour
-anonymous-RSS gate passed (155.6 → 153.5 MiB, −1.3%). The full scoreboard, upgrade/rollback drill,
+Current status: **1.0** for a single node with backups (declared 2026-11-07; the 1.0 release tag
+has not been cut yet, so the latest published release is `v2026.09.13`). On the current schema the
+24-hour soak passed with 1,734,228 PUTs, 0 errors, 0 replication mismatches and 137,487
+byte-verified reads, with anonymous RSS 1,368.2 → 1,357.3 MiB (−0.8%). The full scoreboard, upgrade/rollback drill,
 replication baseline, abrupt-process-kill drill and independent review are recorded in
 [the stability record](docs/stability-2026-11-05.md). The supported deployment scope and known
 limits are in [the support statement](docs/support.md).
