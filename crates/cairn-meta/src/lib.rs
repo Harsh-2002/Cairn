@@ -155,7 +155,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // shortfall is visible before the transaction fails closed.
     let db_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     // The database file does not exist yet on a fresh store; statvfs the containing filesystem.
-    let space_path = db_path.parent().unwrap_or(db_path);
+    let space_path = space_probe_dir(db_path);
     let available_bytes = available_space(space_path);
     if let Some(available) = available_bytes {
         let needed = db_bytes.saturating_mul(3);
@@ -168,9 +168,11 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
             );
         }
     }
+    // `available_bytes` is omitted (an absent `None` field) when the filesystem cannot answer, so an
+    // unknown value never reads as a full disk.
     tracing::info!(
         db_bytes,
-        available_bytes = available_bytes.unwrap_or(0),
+        available_bytes,
         "metadata schema migration starting"
     );
     let migration_started = Instant::now();
@@ -182,7 +184,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     tracing::info!(
         elapsed_seconds,
         wal_bytes,
-        available_bytes = available_space(space_path).unwrap_or(0),
+        available_bytes = available_space(space_path),
         "metadata schema migration complete"
     );
     let writer = Writer::spawn(write_conn, opts.group_commit_linger, opts.synchronous_full);
@@ -206,6 +208,16 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     })
 }
 
+/// The directory to `statvfs` for a database path. A bare relative path such as `cairn.db` has an
+/// empty parent (`Some("")`), which `statvfs` rejects; that means the current directory.
+fn space_probe_dir(db_path: &Path) -> &Path {
+    match db_path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => db_path,
+    }
+}
+
 /// Unprivileged free bytes on the filesystem holding `path`, when the platform can answer.
 #[cfg(unix)]
 fn available_space(path: &Path) -> Option<u64> {
@@ -215,7 +227,7 @@ fn available_space(path: &Path) -> Option<u64> {
     } else {
         stat.f_bsize
     };
-    Some(stat.f_bavail * fragment)
+    Some(stat.f_bavail.saturating_mul(fragment))
 }
 
 #[cfg(not(unix))]
@@ -357,5 +369,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let free = super::available_space(dir.path()).expect("statvfs answers on a temp directory");
         assert!(free > 0, "free space must be positive: {free}");
+    }
+
+    #[test]
+    fn bare_relative_db_path_probes_the_current_directory() {
+        use std::path::Path;
+        let probe = super::space_probe_dir(Path::new("cairn.db"));
+        assert_eq!(probe, Path::new("."));
+        assert!(
+            super::available_space(probe).is_some(),
+            "a bare relative db path must still report free space"
+        );
+        assert_eq!(
+            super::space_probe_dir(Path::new("/var/lib/cairn/cairn.db")),
+            Path::new("/var/lib/cairn")
+        );
+        assert_eq!(
+            super::space_probe_dir(Path::new("data/cairn.db")),
+            Path::new("data")
+        );
+    }
+
+    #[test]
+    fn unknown_free_space_is_none_not_zero() {
+        let missing = std::path::Path::new("/nonexistent-cairn-probe-dir/x");
+        assert_eq!(super::available_space(missing), None);
     }
 }

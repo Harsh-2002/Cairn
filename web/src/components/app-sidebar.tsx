@@ -276,11 +276,14 @@ export function AppSidebar() {
               onClick={() =>
                 window.dispatchEvent(new Event("cairn:command-palette"))
               }
-              aria-label="Open command palette (search)"
+              aria-keyshortcuts="Control+K Meta+K"
               className="flex h-11 w-full items-center gap-2 rounded-md border border-sidebar-border bg-background px-2 text-sm text-muted-foreground outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring md:h-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
             >
               <Search aria-hidden="true" className="size-4 shrink-0" />
-              <span className="group-data-[collapsible=icon]:hidden">
+              {/* The visible text is the accessible name (WCAG 2.5.3 Label in Name). In the icon
+                  rail it stays in the accessibility tree, visually hidden, so the button keeps a
+                  name there. */}
+              <span className="group-data-[collapsible=icon]:sr-only">
                 Search…
               </span>
               <kbd className="ms-auto hidden rounded border bg-muted px-1.5 font-mono text-[11px] text-muted-foreground md:inline group-data-[collapsible=icon]:!hidden">
