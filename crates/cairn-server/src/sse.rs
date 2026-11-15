@@ -47,6 +47,8 @@ fn json(status: StatusCode, body: Vec<u8>) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        // The ticket-mint body carries a single-use credential; never let a cache store it.
+        .header("cache-control", "no-store")
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
         .header("cross-origin-opener-policy", "same-origin")
@@ -225,6 +227,7 @@ mod tests {
             response.headers().get("strict-transport-security").unwrap(),
             "max-age=31536000"
         );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
         assert_eq!(
             response
                 .headers()
