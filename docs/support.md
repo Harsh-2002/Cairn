@@ -1,6 +1,6 @@
 # Support and deployment scope
 
-**Status: 1.0 (2026-11-07).** This page states what is supported today, what is not, and the
+**Status: 1.0 (declared 2026-11-07; the release tag has not been cut, so the latest published release is `v2026.09.13`).** This page states what is supported today, what is not, and the
 operational conditions the durability claims assume. It does not grant an SLA and is not a
 third-party certification. The measured evidence is in
 [`stability-2026-11-05.md`](stability-2026-11-05.md).
