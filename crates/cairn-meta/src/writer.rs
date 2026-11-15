@@ -489,10 +489,22 @@ fn timed_checkpoint(
 /// so the checkpoint can truncate, while bounding the worst-case writer stall.
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// The writer connection's default `busy_timeout` (`SqliteOptions::busy_timeout_ms`), restored
+/// after a checkpoint when the previous value cannot be read back. Never fall back to 0: that would
+/// silently strip the commit path's busy window for the rest of the process.
+const DEFAULT_WRITER_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// The `busy_timeout` to restore after a checkpoint: the value read before it, or the default when
+/// the read failed (or reported a negative value).
+fn busy_timeout_to_restore(previous_ms: rusqlite::Result<i64>) -> Duration {
+    match previous_ms {
+        Ok(ms) if ms >= 0 => Duration::from_millis(ms as u64),
+        _ => DEFAULT_WRITER_BUSY_TIMEOUT,
+    }
+}
+
 fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
-    let prev_ms: i64 = conn
-        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-        .unwrap_or(0);
+    let restore = busy_timeout_to_restore(conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)));
     let _ = conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT);
     let stats = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
         Ok(WalCheckpointStats {
@@ -502,7 +514,7 @@ fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
         })
     });
     // Restore the connection's busy_timeout regardless of the checkpoint outcome.
-    let _ = conn.busy_timeout(Duration::from_millis(prev_ms.max(0) as u64));
+    let _ = conn.busy_timeout(restore);
     stats.map_err(engine_err)
 }
 
@@ -1106,5 +1118,21 @@ mod tests {
             restored, 5000,
             "busy_timeout must be restored after a checkpoint"
         );
+    }
+
+    /// An unreadable previous `busy_timeout` must restore the configured default, never zero.
+    #[test]
+    fn busy_timeout_restore_never_falls_back_to_zero() {
+        assert_eq!(
+            busy_timeout_to_restore(Ok(1234)),
+            Duration::from_millis(1234)
+        );
+        assert_eq!(busy_timeout_to_restore(Ok(0)), Duration::ZERO);
+        assert_eq!(
+            busy_timeout_to_restore(Err(rusqlite::Error::QueryReturnedNoRows)),
+            DEFAULT_WRITER_BUSY_TIMEOUT
+        );
+        assert_eq!(busy_timeout_to_restore(Ok(-1)), DEFAULT_WRITER_BUSY_TIMEOUT);
+        assert_eq!(DEFAULT_WRITER_BUSY_TIMEOUT, Duration::from_millis(5000));
     }
 }

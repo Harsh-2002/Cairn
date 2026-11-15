@@ -234,7 +234,56 @@ fn is_console_asset(path: &str) -> bool {
 }
 
 /// Handle one request under the immutable role of the listener that accepted it.
+///
+/// Response builders always emit `Strict-Transport-Security`; this wrapper removes it unless the
+/// request's effective scheme is HTTPS (direct TLS, or a trusted proxy's validated forwarded
+/// scheme — the same signal that decides the session cookie's `Secure` flag). RFC 6797 §7.2: a
+/// host must not send the header over insecure transport, where a client ignores it anyway.
 pub async fn handle(
+    stack: std::sync::Arc<AppStack>,
+    req: Request<Incoming>,
+    transport: RequestTransport<'_>,
+    request_id: String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Response<ResponseBody> {
+    // Direct TLS and an untrusted peer decide the scheme without reading a header, so the S3 hot
+    // path never copies the request headers here; only a trusted proxy's forwarding is parsed.
+    let https = if transport.direct_secure {
+        true
+    } else if !transport.trusted_proxies.contains(transport.peer) {
+        false
+    } else {
+        let headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        crate::proxy::effective_scheme(
+            transport.direct_secure,
+            transport.peer,
+            &headers,
+            transport.trusted_proxies,
+        )
+        .is_https()
+    };
+    let mut response = handle_request(stack, req, transport, request_id, shutdown).await;
+    gate_hsts(&mut response, https);
+    response
+}
+
+/// Drop `Strict-Transport-Security` from a response sent over a non-HTTPS effective scheme.
+fn gate_hsts(response: &mut Response<ResponseBody>, https: bool) {
+    if !https {
+        response.headers_mut().remove("strict-transport-security");
+    }
+}
+
+async fn handle_request(
     stack: std::sync::Arc<AppStack>,
     req: Request<Incoming>,
     transport: RequestTransport<'_>,
@@ -483,20 +532,7 @@ pub async fn handle(
                 return response;
             }
             Err(ControlBodyError::TooLarge) => {
-                let mut builder = Response::builder()
-                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("content-type", "application/json")
-                    // We stopped reading at the cap, so the rest of the oversize body is still in
-                    // flight; close rather than let those bytes mis-frame the next pooled request (#5).
-                    .header(http::header::CONNECTION, "close");
-                if let Ok(v) = http::HeaderValue::from_str(&request_id) {
-                    builder = builder.header("x-amz-request-id", v);
-                }
-                return builder
-                    .body(full_body(Bytes::from_static(
-                        br#"{"error":"RequestEntityTooLarge","message":"request body exceeds the maximum allowed size"}"#,
-                    )))
-                    .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
+                return payload_too_large_response(&request_id);
             }
             // A transient read error (e.g. the client hung up): preserve the prior behavior of
             // proceeding with an empty body rather than synthesizing a misleading 413.
@@ -863,10 +899,14 @@ fn web_asset_response(
 }
 
 /// Render the management service's JSON response and correlation id onto Hyper.
+///
+/// Control JSON is authenticated and may carry one-time secrets (share tokens, presigned URLs,
+/// session identity), so it is never cacheable.
 fn render_control_response(resp: cairn_control::ControlResponse) -> Response<ResponseBody> {
     let mut builder = Response::builder()
         .status(resp.status)
         .header("content-type", "application/json")
+        .header("cache-control", "no-store")
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
         .header(
@@ -889,6 +929,7 @@ fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .header("cache-control", "no-store")
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
         .header(
@@ -900,6 +941,21 @@ fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
         .header("strict-transport-security", "max-age=31536000")
         .body(full_body(Bytes::from(body.to_owned())))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// The 413 for an oversize control body, built on the hardened JSON builder.
+fn payload_too_large_response(request_id: &str) -> Response<ResponseBody> {
+    let mut response = json_status(
+        413,
+        r#"{"error":"RequestEntityTooLarge","message":"request body exceeds the maximum allowed size"}"#,
+    );
+    // We stopped reading at the cap, so the rest of the oversize body is still in flight; close
+    // rather than let those bytes mis-frame the next pooled request (#5).
+    set_connection_close(&mut response);
+    if let Ok(v) = http::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-amz-request-id", v);
+    }
+    response
 }
 
 /// Build a JSON response with the given status, body, and extra response headers (e.g. `Set-Cookie`).
@@ -920,6 +976,13 @@ fn json_status_with_headers(
         .header("cross-origin-opener-policy", "same-origin")
         .header("cross-origin-resource-policy", "same-origin")
         .header("strict-transport-security", "max-age=31536000");
+    // Session responses are authenticated; default to no-store unless the caller set its own.
+    if !extra
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+    {
+        builder = builder.header("cache-control", "no-store");
+    }
     for (k, v) in extra {
         builder = builder.header(*k, v.as_str());
     }
@@ -2984,6 +3047,52 @@ mod tests {
             "max-age=31536000"
         );
         assert!(response.headers().get("permissions-policy").is_some());
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+
+    #[test]
+    fn json_builders_are_no_store_and_keep_an_explicit_cache_control() {
+        assert_eq!(
+            json_status(200, "{}").headers()["cache-control"],
+            "no-store"
+        );
+        let default = json_status_with_headers(200, "{}", &[("set-cookie", "a=b".to_owned())]);
+        assert_eq!(default.headers()["cache-control"], "no-store");
+        let explicit =
+            json_status_with_headers(200, "{}", &[("Cache-Control", "private".to_owned())]);
+        let values: Vec<_> = explicit.headers().get_all("cache-control").iter().collect();
+        assert_eq!(values, ["private"]);
+    }
+
+    #[test]
+    fn payload_too_large_response_carries_the_hardened_header_set() {
+        let response = payload_too_large_response("req-1");
+        assert_eq!(response.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+        let headers = response.headers();
+        assert_eq!(headers["connection"], "close");
+        assert_eq!(headers["x-amz-request-id"], "req-1");
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["cross-origin-resource-policy"], "same-origin");
+        assert!(headers.get("permissions-policy").is_some());
+        assert!(headers.get("strict-transport-security").is_some());
+    }
+
+    #[test]
+    fn hsts_is_sent_only_over_an_https_effective_scheme() {
+        let mut https = json_status(200, "{}");
+        gate_hsts(&mut https, true);
+        assert_eq!(
+            https.headers()["strict-transport-security"],
+            "max-age=31536000"
+        );
+        let mut plain = json_status(200, "{}");
+        gate_hsts(&mut plain, false);
+        assert!(plain.headers().get("strict-transport-security").is_none());
+        // The other hardening headers are untouched.
+        assert_eq!(plain.headers()["x-content-type-options"], "nosniff");
     }
 
     #[test]

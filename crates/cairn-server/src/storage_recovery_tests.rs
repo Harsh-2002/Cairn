@@ -220,16 +220,29 @@ fn libsql_full_scan_protects_intents_and_claimed_debt() {
     // process so libSQL is the first SQLite user.
     const CHILD_ENV: &str = "CAIRN_LIBSQL_FULL_SCAN_CHILD";
     if std::env::var_os(CHILD_ENV).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "storage_recovery_tests::libsql_full_scan_protects_intents_and_claimed_debt",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
-            .status()
+            .output()
             .expect("spawn isolated libSQL test process");
-        assert!(status.success(), "isolated libSQL test failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated libSQL test failed: {}\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+            output.status
+        );
+        // If the `--exact` path ever stops matching, libtest runs zero tests and exits 0; require
+        // proof that the child actually ran the test.
+        assert!(
+            stdout.contains("1 passed"),
+            "isolated libSQL test did not run (the --exact path no longer matches?)\n\
+             --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+        );
         return;
     }
 
