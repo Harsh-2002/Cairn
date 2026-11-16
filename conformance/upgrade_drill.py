@@ -9,15 +9,16 @@ same data, and verifies:
     partial latest_cover index absent, with zero foreign-key violations,
   * Object Lock retention and legal hold written by the old binary survive the rebuild,
   * every old object still reads byte-for-byte (including ?partNumber),
-  * old rows keep internal_sha256 and have internal_blake3 NULL,
-  * the old multipart sidecar is v2 and the rebuilt/current sidecar is v3,
+  * the integrity baselines the old binary wrote are preserved exactly (SHA-256 only for a
+    release before BLAKE3, BLAKE3 only for a later one),
+  * the old multipart sidecar is preserved and a newly written one is v3,
   * a new post-upgrade multipart write records BLAKE3 and a v3 sidecar,
-  * the old binary refuses the upgraded database,
+  * the old binary refuses the upgraded database (when the schema or protocol advanced),
   * copying the pre-upgrade snapshot back lets the old binary start and read.
 
-Runs in CI (`.github/workflows/validate.yml`) against the pinned release; boto3 comes from the
+Runs in CI (`.github/workflows/validate.yml`) against the latest published release; boto3 comes from the
 pinned conformance requirements. Manual run with any boto3-enabled interpreter:
-  gh release download v2026.09.13 --repo Harsh-2002/Cairn \
+  gh release download --repo Harsh-2002/Cairn \
     --pattern cairn-linux-amd64 --pattern SHA256SUMS --dir /var/tmp/cairn-upgrade
   (cd /var/tmp/cairn-upgrade && sha256sum -c SHA256SUMS --ignore-missing)
   python3 conformance/upgrade_drill.py --root /var/tmp/cairn-upgrade/run \
@@ -204,20 +205,24 @@ def write_objects(s3):
     }
 
 
-def verify_objects(s3, expected, part_reads=False):
+def verify_objects(s3, expected, part_reads=False, legacy_layout=True):
     for key in ("plain", "encrypted", "multipart"):
         body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
         assert body == expected[key], f"{key} body mismatch after upgrade"
         log(f"  GET {key}: {len(body)} bytes exact")
-    if part_reads:
-        # The current code restores the part layout for objects that recorded one; the released
-        # object here predates that record, so its part-number read must fail closed instead.
+    if part_reads and legacy_layout:
+        # The current code restores the part layout for objects that recorded one; an object from a
+        # release that predates that record must fail its part-number read closed instead.
         try:
             s3.get_object(Bucket=BUCKET, Key="multipart", PartNumber=1)
         except Exception:
             log("  legacy multipart ?partNumber=1: refused as expected (no recorded layout)")
         else:
             raise AssertionError("legacy v1 multipart part-number read unexpectedly succeeded")
+    elif part_reads:
+        first = s3.get_object(Bucket=BUCKET, Key="multipart", PartNumber=1)["Body"].read()
+        assert first == expected["multipart"][: 5 * 1024 * 1024], "recorded part layout read mismatch"
+        log("  multipart ?partNumber=1: exact (the release recorded a part layout)")
     head = s3.head_object(Bucket=BUCKET, Key="multipart")
     assert head["ETag"] == expected["multipart_etag"], "composite ETag changed"
 
@@ -311,6 +316,11 @@ def main():
     )
     if old_sidecar is None:
         log("  released multipart has no sidecar (the release predates it); upgrade must still read it")
+    # The drill runs against the latest published release. While that release has the same schema as
+    # the current binary the table rebuilds, legacy baselines and the old-binary refusal do not
+    # apply; the checks below that depend on an older release run only when it actually is older.
+    legacy_layout = old_state["parts"] is None
+    old_rows = {row[0]: (row[1], row[2]) for row in old_state["rows"]}
 
     log("== 2. snapshot the pre-upgrade data directory")
     snapshot = root / "snapshot"
@@ -342,10 +352,15 @@ def main():
         f"{old_state['locks']} -> {state['locks']}"
     )
     log("  clustered shape: WITHOUT ROWID table, id index, no partial cover, current index, 0 FK violations")
-    log(f"  legacy multipart layout after upgrade: {state['parts']!r} (absent is expected for this release)")
+    log(f"  multipart layout after upgrade: {state['parts']!r} (legacy layout: {legacy_layout})")
+    # Integrity baselines written by the old binary must be exactly preserved: SHA-256 only for a
+    # release before BLAKE3, BLAKE3 only for a release after it.
     for key_name, has_sha, has_blake3 in state["rows"]:
-        assert has_sha and not has_blake3, f"legacy row {key_name} changed baseline: {has_sha}/{has_blake3}"
-    verify_objects(s3, expected, part_reads=True)
+        if key_name in old_rows:
+            assert (has_sha, has_blake3) == old_rows[key_name], (
+                f"row {key_name} changed baseline: {old_rows[key_name]} -> {(has_sha, has_blake3)}"
+            )
+    verify_objects(s3, expected, part_reads=True, legacy_layout=legacy_layout)
     verify_lock_object(s3, expected["lock"])
 
     log("== 4. new post-upgrade multipart writes record BLAKE3 and a v3 sidecar")
@@ -383,30 +398,37 @@ def main():
             assert record.get("internal_blake3") and not record.get("internal_sha256")
     assert new_sidecar == 3, f"new multipart sidecar should be v3, got {new_sidecar}"
     log("  new multipart sidecar: v3 with internal_blake3")
-    verify_objects(s3, expected, part_reads=True)
+    verify_objects(s3, expected, part_reads=True, legacy_layout=legacy_layout)
     verify_lock_object(s3, expected["lock"])
     stop(proc)
 
+    will_refuse = state["schema"] > old_state["schema"] or state["proto"] != old_state["proto"]
     log("== 5. the released binary must refuse the upgraded database")
-    refusal = root / "old-refusal.log"
-    env_old = {
-        **os.environ,
-        "CAIRN_DATA_DIR": str(root / "data"),
-        "CAIRN_DB_PATH": str(root / "data" / "cairn.db"),
-        "CAIRN_API_ADDR": f"127.0.0.1:{args.port + 1}",
-        "CAIRN_CONSOLE_ADDR": "off",
-        "CAIRN_MASTER_KEY": key,
-        "CAIRN_LOG_LEVEL": "info",
-    }
-    result = subprocess.run(
-        [args.old_bin, "serve"], env=env_old, capture_output=True, text=True, timeout=60
-    )
-    refusal.write_text(result.stdout + result.stderr)
-    assert result.returncode != 0, "released binary unexpectedly started on the upgraded database"
-    assert "schema" in (result.stdout + result.stderr).lower() or "protocol" in (
-        result.stdout + result.stderr
-    ).lower(), "refusal did not mention schema/protocol"
-    log(f"  refused as expected (exit {result.returncode}): {refusal}")
+    if not will_refuse:
+        log(
+            f"  skipped: the release is already schema v{old_state['schema']} / protocol "
+            f"{old_state['proto']}, so it can open the upgraded database"
+        )
+    if will_refuse:
+        refusal = root / "old-refusal.log"
+        env_old = {
+            **os.environ,
+            "CAIRN_DATA_DIR": str(root / "data"),
+            "CAIRN_DB_PATH": str(root / "data" / "cairn.db"),
+            "CAIRN_API_ADDR": f"127.0.0.1:{args.port + 1}",
+            "CAIRN_CONSOLE_ADDR": "off",
+            "CAIRN_MASTER_KEY": key,
+            "CAIRN_LOG_LEVEL": "info",
+        }
+        result = subprocess.run(
+            [args.old_bin, "serve"], env=env_old, capture_output=True, text=True, timeout=60
+        )
+        refusal.write_text(result.stdout + result.stderr)
+        assert result.returncode != 0, "released binary unexpectedly started on the upgraded database"
+        assert "schema" in (result.stdout + result.stderr).lower() or "protocol" in (
+            result.stdout + result.stderr
+        ).lower(), "refusal did not mention schema/protocol"
+        log(f"  refused as expected (exit {result.returncode}): {refusal}")
 
     log("== 6. snapshot rollback: the released binary starts on the restored copy")
     rollback = root / "rollback"
@@ -420,7 +442,11 @@ def main():
     stop(proc)
     log("  rollback read every pre-upgrade object exactly")
 
-    log("PASS: release -> current-schema upgrade, lock preservation, old-binary refusal, and snapshot rollback")
+    log(
+        "PASS: release -> current-schema upgrade, lock preservation, "
+        + ("old-binary refusal, " if will_refuse else "")
+        + "and snapshot rollback"
+    )
 
 
 if __name__ == "__main__":

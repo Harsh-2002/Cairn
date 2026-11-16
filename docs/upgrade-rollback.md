@@ -155,9 +155,14 @@ to main at `b9472d2` (schema v42, protocol 3) with `conformance/upgrade_drill.py
 - restoring the pre-upgrade data-directory snapshot lets the released binary start and read every
   object exactly.
 
-The drill runs in `validate.yml` (full profile) against the pinned `v2026.09.13` asset; manual runs
-still take `--old-bin`/`--new-bin`. On 2026-11-08 it was extended and re-run from the same pinned
-release (schema v39/protocol 2) to main `f885b5a9` (schema v44/protocol 3):
+The drill runs in `validate.yml` (full profile) against the **latest published release** (no pinned
+tag: the release workflow retires older releases, so `v2026.09.13` no longer exists and `v2026.11.16`,
+schema v45, is the source now); manual runs still take `--old-bin`/`--new-bin`. Checks that depend on
+an older release (legacy SHA-256 baselines, the legacy `?partNumber` failure, old-binary refusal) run
+only when the release really is older than the binary under test; against a same-schema release the
+drill still verifies the in-place start, exact object and Object Lock reads, a new v3/BLAKE3
+multipart write, and the snapshot rollback. On 2026-11-08 it was extended and re-run from
+`v2026.09.13` (schema v39/protocol 2) to main `f885b5a9` (schema v44/protocol 3):
 
 - a GOVERNANCE-retained, legal-held object written by the old binary keeps its exact retention
   mode/date and legal hold after the rebuild, and `PRAGMA foreign_key_check` is empty;

@@ -1,6 +1,6 @@
 # Support and deployment scope
 
-**Status: 1.0 (declared 2026-11-07; the release tag has not been cut, so the latest published release is `v2026.09.13`).** This page states what is supported today, what is not, and the
+**Status: 1.0 (declared 2026-11-07, released as `v2026.11.16`).** This page states what is supported today, what is not, and the
 operational conditions the durability claims assume. It does not grant an SLA and is not a
 third-party certification. The measured evidence is in
 [`stability-2026-11-05.md`](stability-2026-11-05.md).
@@ -30,11 +30,12 @@ third-party certification. The measured evidence is in
   redundancy and geo-distribution.
 - **Backup/restore** per [`backup-restore.md`](backup-restore.md), with the data directory and
   SQLite database kept together on the same filesystem.
-- **Upgrade:** forward upgrade is supported from the last published release. The pinned
-  `v2026.09.13` binary (schema v39, protocol 2) upgrades to the current schema v45/protocol 3,
+- **Upgrade:** forward upgrade is supported from the last published release. The previous release
+  `v2026.09.13` (schema v39, protocol 2) was upgraded to the current schema v45/protocol 3 and
   verified by `conformance/upgrade_drill.py` (clustered table, Object Lock retention/legal-hold
-  preservation, zero foreign-key violations, exact old-object reads and old-binary refusal) and
-  gated in CI. **Downgrade is unsupported** after schema v42; the old binary refuses the upgraded
+  preservation, zero foreign-key violations, exact old-object reads and old-binary refusal). The
+  release policy has since retired that release, so the drill now runs in CI against the latest
+  published release (`v2026.11.16` today) and each future release becomes the next upgrade source. **Downgrade is unsupported** after schema v42; the old binary refuses the upgraded
   database. Restore the pre-upgrade snapshot to roll back.
 - **TLS and access control:** native TLS on the listeners, SigV4/Bearer authentication, the
   policy/ACL/BPA/ownership engine, and the management console. Put a reverse proxy or network

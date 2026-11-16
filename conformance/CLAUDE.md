@@ -372,16 +372,18 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   3.55-5.17x. Reuses `delete_single_key.py`'s SigV4 driver; never pooled with the unversioned or bulk
   ratios. **NOT a gate.**
 - `upgrade_drill.py` — **published-release to current-schema upgrade and snapshot rollback**: runs
-  the pinned old binary, writes plaintext/SSE-S3/multipart objects plus a GOVERNANCE-retained,
+  the latest published release, writes plaintext/SSE-S3/multipart objects plus a GOVERNANCE-retained,
   legal-held object, snapshots the data directory, starts the current binary, asserts schema v44 or later and
   protocol 3, the clustered `object_versions` shape (`WITHOUT ROWID`, id index present, partial
   `latest_cover` absent), zero `foreign_key_check` violations, the exact Object Lock retention and
-  legal-hold rows, and that legacy rows keep SHA-256; reads every old object byte-for-byte (the
-  legacy multipart part read fails closed), writes a new v3/BLAKE3 multipart, asserts the old binary
-  refuses the upgraded database, and restores the snapshot so the old binary can read again. The
-  pinned old binary is schema v39/protocol 2; the target is the current schema (v45)/protocol 3. Runs in
-  `validate.yml` (full profile) against `v2026.09.13`; manual invocation still works with `--old-bin`
-  and `--new-bin`. **Gate.**
+  legal-hold rows, and that the integrity baselines the old binary wrote are preserved exactly;
+  reads every old object byte-for-byte (a legacy multipart part read fails closed), writes a new
+  v3/BLAKE3 multipart, asserts the old binary refuses the upgraded database when the schema or
+  protocol advanced, and restores the snapshot so the old binary can read again. The release has no
+  pinned tag (the release workflow retires older releases): it is the latest published release, and the
+  legacy-only checks run only when that release is older than the binary under test. The v39
+  `v2026.09.13` to v44 run is recorded in `docs/upgrade-rollback.md`. Runs in `validate.yml` (full
+  profile); manual invocation still works with `--old-bin` and `--new-bin`. **Gate.**
 - `delete_single_key_cairn.py` — **Cairn-only writer attribution** for the unversioned single-key
   shape: it imports `delete_single_key.py`'s client unchanged and additionally scrapes `/metrics`
   one full store-metrics tick apart on both sides of the scored window, so the writer's stage rings
