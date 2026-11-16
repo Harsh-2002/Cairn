@@ -11,7 +11,9 @@ case "${1:?CI task required}" in
   upgrade-drill)
     chmod +x target/debug/cairn
     mkdir -p /var/tmp/cairn-upgrade
-    gh release download v2026.09.13 --repo "$GITHUB_REPOSITORY" \
+    # No tag: gh downloads the latest published release, which is the supported upgrade source. The
+    # release workflow retires older releases, so a pinned tag would disappear on the next release.
+    gh release download --repo "$GITHUB_REPOSITORY" \
       --pattern cairn-linux-amd64 --pattern SHA256SUMS \
       --dir /var/tmp/cairn-upgrade --clobber
     (cd /var/tmp/cairn-upgrade && sha256sum -c SHA256SUMS --ignore-missing && chmod +x cairn-linux-amd64)

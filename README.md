@@ -123,8 +123,8 @@ disabled in standard builds; see
 
 ## Stability
 
-Current status: **1.0** for a single node with backups (declared 2026-11-07; the 1.0 release tag
-has not been cut yet, so the latest published release is `v2026.09.13`). On the current schema the
+Current status: **1.0** for a single node with backups (declared 2026-11-07, released as
+`v2026.11.16`). On the current schema the
 24-hour soak passed with 1,734,228 PUTs, 0 errors, 0 replication mismatches and 137,487
 byte-verified reads, with anonymous RSS 1,368.2 → 1,357.3 MiB (−0.8%). The full scoreboard, upgrade/rollback drill,
 replication baseline, abrupt-process-kill drill and independent review are recorded in
