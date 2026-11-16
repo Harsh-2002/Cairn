@@ -196,13 +196,17 @@ const features = [
       ratios, not just the absolute numbers.
     </p>
     <p>
-      On our shared test host, Cairn was faster than RustFS on every equal-durability workload:{" "}
-      <strong>2.24×</strong> on 4 KiB writes, <strong>1.14×</strong> on 1 MiB writes,{" "}
-      <strong>1.92×</strong> on 1 MiB reads, <strong>5.33×</strong> on listing 1,000 keys,{" "}
-      <strong>1.07×</strong> on multipart uploads, and <strong>5.17×</strong> on versioned deletes.
+      On our shared test host, against RustFS 1.0.4 with strict durability on both sides, Cairn was at
+      or above parity on every workload we measured: <strong>1.73×</strong> on 4 KiB writes,{" "}
+      <strong>1.64×</strong> on 1 MiB reads, <strong>5.13×</strong> on listing 1,000 keys,{" "}
+      <strong>2.04×</strong> on a mixed 1 MiB workload, and <strong>32.49×</strong> on versioned
+      deletes. 1 MiB writes (<strong>1.07×</strong>) and multipart uploads (<strong>1.08×</strong>)
+      are parity, not a win.
     </p>
     <p class="note">
-      The unversioned delete row is not an equal-durability comparison. The{" "}
+      The delete ratios are large because RustFS 1.0.4 fsyncs a journal and a quorum receipt for every
+      delete while Cairn batches its cleanup; the versioned delete is the strictest equal-durability
+      row. These are single-node results from one shared host with consumer storage. The{" "}
       <a class="link" href={`${docs}/benchmarks.md`}>benchmark record</a> has the method,
       limitations and reproduction commands; the{" "}
       <a class="link" href={`${docs}/scaling-limits.md`}>scaling guide</a> covers sizing limits.
