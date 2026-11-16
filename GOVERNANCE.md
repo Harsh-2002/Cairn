@@ -19,7 +19,8 @@ is, how it is maintained, and the commitments that make it safe to build on.
 
 ## Maintenance model
 
-- Cairn is **pre-1.0** and maintainer-led. Development happens in the open on
+- Cairn is **1.0** (a single node, within the scope in [`docs/support.md`](./docs/support.md)) and
+  maintainer-led. Development happens in the open on
   [GitHub](https://github.com/Harsh-2002/Cairn); `main` is always the source of truth.
 - Every change must pass its applicable CI gate before merge (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)
   and [`docs/delivery.md`](./docs/delivery.md) §31). Security and data-durability fixes take priority.
@@ -35,8 +36,7 @@ is, how it is maintained, and the commitments that make it safe to build on.
 - The S3 API surface Cairn implements is documented honestly in
   [`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md), including what is **deliberately out of scope** —
   we would rather decline a feature clearly than ship a silent stub.
-- Pre-1.0, the management API and configuration knobs may change between releases; such changes are
-  called out in the release notes.
+- Changes to the management API or the configuration knobs are called out in the release notes.
 
 ## Security
 

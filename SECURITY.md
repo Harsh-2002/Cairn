@@ -95,4 +95,5 @@ A release without `IMAGE-DIGEST` and matching provenance is unsupported for this
 
 ## Supported versions
 
-Cairn is pre-1.0; security fixes land on `main`.
+Only the latest release is supported (exactly one release is active at a time). Security fixes land
+on `main` and ship in the next release.
